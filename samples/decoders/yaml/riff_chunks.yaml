@@ -1,0 +1,33 @@
+# Inspect a little-endian RIFF/WAVE container and PCM format metadata.
+# Audio data and unknown chunks remain bytes; this is not an audio decoder.
+endian: little
+structures:
+  Format:
+    fields:
+      - {name: encoding, type: u16}
+      - {name: channels, type: u16}
+      - {name: sample_rate, type: u32}
+      - {name: bytes_per_second, type: u32}
+      - {name: block_alignment, type: u16}
+      - {name: bits_per_sample, type: u16}
+  Chunk:
+    fields:
+      - {name: id, type: text, length: 4}
+      - {name: length, type: u32}
+      - name: payload
+        type:
+          choose:
+            ref: id
+            cases: {'fmt ': Format}
+            otherwise: bytes
+        length: {ref: length}
+    actions:
+      - align: 2
+  Wave:
+    fields:
+      - {name: format, type: text, length: 4, expect: WAVE}
+      - {name: chunks, type: Chunk, repeat: until end}
+actions:
+  - read: {name: signature, type: text, length: 4, expect: RIFF}
+  - read: {name: length, type: u32}
+  - read: {name: container, type: Wave, length: {ref: length}}

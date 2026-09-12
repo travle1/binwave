@@ -1,0 +1,19 @@
+endian: little
+
+sections:
+  - name: header
+    bytes: 16
+
+  - name: samples
+    repeat: until next
+    fields:
+      - timestamp: u32
+      - temperature: {type: i16, scale: 0.01}
+      - pressure: u16
+      - padding: 4
+
+  - name: footer
+    marker: "DE AD BE EF"
+    fields:
+      - checksum: u32
+# checksum is an ordinary value; edits do not recalculate it.

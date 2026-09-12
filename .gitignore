@@ -1,2 +1,18 @@
-target/
-Cargo.lock
+/target/
+
+# Local workspace state and credentials
+/.codex
+/:memory:.ses
+.env
+.env.*
+*.env
+__pycache__/
+*.py[cod]
+
+# Local media production workspace
+/docs/video-*/
+
+# Keep generated and private data local; only tiny public demos are tracked.
+/samples/data/*
+!/samples/data/sample.csv
+!/samples/data/sensors.bin

@@ -1,28 +1,38 @@
 use crate::config::AppConfig;
-use crate::data::{decimate_minmax, DataStore};
-use egui_plot::{Line, PlotPoints};
+use crate::data::DataStore;
+use anyhow::Result;
+use std::sync::atomic::AtomicBool;
+
+pub type PlotLines = Vec<(usize, String, Vec<[f64; 2]>)>;
 
 pub struct PlotBuilder<'a> {
     pub store: &'a DataStore,
     pub cfg: &'a AppConfig,
 }
 
-impl<'a> PlotBuilder<'a> {
-    pub fn line_for_range(
+impl PlotBuilder<'_> {
+    pub fn lines_for_range(
         &self,
-        name: &str,
-        tmin: f64,
-        tmax: f64,
-        pixel_width: f32,
-    ) -> Option<Line> {
-        let sig = self.store.get(name)?;
-        let target = (self.cfg.view.target_points_per_line as f32)
-            .min(pixel_width.max(100.0)) as usize;
-        let pts = decimate_minmax(&sig.points, tmin, tmax, target);
-        if pts.is_empty() {
-            return None;
-        }
-        let plot_points: PlotPoints = pts.into_iter().map(|p| [p[0], p[1]]).collect();
-        Some(Line::new(plot_points).name(name.to_string()))
+        visible: &[bool],
+        bounds: [f64; 2],
+        target: usize,
+        cancel: &AtomicBool,
+    ) -> Result<PlotLines> {
+        self.store
+            .signals
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| visible.get(*i) == Some(&true))
+            .take(self.cfg.view.max_lines_in_plot)
+            .map(|(i, signal)| {
+                let points = self
+                    .store
+                    .get(&signal.name)
+                    .unwrap()
+                    .points
+                    .for_range_cancel(bounds[0], bounds[1], target, cancel)?;
+                Ok((i, signal.name.clone(), points))
+            })
+            .collect()
     }
 }

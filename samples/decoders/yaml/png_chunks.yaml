@@ -1,0 +1,28 @@
+# Inspect PNG chunk structure. IDAT remains raw compressed bytes.
+# CRC values are displayed, not verified or recalculated by this definition.
+endian: big
+structures:
+  ImageHeader:
+    fields:
+      - {name: width, type: u32}
+      - {name: height, type: u32}
+      - {name: bit_depth, type: u8}
+      - {name: color_type, type: u8}
+      - {name: compression, type: u8}
+      - {name: filter, type: u8}
+      - {name: interlace, type: u8}
+  Chunk:
+    fields:
+      - {name: length, type: u32}
+      - {name: type, type: text, length: 4}
+      - name: payload
+        type:
+          choose:
+            ref: type
+            cases: {IHDR: ImageHeader}
+            otherwise: bytes
+        length: {ref: length}
+      - {name: crc, type: u32}
+actions:
+  - read: {name: signature, type: u64, expect: 0x89504E470D0A1A0A}
+  - read: {name: chunks, type: Chunk, repeat: until end}
