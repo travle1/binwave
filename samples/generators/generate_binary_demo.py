@@ -12,7 +12,7 @@ for index in range(200):
     out += struct.pack('<IhH', timestamp, temperature, pressure)
     out += bytes((0xA5, index % 256, 0x5A, 0xFF))  # preserved padding
 # Literal marker followed by an ordinary illustrative checksum value.
-# PlotterMax does not verify or recalculate this field.
+# Binwave does not verify or recalculate this field.
 out += bytes.fromhex('DE AD BE EF') + struct.pack('<I', 0x12345678)
 path = Path(__file__).resolve().parents[1] / 'data' / 'sensors.bin'
 path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Binwave — Browser Preview</title>
+  <base data-trunk-public-url>
+  <link data-trunk rel="rust" data-bin="binwave">
+  <link data-trunk rel="copy-dir" href="web">
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #202020; color: #eee; font: 14px system-ui; }
+    header { height: 48px; box-sizing: border-box; display: flex; align-items: center; gap: 10px; padding: 8px; }
+    button { padding: 5px 12px; } #status { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    #workspace { position: absolute; top: 48px; left: 0; width: 100%; height: calc(100% - 48px); }
+    #binwave:not([hidden]) { display: block; }
+    #graphics-error { max-width: 680px; margin: 48px auto; padding: 24px; background: #292929; border-radius: 8px; }
+    #graphics-error pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #bbb; }
+  </style>
+</head>
+<body>
+  <header aria-label="File operations">
+    <button id="open" disabled>Open file…</button><input type="file" id="file" hidden>
+    <button id="save" disabled>Save edited copy…</button>
+    <button id="extract" disabled>Extract selection…</button>
+    <button id="cancel" disabled>Cancel export</button>
+    <span id="status" role="status">Starting Binwave…</span>
+  </header>
+  <main id="workspace">
+    <canvas id="binwave" aria-label="Binwave editing workspace"></canvas>
+    <section id="graphics-error" role="alert" hidden>
+      <h1>This browser cannot start the graphics workspace</h1>
+      <p>Binwave tries WebGPU and then WebGL2. No usable renderer could start.</p>
+      <p>If you are using an embedded browser, open <strong id="graphics-url">this page’s URL</strong>
+      in a regular Chrome, Edge, or Firefox window. GPU availability can differ between browsers.</p>
+      <p>If it still fails, check your browser’s graphics acceleration setting and graphics driver,
+      then restart the browser. The egui workspace requires WebGPU or WebGL2; there is no CPU-only renderer.</p>
+      <details><summary>Technical details</summary><pre id="graphics-detail"></pre></details>
+    </section>
+  </main>
+  <script src="web/bridge.js"></script>
+</body>
+</html>

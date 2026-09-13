@@ -184,7 +184,7 @@ enum AppDialogAction {
     LoadCsvConfig,
 }
 
-pub struct PlotterApp {
+pub struct BinwaveApp {
     cfg: AppConfig,
     generation: u64,
     dataset: u64,
@@ -233,7 +233,7 @@ pub struct PlotterApp {
     cache_message: Option<String>,
 }
 
-impl Default for PlotterApp {
+impl Default for BinwaveApp {
     fn default() -> Self {
         let cfg = AppConfig::default();
         let file_locations = FileLocations::default();
@@ -290,7 +290,7 @@ impl Default for PlotterApp {
     }
 }
 
-impl Drop for PlotterApp {
+impl Drop for BinwaveApp {
     fn drop(&mut self) {
         self.plot_cancel.store(true, Ordering::Relaxed);
         self.load_progress.cancelled.store(true, Ordering::Relaxed);
@@ -298,7 +298,7 @@ impl Drop for PlotterApp {
     }
 }
 
-impl PlotterApp {
+impl BinwaveApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::default();
         app.workspace = WorkspaceLayout::load(cc.storage);
@@ -1177,7 +1177,7 @@ impl PlotterApp {
             DialogFileKind::Data,
             self.dialog_template
                 .clone()
-                .set_title("Open file — Plotter Max"),
+                .set_title("Open file — Binwave"),
         );
         self.file_dialog
             .begin_open(dialog, AppDialogAction::OpenData, ctx);
@@ -1193,7 +1193,7 @@ impl PlotterApp {
             DialogFileKind::CsvConfig,
             self.dialog_template
                 .clone()
-                .set_title("Load CSV configuration — Plotter Max")
+                .set_title("Load CSV configuration — Binwave")
                 .add_filter("Markdown config", &["md", "markdown"]),
         );
         self.file_dialog
@@ -1940,7 +1940,7 @@ impl PlotterApp {
     }
 }
 
-impl eframe::App for PlotterApp {
+impl eframe::App for BinwaveApp {
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
         self.dialog_template = rfd::AsyncFileDialog::new().set_parent(frame);
         self.binary
@@ -1954,7 +1954,7 @@ impl eframe::App for PlotterApp {
 }
 
 struct WorkspaceViewer<'a> {
-    app: &'a mut PlotterApp,
+    app: &'a mut BinwaveApp,
 }
 impl TabViewer for WorkspaceViewer<'_> {
     type Tab = Pane;
@@ -2093,7 +2093,7 @@ mod tests {
         )
     }
 
-    fn frame(app: &mut PlotterApp, ctx: &Context, events: Vec<egui::Event>) -> egui::FullOutput {
+    fn frame(app: &mut BinwaveApp, ctx: &Context, events: Vec<egui::Event>) -> egui::FullOutput {
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -2113,7 +2113,7 @@ mod tests {
         )
     }
 
-    fn click(app: &mut PlotterApp, ctx: &Context, label: &str) {
+    fn click(app: &mut BinwaveApp, ctx: &Context, label: &str) {
         frame(app, ctx, vec![]);
         let output = frame(app, ctx, vec![]);
         let pos = output
@@ -2141,7 +2141,7 @@ mod tests {
         }
     }
 
-    fn workspace_frame(app: &mut PlotterApp, ctx: &Context) -> egui::FullOutput {
+    fn workspace_frame(app: &mut BinwaveApp, ctx: &Context) -> egui::FullOutput {
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -2155,7 +2155,7 @@ mod tests {
     }
 
     fn workspace_events(
-        app: &mut PlotterApp,
+        app: &mut BinwaveApp,
         ctx: &Context,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
@@ -2171,7 +2171,7 @@ mod tests {
             |ctx| app.ui_workspace(ctx),
         )
     }
-    fn workspace_click(app: &mut PlotterApp, ctx: &Context, label: &str) {
+    fn workspace_click(app: &mut BinwaveApp, ctx: &Context, label: &str) {
         workspace_frame(app, ctx);
         let output = workspace_frame(app, ctx);
         let pos = output
@@ -2209,7 +2209,7 @@ mod tests {
         path
     }
 
-    fn wait_csv(app: &mut PlotterApp, ctx: &Context) {
+    fn wait_csv(app: &mut BinwaveApp, ctx: &Context) {
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         loop {
             workspace_frame(app, ctx);
@@ -2221,7 +2221,7 @@ mod tests {
         }
     }
 
-    fn wait_byte_preview(app: &mut PlotterApp, ctx: &Context) {
+    fn wait_byte_preview(app: &mut BinwaveApp, ctx: &Context) {
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         loop {
             workspace_frame(app, ctx);
@@ -2254,7 +2254,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = csv_fixture(dir.path(), 30_000);
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.csv_cache_root = dir.path().join("cache");
         app.open_path(path.clone(), &ctx);
         wait_csv(&mut app, &ctx);
@@ -2321,7 +2321,7 @@ mod tests {
             old_view
         );
         // Opening the same source reuses its saved partial index and stays idle.
-        let mut reopened = PlotterApp::default();
+        let mut reopened = BinwaveApp::default();
         reopened.csv_cache_root = dir.path().join("cache");
         reopened.open_path(path, &ctx);
         wait_csv(&mut reopened, &ctx);
@@ -2334,7 +2334,7 @@ mod tests {
         assert!(reopened.csv_complete());
     }
 
-    fn wait_csv_selection(app: &mut PlotterApp, ctx: &Context) {
+    fn wait_csv_selection(app: &mut BinwaveApp, ctx: &Context) {
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
         loop {
             workspace_frame(app, ctx);
@@ -2359,7 +2359,7 @@ mod tests {
         let path = csv_fixture(dir.path(), 300);
         let raw = std::fs::read(&path).unwrap();
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.csv_cache_root = dir.path().join("cache");
         app.open_path(path, &ctx);
         wait_csv(&mut app, &ctx);
@@ -2476,7 +2476,7 @@ mod tests {
         }
         std::fs::write(&path, &raw).unwrap();
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.csv_cache_root = dir.path().join("cache");
         app.open_path(path, &ctx);
         wait_csv(&mut app, &ctx);
@@ -2559,7 +2559,7 @@ mod tests {
         let raw = b"time,value\n1,10\n1,20\n0,30\n2,40\n";
         std::fs::write(&path, raw).unwrap();
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.csv_cache_root = dir.path().join("cache");
         app.open_path(path, &ctx);
         wait_csv(&mut app, &ctx);
@@ -2630,7 +2630,7 @@ mod tests {
         let path = csv_fixture(dir.path(), 30_000);
         let raw = std::fs::read(&path).unwrap();
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.csv_cache_root = dir.path().join("cache");
         app.open_path(path, &ctx);
         wait_csv(&mut app, &ctx);
@@ -2693,7 +2693,7 @@ mod tests {
         drop(file);
         let size = std::fs::metadata(&path).unwrap().len() as usize;
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.csv_cache_root = dir.path().join("cache");
         app.open_path(path, &ctx);
         wait_csv(&mut app, &ctx);
@@ -2721,7 +2721,7 @@ mod tests {
         raw.extend_from_slice(b"invalid,tail\r\n");
         std::fs::write(&path, &raw).unwrap();
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.csv_cache_root = dir.path().join("cache");
         app.open_path(path, &ctx);
         wait_csv(&mut app, &ctx);
@@ -2753,12 +2753,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = csv_fixture(dir.path(), 12);
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.csv_cache_root = dir.path().join("cache");
         app.open_path(path, &ctx);
         wait_csv(&mut app, &ctx);
         workspace_click(&mut app, &ctx, "Python");
-        app.binary.load_python_text("from plottermax import Struct\nByte = Struct('Byte', [('value', 'u8')])\nfile.records('bytes', Byte, count=file.size)", &ctx);
+        app.binary.load_python_text("from binwave import Struct\nByte = Struct('Byte', [('value', 'u8')])\nfile.records('bytes', Byte, count=file.size)", &ctx);
         assert!(app.displayed_decoder == Decoder::Csv);
         app.run_active_decoder(&ctx);
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
@@ -2784,7 +2784,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = csv_fixture(dir.path(), 300);
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.csv_cache_root = dir.path().join("cache");
         app.open_path(path, &ctx);
         wait_csv(&mut app, &ctx);
@@ -2842,7 +2842,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = csv_fixture(dir.path(), 12_000);
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.csv_cache_root = dir.path().join("cache");
         app.open_path(path, &ctx);
         wait_csv(&mut app, &ctx);
@@ -2910,7 +2910,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = csv_fixture(dir.path(), 12_000);
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.csv_cache_root = dir.path().join("cache");
         app.open_path(path, &ctx);
         wait_csv(&mut app, &ctx);
@@ -2954,7 +2954,7 @@ mod tests {
             .write_all(b"invalid,time\n")
             .unwrap();
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.csv_cache_root = dir.path().join("cache");
         app.open_path(path, &ctx);
         wait_csv(&mut app, &ctx);
@@ -2982,7 +2982,7 @@ mod tests {
     #[test]
     fn file_menu_and_apply_shortcut_show_samples_beside_the_bytes() {
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         let output = workspace_frame(&mut app, &ctx);
         let top: Vec<_> = output
             .shapes
@@ -3050,7 +3050,7 @@ mod tests {
     #[test]
     fn welcome_does_not_reserve_empty_editors_and_views() {
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         let output = workspace_frame(&mut app, &ctx);
         let labels: Vec<_> = output
             .shapes
@@ -3075,7 +3075,7 @@ mod tests {
     #[test]
     fn byte_changes_discard_csv_results_and_pending_workers_without_losing_source() {
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.cfg.data_path = Some("source.csv".into());
         app.decoder = Decoder::Csv;
         app.accept_data(store(100), false);
@@ -3098,7 +3098,7 @@ mod tests {
     #[test]
     fn shared_workspace_opens_any_file_and_discards_stale_csv_workers() {
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.accept_data(store(100), false);
         let old_progress = app.load_progress.clone();
         let (tx, rx) = mpsc::channel();
@@ -3170,7 +3170,7 @@ mod tests {
             ("yaml", "YAML", "endian: little\nstructures:\n  Custom:\n    fields:\n      - {name: saved_yaml_field, type: u16}\nactions:\n  - read: {name: custom, type: Custom, repeat: until end}\n"),
         ] {
             let ctx = Context::default();
-            let mut app = PlotterApp::default();
+            let mut app = BinwaveApp::default();
             let definition = dir.path().join(format!("custom.{extension}"));
             std::fs::write(&definition, code).unwrap();
             app.binary.load_yaml(definition, &ctx);
@@ -3198,7 +3198,7 @@ mod tests {
         let data = dir.path().join("empty.raw");
         std::fs::write(&data, []).unwrap();
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.open_path(data, &ctx);
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         while !app.binary.has_file() || app.binary.busy() {
@@ -3232,7 +3232,7 @@ mod tests {
             .read_rows(0..1, &AtomicBool::new(true))
             .is_err());
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("invalid.csv");
         std::fs::write(&path, b"wrong,header\n1,2\n").unwrap();
@@ -3255,7 +3255,7 @@ mod tests {
     #[test]
     fn progressive_plot_controls_work_and_preserve_view_until_completion() {
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         let (tx, rx) = mpsc::channel();
         app.loader_rx = Some(rx);
         *app.load_preview.lock().unwrap() = Some(store(100));
@@ -3298,7 +3298,7 @@ mod tests {
     #[test]
     fn growing_full_range_cancel_and_stale_loads_are_explicit() {
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         let (tx, rx) = mpsc::channel();
         app.loader_rx = Some(rx);
         *app.load_preview.lock().unwrap() = Some(store(100));
@@ -3337,7 +3337,7 @@ mod tests {
     #[test]
     fn more_loaded_rows_do_not_starve_an_existing_plot_query() {
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.accept_data(store(100), true);
         let old = CsvPlotKey {
             dataset: app.dataset,
@@ -3388,7 +3388,7 @@ mod tests {
     #[test]
     fn go_to_byte_shortcut_opens_hex_and_focuses_navigation() {
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.binary.open_demo(&ctx);
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         while !app.binary.has_file() {
@@ -3430,7 +3430,7 @@ mod tests {
 
     #[test]
     fn open_dialog_keeps_workspace_rendering_and_cancellation_keeps_current_state() {
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         let ctx = Context::default();
         app.status = "Existing workspace".into();
         let mut config = AppConfig::default();
@@ -3473,7 +3473,7 @@ mod tests {
 
     #[test]
     fn completed_open_dialog_dispatches_once_and_loads_the_selected_file() {
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         let ctx = Context::default();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("any.extension");
@@ -3501,7 +3501,7 @@ mod tests {
 
     #[test]
     fn cancelled_csv_config_picker_keeps_loaded_config() {
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         let ctx = Context::default();
         app.cfg.data_path = Some("current.csv".into());
         app.file_dialog.begin_test(
@@ -3543,7 +3543,7 @@ mod tests {
             (DialogFileKind::CsvConfig, "configs", "settings.md"),
             (DialogFileKind::Exports, "exports", "selection.bin"),
         ];
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         for (kind, directory, name) in cases {
             let directory = root.path().join(directory);
             std::fs::create_dir(&directory).unwrap();
@@ -3553,7 +3553,7 @@ mod tests {
         }
         let mut storage = MemoryStorage::default();
         eframe::App::save(&mut app, &mut storage);
-        let mut restored = PlotterApp::default();
+        let mut restored = BinwaveApp::default();
         restored.restore_file_locations(Some(&storage));
         for (kind, directory, _) in cases {
             assert_eq!(
@@ -3589,7 +3589,7 @@ mod tests {
     #[test]
     fn decoder_source_and_run_are_visible_then_results_open_beside_it() {
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         let directory = tempfile::tempdir().unwrap();
         let data_path = directory.path().join("waveform.data");
         std::fs::write(&data_path, [1u8, 0, 2, 0, 3, 0, 4, 0]).unwrap();
@@ -3663,12 +3663,12 @@ mod tests {
     #[test]
     fn python_file_runs_only_on_request_and_shows_results_in_same_workspace() {
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("capture.raw");
         let script = directory.path().join("decoder.py");
         std::fs::write(&data, [1u8, 0, 2, 0, 3, 0, 4, 0]).unwrap();
-        std::fs::write(&script, "from plottermax import Struct\nimport math\ndef sample_type():\n    return Struct('Sample', [('amplitude', 'u16')])\nfile.records('samples', sample_type())\nprint('Completed', math.sqrt(16))\n").unwrap();
+        std::fs::write(&script, "from binwave import Struct\nimport math\ndef sample_type():\n    return Struct('Sample', [('amplitude', 'u16')])\nfile.records('samples', sample_type())\nprint('Completed', math.sqrt(16))\n").unwrap();
         app.open_path(data, &ctx);
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         while !app.binary.has_file() {
@@ -3714,7 +3714,7 @@ mod tests {
     #[test]
     fn stop_python_keeps_the_editor_responsive() {
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("capture.raw");
         let script = directory.path().join("loop.py");
@@ -3741,7 +3741,7 @@ mod tests {
         assert!(app.binary.can_apply_definition());
     }
 
-    fn capture_workspace(app: &mut PlotterApp, ctx: &Context, name: &str) {
+    fn capture_workspace(app: &mut BinwaveApp, ctx: &Context, name: &str) {
         let output = workspace_frame(app, ctx);
         let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
         let atlas = ctx.fonts(|fonts| fonts.image());
@@ -3771,7 +3771,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = csv_fixture(dir.path(), 30_000);
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.show_empty_workspace = true;
         for _ in 0..10 {
             workspace_frame(&mut app, &ctx);
@@ -3835,7 +3835,7 @@ mod tests {
             .collect();
         std::fs::write(&path, bytes).unwrap();
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         app.open_path(path, &ctx);
         wait_byte_preview(&mut app, &ctx);
         for _ in 0..40 {
@@ -3850,7 +3850,7 @@ mod tests {
     #[ignore = "writes a tessellated UI capture to /tmp; requires the generated preview fixture"]
     fn capture_editing_workspace() {
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("samples/data/waveform_preview.bin");
         app.binary.open(path, &ctx);
@@ -3939,7 +3939,7 @@ mod tests {
     #[ignore = "captures the actual 40 GB overview to /tmp; requires the generated fixture"]
     fn capture_plot_overview() {
         let ctx = Context::default();
-        let mut app = PlotterApp::default();
+        let mut app = BinwaveApp::default();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         app.open_path(root.join("samples/data/waveform_stress_40gb.bin"), &ctx);
         let deadline = Instant::now() + std::time::Duration::from_secs(20);

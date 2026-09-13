@@ -119,7 +119,7 @@ actions:
                 r#"# Byte preview: edit this to match your data.
 # Field types: u8, i16, u16, i32, f32, f64.
 # F5 runs this script; print() uses Console.
-from plottermax import Struct
+from binwave import Struct
 
 Sample = Struct("Sample", [
     ("value", "u8"),
@@ -165,7 +165,7 @@ print(f"Registered {len(samples):,} samples")
 ## Select all, then Ctrl+/ to uncomment.
 ## On Mac use Cmd+/. F5 runs.
 #
-# from plottermax import Struct
+# from binwave import Struct
 #
 # Header = Struct("Header", [
 #     ("count", "u32"),
@@ -4484,7 +4484,7 @@ actions:
         let ctx = Context::default();
         let mut source = bytes(&[3, 4]);
         let mut workspace = StructureWorkspace::default();
-        let code = "from plottermax import Struct\nfile.read_struct('original', Struct('Record', [('value', 'u8')]))";
+        let code = "from binwave import Struct\nfile.read_struct('original', Struct('Record', [('value', 'u8')]))";
         workspace.apply_python(code, Some(Path::new("original.py")), source.view(), &ctx);
         settle_python(&mut workspace, source.view(), &ctx);
         assert_eq!(workspace.take_run_finished(), Some(RunOutcome::Published));
@@ -4533,7 +4533,7 @@ actions:
         let ctx = Context::default();
         let mut source = bytes(&[3]);
         let mut workspace = StructureWorkspace::default();
-        let code = "from plottermax import Struct\nif file.read_at(0, 1) == bytes([3]):\n    file.read_struct('value', Struct('Record', [('value', 'u8')]))";
+        let code = "from binwave import Struct\nif file.read_at(0, 1) == bytes([3]):\n    file.read_struct('value', Struct('Record', [('value', 'u8')]))";
         workspace.apply_python(code, None, source.view(), &ctx);
         settle_python(&mut workspace, source.view(), &ctx);
         assert!(workspace.is_ready());
@@ -4556,7 +4556,7 @@ actions:
         let mut data = vec![0; 401];
         data[0] = 200;
         let mut source = bytes(&data);
-        let code = r#"from plottermax import Struct
+        let code = r#"from binwave import Struct
 Header = Struct('Header', [('count', 'u8')])
 header = file.read_struct('header', Header)
 Sample = Struct('Sample', [('value', 'u16')])
@@ -4720,7 +4720,7 @@ print(f'{len(samples)} samples')
 
     #[test]
     fn python_highlighting_and_console_limits_preserve_unicode() {
-        let code = "from plottermax import Struct\nname = 'café' # 日本語\nvalue = 0x10\ntext = \"\"\"multiple\nlines 🦀\"\"\"\n";
+        let code = "from binwave import Struct\nname = 'café' # 日本語\nvalue = 0x10\ntext = \"\"\"multiple\nlines 🦀\"\"\"\n";
         let job = source_layout(
             code,
             egui::FontId::monospace(13.),

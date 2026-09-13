@@ -16,3 +16,6 @@ __pycache__/
 /samples/data/*
 !/samples/data/sample.csv
 !/samples/data/sensors.bin
+
+# Local platform build artifacts
+/dist/

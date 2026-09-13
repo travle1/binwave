@@ -1840,12 +1840,12 @@ mod tests {
     #[test]
     #[ignore]
     fn benchmark_csv_source_index() {
-        let temp = if let Some(parent) = std::env::var_os("PLOTTERMAX_BENCH_CACHE_PARENT") {
+        let temp = if let Some(parent) = std::env::var_os("BINWAVE_BENCH_CACHE_PARENT").or_else(|| std::env::var_os("PLOTTERMAX_BENCH_CACHE_PARENT")) {
             tempfile::tempdir_in(parent).unwrap()
         } else {
             tempfile::tempdir().unwrap()
         };
-        let path = if let Some(path) = std::env::var_os("PLOTTERMAX_BENCH_CSV") {
+        let path = if let Some(path) = std::env::var_os("BINWAVE_BENCH_CSV").or_else(|| std::env::var_os("PLOTTERMAX_BENCH_CSV")) {
             PathBuf::from(path)
         } else {
             let path = temp.path().join("benchmark.csv");

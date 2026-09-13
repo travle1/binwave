@@ -68,7 +68,7 @@ fn run_python(
     source: &ByteView,
     cancel: &AtomicBool,
 ) -> Result<(Value, String)> {
-    let interpreter = std::env::var_os("PLOTTERMAX_PYTHON").unwrap_or_else(|| {
+    let interpreter = std::env::var_os("BINWAVE_PYTHON").or_else(|| std::env::var_os("PLOTTERMAX_PYTHON")).unwrap_or_else(|| {
         if cfg!(windows) {
             "python".into()
         } else {
@@ -76,6 +76,12 @@ fn run_python(
         }
     });
     let mut command = Command::new(&interpreter);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Keep the decoder's piped console hidden in the GUI application.
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
     command.args(["-u", "-c", RUNNER]);
     command
         .stdin(Stdio::piped())
@@ -101,7 +107,7 @@ fn run_python(
         command.process_group(0);
     }
     let child = command.spawn().with_context(|| {
-        format!("Start Python interpreter {:?}. Install Python 3 or set PLOTTERMAX_PYTHON to its executable.", interpreter)
+        format!("Start Python interpreter {:?}. Install Python 3 or set BINWAVE_PYTHON to its executable.", interpreter)
     })?;
     let mut child = ChildGuard {
         child,
@@ -497,7 +503,7 @@ mod tests {
         let mut store = bytes(&[2, 10, 0, 20, 0]);
         store.replace(1, &42_u16.to_le_bytes()).unwrap();
         let result = execute(
-            r#"from plottermax import Struct
+            r#"from binwave import Struct
 Header = Struct('Header', [('count', 'u8')])
 header = file.read_struct('header', Header)
 assert file.read_at(1, 2) == bytes([42, 0])
@@ -526,7 +532,7 @@ print('count:', len(samples))
     fn python_functions_and_imports_work_from_the_decoder_directory() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("local_decoder_helper.py"),
-            "from plottermax import Struct\ndef make_type():\n    return Struct('Value', [('number', 'u8')])\n").unwrap();
+            "from binwave import Struct\ndef make_type():\n    return Struct('Value', [('number', 'u8')])\n").unwrap();
         let path = dir.path().join("decoder.py");
         let code = "import math\nfrom local_decoder_helper import make_type\ndef decode():\n    return file.read_struct('value', make_type())\nprint(math.sqrt(decode().number))\n";
         std::fs::write(&path, code).unwrap();
@@ -548,13 +554,13 @@ print('count:', len(samples))
         let path = dir.path().join("large-sparse.raw");
         let length = 5_u64 * 1024 * 1024 * 1024 + 16;
         let mut file = std::fs::File::create(&path).unwrap();
-        file.set_len(length).unwrap();
+        crate::cache::set_fixture_len(&file, length).unwrap();
         file.seek(SeekFrom::Start(length - 4)).unwrap();
         file.write_all(&12345_u32.to_le_bytes()).unwrap();
         drop(file);
         let source = ByteStore::from_file(Arc::new(FileSource::open(&path).unwrap())).view();
         let result = execute(
-            "from plottermax import Struct\nassert file.unpack('<I', offset=file.size - 4) == (12345,)\nSample = Struct('Sample', [('value', 'u32')])\nsamples = file.records('samples', Sample, count=file.size // 4)\nprint(len(samples))\n",
+            "from binwave import Struct\nassert file.unpack('<I', offset=file.size - 4) == (12345,)\nSample = Struct('Sample', [('value', 'u32')])\nsamples = file.records('samples', Sample, count=file.size // 4)\nprint(len(samples))\n",
             &source,
         );
         let (_, output) = result.decoded.expect("registered structures must decode");
@@ -573,7 +579,7 @@ print('count:', len(samples))
     /// Opt in to checking the real generated artifact through Python, the pipe
     /// bridge, Program validation, and Rust's lazy sample-page reader.
     #[test]
-    #[ignore = "requires generated fixture; set PLOTTERMAX_WAVEFORM_FILE to choose its path"]
+    #[ignore = "requires generated fixture; set BINWAVE_WAVEFORM_FILE to choose its path"]
     #[cfg(target_pointer_width = "64")]
     fn verify_generated_waveform_python_runtime() {
         use crate::structure::Node;
@@ -664,7 +670,7 @@ print('count:', len(samples))
         }
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let path = std::env::var_os("PLOTTERMAX_WAVEFORM_FILE")
+        let path = std::env::var_os("BINWAVE_WAVEFORM_FILE").or_else(|| std::env::var_os("PLOTTERMAX_WAVEFORM_FILE"))
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| root.join("samples/data/waveform_stress_40gb.bin"));
         assert!(
@@ -813,7 +819,7 @@ print('count:', len(samples))
     fn python_reads_a_full_chunk_without_buffering_one_json_value_per_byte() {
         let source = bytes(&vec![255; READ_LIMIT]).view();
         let result = execute(
-            "from plottermax import Struct\nassert file.read_at(0, 1024 * 1024) == bytes([255]) * (1024 * 1024)\nfile.read_struct('value', Struct('Value', [('number', 'u8')]))\n",
+            "from binwave import Struct\nassert file.read_at(0, 1024 * 1024) == bytes([255]) * (1024 * 1024)\nfile.read_struct('value', Struct('Value', [('number', 'u8')]))\n",
             &source,
         );
         let (_, output) = result.decoded.expect("registered structures must decode");

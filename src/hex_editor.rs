@@ -1000,11 +1000,7 @@ A gold underline marks search hits; an orange top edge marks edits.");
                     let (hex, ascii, color) = if let Some((byte, _)) = byte {
                         (
                             format!("{byte:02X}"),
-                            if (32..127).contains(&byte) {
-                                (byte as char).to_string()
-                            } else {
-                                "·".into()
-                            },
+                            crate::byte_display::ascii(byte).to_string(),
                             style.text,
                         )
                     } else {

@@ -3115,7 +3115,7 @@ mod tests {
         let path = directory.path().join("large-source.raw");
         let length = 40_usize * 1024 * 1024 * 1024;
         let mut file = std::fs::File::create(&path).unwrap();
-        file.set_len(length as u64).unwrap();
+        crate::cache::set_fixture_len(&file, length as u64).unwrap();
         file.seek(SeekFrom::End(-1)).unwrap();
         file.write_all(&[231]).unwrap();
         drop(file);
@@ -3658,7 +3658,7 @@ mod tests {
         workspace.structure_ui.begin_definition(0..2);
         let yaml = workspace.yaml.clone();
         assert!(workspace.active_authoring_dirty());
-        workspace.load_python_text("from plottermax import Struct\nSample = Struct('Sample', [('value', 'u8')])\nfile.records('samples', Sample)\n", &ctx);
+        workspace.load_python_text("from binwave import Struct\nSample = Struct('Sample', [('value', 'u8')])\nfile.records('samples', Sample)\n", &ctx);
         assert!(
             workspace.pending.is_none(),
             "New Python never replaces the YAML fields"
@@ -4592,7 +4592,7 @@ mod tests {
         let size = 40_000_000_000usize;
         let mut file = std::fs::File::create(&source).unwrap();
         // The logical address is genuinely beyond 32 bits without writing 40 GB in a test.
-        file.set_len(size as u64).unwrap();
+        crate::cache::set_fixture_len(&file, size as u64).unwrap();
         file.seek(SeekFrom::Start((size - 16) as u64)).unwrap();
         file.write_all(&17u64.to_le_bytes()).unwrap();
         file.write_all(&29u64.to_le_bytes()).unwrap();

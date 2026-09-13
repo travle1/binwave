@@ -1,39 +1,87 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+#[cfg(not(target_arch = "wasm32"))]
 mod app;
+#[cfg(not(target_arch = "wasm32"))]
 mod binary;
+#[cfg(not(target_arch = "wasm32"))]
 mod binary_ui;
+#[cfg(target_arch = "wasm32")]
+mod browser;
+mod byte_display;
+#[cfg(not(target_arch = "wasm32"))]
 mod byte_store;
+#[cfg(not(target_arch = "wasm32"))]
 mod cache;
+#[cfg(not(target_arch = "wasm32"))]
 mod config;
+#[cfg(not(target_arch = "wasm32"))]
 mod csv_table;
+#[cfg(not(target_arch = "wasm32"))]
 mod data;
+#[cfg(not(target_arch = "wasm32"))]
 mod field_preview;
+#[cfg(not(target_arch = "wasm32"))]
 mod file_dialog;
+mod file_range;
+#[cfg(not(target_arch = "wasm32"))]
 mod file_source;
+#[cfg(not(target_arch = "wasm32"))]
 mod hex_editor;
+#[cfg(not(target_arch = "wasm32"))]
 mod loaders;
+#[cfg(not(target_arch = "wasm32"))]
 mod plot_index;
+#[cfg(not(target_arch = "wasm32"))]
 mod plot_trace;
+#[cfg(not(target_arch = "wasm32"))]
 mod plotting;
+#[cfg(not(target_arch = "wasm32"))]
 mod python_decoder;
+#[cfg(not(target_arch = "wasm32"))]
 mod structure;
+#[cfg(not(target_arch = "wasm32"))]
 mod structure_plot;
+#[cfg(not(target_arch = "wasm32"))]
 mod structure_ui;
+#[cfg(not(target_arch = "wasm32"))]
 mod structure_views;
 mod workspace_layout;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     env_logger::init();
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            // Keep the existing settings location through the product rename.
+            .with_app_id("Plotter Max")
             .with_inner_size([1280., 850.])
             .with_min_inner_size([1000., 650.]),
         ..Default::default()
     };
     eframe::run_native(
-        "Plotter Max",
+        "Binwave",
         native_options,
-        Box::new(|cc| Box::new(app::PlotterApp::new(cc))),
+        Box::new(|cc| Box::new(app::BinwaveApp::new(cc))),
     )?;
     Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    console_error_panic_hook::set_once();
+    wasm_bindgen_futures::spawn_local(async {
+        let runner = eframe::WebRunner::new();
+        if let Err(error) = runner
+            .start(
+                "binwave",
+                eframe::WebOptions::default(),
+                Box::new(|cc| Box::new(browser::BrowserApp::new(cc))),
+            )
+            .await
+        {
+            browser::startup_error(&format!("Could not start graphics: {error:?}"));
+        }
+    });
 }

@@ -42,8 +42,8 @@ impl FileSource {
     }
 
     pub fn read_range(&self, start: usize, length: usize) -> Result<Vec<u8>> {
-        ensure!(length <= 1024 * 1024, "read exceeds 1 MiB chunk limit");
-        ensure!(start <= self.len, "byte offset is outside the file");
+        let length = crate::file_range::bounded_length(start as u64, length, self.len as u64)
+            .map_err(anyhow::Error::msg)?;
         self.validate()?;
         let mut file = File::open(&self.path)?;
         ensure!(
@@ -88,7 +88,7 @@ mod tests {
             let path = dir.path().join("large.csv");
             let mut file = File::create(&path).unwrap();
             let size = 20 * 1024 * 1024 * 1024u64;
-            file.set_len(size).unwrap();
+            crate::cache::set_fixture_len(&file, size).unwrap();
             file.seek(SeekFrom::Start(size - 4)).unwrap();
             file.write_all(b"TAIL").unwrap();
             drop(file);

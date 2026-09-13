@@ -1,6 +1,6 @@
 # Waveform parser stress fixture
 
-PWAV is a synthetic tagged container for testing PlotterMax's reusable decoders.
+PWAV is a synthetic tagged container for testing Binwave's reusable decoders.
 Its numeric samples are generated from mathematical waveform formulas. The file
 carries names, types, widths, counts, and section lengths so the decoder discovers
 the sample layout from metadata.
@@ -176,9 +176,9 @@ uses a temporary sparse file and writes only its checked records.
 For an existing generated fixture, opt into the production-runtime checks:
 
 ```bash
-PLOTTERMAX_WAVEFORM_FILE=samples/data/waveform_preview.bin cargo test --offline --bin plotter_max verify_generated_waveform_python_runtime -- --ignored --nocapture
-PLOTTERMAX_WAVEFORM_FILE=samples/data/waveform_preview.bin cargo test --offline --test waveform_stress verify_generated_waveform_stress_file -- --ignored --nocapture
-PLOTTERMAX_WAVEFORM_FILE=samples/data/waveform_preview.bin cargo test --offline --test waveform_stress verify_generated_waveform_plot_ranges -- --ignored --nocapture
+BINWAVE_WAVEFORM_FILE=samples/data/waveform_preview.bin cargo test --offline --bin binwave verify_generated_waveform_python_runtime -- --ignored --nocapture
+BINWAVE_WAVEFORM_FILE=samples/data/waveform_preview.bin cargo test --offline --test waveform_stress verify_generated_waveform_stress_file -- --ignored --nocapture
+BINWAVE_WAVEFORM_FILE=samples/data/waveform_preview.bin cargo test --offline --test waveform_stress verify_generated_waveform_plot_ranges -- --ignored --nocapture
 ```
 
 Without the environment variable these optional tests use

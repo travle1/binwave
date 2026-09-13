@@ -1,7 +1,7 @@
-# Plotter Max Config (Markdown)
+# Binwave Config (Markdown)
 
 Open with **File → Load CSV configuration…**. The sample data path is relative
-to the process working directory; launch PlotterMax from the project root.
+to the process working directory; launch Binwave from the project root.
 
 ```json
 {

@@ -1,6 +1,6 @@
 # Python decoders
 
-Open a data file in PlotterMax, then use **Decoder → Open decoder…** to load a
+Open a data file in Binwave, then use **Decoder → Open decoder…** to load a
 `.py` file. Loading only displays its source. **Run script** (F5) executes it;
 **Stop** cancels it. **Save Python…** saves the source. To start from scratch,
 select **Python** and choose **New**. YAML is the default editor; each language has
@@ -22,10 +22,10 @@ the language from `.py`, `.yaml`, or `.yml`. Run the active Python draft with
 Fields and Steps forms. Select **YAML** and choose **New** for a fresh YAML source.
 
 The runtime uses installed `python3`, or `python` on Windows. Set
-`PLOTTERMAX_PYTHON` to a specific executable to select a virtual environment:
+`BINWAVE_PYTHON` to a specific executable to select a virtual environment:
 
 ```sh
-PLOTTERMAX_PYTHON=/path/to/.venv/bin/python target/release/plotter_max
+BINWAVE_PYTHON=/path/to/.venv/bin/python target/release/binwave
 ```
 
 Ordinary imports, functions, loops, and libraries work. The working directory and
@@ -33,8 +33,8 @@ relative imports use the saved script's folder. Output and tracebacks appear in
 the console when execution finishes; they are not streamed while the script runs.
 Python runs with your local user permissions and is **not sandboxed**.
 
-PlotterMax supplies `file` and the `plottermax` module during execution. They do
-not require a pip package; run these scripts inside PlotterMax.
+Binwave supplies `file` and the `binwave` module during execution. They do
+not require a pip package; run these scripts inside Binwave.
 
 ## Run ordinary Python
 
@@ -63,7 +63,7 @@ structure. Changing the bytes still invalidates results until they are refreshed
 ## Read metadata, describe results
 
 ```python
-from plottermax import Field, Struct
+from binwave import Field, Struct
 
 Header = Struct("Header", [
     Field("magic", "text", length=4, expect="DATA"),
