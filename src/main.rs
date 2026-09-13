@@ -12,6 +12,7 @@ mod file_source;
 mod hex_editor;
 mod loaders;
 mod plot_index;
+mod plot_trace;
 mod plotting;
 mod python_decoder;
 mod structure;

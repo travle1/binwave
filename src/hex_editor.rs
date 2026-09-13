@@ -184,6 +184,11 @@ impl HexEditor {
     pub fn select_range(&mut self, range: Range<usize>, reveal: bool) {
         if range.is_empty() {
             self.anchor = None;
+            if reveal {
+                self.caret = range.start;
+                self.reveal = true;
+                self.high_nibble = None;
+            }
             return;
         }
         self.anchor = Some(range.start);
@@ -802,14 +807,19 @@ A gold underline marks search hits; an orange top edge marks edits.");
         let offset_chars = format!("{:X}", source.len()).len().max(8);
         let offset_width = (offset_chars + 2) as f32 * char_width;
         let cell_width = char_width * 3.0;
+        // Keep the text column visually separate from the last hex byte at any DPI.
+        let ascii_gutter = (char_width * 3.0).max(24.0);
+        let row_width = |columns: usize| {
+            offset_width + columns as f32 * (cell_width + char_width) + ascii_gutter + 8.0
+        };
+        let scrollbar = &ui.spacing().scroll;
+        let scrollbar_width =
+            scrollbar.bar_width + scrollbar.bar_inner_margin + scrollbar.bar_outer_margin;
         if self.auto_width {
             let previous = self.bytes_per_row;
             self.bytes_per_row = [32, 16, 8]
                 .into_iter()
-                .find(|n| {
-                    offset_width + (*n as f32) * (cell_width + char_width) + 28.0
-                        <= ui.available_width()
-                })
+                .find(|n| row_width(*n) + scrollbar_width <= ui.available_width())
                 .unwrap_or(8);
             if self.bytes_per_row != previous {
                 self.reveal = true;
@@ -829,13 +839,15 @@ A gold underline marks search hits; an orange top edge marks edits.");
         }
         self.window_start = self.window_start.min(total_rows.saturating_sub(1));
         let rows = WINDOW_ROWS.min(total_rows - self.window_start);
-        let ascii_start = offset_width + self.bytes_per_row as f32 * cell_width + char_width;
-        let content_width = ascii_start + self.bytes_per_row as f32 * char_width + 8.0;
+        let hex_end = offset_width + self.bytes_per_row as f32 * cell_width;
+        let ascii_start = hex_end + ascii_gutter;
+        let content_width = row_width(self.bytes_per_row);
         let id = ui.make_persistent_id("hex_byte_surface");
         let mut clicked_offset = None;
         let mut drag_offset = None;
         let mut requested_page = None;
         let mut wants_context = false;
+        let mut byte_tooltip = None;
         let mut scroll = egui::ScrollArea::both()
             .id_source("hex_continuous_bytes")
             .auto_shrink([false, false]);
@@ -860,6 +872,14 @@ A gold underline marks search hits; an orange top edge marks edits.");
                 if (self.window_start + local_row) % 2 == 0 {
                     painter.rect_filled(rect, 0.0, Color32::from_white_alpha(3));
                 }
+                let divider_x = rect.left() + hex_end + ascii_gutter * 0.5;
+                painter.line_segment(
+                    [
+                        egui::pos2(divider_x, rect.top()),
+                        egui::pos2(divider_x, rect.bottom()),
+                    ],
+                    egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                );
                 painter.text(
                     egui::pos2(rect.left(), text_y),
                     egui::Align2::LEFT_CENTER,
@@ -874,7 +894,7 @@ A gold underline marks search hits; an orange top edge marks edits.");
                     let x = p.x - rect.left();
                     let (column, ascii) = if x >= ascii_start {
                         (((x - ascii_start) / char_width).floor() as usize, true)
-                    } else if x >= offset_width {
+                    } else if x >= offset_width && x < hex_end {
                         (((x - offset_width) / cell_width).floor() as usize, false)
                     } else {
                         return None;
@@ -1015,45 +1035,45 @@ A gold underline marks search hits; an orange top edge marks edits.");
                             egui::Stroke::new(1.5_f32, ui.visuals().selection.stroke.color),
                         );
                     }
-                    if pointer_byte.is_some_and(|(byte, _)| byte == index)
-                        && !ui.input(|i| i.pointer.primary_down())
-                    {
-                        egui::show_tooltip_at_pointer(ui.ctx(), id.with(index), |ui| {
-                            ui.monospace(format!("0x{index:X} · byte {index}"));
-                            if let Some(field) = narrowest_highlight(highlights.iter(), index) {
-                                ui.colored_label(field.color, &field.name);
-                                ui.weak(format!(
-                                    "Decoded field · 0x{:X}–0x{:X} · {} bytes",
-                                    field.range.start,
-                                    field.range.end - 1,
-                                    field.range.len()
-                                ));
-                            }
-                            for bookmark in
-                                self.bookmarks.iter().filter(|h| h.range.contains(&index))
-                            {
-                                ui.colored_label(
-                                    bookmark.color,
-                                    format!("Saved range: {}", bookmark.name),
-                                );
-                            }
-                            if selected {
-                                ui.label("Selected byte");
-                            }
-                            if matched {
-                                ui.colored_label(SEARCH_COLOR, "Search match (gold underline)");
-                            }
-                            if let Some((byte, modified)) = self.byte(index) {
-                                ui.label(format!("u8 {byte} · i8 {} · {byte:08b}", byte as i8));
-                                if modified {
-                                    ui.colored_label(EDIT_COLOR, "Modified byte (orange top edge)");
-                                }
-                            }
-                        });
+                    if pointer_byte.is_some_and(|(byte, _)| byte == index) {
+                        byte_tooltip = Some((response.clone(), index, selected, matched));
                     }
                 }
             }
         });
+        // Menus can cover a different row from the one that opened them. Wait until
+        // every row has handled its menu, then let egui check hover layers and delay.
+        if !wants_context && !ui.input(|i| i.pointer.any_down()) {
+            if let Some((response, index, selected, matched)) = byte_tooltip {
+                response.on_hover_ui_at_pointer(|ui| {
+                    ui.monospace(format!("0x{index:X} · byte {index}"));
+                    if let Some(field) = narrowest_highlight(highlights.iter(), index) {
+                        ui.colored_label(field.color, &field.name);
+                        ui.weak(format!(
+                            "Decoded field · 0x{:X}–0x{:X} · {} bytes",
+                            field.range.start,
+                            field.range.end - 1,
+                            field.range.len()
+                        ));
+                    }
+                    for bookmark in self.bookmarks.iter().filter(|h| h.range.contains(&index)) {
+                        ui.colored_label(bookmark.color, format!("Saved range: {}", bookmark.name));
+                    }
+                    if selected {
+                        ui.label("Selected byte");
+                    }
+                    if matched {
+                        ui.colored_label(SEARCH_COLOR, "Search match (gold underline)");
+                    }
+                    if let Some((byte, modified)) = self.byte(index) {
+                        ui.label(format!("u8 {byte} · i8 {} · {byte:08b}", byte as i8));
+                        if modified {
+                            ui.colored_label(EDIT_COLOR, "Modified byte (orange top edge)");
+                        }
+                    }
+                });
+            }
+        }
         // Recenter only near a local scroll boundary. Keep the same absolute
         // first visible row and fractional pixel position, so wheel scrolling
         // continues through arbitrarily large files without exposing paging.
@@ -1678,6 +1698,139 @@ mod tests {
         );
         assert_eq!(editor.selection(), Some(1..4));
         assert!(!editor.drag_selecting);
+    }
+
+    #[test]
+    fn byte_tooltips_yield_to_context_menus_and_return_after_menu_actions() {
+        let (_dir, source) = fixture();
+        // Exercise menus below and above their originating row. The latter visits
+        // covered rows before it renders the menu that must suppress their tooltip.
+        for near_bottom in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.style_mut(|style| {
+                style.interaction.tooltip_delay = 0.0;
+                style.interaction.show_tooltips_only_when_still = false;
+            });
+            let mut editor = HexEditor::default();
+            let frame = |editor: &mut HexEditor, events: Vec<egui::Event>| {
+                let mut actions = Vec::new();
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(900.0, 700.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            actions = editor.ui(ui, Some(source.clone()), &[]);
+                        });
+                    },
+                );
+                (output, actions)
+            };
+            let text_pos = |output: &egui::FullOutput, label: &str| {
+                output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => Some(text.pos),
+                    _ => None,
+                })
+            };
+            let has_tooltip = |output: &egui::FullOutput| {
+                output.shapes.iter().any(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => {
+                        text.galley.text().starts_with("0x")
+                            && text.galley.text().contains(" · byte ")
+                    }
+                    _ => false,
+                })
+            };
+            let pointer_button = |pos, button, pressed| egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let (output, _) = frame(&mut editor, vec![]);
+            let rows: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if text.galley.text().len() == 8
+                            && usize::from_str_radix(text.galley.text(), 16).is_ok() =>
+                    {
+                        Some(text.pos)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let width = ctx.fonts(|f| f.glyph_width(&FontId::monospace(13.0), '0'));
+            let at_byte = |row| rows[row] + egui::vec2(width * 20.5, 6.5);
+            let low_row = rows.len() - 3;
+            let origin = at_byte(if near_bottom { low_row } else { 0 });
+            let outside = at_byte(if near_bottom { 0 } else { low_row });
+            frame(&mut editor, vec![egui::Event::PointerMoved(origin)]);
+            let (output, _) = frame(&mut editor, vec![]);
+            assert!(
+                has_tooltip(&output),
+                "normal byte hover still shows details"
+            );
+
+            let (output, _) = frame(
+                &mut editor,
+                vec![pointer_button(origin, egui::PointerButton::Secondary, true)],
+            );
+            assert!(!has_tooltip(&output), "hide details as right-click starts");
+            let (output, _) = frame(
+                &mut editor,
+                vec![pointer_button(
+                    origin,
+                    egui::PointerButton::Secondary,
+                    false,
+                )],
+            );
+            assert!(!has_tooltip(&output), "hide details in the opening frame");
+            let (output, _) = frame(&mut editor, vec![]);
+            let menu_point = text_pos(&output, "Copy hex").unwrap() + egui::vec2(4.0, 4.0);
+            assert!((menu_point.y - origin.y).abs() > 21.0);
+            let (output, _) = frame(&mut editor, vec![egui::Event::PointerMoved(menu_point)]);
+            assert!(!has_tooltip(&output), "a menu item covers another byte row");
+            let (output, _) = frame(&mut editor, vec![]);
+            assert!(text_pos(&output, "Copy hex").is_some());
+            assert!(!has_tooltip(&output));
+            let (output, _) = frame(&mut editor, vec![egui::Event::PointerMoved(outside)]);
+            assert!(text_pos(&output, "Copy hex").is_some());
+            assert!(
+                !has_tooltip(&output),
+                "keep details hidden outside an open menu"
+            );
+
+            let action_point = text_pos(&output, "Undo byte edit").unwrap() + egui::vec2(4.0, 4.0);
+            frame(
+                &mut editor,
+                vec![
+                    egui::Event::PointerMoved(action_point),
+                    pointer_button(action_point, egui::PointerButton::Primary, true),
+                ],
+            );
+            let (_, actions) = frame(
+                &mut editor,
+                vec![pointer_button(
+                    action_point,
+                    egui::PointerButton::Primary,
+                    false,
+                )],
+            );
+            assert!(actions
+                .iter()
+                .any(|action| matches!(action, HexAction::Undo)));
+            frame(&mut editor, vec![egui::Event::PointerMoved(outside)]);
+            let (output, _) = frame(&mut editor, vec![]);
+            assert!(text_pos(&output, "Copy hex").is_none());
+            assert!(has_tooltip(&output), "details return after the menu closes");
+        }
     }
 
     #[test]

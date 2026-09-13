@@ -1,6 +1,7 @@
 //! Shared selection and bounded, asynchronous pages for decoded structure views.
 use crate::byte_store::ByteView;
 use crate::hex_editor::HexHighlight;
+use crate::plot_trace::AdaptiveTrace;
 use crate::structure::{LazyArray, Node, ParseOutput, Value};
 use crate::structure_plot::{PlotQuality, PlotReader};
 use egui::{Color32, Ui};
@@ -54,6 +55,13 @@ struct RangeZoom {
     transform: PlotTransform,
 }
 
+#[derive(Clone)]
+struct TableAnchor {
+    target: String,
+    revision: u64,
+    bytes: Range<usize>,
+}
+
 #[derive(Default)]
 pub struct StructureViews {
     selected: Option<String>,
@@ -62,6 +70,7 @@ pub struct StructureViews {
     reveal_selected_row: bool,
     expanded: HashSet<String>,
     table_target: String,
+    table_anchor: Option<TableAnchor>,
     table_jump: usize,
     navigation_selection: Option<Range<usize>>,
     target_initialized: bool,
@@ -76,6 +85,7 @@ pub struct StructureViews {
     plot_reader: PlotReader,
     plot_target: String,
     plot_view: Option<Range<usize>>,
+    plot_axis_width: f32,
     plot_force_view: Option<Range<usize>>,
     plot_fit_y: bool,
     plot_free_y: bool,
@@ -114,6 +124,7 @@ impl StructureViews {
         self.plot_fit_y = true;
         self.plot_refine = false;
         self.plot_anchor = None;
+        self.table_anchor = None;
         self.cancel.store(true, Ordering::Relaxed);
         self.desired = None;
         self.page = None;
@@ -235,12 +246,57 @@ impl StructureViews {
         }
     }
     fn select(&mut self, node: &Node) -> Range<usize> {
+        self.table_anchor = None;
         self.selected = Some(node.path.clone());
         self.plot_follow_selection = true;
         self.pending_hex_selection = false;
         self.last_hex_selection = Some(node.range.clone());
         node.range.clone()
     }
+    fn select_table_node(
+        &mut self,
+        output: &ParseOutput,
+        row: &Node,
+        field: &Node,
+        extend: bool,
+    ) -> Range<usize> {
+        let anchor = if extend {
+            self.table_anchor
+                .as_ref()
+                .filter(|anchor| {
+                    anchor.target == self.table_target && anchor.revision == output.revision
+                })
+                .map(|anchor| anchor.bytes.clone())
+                .or_else(|| {
+                    let collection = find_node(&output.nodes, &self.table_target)?;
+                    let selected =
+                        sample_indices_for_bytes(collection, self.last_hex_selection.as_ref()?)?;
+                    sample_bytes(collection, selected.start..selected.start + 1)
+                })
+        } else {
+            None
+        }
+        .unwrap_or_else(|| row.range.clone());
+        let range = if extend {
+            anchor.start.min(row.range.start)..anchor.end.max(row.range.end)
+        } else {
+            field.range.clone()
+        };
+        self.select(if extend { row } else { field });
+        self.plot_anchor = find_node(&output.nodes, &self.table_target)
+            .and_then(|collection| sample_indices_for_bytes(collection, &anchor))
+            .map(|samples| samples.start);
+        self.table_anchor = Some(TableAnchor {
+            target: self.table_target.clone(),
+            revision: output.revision,
+            bytes: anchor,
+        });
+        self.last_hex_selection = Some(range.clone());
+        // Keep the clicked page visible while Hex and Plot receive the full range.
+        self.reveal_selected_row = false;
+        range
+    }
+
     fn stale(&self, output: &ParseOutput) -> bool {
         self.source_revision
             .is_some_and(|revision| revision != output.revision)
@@ -273,6 +329,7 @@ impl StructureViews {
         if self.stale(output) || selection == self.last_hex_selection {
             return;
         }
+        self.table_anchor = None;
         self.last_hex_selection = selection.clone();
         self.plot_follow_selection = true;
         self.selected = None;
@@ -554,6 +611,7 @@ impl StructureViews {
                 });
         });
         if previous != self.table_target {
+            self.table_anchor = None;
             self.reveal_selected_row = false;
         }
         if let Some(node) = find_node(&output.nodes, &self.table_target) {
@@ -617,6 +675,7 @@ impl StructureViews {
             {
                 start = self.table_jump.min(array.count.saturating_sub(1));
                 if let Some(bytes) = sample_bytes(node, start..start.saturating_add(1)) {
+                    self.table_anchor = None;
                     self.navigation_selection = Some(bytes.clone());
                     self.last_hex_selection = Some(bytes);
                     self.selected = Some(format!("{}[{start}]", node.path));
@@ -659,7 +718,7 @@ impl StructureViews {
             return None;
         }
         self.target_controls(ui, output);
-        ui.weak("Select a sample number for the whole sample, or a value for that field’s bytes.");
+        ui.weak("Click a sample or value · Shift-click to select a range of whole samples.");
         let rows = self.target_rows(output);
         if rows.is_empty() {
             if self.table_target.is_empty() {
@@ -772,26 +831,34 @@ impl StructureViews {
                                 ))
                                 .clicked()
                                 {
-                                    chosen = Some(node.clone());
+                                    chosen = Some((node.clone(), node.clone()));
                                 }
-                                table_cell(
+                                if table_cell(
                                     ui,
                                     &format!("0x{:X}", node.range.start),
                                     widths[1],
                                     row_height,
                                     false,
+                                    true,
                                     false,
-                                    false,
-                                );
-                                table_cell(
+                                )
+                                .clicked()
+                                {
+                                    chosen = Some((node.clone(), node.clone()));
+                                }
+                                if table_cell(
                                     ui,
                                     &node.range.len().to_string(),
                                     widths[2],
                                     row_height,
                                     false,
+                                    true,
                                     false,
-                                    false,
-                                );
+                                )
+                                .clicked()
+                                {
+                                    chosen = Some((node.clone(), node.clone()));
+                                }
                                 for name in &columns {
                                     if let Some(field) = field_at(node, name) {
                                         if table_cell(
@@ -814,7 +881,7 @@ impl StructureViews {
                                         ))
                                         .clicked()
                                         {
-                                            chosen = Some(field.clone());
+                                            chosen = Some((node.clone(), field.clone()));
                                         }
                                     } else {
                                         table_cell(
@@ -837,7 +904,9 @@ impl StructureViews {
             self.reveal_selected_row = false;
         }
         chosen
-            .map(|node| self.select(&node))
+            .map(|(row, field)| {
+                self.select_table_node(output, &row, &field, ui.input(|i| i.modifiers.shift))
+            })
             .or_else(|| self.navigation_selection.take())
     }
 
@@ -1109,13 +1178,16 @@ impl StructureViews {
             self.plot_view = Some(forced.clone());
         }
         let requested = self.plot_view.clone().unwrap_or(view);
-        let width = ui.available_width().max(64.) as usize;
+        // Keep the last measured axis gutter, so resizing uses the new canvas
+        // width immediately. Reduction follows physical pixels, including DPI.
+        let canvas_width = (ui.available_width() - self.plot_axis_width).max(1.);
+        let pixel_width = (canvas_width * ui.ctx().pixels_per_point()).ceil() as usize;
         self.plot_reader.request(
             ui.ctx(),
             source.clone(),
             node.clone(),
             requested.clone(),
-            width,
+            pixel_width,
             self.plot_refine,
         );
         self.plot_reader.tick(ui.ctx());
@@ -1128,7 +1200,7 @@ impl StructureViews {
             ));
             if let Some(data) = self.plot_reader.data() {
                 ui.weak(data.quality.label()).on_hover_text(format!(
-                    "Data covers sample indices {}–{}",
+                    "Data covers sample indices {}–{}. Dense cycles are shown as amplitude bands; zoom in to see individual samples.",
                     data.range.start,
                     data.range.end.saturating_sub(1)
                 ));
@@ -1223,9 +1295,13 @@ impl StructureViews {
                             .map(|point| [point.index as f64, point.value])
                             .collect();
                         let color = field_color(name);
-                        if data.quality == PlotQuality::Exact {
-                            plot_ui.line(Line::new(points.clone()).name(name).color(color));
-                            if values.len() <= width / 5 {
+                        if matches!(data.quality, PlotQuality::Exact | PlotQuality::MinMax) {
+                            // Preserve the source geometry for inspection; the final
+                            // transform determines whether cycles fit as lines or bands.
+                            plot_ui.add(AdaptiveTrace::new(points.clone(), name, color));
+                            if data.quality == PlotQuality::Exact
+                                && values.len() <= canvas_width as usize / 5
+                            {
                                 plot_ui.points(
                                     Points::new(points).name(name).color(color).radius(2.5_f32),
                                 );
@@ -1238,18 +1314,25 @@ impl StructureViews {
                                 let right = band.range.end as f64 - 0.5;
                                 let low = band.min.value;
                                 let high = band.max.value;
-                                plot_ui.polygon(
-                                    Polygon::new(vec![
-                                        [left, low],
-                                        [right, low],
-                                        [right, high],
-                                        [left, high],
-                                    ])
-                                    .name(name)
-                                    .fill_color(color.gamma_multiply(0.23))
-                                    .stroke(egui::Stroke::new(0_f32, color)),
-                                );
-                                for value in [low, high] {
+                                // Flat bands have no area; a zero-height polygon can
+                                // produce non-finite vertices during tessellation.
+                                if low < high {
+                                    plot_ui.polygon(
+                                        Polygon::new(vec![
+                                            [left, low],
+                                            [right, low],
+                                            [right, high],
+                                            [left, high],
+                                        ])
+                                        .name(name)
+                                        .fill_color(color.gamma_multiply(0.23))
+                                        .stroke(egui::Stroke::new(0_f32, color)),
+                                    );
+                                }
+                                for (index, value) in [low, high].into_iter().enumerate() {
+                                    if index == 1 && low == high {
+                                        continue;
+                                    }
                                     plot_ui.line(
                                         Line::new(vec![[left, value], [right, value]])
                                             .name(name)
@@ -1353,6 +1436,7 @@ impl StructureViews {
                     }
                 }
             });
+        self.plot_axis_width = (plot_outer.width() - response.transform.frame().width()).max(0.);
         if let Some((axis, rect)) = axis_hover {
             ui.interact(
                 rect.intersect(plot_clip),
@@ -1581,7 +1665,7 @@ impl StructureViews {
             source,
             node.clone(),
             actual,
-            width,
+            (response.transform.frame().width() * ui.ctx().pixels_per_point()).ceil() as usize,
             self.plot_refine,
         );
         if let Some((bytes, path)) = picked {
@@ -2172,6 +2256,192 @@ actions:
         );
         assert_eq!(views.selected_node(&output).unwrap().path, "header.count");
     }
+    fn table_frame(
+        ctx: &egui::Context,
+        views: &mut StructureViews,
+        output: &ParseOutput,
+        store: &ByteStore,
+        events: Vec<egui::Event>,
+        modifiers: egui::Modifiers,
+    ) -> (egui::FullOutput, Option<Range<usize>>) {
+        let mut selection = None;
+        let frame = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900., 600.),
+                )),
+                events,
+                modifiers,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    selection = views.table(ui, output, store.view());
+                });
+            },
+        );
+        // The workspace sends the same selection back from Hex on the next tick.
+        if let Some(bytes) = &selection {
+            views.select_bytes(output, Some(bytes.clone()));
+        }
+        (frame, selection)
+    }
+
+    fn click_table_row(
+        ctx: &egui::Context,
+        views: &mut StructureViews,
+        output: &ParseOutput,
+        store: &ByteStore,
+        row: usize,
+        field: bool,
+        shift: bool,
+    ) -> Range<usize> {
+        let label = row.to_string();
+        let (frame, _) = table_frame(ctx, views, output, store, vec![], egui::Modifiers::NONE);
+        let pos = frame
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    if text.galley.text() == label && text.pos.x < 100. {
+                        return Some(text.pos + text.galley.size() * 0.5);
+                    }
+                }
+                None
+            })
+            .expect("sample number should be visible");
+        let pos = if field { egui::pos2(750., pos.y) } else { pos };
+        let modifiers = egui::Modifiers {
+            shift,
+            ..Default::default()
+        };
+        table_frame(
+            ctx,
+            views,
+            output,
+            store,
+            vec![egui::Event::PointerMoved(pos)],
+            modifiers,
+        );
+        table_frame(
+            ctx,
+            views,
+            output,
+            store,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers,
+            }],
+            modifiers,
+        );
+        table_frame(
+            ctx,
+            views,
+            output,
+            store,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers,
+            }],
+            modifiers,
+        )
+        .1
+        .expect("table click should select bytes")
+    }
+
+    #[test]
+    fn rendered_table_shift_click_preserves_anchor_and_selects_whole_samples() {
+        let (store, output) = records();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        views.initialize_target(&output);
+        views.request(&output.nodes[2], 0, output.revision, &ctx);
+        settle(&mut views, store.view());
+        assert_eq!(
+            click_table_row(&ctx, &mut views, &output, &store, 3, false, false),
+            32..40
+        );
+        assert_eq!(
+            click_table_row(&ctx, &mut views, &output, &store, 7, false, true),
+            32..72
+        );
+        assert_eq!(
+            click_table_row(&ctx, &mut views, &output, &store, 1, false, true),
+            16..40
+        );
+        // Ordinary cell clicks still select just that field; Shift selects full rows.
+        assert_eq!(
+            click_table_row(&ctx, &mut views, &output, &store, 2, true, false),
+            30..32
+        );
+        assert_eq!(
+            click_table_row(&ctx, &mut views, &output, &store, 5, true, true),
+            24..56
+        );
+        assert_eq!(
+            sample_indices_for_bytes(&output.nodes[2], views.last_hex_selection.as_ref().unwrap()),
+            Some(2..6)
+        );
+        settle_plot(&ctx, &mut views, &output, &store);
+        assert_eq!(views.last_hex_selection, Some(24..56));
+    }
+
+    #[test]
+    fn table_shift_selection_crosses_lazy_pages_and_resets_for_external_selection() {
+        let (store, output) = records();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        views.initialize_target(&output);
+        views.request(&output.nodes[2], 0, output.revision, &ctx);
+        settle(&mut views, store.view());
+        let row = views.target_rows(&output)[3].clone();
+        views.select_table_node(&output, &row, &row, false);
+        views.request(&output.nodes[2], 128, output.revision, &ctx);
+        settle(&mut views, store.view());
+        let row = views.target_rows(&output)[2].clone();
+        assert_eq!(views.select_table_node(&output, &row, &row, true), 32..1056);
+        assert_eq!(views.desired.as_ref().unwrap().key.start, 128);
+        // A linked Hex/Plot selection establishes a fresh starting sample.
+        views.select_bytes(&output, Some(1046..1048)); // sample 129's last field
+        assert_eq!(
+            views.select_table_node(&output, &row, &row, true),
+            1040..1056
+        );
+        views.invalidate();
+        assert!(views.table_anchor.is_none());
+    }
+
+    #[test]
+    fn table_shift_anchor_does_not_leak_between_collections() {
+        let (store, output) = records();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        views.initialize_target(&output);
+        views.request(&output.nodes[2], 0, output.revision, &ctx);
+        settle(&mut views, store.view());
+        let row = views.target_rows(&output)[3].clone();
+        views.select_table_node(&output, &row, &row, false);
+        views.table_target = "descriptors".into();
+        let descriptor = output.nodes[1].children.get(1).cloned().unwrap_or_else(|| {
+            output.nodes[1]
+                .lazy
+                .as_ref()
+                .unwrap()
+                .page(&store.view(), &AtomicBool::new(false), 1, 1)
+                .unwrap()
+                .remove(0)
+        });
+        assert_eq!(
+            views.select_table_node(&output, &descriptor, &descriptor, true),
+            descriptor.range
+        );
+    }
+
     #[test]
     fn sample_and_cell_selection_keep_exact_ranges_and_collection() {
         let (store, output) = records();
@@ -2583,6 +2853,269 @@ actions:
         assert!(views.take_plot_action().is_none());
         assert!(views.stale(&output));
     }
+    fn waveform_plot_fixture() -> (ByteStore, ParseOutput) {
+        let bytes: Vec<_> = (0..65_536)
+            .flat_map(|index| {
+                let phase = (index % 64) as f64 / 64.;
+                [
+                    (phase * std::f64::consts::TAU).sin() * 4.,
+                    10. + phase * 4.,
+                    20. + if index == 5001 {
+                        8.
+                    } else if index % 64 < 32 {
+                        2.
+                    } else {
+                        -2.
+                    },
+                ]
+                .into_iter()
+                .flat_map(f64::to_le_bytes)
+            })
+            .collect();
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let output = Program::parse(
+            r#"
+structures:
+  Sample:
+    fields: [{name: sine, type: f64}, {name: ramp, type: f64}, {name: square, type: f64}]
+actions: [{read: {name: samples, type: Sample, repeat: until end}}]
+"#,
+        )
+        .unwrap()
+        .run(&store.view(), &AtomicBool::new(false))
+        .unwrap();
+        (store, output)
+    }
+
+    fn waveform_plot_frame(
+        ctx: &egui::Context,
+        views: &mut StructureViews,
+        output: &ParseOutput,
+        store: &ByteStore,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200., 700.),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    views.plot(ui, output, store.view());
+                });
+            },
+        )
+    }
+
+    #[test]
+    fn zoom_out_keeps_resolved_traces_and_dense_bands_with_source_provenance() {
+        let (store, output) = waveform_plot_fixture();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        settle_plot(&ctx, &mut views, &output, &store);
+        fn paths(shape: &egui::Shape, color: Color32, traces: &mut Vec<Vec<egui::Pos2>>) {
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        paths(shape, color, traces);
+                    }
+                }
+                egui::Shape::Path(path)
+                    if !path.closed && path.stroke.color == color && path.points.len() > 4 =>
+                {
+                    traces.push(path.points.clone());
+                }
+                _ => (),
+            }
+        }
+        for count in [2048, 2049, 2179, 4096, 8193, 10_000, 65_536] {
+            views.plot_force_view = Some(0..count);
+            views.plot_fit_y = true;
+            settle_plot(&ctx, &mut views, &output, &store);
+            let rendered = waveform_plot_frame(&ctx, &mut views, &output, &store);
+            let data = views.plot_reader.data().unwrap();
+            assert_eq!(data.scanned, count);
+            assert!(data.complete);
+            if count > 8192 {
+                assert_eq!(data.quality, PlotQuality::MinMax);
+            }
+            let transform = navigation_memory(&ctx, &views, &output).transform().clone();
+            for name in ["sine", "ramp", "square"] {
+                let values = &data.series[name];
+                assert!(values.windows(2).all(|pair| pair[0].index < pair[1].index));
+                let mut traces = Vec::new();
+                for shape in &rendered.shapes {
+                    paths(&shape.shape, field_color(name), &mut traces);
+                }
+                if count <= 10_000 {
+                    assert_eq!(traces.len(), 1,
+                        "{count} samples: {name} cycles fit and must remain a continuous trace");
+                    let trace = &traces[0];
+                    assert_eq!(trace.len(), values.len());
+                    for (screen, sample) in trace.iter().zip(values) {
+                        let expected = transform
+                            .position_from_point(&PlotPoint::new(sample.index as f64, sample.value));
+                        assert!(screen.distance(expected) < 0.01);
+                    }
+                } else {
+                    assert!(traces.is_empty(), "subpixel cycles must become a band");
+                    assert!(rendered.shapes.iter().any(|shape| matches!(
+                        &shape.shape, egui::Shape::Mesh(mesh)
+                        if mesh.vertices.len() > 100
+                            && mesh.vertices.iter().any(|v| v.color == field_color(name).gamma_multiply(0.45))
+                    )), "{name} must render a continuous amplitude mesh");
+                }
+                for sample in values {
+                    assert_eq!(
+                        store
+                            .view()
+                            .read(sample.bytes.start, sample.bytes.len())
+                            .unwrap()
+                            .as_slice(),
+                        sample.value.to_le_bytes()
+                    );
+                }
+            }
+            if count > 5001 {
+                let spike = data.series["square"]
+                    .iter()
+                    .find(|sample| sample.index == 5001)
+                    .expect("single-sample peak must survive reduction");
+                assert_eq!(spike.value, 28.);
+                assert_eq!(spike.bytes, 5001 * 24 + 16..5001 * 24 + 24);
+            }
+        }
+        // Selection still resolves to the source sample after traces are reduced.
+        views.plot_force_view = Some(0..10_000);
+        settle_plot(&ctx, &mut views, &output, &store);
+        assert_eq!(
+            click_plot(&ctx, &mut views, &output, &store, 5001., 28., false),
+            Some(5001 * 24 + 16..5001 * 24 + 24)
+        );
+        views.plot_force_view = Some(0..65_536);
+        settle_plot(&ctx, &mut views, &output, &store);
+        assert_eq!(
+            click_plot(&ctx, &mut views, &output, &store, 5001., 28., false),
+            Some(5001 * 24 + 16..5001 * 24 + 24),
+            "selecting a peak inside an amplitude band must retain exact source bytes"
+        );
+    }
+
+    #[test]
+    fn display_scale_changes_reduction_without_changing_sample_range_or_selection() {
+        let (store, output) = waveform_plot_fixture();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        settle_plot(&ctx, &mut views, &output, &store);
+        views.plot_force_view = Some(0..4096);
+        settle_plot(&ctx, &mut views, &output, &store);
+        let selected = click_plot(&ctx, &mut views, &output, &store, 1008., -4., false);
+        assert_eq!(selected, Some(1008 * 24..1008 * 24 + 8));
+        for (scale, quality) in [(1., PlotQuality::MinMax), (2., PlotQuality::Exact), (1., PlotQuality::MinMax)] {
+            ctx.set_pixels_per_point(scale);
+            settle_plot(&ctx, &mut views, &output, &store);
+            let data = views.plot_reader.data().unwrap();
+            assert_eq!(data.quality, quality, "display scale {scale}");
+            assert_eq!(data.range, 0..4096);
+            assert_eq!(views.last_hex_selection, selected);
+        }
+    }
+
+    #[test]
+    #[ignore = "writes waveform zoom captures to /tmp"]
+    fn capture_waveform_zoom_levels() {
+        let (store, output) = waveform_plot_fixture();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        settle_plot(&ctx, &mut views, &output, &store);
+        for count in [2048, 2179, 10_000] {
+            views.plot_force_view = Some(0..count);
+            views.plot_fit_y = true;
+            settle_plot(&ctx, &mut views, &output, &store);
+            let rendered = waveform_plot_frame(&ctx, &mut views, &output, &store);
+            write_waveform_capture(&ctx, rendered,
+                &format!("/tmp/plottermax-waveform-{count}.json"));
+        }
+    }
+
+    fn write_waveform_capture(ctx: &egui::Context, rendered: egui::FullOutput, path: &str) {
+        let primitives = ctx.tessellate(rendered.shapes, rendered.pixels_per_point);
+        let atlas = ctx.fonts(|fonts| fonts.image());
+        let pixels: Vec<[u8; 4]> = atlas
+            .srgba_pixels(None)
+            .map(|pixel| pixel.to_array())
+            .collect();
+        let meshes: Vec<_> = primitives.into_iter().filter_map(|primitive| {
+            let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive else { return None; };
+            Some(serde_json::json!({
+                "clip": [primitive.clip_rect.min.x, primitive.clip_rect.min.y, primitive.clip_rect.max.x, primitive.clip_rect.max.y],
+                "vertices": mesh.vertices.iter().map(|v| (v.pos.x, v.pos.y, v.uv.x, v.uv.y, v.color.to_array())).collect::<Vec<_>>(),
+                "indices": mesh.indices,
+            }))
+        }).collect();
+        let capture = serde_json::json!({"size": [1200, 700], "atlas_size": atlas.size, "atlas": pixels, "meshes": meshes});
+        std::fs::write(path, serde_json::to_vec(&capture).unwrap()).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires generated 2 GB demo and writes captures to /tmp"]
+    fn capture_demo_dense_zoom() {
+        let source = crate::file_source::FileSource::open(std::path::Path::new(
+            "samples/data/waveform_demo_2gb.bin",
+        )).unwrap();
+        let store = ByteStore::from_file(Arc::new(source));
+        let output = Program::parse(include_str!("../samples/decoders/yaml/waveform.yaml"))
+            .unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        settle_plot(&ctx, &mut views, &output, &store);
+        for count in [2179, 12_496, 32_768] {
+            views.plot_force_view = Some(28_358..28_358 + count);
+            views.plot_fit_y = true;
+            settle_plot(&ctx, &mut views, &output, &store);
+            assert_eq!(views.plot_reader.data().unwrap().scanned, count);
+            let rendered = waveform_plot_frame(&ctx, &mut views, &output, &store);
+            write_waveform_capture(&ctx, rendered,
+                &format!("/tmp/plottermax-demo-density-{count}.json"));
+        }
+    }
+
+    #[test]
+    fn flat_overview_bands_produce_only_finite_geometry() {
+        let count = 100_000;
+        let store = ByteStore::from_snapshot(Original::from_bytes(&vec![7; count]).unwrap());
+        let output =
+            Program::parse("actions: [{read: {name: samples, type: u8, repeat: until end}}]")
+                .unwrap()
+                .run(&store.view(), &AtomicBool::new(false))
+                .unwrap();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        settle_plot(&ctx, &mut views, &output, &store);
+        views.plot_force_view = Some(0..count);
+        settle_plot(&ctx, &mut views, &output, &store);
+        let data = views.plot_reader.data().unwrap();
+        assert_eq!(data.quality, PlotQuality::SampledPreview);
+        assert!(data.envelopes["value"]
+            .iter()
+            .all(|band| band.min.value == 7. && band.max.value == 7.));
+        let rendered = waveform_plot_frame(&ctx, &mut views, &output, &store);
+        let primitives = ctx.tessellate(rendered.shapes, rendered.pixels_per_point);
+        assert!(!primitives.is_empty());
+        for primitive in primitives {
+            if let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive {
+                assert!(
+                    mesh.vertices
+                        .iter()
+                        .all(|vertex| vertex.pos.is_finite() && vertex.uv.is_finite()),
+                    "flat overview must not send invalid triangles to the GPU"
+                );
+            }
+        }
+    }
+
     #[test]
     fn rendered_overview_uses_amplitude_bands_instead_of_sample_dots() {
         let count = 100_000;

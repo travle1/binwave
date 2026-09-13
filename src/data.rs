@@ -1,11 +1,16 @@
 use crate::plot_index::{Sample, SummaryIndex};
-use anyhow::{ensure, Context, Result};
+#[cfg(test)]
+use anyhow::Context;
+use anyhow::{ensure, Result};
+#[cfg(test)]
 use memmap2::Mmap;
 use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
 use std::fs::File;
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
 /// A sealed native-f64 CSV chunk. A mapped chunk is never appended to or modified.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct MappedChunk {
     map: Mmap,
@@ -13,6 +18,7 @@ pub struct MappedChunk {
     columns: usize,
 }
 
+#[cfg(test)]
 impl MappedChunk {
     pub fn open(file: File, rows: usize, columns: usize) -> Result<Arc<Self>> {
         let len = rows
@@ -34,6 +40,7 @@ impl MappedChunk {
 
 /// Immutable view of all completed chunks, sharing mappings with newer views.
 /// X is stored once per row. Only small chunk/index metadata is copied for updates.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct MappedTable {
     chunks: Vec<(usize, Arc<MappedChunk>)>,
@@ -42,6 +49,7 @@ pub struct MappedTable {
     _pending: Option<Arc<crate::cache::PendingDirectory>>,
 }
 
+#[cfg(test)]
 impl MappedTable {
     pub fn from_chunks(
         chunks: Vec<Arc<MappedChunk>>,
@@ -75,7 +83,7 @@ impl MappedTable {
     }
 }
 
-type ViewCache = VecDeque<((u64, u64, usize), Vec<[f64; 2]>)>;
+type ViewCache = VecDeque<((u64, u64, usize), Vec<Sample>)>;
 
 pub trait PointSource: std::fmt::Debug + Send + Sync {
     fn point(&self, record: usize, column: usize, cancel: &AtomicBool) -> Result<[f64; 2]>;
@@ -84,6 +92,7 @@ pub trait PointSource: std::fmt::Debug + Send + Sync {
     }
 }
 
+#[cfg(test)]
 impl PointSource for MappedTable {
     fn point(&self, record: usize, column: usize, _cancel: &AtomicBool) -> Result<[f64; 2]> {
         ensure!(record < self.rows, "row is outside the loaded portion");
@@ -136,6 +145,7 @@ impl PointSeries {
     pub fn for_range(&self, min: f64, max: f64, target: usize) -> Result<Vec<[f64; 2]>> {
         self.for_range_cancel(min, max, target, &AtomicBool::new(false))
     }
+    #[cfg(test)]
     pub fn for_range_cancel(
         &self,
         min: f64,
@@ -143,6 +153,21 @@ impl PointSeries {
         target: usize,
         cancel: &AtomicBool,
     ) -> Result<Vec<[f64; 2]>> {
+        Ok(self
+            .samples_for_range_cancel(min, max, target, cancel)?
+            .into_iter()
+            .map(|sample| sample.point)
+            .collect())
+    }
+    /// Keep source row identities attached to plotted samples, including when
+    /// X values repeat or arrive out of order.
+    pub fn samples_for_range_cancel(
+        &self,
+        min: f64,
+        max: f64,
+        target: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<Sample>> {
         self.table.validate()?;
         if target == 0 {
             return Ok(Vec::new());
@@ -166,7 +191,7 @@ impl PointSeries {
             cancel,
         )?;
         self.table.validate()?;
-        let points: Vec<_> = plot.samples.iter().map(|s| s.point).collect();
+        let points = plot.samples;
         if cache.len() == 4 {
             cache.pop_front();
         }
@@ -181,6 +206,33 @@ pub struct Signal {
     pub points: PointSeries,
 }
 
+/// How much of an original CSV has been indexed. Bounds and row counts in the
+/// containing store describe only this prefix until `complete` becomes true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CsvExtent {
+    pub complete: bool,
+    pub indexed_bytes: u64,
+    pub source_bytes: u64,
+}
+
+/// Exact original-source bytes for one indexed CSV data row. Field ranges
+/// exclude delimiters and include any raw quotes/escapes. Empty fields have
+/// empty ranges. Both fields and values are ordered X, then `DataStore.signals`.
+#[derive(Debug, Clone)]
+pub struct CsvRow {
+    pub index: usize,
+    pub range: std::ops::Range<usize>,
+    pub fields: Vec<std::ops::Range<usize>>,
+    pub values: Vec<f64>,
+}
+
+pub trait CsvRows: std::fmt::Debug + Send + Sync {
+    fn row(&self, index: usize, cancel: &AtomicBool) -> Result<CsvRow>;
+    /// Header bytes, blank records and bytes outside this indexed snapshot do
+    /// not identify a data row. Separators/newlines identify only their row.
+    fn find_byte(&self, offset: usize, cancel: &AtomicBool) -> Result<Option<CsvRow>>;
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct DataStore {
     pub signals: Vec<Signal>,
@@ -188,6 +240,8 @@ pub struct DataStore {
     pub time_max: f64,
     pub rows: usize,
     pub storage: String,
+    pub csv_extent: Option<CsvExtent>,
+    pub csv_rows: Option<Arc<dyn CsvRows>>,
     name_to_index: HashMap<String, usize>,
 }
 
@@ -204,6 +258,8 @@ impl DataStore {
             time_max,
             rows,
             storage: "decoded disk cache".into(),
+            csv_extent: None,
+            csv_rows: None,
             name_to_index,
         }
     }

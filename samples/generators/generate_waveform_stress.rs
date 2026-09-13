@@ -1,12 +1,13 @@
 //! Deterministic waveforms in a generic, descriptor-driven tagged container.
 //! PWAV is a synthetic fixture format defined by this generator and its decoders.
 //! Build: rustc --edition=2021 -O samples/generators/generate_waveform_stress.rs -o /tmp/generate_waveform_stress
-//! Run: /tmp/generate_waveform_stress --output samples/data/waveform_stress_40gb.bin
+//! Binary: /tmp/generate_waveform_stress --output samples/data/waveform_demo_2gb.bin --size-gb 2
+//! CSV: /tmp/generate_waveform_stress --csv --output samples/data/waveform_demo_2gb.csv --size-gb 2
 use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -341,6 +342,120 @@ fn generate(path: &Path, requested: u64, no_compression: bool, reordered: bool) 
     );
     Ok(())
 }
+
+fn csv_header() -> String {
+    let mut header = String::from("time");
+    for (name, _, _) in CHANNELS {
+        header.push(',');
+        header.push_str(name);
+    }
+    header.push('\n');
+    header
+}
+
+fn csv_values(index: u64) -> String {
+    let mut record = [0; RECORD_BYTES as usize];
+    encode_record(&mut record, index, false);
+    let mut offset = 0;
+    let mut values = String::new();
+    for (_, code, width) in CHANNELS {
+        let end = offset + width as usize;
+        let bytes = &record[offset..end];
+        // CSV is read as f64. Widen f32 before formatting so both views display
+        // exactly the same value, including the binary record's f32 rounding.
+        let value = match code {
+            3 => f64::from_le_bytes(bytes.try_into().unwrap()).to_string(),
+            4 => (f32::from_le_bytes(bytes.try_into().unwrap()) as f64).to_string(),
+            5 => u32::from_le_bytes(bytes.try_into().unwrap()).to_string(),
+            6 => i32::from_le_bytes(bytes.try_into().unwrap()).to_string(),
+            _ => unreachable!("unsupported waveform channel type"),
+        };
+        values.push(',');
+        values.push_str(&value);
+        offset = end;
+    }
+    values.push('\n');
+    values
+}
+
+/// Every row has a unique sample index followed by the common waveform period.
+/// A short blank-line tail fills the requested size without a partial CSV row.
+fn write_csv(output: &mut impl Write, requested: u64) -> Result<(u64, u64)> {
+    let header = csv_header();
+    let period: Vec<_> = (0..PATTERN_RECORDS as u64).map(csv_values).collect();
+    let minimum = (header.len() + 1 + period[0].len()) as u64;
+    if requested < minimum {
+        return Err(
+            format!("CSV needs at least {minimum} bytes for a header and one sample").into(),
+        );
+    }
+    output.write_all(header.as_bytes())?;
+    let mut written = header.len() as u64;
+    let mut count = 0u64;
+    let started = Instant::now();
+    let mut progress = Instant::now();
+    loop {
+        let index = count.to_string();
+        let values = &period[(count % PATTERN_RECORDS as u64) as usize];
+        let row_bytes = (index.len() + values.len()) as u64;
+        if row_bytes > requested - written {
+            break;
+        }
+        output.write_all(index.as_bytes())?;
+        output.write_all(values.as_bytes())?;
+        count += 1;
+        written += row_bytes;
+        if count % 65536 == 0 && progress.elapsed() >= Duration::from_secs(2) {
+            println!(
+                "{:.2}/{:.2} GB ({:.1}%) · {count} CSV samples · {:.0}s elapsed",
+                written as f64 / 1e9,
+                requested as f64 / 1e9,
+                100. * written as f64 / requested as f64,
+                started.elapsed().as_secs_f64()
+            );
+            io::stdout().flush()?;
+            progress = Instant::now();
+        }
+    }
+    let blank_bytes = requested - written;
+    output.write_all(&vec![b'\n'; blank_bytes as usize])?;
+    Ok((count, blank_bytes))
+}
+
+fn generate_csv(path: &Path, requested: u64) -> Result<()> {
+    if fs::symlink_metadata(path).is_ok() {
+        return Err(format!("Refusing to overwrite {}", path.display()).into());
+    }
+    let partial = path.with_file_name(format!(
+        "{}.partial",
+        path.file_name()
+            .ok_or("Output needs a filename")?
+            .to_string_lossy()
+    ));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)?;
+    let guard = Partial(partial.clone());
+    let mut writer = BufWriter::with_capacity(BUFFER_BYTES, file);
+    println!("Writing {requested} bytes of CSV; 32 MiB buffer, 12 waveform channels.");
+    let started = Instant::now();
+    let (count, blank_bytes) = write_csv(&mut writer, requested)?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    if writer.get_ref().metadata()?.len() != requested {
+        return Err("CSV output length does not match the requested size".into());
+    }
+    drop(writer);
+    fs::hard_link(&partial, path)?;
+    drop(guard);
+    println!(
+        "Ready: {} ({requested} bytes), {count} samples, {blank_bytes} trailing blank bytes, {:.1}s total",
+        path.display(), started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("Error: {error}");
@@ -349,16 +464,18 @@ fn main() {
 }
 fn run() -> Result<()> {
     let mut args = env::args().skip(1);
-    let mut output = PathBuf::from("samples/data/waveform_stress_40gb.bin");
+    let mut output = None;
     let mut size = DEFAULT_BYTES;
     let mut verify = None;
     let mut no_compression = false;
     let mut reordered = false;
+    let mut csv = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--no-compression" => no_compression = true,
             "--reordered" => reordered = true,
-            "--output" => output = args.next().ok_or("--output needs a path")?.into(),
+            "--csv" => csv = true,
+            "--output" => output = Some(PathBuf::from(args.next().ok_or("--output needs a path")?)),
             "--size-bytes" => size = args.next().ok_or("--size-bytes needs a number")?.parse()?,
             "--size-gb" => {
                 size = args
@@ -370,15 +487,31 @@ fn run() -> Result<()> {
             }
             "--verify" => verify = Some(PathBuf::from(args.next().ok_or("--verify needs a path")?)),
             "--help" | "-h" => {
-                println!("Generate deterministic waveforms in a PWAV tagged container.\n--output PATH       New output file (never overwritten)\n--size-gb N         Decimal GB; default 40\n--size-bytes N      Small fixtures; rounds down to complete records\n--reordered         Reverse descriptors and fields; move sample payload to byte 8192\n--no-compression    Disable compression on the new file (Linux chattr +m)\n--verify PATH       Verify metadata and distributed record probes\nDecode with samples/decoders/python/waveform.py or samples/decoders/yaml/waveform.yaml.");
+                println!("Generate deterministic waveforms as a PWAV tagged container or CSV.\n--csv               Write CSV: sample index (time) plus the same 12 channels\n--output PATH       New output file (never overwritten)\n--size-gb N         Decimal GB; default 40\n--size-bytes N      Exact CSV bytes; binary rounds down to complete records\n--reordered         Reverse descriptors and fields; move sample payload to byte 8192\n--no-compression    Disable compression on the new file (Linux chattr +m)\n--verify PATH       Verify metadata and distributed record probes\nBinary decoders: samples/decoders/python/waveform.py or samples/decoders/yaml/waveform.yaml.\nCSV opens directly; demo settings: samples/configs/waveform_demo_2gb.md.\nVerify the pair: python3 samples/generators/verify_waveform_demo.py --help");
                 return Ok(());
             }
             _ => return Err(format!("Unknown argument {arg}").into()),
         }
     }
+    if csv && (reordered || no_compression || verify.is_some()) {
+        return Err(
+            "--csv cannot be combined with --reordered, --no-compression, or --verify".into(),
+        );
+    }
     if let Some(path) = verify {
         inspect(&path)
     } else {
-        generate(&output, size, no_compression, reordered)
+        let output = output.unwrap_or_else(|| {
+            PathBuf::from(if csv {
+                "samples/data/waveform_stress_40gb.csv"
+            } else {
+                "samples/data/waveform_stress_40gb.bin"
+            })
+        });
+        if csv {
+            generate_csv(&output, size)
+        } else {
+            generate(&output, size, no_compression, reordered)
+        }
     }
 }

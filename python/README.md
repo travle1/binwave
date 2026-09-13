@@ -3,10 +3,19 @@
 Open a data file in PlotterMax, then use **Decoder → Open decoder…** to load a
 `.py` file. Loading only displays its source. **Run script** (F5) executes it;
 **Stop** cancels it. **Save Python…** saves the source. To start from scratch,
-select **Python** and choose **New**. **View → Decoder workspace** restores the editor
+select **Python** and choose **New**. YAML is the default editor; each language has
+its own editable, commented starter. **View → Decoder workspace** restores the editor
 beside Hex.
 
-The **Python / YAML** selector chooses between two independent drafts. Switching
+When a nonempty binary file opens, untouched starters become executable byte
+preview decoders. The initial plot comes from the built-in native YAML reader,
+so Python is not required for opening or previewing a file. Switch to Python to
+edit the equivalent `u8` record definition, then use **Run script** to apply it.
+Existing loaded, edited, or deliberately cleared drafts are preserved. Only the
+explicit Run action executes your Python; subsequent byte edits rerun the last
+decoder that successfully published results.
+
+The **YAML / Python** selector chooses between two independent drafts. Switching
 keeps both sources; it does not convert or run either one. **Open decoder…** chooses
 the language from `.py`, `.yaml`, or `.yml`. Run the active Python draft with
 **Run script**, or the active YAML draft with **Decode file**. YAML keeps its
@@ -26,6 +35,30 @@ Python runs with your local user permissions and is **not sandboxed**.
 
 PlotterMax supplies `file` and the `plottermax` module during execution. They do
 not require a pip package; run these scripts inside PlotterMax.
+
+## Run ordinary Python
+
+```python
+test = 5
+print(test)
+```
+
+**Run script** (F5) prints `5` in Console. An assignment on its own is also valid;
+it finishes with no printed output. Imports, calculations, and raw byte reads do
+not have to create a dataset. **New** starts with a commented example that reads a
+header count and describes the following samples. Adapt it to your binary file,
+select all, and press Ctrl+/ (Cmd+/ on macOS) to uncomment. This shortcut also
+toggles comments on selected lines. Untouched starters do not run or count as
+unsaved edits; loading a decoder replaces the starter with its source.
+
+Each Run executes the whole script in a fresh Python interpreter. Variables do not
+persist between runs. Use `print()` to display a value; the editor runs scripts
+rather than evaluating expressions as an interactive Python prompt.
+
+Runs that publish no data, fail, or are stopped keep the previously decoded results
+for the same working-byte revision. Errors appear beside the source in Console.
+Only a successful run with registered data replaces Plot, Table, and decoded
+structure. Changing the bytes still invalidates results until they are refreshed.
 
 ## Read metadata, describe results
 
@@ -63,7 +96,8 @@ computed arrays, decompressed buffers, and Python callbacks executed for every p
 You can still use Python libraries to inspect or calculate such values and print them.
 
 Each run reads a consistent version of the working bytes, including unsaved Hex
-edits. Byte edits invalidate results and rerun the last executed script. Changes
+edits. Byte edits invalidate results and rerun the last decoder that successfully
+published data. Plain scripts and failed attempts do not replace that decoder. Changes
 to the script editor itself remain a draft until **Run script**. Scripts may
 therefore execute more than once while editing a file.
 

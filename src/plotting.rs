@@ -3,7 +3,7 @@ use crate::data::DataStore;
 use anyhow::Result;
 use std::sync::atomic::AtomicBool;
 
-pub type PlotLines = Vec<(usize, String, Vec<[f64; 2]>)>;
+pub type PlotLines = Vec<(usize, String, Vec<crate::plot_index::Sample>)>;
 
 pub struct PlotBuilder<'a> {
     pub store: &'a DataStore,
@@ -30,7 +30,7 @@ impl PlotBuilder<'_> {
                     .get(&signal.name)
                     .unwrap()
                     .points
-                    .for_range_cancel(bounds[0], bounds[1], target, cancel)?;
+                    .samples_for_range_cancel(bounds[0], bounds[1], target, cancel)?;
                 Ok((i, signal.name.clone(), points))
             })
             .collect()

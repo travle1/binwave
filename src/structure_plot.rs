@@ -12,12 +12,13 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-const EXACT_LIMIT: usize = 2048;
+const MIN_EXACT_LIMIT: usize = 2048;
+const MAX_EXACT_LIMIT: usize = 8192;
 const AUTO_SCAN_LIMIT: usize = 65_536;
 const PREVIEW_LIMIT: usize = 65_536;
 const PREVIEW_WINDOWS: usize = 128;
 const PREVIEW_WINDOW_SIZE: usize = PREVIEW_LIMIT / PREVIEW_WINDOWS;
-const MAX_BUCKETS: usize = 512;
+const MAX_BUCKETS: usize = 4096;
 const MAX_SERIES: usize = 32;
 const CACHE_ENTRIES: usize = 3;
 
@@ -38,7 +39,7 @@ impl PlotQuality {
     pub fn label(self) -> &'static str {
         match self {
             Self::Exact => "All samples",
-            Self::MinMax => "Min/max overview",
+            Self::MinMax => "Reduced · min/max retained",
             Self::SampledPreview => "Estimated range · peaks may be missed",
         }
     }
@@ -68,6 +69,7 @@ struct Key {
     path: String,
     range: Range<usize>,
     buckets: usize,
+    exact_limit: usize,
     refine: bool,
 }
 #[derive(Clone)]
@@ -78,7 +80,7 @@ struct Request {
 }
 struct Cached {
     request: Request,
-    data: PlotData,
+    data: Arc<PlotData>,
 }
 struct Outcome {
     key: Key,
@@ -93,7 +95,7 @@ struct Running {
 pub struct PlotReader {
     desired: Option<Request>,
     running: Option<Running>,
-    data: Option<PlotData>,
+    data: Option<Arc<PlotData>>,
     error: Option<String>,
     cache: VecDeque<Cached>,
 }
@@ -105,6 +107,7 @@ impl Drop for PlotReader {
     }
 }
 impl PlotReader {
+    /// `pixel_width` is the plot canvas width in physical display pixels.
     pub fn request(
         &mut self,
         ctx: &egui::Context,
@@ -121,13 +124,14 @@ impl PlotReader {
         let start = range.start.min(count);
         let range = start..range.end.max(start).min(count);
         // Quantized widths avoid restarting a query for single-pixel pane changes.
-        let buckets = pixel_width.clamp(64, MAX_BUCKETS).div_ceil(64) * 64;
+        let buckets = display_buckets(pixel_width);
         let key = Key {
             revision: source.revision,
             definition: identity(&node),
             path: node.path.clone(),
             range,
             buckets,
+            exact_limit: exact_limit(pixel_width),
             refine,
         };
         if self
@@ -176,6 +180,7 @@ impl PlotReader {
                 {
                     match outcome.result {
                         Ok(data) => {
+                            let data = Arc::new(data);
                             if data.complete {
                                 self.cache.push_front(Cached {
                                     request: self.desired.as_ref().unwrap().clone(),
@@ -247,7 +252,7 @@ impl PlotReader {
         self.cache.clear();
     }
     pub fn data(&self) -> Option<&PlotData> {
-        self.data.as_ref()
+        self.data.as_deref()
     }
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
@@ -430,6 +435,28 @@ fn bucket_range(range: &Range<usize>, buckets: usize, index: usize) -> Range<usi
     range.start + start..range.start + end
 }
 
+// Preserve individual samples while there is useful screen resolution. The
+// 64-pixel quantization keeps small pane resizes from restarting plot queries;
+// the cap bounds exact point storage even on very large displays.
+fn exact_limit(pixel_width: usize) -> usize {
+    pixel_width
+        .clamp(MIN_EXACT_LIMIT / 2, MAX_EXACT_LIMIT / 2)
+        .div_ceil(64)
+        * 64
+        * 2
+}
+
+// Subpixel buckets preserve local turning points before the renderer chooses
+// between individual traces and dense amplitude ranges. Quantization limits
+// resize churn; saturation bounds storage on large or high-DPI displays.
+fn display_buckets(pixel_width: usize) -> usize {
+    pixel_width
+        .saturating_mul(2)
+        .clamp(128, MAX_BUCKETS)
+        .div_ceil(64)
+        * 64
+}
+
 fn reduction_buckets(quality: PlotQuality, requested: usize) -> usize {
     if quality == PlotQuality::SampledPreview {
         requested.clamp(2, PREVIEW_WINDOWS)
@@ -475,7 +502,7 @@ fn read_plot(
     request.source.validate()?;
     ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
     let range = &request.key.range;
-    let quality = if range.len() <= EXACT_LIMIT {
+    let quality = if range.len() <= request.key.exact_limit {
         PlotQuality::Exact
     } else if range.len() <= AUTO_SCAN_LIMIT || request.key.refine {
         PlotQuality::MinMax
@@ -784,6 +811,7 @@ mod tests {
                 path: node.path.clone(),
                 range,
                 buckets: 128,
+                exact_limit: exact_limit(512),
                 refine,
             },
             source,
@@ -817,6 +845,203 @@ mod tests {
         assert_eq!(points[1023].bytes, 5096..5100);
         assert_eq!(points[1023].path, "samples[1274]");
     }
+    #[test]
+    fn exact_point_budget_scales_with_plot_width_and_remains_bounded() {
+        for width in [0, 128, 512, 1024] {
+            assert_eq!(exact_limit(width), MIN_EXACT_LIMIT);
+        }
+        assert_eq!(exact_limit(1025), 2176);
+        assert_eq!(exact_limit(1088), 2176);
+        assert_eq!(exact_limit(1089), 2304);
+        assert_eq!(exact_limit(1200), 2432);
+        assert_eq!(exact_limit(2048), 4096);
+        for width in [4096, 8192, usize::MAX] {
+            assert_eq!(exact_limit(width), MAX_EXACT_LIMIT);
+        }
+    }
+
+    #[test]
+    fn reduction_budget_tracks_physical_pixels_without_overflow() {
+        assert_eq!(display_buckets(0), 128);
+        assert_eq!(display_buckets(64), 128);
+        assert_eq!(display_buckets(65), 192);
+        assert_eq!(display_buckets(512), 1024);
+        assert_eq!(display_buckets(1250), 2560);
+        assert_eq!(display_buckets(1280), 2560);
+        assert_eq!(display_buckets(1281), 2624);
+        for width in [2048, 4096, usize::MAX] {
+            assert_eq!(display_buckets(width), MAX_BUCKETS);
+        }
+        assert_eq!(
+            reduction_buckets(PlotQuality::SampledPreview, display_buckets(4096)),
+            PREVIEW_WINDOWS,
+            "a larger display must not increase preview reads"
+        );
+    }
+
+    #[test]
+    fn display_resolution_preserves_short_cycles_and_exact_extrema_at_12496_samples() {
+        let range = 28_358..40_854;
+        let value = |name: &str, index: usize| match name {
+            "counter" => 110. + (index % 16) as f64,
+            "sine" => ((index % 64) as f64 * std::f64::consts::TAU / 64.).sin() * 4.,
+            "spike" => {
+                if index == 33_451 { 10_000. } else { 0. }
+            },
+            _ => unreachable!(),
+        };
+        let names = ["counter", "sine", "spike"];
+        let bytes: Vec<_> = (0..range.end)
+            .flat_map(|index| {
+                names
+                    .into_iter()
+                    .flat_map(move |name| value(name, index).to_le_bytes())
+            })
+            .collect();
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let node = parse(
+            &store.view(),
+            r#"
+structures:
+  Sample:
+    fields: [{name: counter, type: f64}, {name: sine, type: f64}, {name: spike, type: f64}]
+actions: [{read: {name: samples, type: Sample, repeat: until end}}]
+"#,
+        );
+        let mut request = request(store.view(), node, range.clone(), false);
+        request.key.exact_limit = exact_limit(1280);
+        let turns: Vec<_> = (range.start + 1..range.end - 1)
+            .filter(|index| matches!(index % 16, 0 | 15))
+            .collect();
+        assert_eq!(turns.len(), 1562);
+        request.key.buckets = 512;
+        let coarse = read_plot(&request, &AtomicBool::new(false), |_| {}).unwrap();
+        assert!(turns.iter().any(|index| !coarse.series["counter"]
+            .iter()
+            .any(|point| point.index == *index)));
+        request.key.buckets = display_buckets(1280);
+        let data = read_plot(&request, &AtomicBool::new(false), |_| {}).unwrap();
+        assert_eq!(data.quality, PlotQuality::MinMax);
+        assert_eq!(data.scanned, range.len());
+        assert!(data.complete);
+        for index in turns {
+            assert!(
+                data.series["counter"].iter().any(|point| point.index == index),
+                "lost the real turning point at sample {index}"
+            );
+        }
+        for (field_index, name) in names.into_iter().enumerate() {
+            let points = &data.series[name];
+            assert!(points.len() <= 4 * request.key.buckets);
+            assert!(points.windows(2).all(|pair| pair[0].index < pair[1].index));
+            assert_eq!(data.envelopes[name].len(), request.key.buckets);
+            for band in &data.envelopes[name] {
+                let expected_min = band
+                    .range
+                    .clone()
+                    .map(|index| value(name, index))
+                    .fold(f64::INFINITY, f64::min);
+                let expected_max = band
+                    .range
+                    .clone()
+                    .map(|index| value(name, index))
+                    .fold(f64::NEG_INFINITY, f64::max);
+                assert_eq!(band.min.value, expected_min);
+                assert_eq!(band.max.value, expected_max);
+                for point in [&band.min, &band.max] {
+                    assert!(band.range.contains(&point.index));
+                    assert_eq!(
+                        point.bytes,
+                        point.index * 24 + field_index * 8..point.index * 24 + field_index * 8 + 8
+                    );
+                    assert_eq!(point.path, format!("samples[{}].{name}", point.index));
+                }
+            }
+        }
+        let spike = data.series["spike"]
+            .iter()
+            .find(|point| point.index == 33_451)
+            .unwrap();
+        assert_eq!(spike.value, 10_000.);
+        assert_eq!(spike.bytes, 33_451 * 24 + 16..33_451 * 24 + 24);
+    }
+
+    #[test]
+    fn reduction_cache_distinguishes_physical_canvas_widths() {
+        let (store, node) = fixture(50_000, 33_451);
+        let ctx = egui::Context::default();
+        let mut reader = PlotReader::default();
+        for width in [640, 1280, 640] {
+            reader.request(&ctx, store.view(), node.clone(), 28_358..40_854, width, false);
+            settle(&mut reader, &ctx);
+            assert!(reader.error().is_none());
+            let data = reader.data().unwrap();
+            assert_eq!(data.quality, PlotQuality::MinMax);
+            assert_eq!(data.scanned, 12_496);
+            assert_eq!(data.envelopes["value"].len(), display_buckets(width));
+            assert!(data.series["value"]
+                .iter()
+                .any(|point| point.index == 33_451 && point.value == 100_000.));
+        }
+        assert_eq!(reader.cache.len(), 2);
+    }
+
+    #[test]
+    fn zooming_past_2048_samples_keeps_each_sample_when_the_plot_has_room() {
+        let (store, node) = fixture(6000, 5500);
+        for count in [2048, 2049, 2179, 2432] {
+            let mut request = request(store.view(), node.clone(), 3342..3342 + count, false);
+            request.key.exact_limit = exact_limit(1200);
+            let data = read_plot(&request, &AtomicBool::new(false), |_| {}).unwrap();
+            assert_eq!(data.quality, PlotQuality::Exact);
+            assert_eq!(data.scanned, count);
+            assert!(data.envelopes.is_empty());
+            let samples = &data.series["value"];
+            assert_eq!(samples.len(), count);
+            for (offset, sample) in samples.iter().enumerate() {
+                let index = 3342 + offset;
+                assert_eq!(sample.index, index);
+                assert_eq!(sample.bytes, index * 4..index * 4 + 4);
+                assert_eq!(sample.path, format!("samples[{index}]"));
+            }
+        }
+    }
+
+    #[test]
+    fn resized_plot_requeries_exact_budget_and_reuses_matching_cached_data() {
+        let (store, node) = fixture(9000, 2111);
+        let ctx = egui::Context::default();
+        let mut reader = PlotReader::default();
+        for (width, quality) in [
+            (512, PlotQuality::MinMax),
+            (1200, PlotQuality::Exact),
+            (512, PlotQuality::MinMax),
+        ] {
+            reader.request(&ctx, store.view(), node.clone(), 0..2179, width, false);
+            settle(&mut reader, &ctx);
+            assert!(reader.error().is_none());
+            let data = reader.data().unwrap();
+            assert_eq!(data.quality, quality);
+            assert_eq!(data.scanned, 2179);
+            let points = &data.series["value"];
+            if quality == PlotQuality::Exact {
+                assert_eq!(points.len(), 2179);
+            } else {
+                assert!(points.len() <= 4 * MAX_BUCKETS);
+            }
+            let spike = points.iter().find(|point| point.index == 2111).unwrap();
+            assert_eq!(spike.value, 100_000.);
+            assert_eq!(spike.bytes, 8444..8448);
+        }
+        assert_eq!(reader.cache.len(), 2);
+        reader.request(&ctx, store.view(), node, 0..8193, usize::MAX, false);
+        settle(&mut reader, &ctx);
+        let data = reader.data().unwrap();
+        assert_eq!(data.quality, PlotQuality::MinMax);
+        assert_eq!(data.scanned, 8193);
+        assert!(data.series["value"].len() <= 4 * MAX_BUCKETS);
+    }
+
     #[test]
     fn min_max_keeps_an_isolated_spike_and_temporal_order_with_bounded_points() {
         let (store, node) = fixture(65_536, 33_333);
@@ -1115,6 +1340,30 @@ actions:
         assert!(reader.data().is_none());
         assert!(!reader.is_loading());
     }
+    #[test]
+    fn completed_and_revisited_plots_share_cached_sample_storage() {
+        let (store, node) = fixture(65_536, 33_333);
+        let ctx = egui::Context::default();
+        let mut reader = PlotReader::default();
+        reader.request(&ctx, store.view(), node.clone(), 0..65_536, 2048, false);
+        settle(&mut reader, &ctx);
+        let first = reader.data.as_ref().unwrap().clone();
+        assert!(Arc::ptr_eq(&first, &reader.cache.front().unwrap().data));
+        assert_eq!(first.envelopes["value"].len(), MAX_BUCKETS);
+        reader.request(&ctx, store.view(), node.clone(), 1000..33_768, 2048, false);
+        settle(&mut reader, &ctx);
+        assert_eq!(reader.cache.len(), 2);
+        assert!(Arc::ptr_eq(
+            reader.data.as_ref().unwrap(),
+            &reader.cache.front().unwrap().data
+        ));
+        reader.request(&ctx, store.view(), node, 0..65_536, 2048, false);
+        settle(&mut reader, &ctx);
+        assert!(Arc::ptr_eq(reader.data.as_ref().unwrap(), &first));
+        assert!(Arc::ptr_eq(&reader.cache.front().unwrap().data, &first));
+        assert_eq!(reader.cache.len(), 2);
+    }
+
     #[test]
     fn cached_ranges_do_not_survive_a_definition_change_or_byte_edit() {
         let (mut store, node) = fixture(4096, usize::MAX);

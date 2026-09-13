@@ -5,6 +5,8 @@ Its numeric samples are generated from mathematical waveform formulas. The file
 carries names, types, widths, counts, and section lengths so the decoder discovers
 the sample layout from metadata.
 
+For a ready-to-present CSV and binary pair, see the [2 GB demo guide](waveform_demo_guide.md).
+
 ## Generate a small example first
 
 From the project directory:
@@ -72,10 +74,12 @@ errors arrive when execution completes.
 
 ## Plot navigation
 
-Detailed ranges show sample lines and markers. **Overview** initially estimates
+Detailed ranges show continuous sample lines and markers. Denser, fully read
+ranges retain first/minimum/maximum/last samples per group as a continuous trace.
+**Overview** initially estimates
 amplitude bands from at most 128 contiguous windows of up to 512 records each,
 for at most 65,536 records. Peaks in unread regions can be missed. **Scan for all
-peaks** reads every sample in the current range and builds complete min/max bands;
+peaks** reads every sample in the current range and builds a min/max trace;
 the scan is cancellable and does not load the whole file into RAM.
 
 Drag to pan and use the wheel to zoom. Right-drag a horizontal range to zoom to

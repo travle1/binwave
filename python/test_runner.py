@@ -135,8 +135,7 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(reader.tell(), 2)
         self.assertEqual(reader.seek(-1, 2), 3)
         self.assertEqual(reader.read(1), b"\x00")
-        with self.assertRaisesRegex(ValueError, "did not describe"):
-            reader.program()
+        self.assertIsNone(reader.program())
         with self.assertRaisesRegex(ValueError, "exceeds file size"):
             reader.read(1)
         reader = runner.Reader(2 * runner.READ_LIMIT, "large", lambda a, b: bytes(b))
@@ -221,6 +220,23 @@ class ProtocolTests(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
             process.communicate(timeout=5)
+
+    def test_plain_python_and_raw_reads_succeed_with_explicit_null_program(self):
+        for script, expected_stdout in [
+            ("test = 5", ""),
+            ("import math\ndef squared(x): return x*x\nprint(squared(3), math.sqrt(16))", "9 4.0\n"),
+            ("from plottermax import file\nprint(file.read_at(0, 2).hex())", "0700\n"),
+        ]:
+            with self.subTest(script=script):
+                result = self.run_script(script)
+                self.assertEqual(result, {"done": {"program": None, "stdout": expected_stdout}})
+
+    def test_invalid_raw_read_is_still_a_script_error(self):
+        result = self.run_script("print('reading')\nfile.read_at(1, 2)")
+        self.assertIn("ValueError", result["error"])
+        self.assertIn("exceeds file size", result["error"])
+        self.assertEqual(result["stdout"], "reading\n")
+        self.assertNotIn("done", result)
 
     def test_regular_python_imports_functions_and_print_are_separate_from_protocol(self):
         result = self.run_script("from plottermax import Struct, file\nimport math\ndef squared(x): return x*x\nprint(squared(3), math.sqrt(16))\nfile.read_struct('sample', Struct('Sample', [('value','u16')]))")

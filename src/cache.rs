@@ -7,6 +7,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -157,12 +158,14 @@ fn publish_pointer(root: &Path, key: &str, directory: &Path) -> Result<()> {
 
 /// Keeps incomplete CSV chunks alive while a preview still uses their mappings.
 /// Successful publication transfers cleanup responsibility to the disk cache.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct PendingDirectory {
     pub path: PathBuf,
     published: AtomicBool,
 }
 
+#[cfg(test)]
 impl PendingDirectory {
     pub fn new(root: &Path) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
@@ -177,6 +180,7 @@ impl PendingDirectory {
     }
 }
 
+#[cfg(test)]
 impl Drop for PendingDirectory {
     fn drop(&mut self) {
         if !self.published.load(Ordering::Relaxed) {

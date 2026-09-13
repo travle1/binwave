@@ -43,9 +43,24 @@ including `.csv`, `.bin`, `.png`, `.zip`, `.yaml`, `.md`, and extensionless file
 opens as bytes. No definition or full-file scan is required to start using Hex.
 Opening an arbitrary file never applies the demo layout.
 
-The default workspace puts **Decoder** on the left and **Hex** on the right.
-The **Python / YAML** selector switches between independent drafts and keeps each
-source when you switch back. It does not convert or execute the source.
+Before opening a file, the workspace puts **Decoder** on the left and **Hex** on
+the right. Opening a nonempty binary file adds a **Byte preview** plot above Hex:
+unsigned 8-bit values at byte offset zero, one byte per sample. The first 1,024
+values appear through bounded reads; more are loaded as you navigate. The file
+is not scanned or copied into RAM to create this preview.
+
+Untouched YAML and Python starters become short, executable definitions of that
+byte interpretation. Edit the fields, byte order, or starting offset and press
+F5 to replace the preview with your decoded data. The built-in preview uses the
+native YAML reader; opening a data file never runs user Python. Loaded, edited,
+and deliberately cleared decoder drafts remain intact, and the plot stays labeled
+**Byte preview** until a different decoder successfully replaces it.
+
+The decoder starts in **YAML**, with **Python** and **CSV** alongside it.
+Python and YAML retain independent source drafts when you switch modes; switching
+does not convert or execute either source. Choosing an editor preserves the current
+Plot and Decoded samples, including their selection and view. Apply or run the
+chosen decoder to replace those results.
 **Open decoder…** selects Python for `.py` and YAML for `.yaml` or `.yml`, then
 loads that source without executing it.
 
@@ -53,8 +68,18 @@ For Python, choose **Run script** (F5); **Stop** cancels a running script and
 **Save Python…** saves its source. For YAML, choose **Decode file** (F5) and
 **Save YAML…**. Run executes the active draft against the open file. A successful
 run opens **Decoded samples** below Hex; **Show plot** opens the decoded channels. The decoder stays visible beside results.
-**New** starts a fresh decoder in the selected language.
-CSV still opens its column settings and progressive samples automatically.
+With no data file open, both source editors start with editable, commented examples;
+**New** restores the
+starter for the selected language. The examples read a sample count from a header,
+then describe that many records. Adapt the fields to your file, select all, and
+press Ctrl+/ (Cmd+/ on macOS) to uncomment. The same shortcut toggles comments on
+selected lines while editing. Untouched starters are clean drafts and cannot run
+until they contain uncommented code. Opening a decoder replaces its language's
+starter with the loaded source. Ordinary scripts can finish
+without publishing a dataset; output appears in Console, and existing results
+remain available. Only a successful data-producing run replaces them.
+Opening CSV selects its settings in Decoder and automatically shows a plot and
+table from an initial portion of the numeric columns. More rows are read when requested; opening does not scan to EOF.
 
 Python is a direct source editor with a console for completed runs. For YAML,
 the source editor and **Fields** and **Steps** forms edit the same YAML draft.
@@ -114,7 +139,7 @@ and undo groups over the original file; opening and editing do not copy the enti
 file or allocate its size in RAM. Changed bytes stay distinguishable from original
 bytes, including after saving a copy. Byte edits invalidate dependent decoded views
 and trigger background reinterpretation of the last applied decoder. For Python,
-this reruns the last executed script against the updated working bytes; unrun source
+this reruns the last script that successfully published decoded data against the updated working bytes; unrun source
 changes in the editor remain a draft.
 
 **Save edited copy…** streams the complete working file to a different destination.
@@ -126,16 +151,19 @@ changing a decoder preserves that byte history. Unsaved bytes, Python/YAML sourc
 and pending legacy table edits are guarded when replacing the open file or closing
 PlotterMax.
 
-`.csv` files start progressive CSV interpretation automatically while Hex remains
-available. Select **CSV columns** in Inspector for delimited numeric text with any
-other extension, or **Decoder** to use the applied decoder. Raw CSV edits clear
-CSV results because that reader accesses the original file; save and reopen the
-edited copy to plot its updated CSV values. CSV table cells are read-only and do
-not yet identify exact source-byte ranges.
+`.csv` files read an initial portion automatically while Hex remains available.
+Select **CSV** in Decoder and press **Apply** for delimited numeric text with another extension.
+Decoder holds CSV settings, Plot holds column visibility and navigation, and
+Inspector shows the selected bytes or decoded value. Raw CSV edits clear CSV
+results because that reader accesses the original file; save and reopen the
+edited copy to plot its updated CSV values. CSV table cells are read-only; selecting
+a value reveals its exact source bytes in Hex and marks its sample in Plot.
+Selecting a row number selects the entire raw record, including its line ending.
 
 General Open treats Python, YAML, and Markdown as data files too. Use
-**Open decoder…** in Decoder for a saved script or definition, or
-**Load CSV configuration…** under the file menu for a Markdown configuration.
+**Open decoder…** in Python or YAML mode for a saved script or definition, or
+**Open configuration…** in CSV mode for a Markdown configuration. The latter is
+also available as **File → Load CSV configuration…**.
 **Tools → Clear disk cache** removes disposable entries without closing the file.
 
 ## Python decoders
@@ -154,6 +182,13 @@ header = file.read_struct("header", Header)
 samples = file.records("samples", Sample, count=header.count, offset=header.offset)
 print(f"{len(samples):,} samples")
 ```
+
+Assignments, imports, calculations, `print()`, and raw byte reads work without
+registering decoded data. For example, `test = 5` finishes successfully with no
+printed output; add `print(test)` to see `5` in Console. Each Run starts a fresh
+Python interpreter, so keep assignments and the code using them in the same script.
+Errors and stopped runs preserve results from the last successful decoder for the
+same byte revision.
 
 `read_struct()` returns metadata you can use in normal Python control flow.
 `records()` registers a typed collection for Plot, Decoded samples, and Hex without
@@ -274,7 +309,7 @@ These examples exercise reusable mechanisms; they are not automatic file importe
 | RIFF/WAVE | [Container example](samples/decoders/yaml/riff_chunks.yaml): nested bounded regions, type choices, format metadata, and two-byte alignment. | Audio payload and unknown chunks remain raw bytes; there is no audio decoder. |
 | ZIP | Offset references, variable lengths, and type choices can describe directory entries and referenced records. | No complete ZIP definition, decompression, or archive rebuilding is included. See the [ZIP specification](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT). |
 | SQLite | Fixed header fields, bounded pages, and data-derived type mappings provide building blocks. | No complete database reader exists; SQLite's variable-length integer encoding is not LEB128, so the current `varuint` reader is unsuitable for its records. See the [SQLite file format](https://www.sqlite.org/fileformat.html). |
-| CSV | The existing progressive CSV reader handles quoted fields and multiline records. | The generic interpreter has no CSV tokenizer; raw-to-cell range linking and length-changing CSV edits are not implemented. See [RFC 4180](https://www.rfc-editor.org/rfc/rfc4180.html). |
+| CSV | The CSV reader handles quoted fields and multiline records in requested portions. | The CSV backend links cells and plotted points to exact raw bytes, including quoted and multiline fields. The generic interpreter has no CSV tokenizer; length-changing CSV edits are not implemented. See [RFC 4180](https://www.rfc-editor.org/rfc/rfc4180.html). |
 
 Generic collections with a known fixed item size remain lazy. **Decoded structure** and
 **Decoded samples** fetch 128-item pages in background workers. The table defaults
@@ -286,15 +321,20 @@ the sample's page even when the Decoded structure view is closed.
 
 **Plot** navigates independently of table pages, using sample index on its horizontal
 axis. Panning and zooming request the visible range in a background worker. Detailed
-views show lines with small markers at the actual samples. Wider views show amplitude
-bands from the observed minimum and maximum values, retaining their sample indices
-and byte locations.
+views show continuous lines with markers when samples have enough space. The exact
+sample budget follows the physical canvas width, bounded at 2,048–8,192 samples per
+field. Larger fully read ranges retain each group's first, minimum, maximum, and
+last samples in time order, using up to two groups per physical pixel (at most
+4,096 groups per field). Original byte locations remain available for selection.
+Resolved waveforms stay continuous lines; cycles too dense for the screen become
+amplitude bands instead of aliased zigzags. Zoom in to see their individual samples.
+This affects rendering only; decoded values, byte edits, and exports stay exact.
 
 **Overview** shows the collection's full range. For large ranges, its initial bands
 are estimates from up to 128 distributed, contiguous windows of up to 512 samples
 each: at most 65,536 samples in total. These windows reveal local waveform variation,
 but peaks in unread regions can be missed. **Scan for all peaks** explicitly reads
-every sample in the current range and progressively builds complete min/max bands.
+every sample in the current range and progressively builds a min/max trace.
 Navigation and cancellation stop that scan; opening or plotting a file does not
 require an initial whole-file scan. Recent results are cached in bounded memory for
 the current source and definition. Plot displays up to 32 numeric fields.
@@ -336,8 +376,8 @@ rules that rebuild a container from its edited structure.
 ## Binary demo: select, inspect, edit, save
 
 1. Choose **File → Open sensor demo**, then **Decode file** (F5). The embedded demo works
-   regardless of the working directory. Opening a file or loading YAML never
-   applies a layout implicitly.
+   regardless of the working directory. Loading YAML does not execute it; the
+   automatic byte preview for external files does not apply the demo layout.
 2. X defaults to record index and Y to temperature. Click the obvious spike at
    **record 73**, temperature **85**. Its table row is selected and scrolled into
    view; the hex panel highlights temperature's bytes at **0x380–0x381** (896–897).
@@ -562,8 +602,8 @@ checksums. No decompressor, recompressor, or plugin framework is included now.
   parsing and table work. Decimal inputs support
   up to **1,024 characters**, with an explicit exponent between −1,024 and 1,024;
   scales must also fit a finite nonzero f64 for plotting.
-- CSV plots and Markdown configuration remain available; CSV loading now uses
-  the progressive original-file access described below.
+- CSV plots and Markdown configuration use the original-file access described
+  below, with bounded initial reads and optional whole-file indexing.
 
 The core in `src/binary/` separates schema validation, numeric encoding/decoding,
 physical section resolution, snapshot/edit history/export, and sample selection
@@ -574,41 +614,60 @@ and its workspace views.
 
 ## CSV workflow and Markdown configuration
 
-Choose **Open file…** or drop a CSV, then use **Inspector** for CSV settings.
-For delimited text with another extension, choose **CSV columns** in Inspector.
-Use **File → Load CSV configuration…** to apply a Markdown config and open its data file.
-CSV decoding starts without a binary snapshot; the file is also available in Hex.
+Choose **Open file…** or drop a CSV. **Decoder** selects **CSV** and opens the
+first portion of the file; **Hex** can already browse the whole file. For delimited
+text with another extension, select **CSV** in Decoder and press **Apply**. Python and YAML remain
+available in the same selector, with their drafts preserved.
 
-For a **headerless CSV**, expand **CSV settings**, turn off **Has header row**, set
-**Time column** to **c0** (the checkbox switches the default for you), and click
-**Reload CSV**. Names are `c0`, `c1`, etc.; row zero is retained. Header errors are
-reported after reading the first record, without loading the entire file. The
-settings panel also supports a delimiter character. Loading shows byte progress,
-elapsed time, a cancel button, and whether the completed load was a cache hit.
+Choose the **Separator**, whether the **First row is a header**, and the **X column**,
+then press **Apply** (F5). For a headerless file, turn off the header checkbox and
+use `c0` for X; columns are named `c0`, `c1`, etc., and row zero is retained.
+Settings changes take effect when applied. Existing results remain visible until
+the replacement rows arrive. **Open configuration…** loads a Markdown configuration
+and its data file; the same command remains in the File menu.
 
-**Use CSV data while it loads.** On an uncached load, the first completed batch
-(up to 8,192 rows, fewer for wide rows) becomes available without waiting for EOF.
-You can select signals, plot, pan, and zoom immediately within the loaded portion.
-More completed rows are published about every half second. The row count and
-**Partial file** label distinguish loaded data from the complete file; navigation
-covers only the time range loaded so far.
+A cold open requests **up to 8,192 rows**, stopping sooner if it reaches the
+interactive byte budget. Each request indexes up to **8 MiB of new input**, plus
+the final record (at most **1 MiB**) and **64 KiB** of read-ahead. Header bytes count
+toward that budget and have the same 1 MiB record limit. No automatic scan continues
+to the end of the file after that request finishes. An existing cached index may
+make more rows available immediately.
 
-**Follow loaded range** initially expands the full plot as data arrives. Panning,
-zooming, or adjusting the navigator stops following and preserves your view through
-later updates and completion. Signal visibility and search remain unchanged.
-Use **Full Range** or enable **Follow loaded range** to follow again. Reloading the same CSV retains its existing dataset until replacement rows arrive.
-Opening a different file clears the previous file's CSV views so interpretations
-continue to refer to one source.
+- In **Decoded samples**, use **Next rows**, change the page, or **Go to row**
+  (numbered from zero). A request beyond the indexed portion reads forward in
+  bounded batches until the requested page is found or EOF is reached. A distant
+  row can take time because CSV records have variable lengths and quoted newlines.
+- In **Plot**, **Next** reads another portion when you reach the available range.
+  **Previous**, **Start**, and zoom controls navigate the known data. **Columns**
+  holds search, individual visibility checkboxes, **Show all**, and **Hide all**;
+  these visibility choices also determine the table columns. **Available range**
+  fits the rows known so far; it becomes **Overview** when the file is complete.
+- **Index entire file**, available in Decoder and Plot, explicitly scans every
+  remaining row for an exact row count, complete X range, and whole-file summaries.
+  **Stop** cancels the active request while keeping rows already available. Later
+  errors also leave the accepted portion usable with an error message.
 
-**Cancel loading** keeps the last published portion usable, marked incomplete.
-An error later in the file also keeps that portion with an explicit error message.
-Unfinished files never become complete index/cache hits. The default mode writes
-no partial disk data. **Reload CSV** starts a fresh load;
-resuming an interrupted parse and seeking directly into unread CSV rows are not
-implemented.
+Click a table value or a plotted sample to select its raw field bytes in **Hex**.
+Click a row number for the entire record. Selecting bytes in Hex reveals the
+corresponding table row and marks the sample in Plot; headers and blank lines
+have no sample. The plot preserves its zoom and pans only when the selected X
+is outside the current view. Byte selections remain exact, including raw quotes
+and escapes; an empty CSV cell selects no bytes. Use Hex's selection operations
+to copy, export, or overwrite the selected bytes.
 
-Examples: `samples/data/sample.csv` and `samples/configs/sample_config.md`. A Markdown config
-contains a fenced JSON block:
+Selecting bytes beyond the indexed prefix requests bounded batches until that
+record is found. This can take time for a distant offset; **Stop** cancels it.
+Plot selection retains the actual source row, including duplicate or unsorted X
+values. Changing the Python/YAML/CSV editor leaves these results and links intact.
+
+The status reports rows **available** until EOF is known, then reports the file as
+**complete**. An idle, partly indexed file is ready to use. Completed portions are
+saved as resumable indexes: reopening an unchanged file restores those rows, and
+the next request resumes from the saved record boundary. Opening another file
+clears the previous file's CSV views.
+
+Examples: `samples/data/sample.csv` and `samples/configs/sample_config.md`.
+A Markdown configuration contains a fenced JSON block:
 
 ````markdown
 # Plotter Max Config
@@ -620,78 +679,51 @@ contains a fenced JSON block:
     "delimiter": ",",
     "has_header": true,
     "time_column": "time",
-    "ram_cache_mib": 64,
-    "decoded_disk_cache": false,
-    "decoded_cache_limit_mib": 1024
+    "ram_cache_mib": 64
   },
   "view": { "max_lines_in_plot": 2000, "target_points_per_line": 2000 }
 }
 ```
 ````
 
-`csv.include_signals` optionally lists columns to include. `csv.delimiter` defaults
-to `,`; `csv.has_header` controls the header row. The CSV renderer uses cached
-min/max summaries and background loading. Generate an optional large
-CSV with:
+The configured data path is relative to the application's working directory.
+`csv.include_signals` optionally limits the columns decoded; hiding a column in
+Plot only changes its visibility. Generate an optional large CSV with:
 
 ```sh
 python3 samples/generators/generate_large_csv.py --gb 20 --signals 8 --out samples/data/large_test.csv
 ```
 
-## CSV storage and large-file loading
+## CSV storage and large-file reading
 
-**By default, CSV values stay in the original file.** PlotterMax streams through
-it to build a compact index of record positions and plot summaries. It does not
-copy the whole CSV or write all decoded values to disk. The first rows are usable
-while the initial scan continues. A complete overview still requires that scan;
-reopening an unchanged file reuses the saved index without scanning everything.
+**CSV values stay in the original file.** PlotterMax keeps a compact index of row
+positions and plot summaries for the portion it has read. Neither normal browsing
+nor **Index entire file** creates a full numeric copy.
 
 - **Decoded RAM cache: 64 MiB by default**, shared across signals and views.
-  Recently read blocks are retained; older blocks are evicted and parsed again
-  from the original file when needed. CSV record checkpoints handle quoted fields
-  and multiline records correctly. The setting is adjustable under **CSV settings**
-  or with `csv.ram_cache_mib` (1–4,096 MiB; subject to platform limits). This bounds
-  decoded block allocations, not total process memory: indexes, parser buffers,
-  the current block, rendered points, and UI state need additional memory. The
-  operating system also manages its own file cache.
-- **A small disk index replaces the full decoded copy.** Seek checkpoints are
-  capped at 65,536 entries. Plot summaries have a bounded block count across
-  signals; larger files use coarser blocks. A saved index is limited to 64 MiB per
-  entry. If saving fails, including insufficient disk space, the file remains
-  usable with its index in RAM. Invalid or incomplete indexes are rebuilt.
-- Full-range plots use stored extrema. Zooming into a block may require reading
-  and decoding that region again, especially after eviction. Unsorted time values
-  can require wider reads. Queries run in a cancellable background worker and
-  retain the last plot while updating; four rendered views are cached per signal.
-  Progressive updates publish only the latest pending snapshot and preserve the
-  user's viewport and signal selections.
-- Keep the original CSV available and unchanged while using it. Source identity
-  is checked before queries and after reads. Detected replacement or modification
-  requires **Reload CSV**, avoiding a mixture of old summaries and new values.
-  This is an original-file reader, not an immutable snapshot or live-tail viewer.
+  Older blocks are evicted and parsed again when needed. `csv.ram_cache_mib` in a
+  configuration sets this budget (1–4,096 MiB, subject to platform limits).
+  This is a decoded-block budget, not total process memory: indexes, parser buffers,
+  the current block, plot points, UI state, and the OS file cache are additional.
+- CSV records, including quoted multiline records and headers, are limited to
+  **1 MiB of source bytes each**. Oversized records fail with an explicit error;
+  earlier accepted rows remain available.
+- Seek checkpoints are capped at **65,536 entries**, and plot summaries have a
+  bounded block count across signals. A saved index is limited to **64 MiB**.
+  Both partial and complete indexes are reused when the source and parsing settings
+  match. Invalid indexes are rebuilt. If index storage is unavailable, the open
+  file stays usable with its index in memory.
+- Known-range plots use stored extrema. A narrow zoom may read a block again after
+  eviction; unsorted X values can require wider reads. Table and plot requests run
+  in background workers, and four rendered views are cached per signal.
+- Keep the original CSV available and unchanged. Source identity is checked before
+  queries and after reads. After a detected change, reopen the file or reapply its
+  CSV settings to rebuild the index. This is not a live-tail viewer.
 
-### Optional complete decoded cache
-
-Enable **Keep a full decoded copy on disk** (`csv.decoded_disk_cache: true`) when
-faster rereads justify the extra storage. It is **off by default**. Decoded data
-needs approximately `rows × (selected signals + 1) × 8` bytes, which can exceed the
-CSV size. Completed chunks are frozen and mapped read-only; the operating system
-controls resident mapped pages. This mode does not use the decoded RAM block limit.
-
-**Total decoded data limit** defaults to **1,024 MiB**
-(`csv.decoded_cache_limit_mib`). New copies share that budget under `csv-decoded/`
-within the cache directory. Existing data is counted before starting a copy, and
-row writes enforce the remaining budget. Writers are serialized within one app
-instance; simultaneous separate instances do not coordinate their budgets.
-A conservative size estimate may skip caching even when the eventual copy would
-fit. If a new copy cannot fit, loading uses the original CSV and compact index.
-Index metadata is additional to this limit. Lowering the limit does not delete
-existing entries, and an existing complete cache can still be reused.
-
-Optional decoded chunks are immutable and shared between progressive views;
-unfinished chunks remain private and are removed when their last view closes.
-They never become completed cache hits. Binary snapshots use their separate
-storage rules above.
+Older configurations may contain `csv.decoded_disk_cache` and
+`csv.decoded_cache_limit_mib`. They remain accepted for compatibility, but the
+interactive workspace always uses the original-file reader and ignores those
+decoded-copy settings.
 
 ### Cache location and clearing
 
@@ -704,24 +736,25 @@ preferences does not invalidate a compatible index.
 
 **Clear disk cache** removes disposable entries while retaining open data, original
 source files, edited-copy exports, and unsaved edits. Some operating systems require
-closing mapped files before removal. Indexes and binary snapshots can accumulate
-across files/settings; their disk usage is separate from the optional decoded limit.
+closing mapped files before removal. Advancing a CSV prefix replaces its old
+index entry; indexes for different files/settings and binary snapshots can still
+accumulate.
 
-**Decoded copies created by earlier versions remain on disk until cleared.** They
-are neither automatically deleted nor used by the new default reader. The optional
-limit applies to the new `csv-decoded/` directory, not these older entries. Use
-**Clear disk cache** to reclaim that previous storage.
+Decoded copies created by earlier versions remain on disk until cleared. The
+interactive CSV reader does not use them. **Clear disk cache** also reclaims that
+older storage.
 
 ### Reproducible measurements
 
-Run the default original-file/index benchmark with:
+Run the original-file/index **full-scan** benchmark with:
 
 ```sh
 cargo test --release benchmark_csv_source_index -- --ignored --nocapture
 ```
 
 It generates one million rows and eight signals, measures first usable rows, the
-initial scan, index size, reopening, and an uncached narrow zoom. To use an existing
+full index scan, index size, reopening, and an uncached narrow zoom. It measures
+explicit indexing, not the bounded default open. To use an existing
 **headerless** CSV, set `PLOTTERMAX_BENCH_CSV` to its path and
 `PLOTTERMAX_BENCH_CACHE_PARENT` to an existing scratch directory. The benchmark
 creates and removes its own temporary index; it never changes the source.
@@ -733,16 +766,17 @@ window painting, and do not flush the operating system's file cache. Timings dep
 on hardware, filesystem cache state, and data.
 
 For the existing 20.0 GiB `large_test.csv` (439,600,000 rows, eight signals),
-the same default benchmark produced a **756,954-byte index (739 KiB)** and peaked
+the same full-scan benchmark produced a **756,954-byte index (739 KiB)** and peaked
 at about **71 MiB process RSS**. First 8,192 rows arrived in **2.2 ms**; the full
 scan took **85.9 seconds**, reopening took **2.0 ms**, and a previously uncached
 narrow zoom took **351 ms**. No full decoded copy was created. These measurements
-exclude GUI memory and OS file-cache memory; the initial scan still reads the
-whole original file even though interaction starts with its first batch.
+exclude GUI memory and OS file-cache memory. They predate the bounded-opening
+workflow and describe a complete scan; they do not imply that opening now scans
+the whole file.
 
 The older `benchmark_csv_cache` and `benchmark_csv_first_rows` benchmarks explicitly
-exercise the optional full decoded backend without its policy limit. They can
-create large temporary copies; use the source-index benchmark for default behavior.
+exercise the legacy full decoded backend without its policy limit. They can
+create large temporary copies and do not represent the interactive CSV workflow.
 
 ## Verification
 
@@ -763,15 +797,14 @@ layouts, incomplete records, and duplicate/unsorted X selection with extrema
 preservation. Cache tests cover cold/warm opens, source/settings invalidation,
 immutable live mappings, headerless CSV row zero, early header failure, cancellation,
 summary queries without source reads, and updating only the edited index block.
-Progressive CSV tests query and navigate before EOF, cross chunk boundaries,
-retain immutable earlier views, keep cancelled/failed prefixes usable, clean up
-incomplete chunks, reuse old caches, and preserve viewport/visibility on completion.
-Default storage tests verify that only an index is written, quoted/multiline
-records seek correctly after eviction, decoded blocks stay within their RAM budget,
-changed sources reject cached views, unavailable index storage remains usable, and
-optional decoded writes respect the size limit. Background plot tests cover
-cancellation and accepting useful results while more rows arrive. An egui test
-exercises signal controls and navigation with the loader still active.
+CSV tests cover bounded initial requests, forward row requests, resumable partial
+indexes, explicit full indexing, source/settings invalidation, oversized records,
+and usable prefixes after cancellation or errors. Storage tests verify that only
+an index is written, quoted/multiline records seek correctly after eviction,
+decoded blocks stay within their RAM budget, and unavailable index storage leaves
+the file usable. Legacy decoded-cache tests retain compatibility coverage.
+Background plot tests cover cancellation and accepting useful results while more
+rows arrive. Egui tests exercise column controls and navigation during reading.
 An egui event test opens the demo, clicks Apply and the spike, types
 a table edit, undoes/redoes it, and verifies the asynchronously exported bytes.
 Another egui test switches between sample/footer/header sections, selects footer

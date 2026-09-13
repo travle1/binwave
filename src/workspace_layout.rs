@@ -106,6 +106,20 @@ impl WorkspaceLayout {
         self.focus(Pane::Layout);
     }
 
+    /// Make a first plot visible above the source bytes. Once Plot has a place,
+    /// keep the user's arrangement, including stacks and floating windows.
+    pub fn show_initial_plot(&mut self) {
+        if self.dock.find_tab(&Pane::Plot).is_none() {
+            if let Some((surface, node, _)) = self.dock.find_tab(&Pane::Hex) {
+                self.dock
+                    .split((surface, node), Split::Above, 0.60, Node::leaf(Pane::Plot));
+            } else {
+                self.open_editor(Pane::Plot);
+            }
+        }
+        self.focus(Pane::Plot);
+    }
+
     /// Reveal samples below the content editors, keeping the decoder visible.
     /// An existing samples panel, including a floating one, is only focused.
     pub fn show_samples(&mut self) {
@@ -272,6 +286,55 @@ mod tests {
         assert_decoder_left(&workspace);
         assert_eq!(Pane::Layout.title(), "Decoder");
         assert_eq!(Pane::Structures.title(), "Decoded structure");
+    }
+
+    #[test]
+    fn first_plot_opens_above_hex_and_repeated_requests_keep_geometry() {
+        let mut workspace = WorkspaceLayout::default();
+        workspace.show_initial_plot();
+        workspace.show_decoder();
+        assert_decoder_left(&workspace);
+        let plot = workspace.dock.find_tab(&Pane::Plot).unwrap();
+        let hex = workspace.dock.find_tab(&Pane::Hex).unwrap();
+        assert_eq!(plot.1, NodeIndex::root().right().left());
+        assert_eq!(hex.1, NodeIndex::root().right().right());
+        assert!(matches!(workspace.dock[plot.0][NodeIndex::root().right()],
+            Node::Vertical { fraction, .. } if (fraction - 0.60).abs() < 0.001));
+        assert!(workspace.dock.find_tab(&Pane::Table).is_none());
+        for _ in 0..3 {
+            workspace.show_initial_plot();
+        }
+        assert_eq!(workspace.dock.find_tab(&Pane::Plot), Some(plot));
+        assert_eq!(workspace.dock.find_tab(&Pane::Hex), Some(hex));
+        assert_eq!(workspace.dock.iter_all_tabs().count(), 5);
+    }
+
+    #[test]
+    fn first_plot_keeps_existing_custom_stack_and_floating_geometry() {
+        let mut dock = DockState::new(vec![Pane::Hex, Pane::Plot]);
+        dock.main_surface_mut()
+            .split_right(NodeIndex::root(), 0.81, vec![Pane::Layout]);
+        let mut workspace = WorkspaceLayout { dock };
+        let hex = workspace.dock.find_tab(&Pane::Hex).unwrap();
+        let plot = workspace.dock.find_tab(&Pane::Plot).unwrap();
+        workspace.show_initial_plot();
+        assert_eq!(workspace.dock.find_tab(&Pane::Hex), Some(hex));
+        assert_eq!(workspace.dock.find_tab(&Pane::Plot), Some(plot));
+        assert!(matches!(workspace.dock[hex.0][NodeIndex::root()],
+            Node::Horizontal { fraction, .. } if (fraction - 0.81).abs() < 0.001));
+        workspace.dock.detach_tab(
+            plot,
+            egui::Rect::from_min_size(egui::pos2(60., 70.), egui::vec2(640., 480.)),
+        );
+        let floating = workspace.dock.find_tab(&Pane::Plot).unwrap();
+        workspace.focus(Pane::Plot);
+        let mut before = MemoryStorage::default();
+        workspace.save(&mut before);
+        workspace.show_initial_plot();
+        let mut after = MemoryStorage::default();
+        workspace.save(&mut after);
+        assert_eq!(workspace.dock.find_tab(&Pane::Plot), Some(floating));
+        assert_eq!(before.0, after.0);
     }
 
     #[test]

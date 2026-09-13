@@ -95,14 +95,132 @@ pub enum DecoderLanguage {
     Python,
 }
 
+impl DecoderLanguage {
+    pub fn byte_preview(self) -> &'static str {
+        match self {
+            Self::Yaml => {
+                r#"# Byte preview: edit this to match your data.
+# Field types: u8, i16, u16, i32, f32, f64.
+# F5 updates the plot, samples, and Hex links.
+endian: little
+structures:
+  Sample:
+    fields:
+      - {name: value, type: u8}
+actions:
+  - read:
+      name: samples
+      type: Sample
+      at: 0
+      repeat: until end
+"#
+            }
+            Self::Python => {
+                r#"# Byte preview: edit this to match your data.
+# Field types: u8, i16, u16, i32, f32, f64.
+# F5 runs this script; print() uses Console.
+from plottermax import Struct
+
+Sample = Struct("Sample", [
+    ("value", "u8"),
+], endian="little")
+
+samples = file.records(
+    "samples", Sample, offset=0,
+)
+print(f"Registered {len(samples):,} samples")
+"#
+            }
+        }
+    }
+
+    pub fn starter(self) -> &'static str {
+        match self {
+            Self::Yaml => {
+                r#"## Adapt this example to your binary file.
+## Header: u32 count. Samples: u32 time, f32 value.
+## Select all, then Ctrl+/ to uncomment.
+## On Mac use Cmd+/. F5 decodes.
+#
+# endian: little
+# structures:
+#   Header:
+#     fields:
+#       - {name: count, type: u32}
+#   Sample:
+#     fields:
+#       - {name: time, type: u32}
+#       - {name: value, type: f32}
+# actions:
+#   - read: {name: header, type: Header}
+#   - read:
+#       name: samples
+#       type: Sample
+#       repeat: {ref: header.count}
+"#
+            }
+            Self::Python => {
+                r#"## Adapt this example to your binary file.
+## `file` is the open file. print() uses Console.
+## Select all, then Ctrl+/ to uncomment.
+## On Mac use Cmd+/. F5 runs.
+#
+# from plottermax import Struct
+#
+# Header = Struct("Header", [
+#     ("count", "u32"),
+# ], endian="little")
+#
+# Sample = Struct("Sample", [
+#     ("time", "u32"),
+#     ("value", "f32"),
+# ], endian="little")
+#
+# header = file.read_struct("header", Header)
+# samples = file.records(
+#     "samples", Sample, count=header.count,
+# )
+# print(f"Decoded {len(samples)} samples")
+"#
+            }
+        }
+    }
+}
+
+pub fn has_decoder_code(source: &str) -> bool {
+    source.lines().any(|line| {
+        let line = line.trim();
+        !line.is_empty() && !line.starts_with('#')
+    })
+}
+
 #[derive(Clone)]
 struct PythonSource {
     code: String,
     path: Option<PathBuf>,
 }
+#[derive(Clone)]
+enum RunSource {
+    Yaml(Program),
+    Python(PythonSource),
+}
+impl RunSource {
+    fn language(&self) -> DecoderLanguage {
+        match self {
+            Self::Yaml(_) => DecoderLanguage::Yaml,
+            Self::Python(_) => DecoderLanguage::Python,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunOutcome {
+    Published,
+    NoData,
+    Failed(String),
+    Cancelled,
+}
 struct Decoded {
-    output: ParseOutput,
-    python_program: Option<Program>,
+    data: Option<(Program, ParseOutput)>,
     stdout: String,
 }
 type Parsed = (u64, Result<Decoded, String>);
@@ -127,6 +245,9 @@ pub struct StructureWorkspace {
     formats: FormatEditor,
     decoded_ready: bool,
     explicit_apply_pending: bool,
+    pending_source: Option<RunSource>,
+    last_run_language: Option<DecoderLanguage>,
+    run_finished: Option<RunOutcome>,
     source: Option<ByteView>,
     run_requested: bool,
 }
@@ -150,8 +271,15 @@ impl StructureWorkspace {
                     .any(|l| l.starts_with("actions:") || l.starts_with("structures:"))
             })
     }
+    #[cfg(test)]
     pub fn has_program(&self) -> bool {
+        self.program.is_some() || self.python_source.is_some() || self.pending_source.is_some()
+    }
+    pub fn has_published_program(&self) -> bool {
         self.program.is_some() || self.python_source.is_some()
+    }
+    pub fn has_output(&self) -> bool {
+        self.output.is_some()
     }
     pub fn decode_error(&self) -> Option<&str> {
         self.error.as_deref()
@@ -162,35 +290,43 @@ impl StructureWorkspace {
     pub fn is_ready(&self) -> bool {
         self.output.is_some() && !self.is_parsing()
     }
-    pub fn clear_program(&mut self) {
+    /// Stop a worker without changing the last published data or its view state.
+    fn stop_worker(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
         self.receiver = None;
+        self.started = None;
+        self.pending_revision = None;
+        self.explicit_apply_pending = false;
+        self.pending_source = None;
+        self.decoded_ready = false;
+        self.run_finished = None;
+    }
+    pub fn clear_program(&mut self) {
+        self.stop_worker();
         self.program = None;
         self.python_source = None;
         self.python_stdout.clear();
+        self.last_run_language = None;
         self.output = None;
         self.error = None;
-        self.started = None;
-        self.pending_revision = None;
         self.views.reset();
-        self.decoded_ready = false;
-        self.explicit_apply_pending = false;
     }
     pub fn clear_file(&mut self) {
         *self = Self::default();
     }
     pub fn apply(&mut self, yaml: &str, source: ByteView, ctx: &Context) -> bool {
-        self.clear_program();
+        self.stop_worker();
+        self.invalidate_changed_revision(source.revision);
+        self.last_run_language = Some(DecoderLanguage::Yaml);
         match Program::parse(yaml) {
             Ok(program) => {
-                self.program = Some(program);
-                self.views.reset();
-                self.reparse(source, ctx);
-                self.explicit_apply_pending = true;
+                self.start_run(RunSource::Yaml(program), source, ctx, true);
                 true
             }
             Err(error) => {
-                self.error = Some(format!("{error:#}"));
+                let error = format!("{error:#}");
+                self.run_finished = Some(RunOutcome::Failed(error.clone()));
+                self.error = Some(error);
                 false
             }
         }
@@ -202,28 +338,52 @@ impl StructureWorkspace {
         source: ByteView,
         ctx: &Context,
     ) -> bool {
-        self.clear_program();
-        self.python_source = Some(PythonSource {
-            code: code.into(),
-            path: script_path.map(Path::to_path_buf),
-        });
-        self.reparse(source, ctx);
-        self.explicit_apply_pending = true;
+        self.start_run(
+            RunSource::Python(PythonSource {
+                code: code.into(),
+                path: script_path.map(Path::to_path_buf),
+            }),
+            source,
+            ctx,
+            true,
+        );
         true
     }
     pub fn cancel_decoding(&mut self) {
-        self.invalidate();
-        self.error = Some("Decoding stopped.".into());
+        let explicit = self.explicit_apply_pending;
+        let python = self.last_run_language == Some(DecoderLanguage::Python);
+        self.stop_worker();
+        self.error = None;
+        if python {
+            self.python_stdout = "Script stopped.".into();
+        }
+        if explicit {
+            self.run_finished = Some(RunOutcome::Cancelled);
+        }
     }
     pub fn reparse(&mut self, source: ByteView, ctx: &Context) {
-        let python = self.python_source.clone();
-        let program = self.program.clone();
-        if python.is_none() && program.is_none() {
-            return;
+        // Byte edits rerun only the last published decoder. An interrupted
+        // candidate must be run explicitly against the changed bytes.
+        let decoder = self
+            .python_source
+            .clone()
+            .map(RunSource::Python)
+            .or_else(|| self.program.clone().map(RunSource::Yaml));
+        self.invalidate_changed_revision(source.revision);
+        if let Some(decoder) = decoder {
+            self.start_run(decoder, source, ctx, false);
         }
-        self.invalidate();
+    }
+    fn start_run(&mut self, decoder: RunSource, source: ByteView, ctx: &Context, explicit: bool) {
+        self.stop_worker();
+        self.invalidate_changed_revision(source.revision);
         self.error = None;
-        self.python_stdout.clear();
+        self.last_run_language = Some(decoder.language());
+        if decoder.language() == DecoderLanguage::Python {
+            self.python_stdout.clear();
+        }
+        self.pending_source = Some(decoder.clone());
+        self.explicit_apply_pending = explicit;
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
         let (sender, receiver) = mpsc::channel();
@@ -235,23 +395,25 @@ impl StructureWorkspace {
             let result = source
                 .validate()
                 .and_then(|_| {
-                    let decoded = if let Some(python) = python {
-                        let result = crate::python_decoder::run(
-                            &python.code,
-                            python.path.as_deref(),
-                            &source,
-                            &cancel,
-                        )?;
-                        Decoded {
-                            output: result.output,
-                            python_program: Some(result.program),
-                            stdout: bounded_console(&result.stdout),
+                    let decoded = match decoder {
+                        RunSource::Python(python) => {
+                            let result = crate::python_decoder::run(
+                                &python.code,
+                                python.path.as_deref(),
+                                &source,
+                                &cancel,
+                            )?;
+                            Decoded {
+                                data: result.decoded,
+                                stdout: bounded_console(&result.stdout),
+                            }
                         }
-                    } else {
-                        Decoded {
-                            output: program.unwrap().run(&source, &cancel)?,
-                            python_program: None,
-                            stdout: String::new(),
+                        RunSource::Yaml(program) => {
+                            let output = program.run(&source, &cancel)?;
+                            Decoded {
+                                data: Some((program, output)),
+                                stdout: String::new(),
+                            }
                         }
                     };
                     source.validate()?;
@@ -264,60 +426,84 @@ impl StructureWorkspace {
             }
         });
     }
-    pub fn invalidate(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-        self.receiver = None;
-        self.output = None;
-        self.started = None;
-        self.pending_revision = None;
-        self.views.invalidate();
-        self.decoded_ready = false;
-        self.explicit_apply_pending = false;
-    }
-    pub fn tick(&mut self, ctx: &Context, source: ByteView) {
-        self.source = Some(source.clone());
+    fn invalidate_changed_revision(&mut self, revision: u64) {
         if self
             .pending_revision
-            .is_some_and(|revision| revision != source.revision)
+            .is_some_and(|pending| pending != revision)
             || self
                 .output
                 .as_ref()
-                .is_some_and(|output| output.revision != source.revision)
+                .is_some_and(|output| output.revision != revision)
         {
             self.invalidate();
         }
+    }
+    pub fn invalidate(&mut self) {
+        self.stop_worker();
+        self.output = None;
+        self.views.invalidate();
+    }
+    pub fn tick(&mut self, ctx: &Context, source: ByteView) {
+        self.source = Some(source.clone());
+        self.invalidate_changed_revision(source.revision);
         if let Some(rx) = &self.receiver {
             match rx.try_recv() {
                 Ok((revision, result)) => {
+                    let explicit = self.explicit_apply_pending;
+                    let decoder = self.pending_source.take();
                     self.receiver = None;
                     self.started = None;
                     self.pending_revision = None;
+                    self.explicit_apply_pending = false;
                     if revision == source.revision {
                         match result {
                             Ok(decoded) => {
-                                self.output = Some(decoded.output);
-                                if let Some(program) = decoded.python_program {
-                                    self.program = Some(program);
-                                }
-                                self.python_stdout = decoded.stdout;
                                 self.error = None;
-                                self.decoded_ready = self.explicit_apply_pending;
-                                self.explicit_apply_pending = false;
+                                if self.last_run_language == Some(DecoderLanguage::Python) {
+                                    self.python_stdout = if decoded.stdout.is_empty() {
+                                        "Script finished. No output.".into()
+                                    } else {
+                                        decoded.stdout
+                                    };
+                                }
+                                let outcome = if let Some((program, output)) = decoded.data {
+                                    // Explicit successful replacement starts a new view;
+                                    // byte-edit refresh retains viewport and selection.
+                                    if explicit {
+                                        self.views.reset();
+                                    }
+                                    self.program = Some(program);
+                                    self.python_source = match decoder {
+                                        Some(RunSource::Python(python)) => Some(python),
+                                        _ => None,
+                                    };
+                                    self.output = Some(output);
+                                    self.decoded_ready = explicit;
+                                    RunOutcome::Published
+                                } else {
+                                    RunOutcome::NoData
+                                };
+                                if explicit {
+                                    self.run_finished = Some(outcome);
+                                }
                             }
                             Err(error) => {
+                                if explicit {
+                                    self.run_finished = Some(RunOutcome::Failed(error.clone()));
+                                }
                                 self.error = Some(error);
-                                self.explicit_apply_pending = false;
                             }
                         }
                     }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.receiver = None;
-                    self.started = None;
-                    self.pending_revision = None;
-                    self.explicit_apply_pending = false;
-                    self.error =
-                        Some("Definition worker stopped before returning a result.".into());
+                    let explicit = self.explicit_apply_pending;
+                    self.stop_worker();
+                    let error = "Definition worker stopped before returning a result.".to_owned();
+                    if explicit {
+                        self.run_finished = Some(RunOutcome::Failed(error.clone()));
+                    }
+                    self.error = Some(error);
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     ctx.request_repaint_after(Duration::from_millis(30))
@@ -328,6 +514,10 @@ impl StructureWorkspace {
         if let Some(output) = &self.output {
             self.views.select_bytes(output, self.selection.clone());
         }
+    }
+    /// Completion of an explicit attempt, independently of whether it published data.
+    pub fn take_run_finished(&mut self) -> Option<RunOutcome> {
+        self.run_finished.take()
     }
     pub fn begin_definition(&mut self, range: Range<usize>) {
         self.formats = FormatEditor::default();
@@ -400,7 +590,7 @@ impl StructureWorkspace {
             });
         }
         if let Some(error) = &self.error {
-            if self.python_source.is_some() {
+            if self.last_run_language == Some(DecoderLanguage::Python) {
                 ui.colored_label(
                     Color32::LIGHT_RED,
                     error.lines().last().unwrap_or("Python decoder failed."),
@@ -412,7 +602,6 @@ impl StructureWorkspace {
     }
     pub fn tree(&mut self, ui: &mut Ui, selection: Option<Range<usize>>) -> Option<Range<usize>> {
         self.selection = selection.clone();
-        self.status(ui);
         let selected = self
             .output
             .as_ref()
@@ -423,7 +612,6 @@ impl StructureWorkspace {
         selected
     }
     pub fn table(&mut self, ui: &mut Ui, source: ByteView) -> Option<Range<usize>> {
-        self.status(ui);
         let selected = self
             .output
             .as_ref()
@@ -434,7 +622,6 @@ impl StructureWorkspace {
         selected
     }
     pub fn plot(&mut self, ui: &mut Ui, source: ByteView) -> Option<Range<usize>> {
-        self.status(ui);
         let selected = self
             .output
             .as_ref()
@@ -561,7 +748,7 @@ impl StructureWorkspace {
             ui.separator();
             ui.weak("F5 Decode");
         });
-        if self.python_source.is_none() {
+        if self.last_run_language != Some(DecoderLanguage::Python) {
             self.status(ui);
         }
         ui.separator();
@@ -580,7 +767,7 @@ impl StructureWorkspace {
     }
 
     fn python_editor(&mut self, ui: &mut Ui, code: &mut String) {
-        let active_python = self.python_source.is_some();
+        let active_python = self.last_run_language == Some(DecoderLanguage::Python);
         let height = ui.available_height();
         let console_height: f32 = if active_python && self.error.is_some() {
             180.
@@ -1101,11 +1288,57 @@ impl YamlLayoutCache {
                             );
                             let text_width =
                                 (size.x - gutter_width - ui.spacing().item_spacing.x).max(80.);
+                            let editor_id = ui.make_persistent_id(egui::Id::new((
+                                "decoder_source_text",
+                                language,
+                            )));
+                            let focused = ui.memory(|memory| memory.has_focus(editor_id));
+                            let toggle = focused
+                                && ui.input_mut(|input| {
+                                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::Slash)
+                                });
+                            // egui 0.27 also matches Shift+Command+Z as Undo; handle Redo
+                            // first so the standard shortcut works in the source editors.
+                            let redo = focused
+                                && ui.input_mut(|input| {
+                                    input.consume_key(
+                                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                                        egui::Key::Z,
+                                    )
+                                });
+                            let mut shortcut_changed = false;
+                            if toggle || redo {
+                                if let Some(mut state) =
+                                    egui::TextEdit::load_state(ui.ctx(), editor_id)
+                                {
+                                    if let Some(selection) = state.cursor.char_range() {
+                                        let mut undoer = state.undoer();
+                                        let next = if toggle {
+                                            undoer.add_undo(&(selection, yaml.clone()));
+                                            let selection = toggle_source_comments(yaml, selection);
+                                            undoer.feed_state(
+                                                ui.input(|input| input.time),
+                                                &(selection, yaml.clone()),
+                                            );
+                                            Some((selection, yaml.clone()))
+                                        } else {
+                                            undoer.redo(&(selection, yaml.clone())).cloned()
+                                        };
+                                        if let Some((selection, source)) = next {
+                                            *yaml = source;
+                                            state.cursor.set_char_range(Some(selection));
+                                            shortcut_changed = true;
+                                        }
+                                        state.set_undoer(undoer);
+                                        state.store(ui.ctx(), editor_id);
+                                    }
+                                }
+                            }
                             let mut layouter = |ui: &Ui, text: &str, _width: f32| {
                                 self.layout(ui, text, &font, language)
                             };
-                            let output = egui::TextEdit::multiline(yaml)
-                                .id_source(("decoder_source_text", language))
+                            let mut output = egui::TextEdit::multiline(yaml)
+                                .id(editor_id)
                                 .code_editor()
                                 .font(font.clone())
                                 .frame(false)
@@ -1121,6 +1354,9 @@ impl YamlLayoutCache {
                                     }
                                 })
                                 .show(ui);
+                            if shortcut_changed {
+                                output.response.mark_changed();
+                            }
                             let gutter = egui::Rect::from_min_max(
                                 gutter.min,
                                 egui::pos2(gutter.right(), output.response.rect.bottom()),
@@ -1149,6 +1385,79 @@ impl YamlLayoutCache {
                     });
             });
     }
+}
+
+/// Toggle complete source lines, using character indices to match egui's cursors.
+fn toggle_source_comments(
+    text: &mut String,
+    mut selection: egui::text::CCursorRange,
+) -> egui::text::CCursorRange {
+    let chars: Vec<char> = text.chars().collect();
+    selection.primary.index = selection.primary.index.min(chars.len());
+    selection.secondary.index = selection.secondary.index.min(chars.len());
+    let [first, last] = selection.sorted();
+    // A selection ending at the start of a line excludes that following line.
+    let last = if first.index < last.index {
+        last.index - 1
+    } else {
+        last.index
+    };
+    let mut start = chars[..first.index]
+        .iter()
+        .rposition(|&ch| ch == '\n')
+        .map_or(0, |position| position + 1);
+    let mut positions = Vec::new();
+    while start <= last {
+        let end = chars[start..]
+            .iter()
+            .position(|&ch| ch == '\n')
+            .map_or(chars.len(), |position| start + position);
+        let content = (start..end).find(|&position| !matches!(chars[position], ' ' | '\t' | '\r'));
+        if let Some(position) = content {
+            positions.push(position);
+        } else if selection.primary.index == selection.secondary.index {
+            // On an empty current line, keep its indentation before inserting '# '.
+            positions.push(if end > start && chars[end - 1] == '\r' {
+                end - 1
+            } else {
+                end
+            });
+        }
+        if end == chars.len() {
+            break;
+        }
+        start = end + 1;
+    }
+    let uncomment = !positions.is_empty()
+        && positions
+            .iter()
+            .all(|&position| chars.get(position) == Some(&'#'));
+    let mut result = String::with_capacity(text.len() + positions.len() * 2);
+    let mut copied = 0;
+    let mut shift = 0_isize;
+    for position in positions {
+        result.extend(chars[copied..position].iter());
+        let removed = if uncomment {
+            1 + usize::from(chars.get(position + 1) == Some(&' '))
+        } else {
+            result.push_str("# ");
+            0
+        };
+        let added = if uncomment { 0 } else { 2 };
+        let adjusted_position = position.checked_add_signed(shift).unwrap();
+        for cursor in [&mut selection.primary, &mut selection.secondary] {
+            if cursor.index >= adjusted_position {
+                cursor.index = adjusted_position
+                    + added
+                    + cursor.index.saturating_sub(adjusted_position + removed);
+            }
+        }
+        shift += added as isize - removed as isize;
+        copied = position + removed;
+    }
+    result.extend(chars[copied..].iter());
+    *text = result;
+    selection
 }
 
 /// A small, lossless lexer for display only. Unknown YAML remains editable and unmodified.
@@ -2279,7 +2588,7 @@ impl StepsEditor {
     }
 }
 fn draft_program(yaml: &str) -> Result<Program> {
-    if yaml.trim().is_empty() {
+    if !has_decoder_code(yaml) {
         Ok(Program {
             endian: Endian::Little,
             structures: BTreeMap::new(),
@@ -3046,7 +3355,7 @@ impl Builder {
         Ok(next)
     }
     fn generate(&self, yaml: &str) -> Result<String> {
-        let mut program = if yaml.trim().is_empty() {
+        let mut program = if !has_decoder_code(yaml) {
             Program {
                 endian: self.endian,
                 structures: BTreeMap::new(),
@@ -3494,7 +3803,7 @@ mod tests {
     #[test]
     fn builder_uses_selection_and_preserves_existing_types() {
         let mut builder = Builder::from_range(16..20);
-        let yaml = builder.generate("").unwrap();
+        let yaml = builder.generate(DecoderLanguage::Yaml.starter()).unwrap();
         let program = Program::parse(&yaml).unwrap();
         assert!(program.structures.contains_key("Record"));
         let Action::Read(read) = &program.actions[0] else {
@@ -3672,6 +3981,13 @@ actions:
             source.view(),
             &ctx
         ));
+        settle(&mut workspace, source.view(), &ctx);
+        assert!(workspace.is_ready());
+        assert!(workspace.apply(
+            "actions: [{read: {name: first, type: u8}}]",
+            source.view(),
+            &ctx
+        ));
         let old_cancel = workspace.cancel.clone();
         source.replace(0, &[9]).unwrap();
         workspace.tick(&ctx, source.view());
@@ -3688,6 +4004,27 @@ actions:
         workspace.clear_file();
         assert!(!workspace.has_program());
         assert!(workspace.output.is_none());
+    }
+    #[test]
+    fn byte_edits_cancel_unpublished_candidates_without_automatic_retry() {
+        let mut source = bytes(&[1, 2]);
+        let ctx = Context::default();
+        let mut workspace = StructureWorkspace::default();
+        workspace.apply(
+            "actions: [{read: {name: first, type: u8}}]",
+            source.view(),
+            &ctx,
+        );
+        let cancel = workspace.cancel.clone();
+        source.replace(0, &[9]).unwrap();
+        workspace.tick(&ctx, source.view());
+        workspace.reparse(source.view(), &ctx);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(!workspace.has_program());
+        assert!(!workspace.has_output());
+        assert!(!workspace.is_parsing());
+        assert!(!workspace.take_decoded());
+        assert_eq!(workspace.take_run_finished(), None);
     }
     #[test]
     fn repeat_keywords_paths_and_type_picker_match_engine_syntax() {
@@ -4041,6 +4378,179 @@ actions:
     }
 
     #[test]
+    fn plain_python_succeeds_without_creating_a_read_plan() {
+        let ctx = Context::default();
+        let source = bytes(&[3, 4]);
+        let mut workspace = StructureWorkspace::default();
+        workspace.apply_python("test = 5", None, source.view(), &ctx);
+        settle_python(&mut workspace, source.view(), &ctx);
+        assert!(workspace.decode_error().is_none());
+        assert_eq!(workspace.take_run_finished(), Some(RunOutcome::NoData));
+        assert_eq!(workspace.take_run_finished(), None);
+        assert!(!workspace.take_decoded());
+        assert!(!workspace.has_program());
+        assert!(!workspace.is_ready());
+        assert!(workspace.output.is_none());
+        assert_eq!(workspace.python_stdout, "Script finished. No output.");
+
+        workspace.apply_python("print(5)", None, source.view(), &ctx);
+        settle_python(&mut workspace, source.view(), &ctx);
+        assert_eq!(workspace.python_stdout, "5\n");
+        assert_eq!(workspace.take_run_finished(), Some(RunOutcome::NoData));
+        assert!(!workspace.has_program());
+    }
+
+    #[test]
+    fn unsuccessful_or_plain_python_preserves_yaml_results_and_selection() {
+        let ctx = Context::default();
+        let mut source = bytes(&[3, 4]);
+        let mut workspace = StructureWorkspace::default();
+        workspace.apply(
+            "actions: [{read: {name: original, type: u8}}]",
+            source.view(),
+            &ctx,
+        );
+        settle(&mut workspace, source.view(), &ctx);
+        assert_eq!(workspace.take_run_finished(), Some(RunOutcome::Published));
+        assert!(workspace.take_decoded());
+        workspace.select_bytes(0..1);
+        let original_nodes = workspace.output.as_ref().unwrap().nodes.as_ptr();
+
+        for (code, successful) in [
+            ("test = 5", true),
+            ("print(file.read_at(0, 1))", true),
+            ("raise ValueError('test failure')", false),
+        ] {
+            workspace.apply_python(code, None, source.view(), &ctx);
+            assert_eq!(
+                workspace.output.as_ref().unwrap().nodes.as_ptr(),
+                original_nodes
+            );
+            assert_eq!(workspace.selected_node().unwrap().path, "original");
+            settle_python(&mut workspace, source.view(), &ctx);
+            let outcome = workspace.take_run_finished().unwrap();
+            if successful {
+                assert_eq!(outcome, RunOutcome::NoData);
+                assert!(workspace.error.is_none());
+            } else {
+                assert!(
+                    matches!(outcome, RunOutcome::Failed(ref message) if message.contains("test failure"))
+                );
+            }
+            assert!(!workspace.take_decoded());
+            assert!(workspace.is_ready());
+            assert!(workspace.python_source.is_none());
+            assert_eq!(
+                workspace.output.as_ref().unwrap().nodes.as_ptr(),
+                original_nodes
+            );
+            assert_eq!(workspace.selection, Some(0..1));
+            assert_eq!(workspace.selected_node().unwrap().path, "original");
+        }
+        workspace.apply_python("while True: pass", None, source.view(), &ctx);
+        workspace.cancel_decoding();
+        assert_eq!(workspace.take_run_finished(), Some(RunOutcome::Cancelled));
+        assert_eq!(
+            workspace.output.as_ref().unwrap().nodes.as_ptr(),
+            original_nodes
+        );
+        assert_eq!(workspace.selected_node().unwrap().path, "original");
+        assert!(!workspace.is_parsing());
+        assert!(workspace.is_ready());
+
+        assert!(!workspace.apply("actions: [{read: {type: missing}}]", source.view(), &ctx));
+        assert!(matches!(
+            workspace.take_run_finished(),
+            Some(RunOutcome::Failed(_))
+        ));
+        assert_eq!(
+            workspace.output.as_ref().unwrap().nodes.as_ptr(),
+            original_nodes
+        );
+        source.replace(0, &[9]).unwrap();
+        workspace.reparse(source.view(), &ctx);
+        assert!(workspace.output.is_none());
+        settle(&mut workspace, source.view(), &ctx);
+        assert_eq!(
+            workspace.selected_node().unwrap().value,
+            Some(Value::Unsigned(9))
+        );
+        assert_eq!(workspace.selected_node().unwrap().path, "original");
+        assert_eq!(workspace.take_run_finished(), None);
+    }
+
+    #[test]
+    fn byte_edits_refresh_the_last_published_python_after_plain_or_failed_runs() {
+        let ctx = Context::default();
+        let mut source = bytes(&[3, 4]);
+        let mut workspace = StructureWorkspace::default();
+        let code = "from plottermax import Struct\nfile.read_struct('original', Struct('Record', [('value', 'u8')]))";
+        workspace.apply_python(code, Some(Path::new("original.py")), source.view(), &ctx);
+        settle_python(&mut workspace, source.view(), &ctx);
+        assert_eq!(workspace.take_run_finished(), Some(RunOutcome::Published));
+        assert!(workspace.take_decoded());
+        workspace.select_bytes(0..1);
+        for attempt in ["test = 5", "raise ValueError('test failure')"] {
+            workspace.apply_python(attempt, Some(Path::new("scratch.py")), source.view(), &ctx);
+            settle_python(&mut workspace, source.view(), &ctx);
+            assert!(!workspace.take_decoded());
+            assert_eq!(workspace.python_source.as_ref().unwrap().code, code);
+            assert_eq!(
+                workspace.python_source.as_ref().unwrap().path.as_deref(),
+                Some(Path::new("original.py"))
+            );
+            assert_eq!(
+                workspace.selected_node().unwrap().value,
+                Some(Value::Unsigned(3))
+            );
+        }
+        // A failing YAML replacement must preserve the Python refresh source too.
+        workspace.apply(
+            "actions: [{read: {name: too_wide, type: u64}}]",
+            source.view(),
+            &ctx,
+        );
+        settle(&mut workspace, source.view(), &ctx);
+        assert!(matches!(
+            workspace.take_run_finished(),
+            Some(RunOutcome::Failed(_))
+        ));
+        assert_eq!(workspace.python_source.as_ref().unwrap().code, code);
+        source.replace(0, &[9]).unwrap();
+        workspace.reparse(source.view(), &ctx);
+        assert!(workspace.output.is_none());
+        settle_python(&mut workspace, source.view(), &ctx);
+        assert_eq!(
+            workspace.selected_node().unwrap().value,
+            Some(Value::Unsigned(9))
+        );
+        assert_eq!(workspace.take_run_finished(), None);
+        assert!(!workspace.take_decoded());
+    }
+
+    #[test]
+    fn no_data_after_byte_revision_change_never_restores_stale_decoding() {
+        let ctx = Context::default();
+        let mut source = bytes(&[3]);
+        let mut workspace = StructureWorkspace::default();
+        let code = "from plottermax import Struct\nif file.read_at(0, 1) == bytes([3]):\n    file.read_struct('value', Struct('Record', [('value', 'u8')]))";
+        workspace.apply_python(code, None, source.view(), &ctx);
+        settle_python(&mut workspace, source.view(), &ctx);
+        assert!(workspace.is_ready());
+        workspace.take_decoded();
+        workspace.take_run_finished();
+        source.replace(0, &[4]).unwrap();
+        workspace.reparse(source.view(), &ctx);
+        assert!(workspace.output.is_none());
+        settle_python(&mut workspace, source.view(), &ctx);
+        assert!(workspace.error.is_none());
+        assert!(workspace.output.is_none());
+        assert!(!workspace.is_ready());
+        assert!(!workspace.take_decoded());
+        assert_eq!(workspace.take_run_finished(), None);
+    }
+
+    #[test]
     fn python_decoder_reruns_header_logic_after_byte_edits() {
         let ctx = Context::default();
         let mut data = vec![0; 401];
@@ -4273,6 +4783,193 @@ print(f'{len(samples)} samples')
         assert!(!workspace.builder.active);
         assert!(workspace.decode_error().is_none());
         assert!(workspace.editor_page == EditorPage::Yaml);
+    }
+
+    #[test]
+    fn source_comment_toggle_preserves_unicode_indentation_and_line_selection() {
+        use egui::text::{CCursor, CCursorRange};
+
+        let original = "  # café\n\t# value\nlast: 3\n";
+        let end = "  # café\n\t# value\n".chars().count();
+        for reverse in [false, true] {
+            let mut text = original.to_owned();
+            let selection = if reverse {
+                CCursorRange::two(CCursor::new(end), CCursor::new(0))
+            } else {
+                CCursorRange::two(CCursor::new(0), CCursor::new(end))
+            };
+            let next = toggle_source_comments(&mut text, selection);
+            assert_eq!(text, "  café\n\tvalue\nlast: 3\n");
+            assert_eq!(next.sorted()[0].index, 0);
+            assert_eq!(next.sorted()[1].index, end - 4);
+            assert_eq!(next.primary.index == 0, reverse);
+            let restored = toggle_source_comments(&mut text, next);
+            assert_eq!(text, original);
+            assert_eq!(restored, selection);
+        }
+
+        let mut mixed = "  value\n\n  # note\nlast\n".to_owned();
+        let selected_end = "  value\n\n  # note\n".chars().count();
+        let selected = CCursorRange::two(CCursor::new(0), CCursor::new(selected_end));
+        let next = toggle_source_comments(&mut mixed, selected);
+        assert_eq!(mixed, "  # value\n\n  # # note\nlast\n");
+        toggle_source_comments(&mut mixed, next);
+        assert_eq!(mixed, "  value\n\n  # note\nlast\n");
+
+        let mut current = "🦀 = 1\n  value\n".to_owned();
+        let selection = CCursorRange::one(CCursor::new(10));
+        let next = toggle_source_comments(&mut current, selection);
+        assert_eq!(current, "🦀 = 1\n  # value\n");
+        assert_eq!(next.primary.index, 12);
+        assert_eq!(toggle_source_comments(&mut current, next), selection);
+        assert_eq!(current, "🦀 = 1\n  value\n");
+
+        let mut blank = "\t\r\nlast".to_owned();
+        let cursor = CCursorRange::one(CCursor::new(1));
+        let next = toggle_source_comments(&mut blank, cursor);
+        assert_eq!(blank, "\t# \r\nlast");
+        assert_eq!(next.primary.index, 3);
+        assert_eq!(toggle_source_comments(&mut blank, next), cursor);
+        assert_eq!(blank, "\t\r\nlast");
+    }
+
+    #[test]
+    fn source_comment_shortcut_requires_focus_and_supports_undo_in_both_languages() {
+        for language in [DecoderLanguage::Yaml, DecoderLanguage::Python] {
+            let ctx = Context::default();
+            let mut cache = YamlLayoutCache::default();
+            let mut source = language.starter().to_owned();
+            let original = source.clone();
+            let mut frame = |source: &mut String, events: Vec<egui::Event>| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(700., 400.),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            cache.editor(ui, source, language);
+                        });
+                    },
+                )
+            };
+            let key = |key, modifiers| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            };
+            frame(&mut source, vec![]);
+            let output = frame(
+                &mut source,
+                vec![key(egui::Key::Slash, egui::Modifiers::COMMAND)],
+            );
+            assert_eq!(
+                source, original,
+                "An unfocused editor must not handle the shortcut"
+            );
+            let position = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == source => {
+                        Some(text.pos + egui::vec2(12., 6.))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            frame(&mut source, vec![egui::Event::PointerMoved(position)]);
+            for pressed in [true, false] {
+                frame(
+                    &mut source,
+                    vec![egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+            let id = ctx
+                .memory(|memory| memory.focused())
+                .expect("source editor focus");
+            frame(
+                &mut source,
+                vec![key(egui::Key::A, egui::Modifiers::COMMAND)],
+            );
+            frame(
+                &mut source,
+                vec![key(egui::Key::Slash, egui::Modifiers::COMMAND)],
+            );
+            assert!(has_decoder_code(&source));
+            assert!(source.starts_with("# "), "Instructions remain commented");
+            let uncommented = source.clone();
+            let selection = egui::TextEdit::load_state(&ctx, id)
+                .unwrap()
+                .cursor
+                .char_range()
+                .unwrap();
+            assert_eq!(selection.sorted()[0].index, 0);
+            assert_eq!(selection.sorted()[1].index, source.chars().count());
+            frame(
+                &mut source,
+                vec![key(egui::Key::Z, egui::Modifiers::COMMAND)],
+            );
+            assert_eq!(source, original, "Toggle is one undoable edit");
+            frame(
+                &mut source,
+                vec![key(
+                    egui::Key::Z,
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                )],
+            );
+            assert_eq!(source, uncommented);
+
+            // The actual starter must decode after the documented keyboard sequence.
+            let mut data = 2_u32.to_le_bytes().to_vec();
+            for (time, value) in [(100_u32, 1.5_f32), (200, -2.5)] {
+                data.extend_from_slice(&time.to_le_bytes());
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            let data = bytes(&data);
+            let cancel = AtomicBool::new(false);
+            let parsed = match language {
+                DecoderLanguage::Yaml => Program::parse(&source)
+                    .unwrap()
+                    .run(&data.view(), &cancel)
+                    .unwrap(),
+                DecoderLanguage::Python => {
+                    let output =
+                        crate::python_decoder::run(&source, None, &data.view(), &cancel).unwrap();
+                    assert_eq!(output.stdout.trim(), "Decoded 2 samples");
+                    output.decoded.unwrap().1
+                }
+            };
+            let samples = &parsed.nodes[1];
+            assert_eq!(samples.range, 4..20);
+            assert_eq!(samples.children.len(), 2);
+            assert_eq!(
+                samples.children[0].children[0].value,
+                Some(Value::Unsigned(100))
+            );
+            assert_eq!(
+                samples.children[0].children[1].value,
+                Some(Value::Float(1.5))
+            );
+            assert_eq!(
+                samples.children[1].children[0].value,
+                Some(Value::Unsigned(200))
+            );
+            assert_eq!(
+                samples.children[1].children[1].value,
+                Some(Value::Float(-2.5))
+            );
+        }
     }
 
     #[test]

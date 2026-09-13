@@ -25,8 +25,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const RUNNER: &str = include_str!("../python/runner.py");
 
 pub struct PythonOutput {
-    pub program: Program,
-    pub output: ParseOutput,
+    pub decoded: Option<(Program, ParseOutput)>,
     pub stdout: String,
 }
 
@@ -55,12 +54,12 @@ pub fn run(
             .context("decode Python read plan")?;
         Ok((program, output))
     };
-    let (program, output) = decode().map_err(|error| with_output(error, &stdout))?;
-    Ok(PythonOutput {
-        program,
-        output,
-        stdout,
-    })
+    let decoded = if plan.is_null() {
+        None
+    } else {
+        Some(decode().map_err(|error| with_output(error, &stdout))?)
+    };
+    Ok(PythonOutput { decoded, stdout })
 }
 
 fn run_python(
@@ -382,6 +381,13 @@ fn exchange(
             }
         } else if let Some(done) = object.get("done") {
             ensure!(object.len() == 1, "invalid Python decoder completion");
+            // No decoded data is represented by an explicit null plan. A
+            // missing field remains a malformed response, not an empty run.
+            ensure!(
+                done.as_object()
+                    .is_some_and(|object| object.contains_key("program")),
+                "invalid Python decoder completion: missing program"
+            );
             let done: Done = serde_json::from_value(done.clone())
                 .context("invalid Python decoder completion")?;
             return Ok((done.program, bounded_text(&done.stdout)));
@@ -470,6 +476,23 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_python_succeeds_without_registering_decoded_data() {
+        let source = bytes(&[7, 0]).view();
+        for (code, expected_stdout) in [
+            ("test = 5", ""),
+            (
+                "import math\ndef squared(value): return value * value\nprint(squared(3), math.sqrt(16))",
+                "9 4.0\n",
+            ),
+            ("print(file.read_at(0, 2).hex())", "0700\n"),
+        ] {
+            let result = execute(code, &source);
+            assert!(result.decoded.is_none(), "ordinary code emitted a read plan");
+            assert_eq!(result.stdout, expected_stdout);
+        }
+    }
+
+    #[test]
     fn python_reads_working_edits_and_returns_the_shared_parser_plan() {
         let mut store = bytes(&[2, 10, 0, 20, 0]);
         store.replace(1, &42_u16.to_le_bytes()).unwrap();
@@ -485,17 +508,18 @@ print('count:', len(samples))
             &store.view(),
         );
         assert!(result.stdout.contains("count: 2"));
-        assert_eq!(result.output.revision, store.view().revision);
-        assert_eq!(result.output.consumed, 5);
+        let (program, output) = result.decoded.expect("registered structures must decode");
+        assert_eq!(output.revision, store.view().revision);
+        assert_eq!(output.consumed, 5);
         assert_eq!(
-            result.output.nodes[1].children[0].children[0].numeric(),
+            output.nodes[1].children[0].children[0].numeric(),
             Some(42.0)
         );
         assert_eq!(
-            result.output.nodes[1].children[1].children[0].numeric(),
+            output.nodes[1].children[1].children[0].numeric(),
             Some(20.0)
         );
-        assert!(result.program.structures.contains_key("Sample"));
+        assert!(program.structures.contains_key("Sample"));
     }
 
     #[test]
@@ -514,7 +538,8 @@ print('count:', len(samples))
         )
         .unwrap_or_else(|error| panic!("{error:#}"));
         assert!(result.stdout.contains("9.0"));
-        assert_eq!(result.output.nodes[0].children[0].numeric(), Some(81.0));
+        let (_, output) = result.decoded.expect("registered structures must decode");
+        assert_eq!(output.nodes[0].children[0].numeric(), Some(81.0));
     }
 
     #[test]
@@ -532,8 +557,9 @@ print('count:', len(samples))
             "from plottermax import Struct\nassert file.unpack('<I', offset=file.size - 4) == (12345,)\nSample = Struct('Sample', [('value', 'u32')])\nsamples = file.records('samples', Sample, count=file.size // 4)\nprint(len(samples))\n",
             &source,
         );
-        assert_eq!(result.output.nodes.len(), 1);
-        let node = &result.output.nodes[0];
+        let (_, output) = result.decoded.expect("registered structures must decode");
+        assert_eq!(output.nodes.len(), 1);
+        let node = &output.nodes[0];
         let lazy = node.lazy.as_ref().expect("large records must remain lazy");
         assert_eq!(lazy.count, usize::try_from(length / 4).unwrap());
         assert!(node.children.is_empty());
@@ -666,9 +692,10 @@ print('count:', len(samples))
             .stdout
             .contains("Discovered 12 fields, 64 bytes per sample"));
         assert!(result.stdout.contains("Registered"));
-        assert_eq!(result.output.consumed, source.len());
+        let (program, output) = result.decoded.expect("registered structures must decode");
+        assert_eq!(output.consumed, source.len());
         // Reuse the returned Rust plan independently of the Python process.
-        let output = result.program.run(&source, &cancel).unwrap();
+        let output = program.run(&source, &cancel).unwrap();
         assert_eq!(output.consumed, source.len());
         assert_eq!(output.revision, source.revision);
         assert!(
@@ -707,7 +734,7 @@ print('count:', len(samples))
             .map(|(name, _, _, _)| name)
             .into_iter()
             .collect::<BTreeSet<_>>();
-        let sample_type = &result.program.structures["Sample"];
+        let sample_type = &program.structures["Sample"];
         assert_eq!(
             sample_type
                 .fields
@@ -789,7 +816,8 @@ print('count:', len(samples))
             "from plottermax import Struct\nassert file.read_at(0, 1024 * 1024) == bytes([255]) * (1024 * 1024)\nfile.read_struct('value', Struct('Value', [('number', 'u8')]))\n",
             &source,
         );
-        assert_eq!(result.output.nodes[0].children[0].numeric(), Some(255.0));
+        let (_, output) = result.decoded.expect("registered structures must decode");
+        assert_eq!(output.nodes[0].children[0].numeric(), Some(255.0));
     }
 
     fn cancel_running_code(blocking_code: &str) {
@@ -874,6 +902,27 @@ print('count:', len(samples))
             &source,
         );
         assert!(unknown.contains("unrecognized"), "{unknown}");
+    }
+
+    #[test]
+    fn no_data_completion_requires_explicit_null_and_rejects_other_empty_plans() {
+        let source = bytes(&[1]).view();
+        let missing = fail(
+            "import json, sys\nsys.__stdout__.write(json.dumps({'done': {'stdout': 'finished'}}) + '\\n')\nsys.__stdout__.flush()",
+            &source,
+        );
+        assert!(missing.contains("missing program"), "{missing}");
+        for plan in [json!({}), json!([]), json!(false), json!(1), json!("")] {
+            let completion =
+                json!({"done": {"program": plan, "stdout": "before invalid plan"}}).to_string();
+            let literal = serde_json::to_string(&format!("{completion}\n")).unwrap();
+            let error = fail(
+                &format!("import sys\nsys.__stdout__.write({literal})\nsys.__stdout__.flush()"),
+                &source,
+            );
+            assert!(error.contains("invalid read plan"), "{error}");
+            assert!(error.contains("before invalid plan"), "{error}");
+        }
     }
 
     #[test]

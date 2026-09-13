@@ -1,3 +1,4 @@
+#[cfg(test)]
 pub mod csv;
 pub mod csv_index;
 
@@ -30,10 +31,17 @@ pub fn file_kind(path: &Path) -> FileKind {
     }
 }
 
-pub fn load_data(
+pub const CSV_INITIAL_ROWS: usize = 8192;
+
+/// Demand a CSV prefix without creating a complete decoded copy. A request may
+/// stop before `target_rows` at its byte budget; inspect `csv_extent` before
+/// requesting another bounded continuation.
+pub fn load_csv_rows(
     cfg: &AppConfig,
+    root: &Path,
     progress: &LoadProgress,
+    target_rows: usize,
     update: impl FnMut(DataStore),
 ) -> Result<DataStore> {
-    csv::load_csv_progressive(cfg, &crate::cache::root(), progress, update)
+    csv_index::load_rows(cfg, root, progress, target_rows, update)
 }

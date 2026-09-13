@@ -1,22 +1,26 @@
 use crate::binary_ui::{BinaryWorkspace, OpenedFile};
 use crate::cache::LoadProgress;
 use crate::config::AppConfig;
-use crate::csv_table::CsvTable;
-use crate::data::DataStore;
+use crate::csv_table::{CsvCellSelection, CsvRowSelection, CsvTable};
+use crate::data::{CsvRow, DataStore};
 use crate::file_dialog::{FileKind as DialogFileKind, FileLocations, NativeFileDialog};
-use crate::loaders::{file_kind, load_data, FileKind};
+use crate::hex_editor::HexHighlight;
+use crate::loaders::{file_kind, load_csv_rows, FileKind, CSV_INITIAL_ROWS};
 use crate::plotting::{PlotBuilder, PlotLines};
+use crate::structure_ui::DecoderLanguage;
 use crate::workspace_layout::{Pane, WorkspaceLayout};
 use anyhow::Result;
 use egui::{Context, Ui};
 use egui_dock::{DockArea, TabViewer};
-use egui_plot::{Legend, Line, Plot, PlotBounds};
+use egui_plot::{Legend, Line, Plot, PlotBounds, PlotPoint, Points, VLine};
+use std::ops::Range;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::thread;
+#[cfg(test)]
 use std::time::Instant;
 
 const DEFINITION_EXAMPLES: &[(&str, &str)] = &[
@@ -145,6 +149,35 @@ enum Decoder {
     Csv,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CsvLinkRequest {
+    Cell(CsvCellSelection),
+    Rows(CsvRowSelection),
+    Bytes(Range<usize>),
+}
+
+struct CsvLinkedSelection {
+    row: CsvRow,
+    column: Option<usize>,
+    bytes: Range<usize>,
+    rows: Option<CsvRowSelection>,
+    anchor: Option<CsvRow>,
+}
+
+/// A range lookup reads only its two endpoints; intermediate records stay on disk.
+#[derive(Debug)]
+struct CsvLinkRows {
+    row: CsvRow,
+    anchor: Option<CsvRow>,
+}
+
+#[derive(Clone)]
+struct CsvLinkJob {
+    serial: u64,
+    dataset: u64,
+    request: CsvLinkRequest,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum AppDialogAction {
     OpenData,
@@ -173,6 +206,7 @@ pub struct PlotterApp {
     view: Option<ViewState>,
     binary: BinaryWorkspace,
     decoder: Decoder,
+    displayed_decoder: Decoder,
     workspace: WorkspaceLayout,
     show_empty_workspace: bool,
     show_decoding_guide: bool,
@@ -182,7 +216,20 @@ pub struct PlotterApp {
     file_locations: FileLocations,
     dialog_template: rfd::AsyncFileDialog,
     load_progress: Arc<LoadProgress>,
-    load_started: Instant,
+    csv_applied: Option<AppConfig>,
+    csv_result_x: String,
+    csv_target: Option<usize>,
+    csv_full_index: bool,
+    csv_advance_plot: bool,
+    csv_cache_root: std::path::PathBuf,
+    csv_selection: Option<CsvLinkedSelection>,
+    csv_link_request: Option<CsvLinkRequest>,
+    csv_link_serial: u64,
+    csv_link_indexing: bool,
+    csv_link_job: Option<CsvLinkJob>,
+    csv_link_rx: Option<Receiver<Result<Option<CsvLinkRows>>>>,
+    csv_link_cancel: Arc<AtomicBool>,
+    last_hex_selection: Option<Range<usize>>,
     cache_message: Option<String>,
 }
 
@@ -190,7 +237,7 @@ impl Default for PlotterApp {
     fn default() -> Self {
         let cfg = AppConfig::default();
         let file_locations = FileLocations::default();
-        let mut binary = BinaryWorkspace::python_workspace();
+        let mut binary = BinaryWorkspace::default();
         binary.set_file_locations(file_locations.clone());
         Self {
             cfg,
@@ -214,6 +261,7 @@ impl Default for PlotterApp {
             view: None,
             binary,
             decoder: Decoder::Layout,
+            displayed_decoder: Decoder::Layout,
             workspace: WorkspaceLayout::default(),
             show_empty_workspace: false,
             show_decoding_guide: false,
@@ -223,7 +271,20 @@ impl Default for PlotterApp {
             file_locations,
             dialog_template: rfd::AsyncFileDialog::new(),
             load_progress: Arc::new(LoadProgress::default()),
-            load_started: Instant::now(),
+            csv_applied: None,
+            csv_result_x: "X".into(),
+            csv_target: None,
+            csv_full_index: false,
+            csv_advance_plot: false,
+            csv_cache_root: crate::cache::root(),
+            csv_selection: None,
+            csv_link_request: None,
+            csv_link_serial: 0,
+            csv_link_indexing: false,
+            csv_link_job: None,
+            csv_link_rx: None,
+            csv_link_cancel: Arc::new(AtomicBool::new(false)),
+            last_hex_selection: None,
             cache_message: None,
         }
     }
@@ -233,6 +294,7 @@ impl Drop for PlotterApp {
     fn drop(&mut self) {
         self.plot_cancel.store(true, Ordering::Relaxed);
         self.load_progress.cancelled.store(true, Ordering::Relaxed);
+        self.csv_link_cancel.store(true, Ordering::Relaxed);
     }
 }
 
@@ -250,67 +312,438 @@ impl PlotterApp {
     }
 
     fn begin_load(&mut self, cfg: AppConfig, ctx: &Context) {
+        self.clear_csv_selection();
+        self.cfg = cfg.clone();
+        self.csv_applied = Some(cfg);
+        self.load_has_data = false;
+        self.csv_target = None;
+        self.csv_advance_plot = false;
+        self.csv_table = CsvTable::default();
+        self.start_csv_read(CSV_INITIAL_ROWS, false, ctx);
+    }
+
+    fn start_csv_read(&mut self, rows: usize, full: bool, ctx: &Context) {
+        let Some(cfg) = self.csv_applied.clone() else {
+            return;
+        };
         self.load_progress.cancelled.store(true, Ordering::Relaxed);
         self.load_progress = Arc::new(LoadProgress::default());
-        self.load_started = Instant::now();
-        self.cfg = cfg.clone();
-        self.status = format!("Checking CSV cache / loading: {:?}", cfg.data_path);
-
-        // One replaceable preview slot bounds memory even when the UI is idle.
+        self.csv_full_index = full;
+        self.status = if full {
+            "Indexing entire CSV…"
+        } else {
+            "Reading CSV rows…"
+        }
+        .into();
         self.load_preview = Arc::new(Mutex::new(None));
-        self.load_has_data = false;
         let (tx, rx) = mpsc::channel();
         self.loader_rx = Some(rx);
         let progress = self.load_progress.clone();
         let preview = self.load_preview.clone();
+        let root = self.csv_cache_root.clone();
         ctx.request_repaint();
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let res = load_data(&cfg, &progress, |data| {
+            let update = |data| {
                 *preview.lock().unwrap_or_else(|e| e.into_inner()) = Some(data);
                 ctx.request_repaint();
-            });
+            };
+            let res = if full {
+                crate::loaders::csv_index::load(&cfg, &root, &progress, update)
+            } else {
+                load_csv_rows(&cfg, &root, &progress, rows, update)
+            };
             let _ = tx.send(res);
             ctx.request_repaint();
         });
     }
 
+    fn csv_complete(&self) -> bool {
+        self.data.as_ref().is_some_and(|data| {
+            data.csv_extent
+                .as_ref()
+                .map_or(!self.data_partial, |extent| extent.complete)
+        })
+    }
+
+    fn request_csv_rows(&mut self, rows: usize, ctx: &Context) {
+        if !self.load_has_data || self.csv_complete() || self.csv_applied.is_none() {
+            return;
+        }
+        if self.data.as_ref().is_some_and(|data| data.rows >= rows) {
+            return;
+        }
+        self.follow_loading = false;
+        self.csv_link_indexing = false;
+        self.csv_target = Some(rows);
+        if self.loader_rx.is_none() {
+            self.start_csv_read(rows, false, ctx);
+        }
+    }
+
+    fn index_entire_csv(&mut self, ctx: &Context) {
+        if !self.load_has_data || self.csv_complete() || self.csv_applied.is_none() {
+            return;
+        }
+        self.csv_target = None;
+        self.csv_link_indexing = false;
+        self.follow_loading = false;
+        self.start_csv_read(usize::MAX, true, ctx);
+    }
+
+    fn stop_csv_read(&mut self) {
+        self.csv_link_indexing = false;
+        self.csv_link_request = None;
+        self.csv_link_cancel.store(true, Ordering::Relaxed);
+        self.load_progress.cancelled.store(true, Ordering::Relaxed);
+        self.csv_target = None;
+        self.csv_advance_plot = false;
+    }
+
+    fn clear_csv_selection(&mut self) {
+        self.csv_link_serial = self.csv_link_serial.wrapping_add(1);
+        self.csv_link_cancel.store(true, Ordering::Relaxed);
+        self.csv_link_request = None;
+        self.csv_selection = None;
+        self.csv_table.clear_selection();
+        if self.csv_link_indexing {
+            self.load_progress.cancelled.store(true, Ordering::Relaxed);
+            self.csv_target = None;
+            self.csv_link_indexing = false;
+            // A superseded byte lookup must not publish into or cancel its successor.
+            self.loader_rx = None;
+            self.load_preview = Arc::new(Mutex::new(None));
+            self.csv_full_index = false;
+        }
+        self.last_hex_selection = self.binary.byte_selection();
+    }
+
+    fn request_csv_link(&mut self, request: CsvLinkRequest) {
+        if self.displayed_decoder != Decoder::Csv || !self.load_has_data {
+            return;
+        }
+        self.clear_csv_selection();
+        match &request {
+            CsvLinkRequest::Cell(cell) => self.csv_table.select(*cell),
+            CsvLinkRequest::Rows(rows) => self.csv_table.select_rows(*rows),
+            CsvLinkRequest::Bytes(_) => {}
+        }
+        self.csv_link_request = Some(request);
+        self.follow_loading = false;
+    }
+
+    fn poll_csv_links(&mut self, ctx: &Context) {
+        if self.displayed_decoder != Decoder::Csv || !self.load_has_data {
+            return;
+        }
+        let bytes = self.binary.byte_selection();
+        if bytes != self.last_hex_selection {
+            self.clear_csv_selection();
+            if let Some(range) = bytes {
+                self.request_csv_link(CsvLinkRequest::Bytes(range));
+            }
+        }
+        let result = self
+            .csv_link_rx
+            .as_ref()
+            .and_then(|rx| match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err(anyhow::anyhow!("CSV selection worker stopped")))
+                }
+            });
+        if let Some(result) = result {
+            self.csv_link_rx = None;
+            let job = self.csv_link_job.take().unwrap();
+            if job.serial == self.csv_link_serial
+                && job.dataset == self.dataset
+                && self.csv_link_request.as_ref() == Some(&job.request)
+            {
+                self.csv_link_request = None;
+                self.csv_link_indexing = false;
+                match result {
+                    Ok(Some(CsvLinkRows { row, anchor })) => {
+                        let mut selected_rows = None;
+                        let (column, bytes, reveal) = match job.request {
+                            CsvLinkRequest::Cell(cell) => {
+                                let bytes = cell
+                                    .column
+                                    .and_then(|column| row.fields.get(column).cloned())
+                                    .unwrap_or_else(|| row.range.clone());
+                                (cell.column, bytes, true)
+                            }
+                            CsvLinkRequest::Rows(rows) => {
+                                selected_rows = Some(rows);
+                                let first = anchor.as_ref().unwrap_or(&row);
+                                let bytes = first.range.start.min(row.range.start)
+                                    ..first.range.end.max(row.range.end);
+                                (None, bytes, true)
+                            }
+                            CsvLinkRequest::Bytes(bytes) => {
+                                let column = row.fields.iter().position(|field| {
+                                    !field.is_empty()
+                                        && field.start <= bytes.start
+                                        && bytes.end <= field.end
+                                });
+                                (column, bytes, false)
+                            }
+                        };
+                        if let Some(signal) = column.and_then(|column| column.checked_sub(1)) {
+                            if let Some(visible) = self.visible.get_mut(signal) {
+                                *visible = true;
+                            }
+                        }
+                        if let Some(rows) = selected_rows {
+                            self.csv_table.select_rows(rows);
+                        } else {
+                            self.csv_table.select(CsvCellSelection {
+                                row: row.index,
+                                column,
+                            });
+                        }
+                        if let (Some(&x), Some(view), Some(data)) =
+                            (row.values.first(), &mut self.view, &self.data)
+                        {
+                            let bounds = view.bounds(data);
+                            if x.is_finite() && (x < bounds.0 || x > bounds.1) {
+                                view.set_center_span(x, view.span, data);
+                            }
+                        }
+                        if reveal {
+                            self.binary.select_source_range(bytes.clone(), true);
+                            self.last_hex_selection = self.binary.byte_selection();
+                        }
+                        self.csv_selection = Some(CsvLinkedSelection {
+                            row,
+                            column,
+                            bytes,
+                            rows: selected_rows,
+                            anchor,
+                        });
+                    }
+                    Ok(None) => {
+                        // csv::Reader can stop between CR and LF. Probe the exact
+                        // boundary before requesting more rows, so its LF still
+                        // selects the preceding row without scanning the next one.
+                        if let CsvLinkRequest::Bytes(bytes) = &job.request {
+                            if let Some(data) = &self.data {
+                                if data.csv_extent.is_some_and(|extent| {
+                                    !extent.complete
+                                        && bytes.start as u64 >= extent.indexed_bytes
+                                        && (bytes.start as u64) < extent.source_bytes
+                                }) {
+                                    let target = data.rows.saturating_add(CSV_INITIAL_ROWS);
+                                    self.csv_link_request = Some(job.request);
+                                    if self.loader_rx.is_none() {
+                                        self.csv_link_indexing = true;
+                                        self.start_csv_read(target, false, ctx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => self.status = format!("CSV selection: {error:#}"),
+                }
+            }
+        }
+        if self.csv_link_rx.is_none() && !(self.csv_link_indexing && self.loader_rx.is_some()) {
+            if let (Some(request), Some(data)) = (&self.csv_link_request, &self.data) {
+                let beyond_prefix = match request {
+                    CsvLinkRequest::Bytes(bytes) => data.csv_extent.is_some_and(|extent| {
+                        !extent.complete
+                            && bytes.start as u64 > extent.indexed_bytes
+                            && (bytes.start as u64) < extent.source_bytes
+                    }),
+                    CsvLinkRequest::Cell(cell) => cell.row >= data.rows && !self.csv_complete(),
+                    CsvLinkRequest::Rows(rows) => {
+                        rows.anchor.max(rows.active) >= data.rows && !self.csv_complete()
+                    }
+                };
+                if beyond_prefix {
+                    if self.loader_rx.is_none() {
+                        let target = data.rows.saturating_add(CSV_INITIAL_ROWS);
+                        self.csv_link_indexing = true;
+                        self.start_csv_read(target, false, ctx);
+                    }
+                } else if let Some(rows) = data.csv_rows.clone() {
+                    let job = CsvLinkJob {
+                        serial: self.csv_link_serial,
+                        dataset: self.dataset,
+                        request: request.clone(),
+                    };
+                    self.csv_link_job = Some(job.clone());
+                    let (tx, rx) = mpsc::channel();
+                    self.csv_link_rx = Some(rx);
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    self.csv_link_cancel = cancel.clone();
+                    let ctx = ctx.clone();
+                    thread::spawn(move || {
+                        let result = match job.request {
+                            CsvLinkRequest::Cell(cell) => rows
+                                .row(cell.row, &cancel)
+                                .map(|row| Some(CsvLinkRows { row, anchor: None })),
+                            CsvLinkRequest::Rows(selection) => (|| {
+                                let row = rows.row(selection.active, &cancel)?;
+                                let anchor = if selection.anchor != selection.active {
+                                    Some(rows.row(selection.anchor, &cancel)?)
+                                } else {
+                                    None
+                                };
+                                Ok(Some(CsvLinkRows { row, anchor }))
+                            })(),
+                            CsvLinkRequest::Bytes(bytes) => rows
+                                .find_byte(bytes.start, &cancel)
+                                .map(|row| row.map(|row| CsvLinkRows { row, anchor: None })),
+                        };
+                        let _ = tx.send(result);
+                        ctx.request_repaint();
+                    });
+                } else {
+                    self.csv_link_request = None;
+                }
+            }
+        }
+        if self.csv_link_request.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(25));
+        }
+    }
+
+    fn csv_column_name(&self, column: usize) -> &str {
+        if column == 0 {
+            &self.csv_result_x
+        } else {
+            self.data
+                .as_ref()
+                .and_then(|data| data.signals.get(column - 1))
+                .map_or("Value", |signal| signal.name.as_str())
+        }
+    }
+
+    fn csv_selected_samples(&self) -> Vec<(usize, crate::plot_index::Sample)> {
+        let Some(selection) = &self.csv_selection else {
+            return Vec::new();
+        };
+        let mut samples = Vec::new();
+        if let Some(rows) = selection.rows {
+            // Highlight the bounded plot preview by record identity: duplicate or
+            // unsorted X values must not select unrelated records in between them.
+            let range = rows.rows();
+            samples.extend(
+                self.plot_lines
+                    .iter()
+                    .filter(|(column, _, _)| self.visible.get(*column) == Some(&true))
+                    .flat_map(|(column, _, points)| {
+                        points.iter().filter_map(|sample| {
+                            (range.contains(&sample.record)
+                                && sample.point.iter().all(|value| value.is_finite()))
+                            .then_some((*column, *sample))
+                        })
+                    }),
+            );
+        }
+        for row in std::iter::once(&selection.row).chain(selection.anchor.as_ref()) {
+            let Some(&x) = row.values.first().filter(|x| x.is_finite()) else {
+                continue;
+            };
+            for (column, &y) in row.values.iter().enumerate().skip(1) {
+                if y.is_finite()
+                    && self.visible.get(column - 1) == Some(&true)
+                    && selection
+                        .column
+                        .is_none_or(|selected| selected == 0 || selected == column)
+                    && !samples
+                        .iter()
+                        .any(|(signal, sample)| *signal == column - 1 && sample.record == row.index)
+                {
+                    samples.push((
+                        column - 1,
+                        crate::plot_index::Sample {
+                            record: row.index,
+                            byte_offset: row.fields[column].start,
+                            point: [x, y],
+                        },
+                    ));
+                }
+            }
+        }
+        samples
+    }
+
+    fn csv_highlights(&self) -> Vec<HexHighlight> {
+        let Some(selection) = &self.csv_selection else {
+            return Vec::new();
+        };
+        selection
+            .row
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, range)| !range.is_empty())
+            .map(|(column, range)| HexHighlight {
+                range: range.clone(),
+                name: format!(
+                    "Row {} · {}",
+                    selection.row.index,
+                    self.csv_column_name(column)
+                ),
+                color: [
+                    egui::Color32::from_rgb(91, 154, 184),
+                    egui::Color32::from_rgb(176, 145, 83),
+                    egui::Color32::from_rgb(125, 163, 104),
+                ][column % 3],
+            })
+            .collect()
+    }
+
+    fn run_active_decoder(&mut self, ctx: &Context) {
+        if self.decoder == Decoder::Csv {
+            if self.binary.source_path().is_some() && !self.binary.has_byte_edits() {
+                self.begin_load(self.cfg.clone(), ctx);
+            }
+        } else if self.binary.can_apply_definition() {
+            self.binary.apply_definition(ctx);
+        }
+    }
+
     fn accept_data(&mut self, data: DataStore, partial: bool) {
+        if let Some(cfg) = &self.csv_applied {
+            self.csv_result_x.clone_from(&cfg.csv.time_column);
+        }
+        self.displayed_decoder = Decoder::Csv;
         self.generation = self.generation.wrapping_add(1);
         if !self.load_has_data {
-            if self.binary.has_file() && self.decoder == Decoder::Csv {
+            if self.binary.has_file() {
                 self.workspace.show_samples();
+                self.workspace.show_initial_plot();
+                self.workspace.show_decoder();
             }
             self.dataset = self.dataset.wrapping_add(1);
+            self.last_hex_selection = None;
             self.plot_lines.clear();
         }
         if !self.load_has_data {
             self.visible = vec![true; data.signals.len()];
             self.view = Some(ViewState::from_store(&data));
-            self.follow_loading = true;
+            self.follow_loading = !self.csv_full_index;
+        } else if self.csv_advance_plot {
+            if let Some(view) = &mut self.view {
+                view.jump_to_end(&data);
+            }
         } else if self.follow_loading {
             if let Some(view) = &mut self.view {
                 view.set_full(&data);
             }
         }
+        let partial = partial
+            || data
+                .csv_extent
+                .as_ref()
+                .is_some_and(|extent| !extent.complete);
         self.status = if partial {
-            format!(
-                "{} rows / {} signals ready · loading more…",
-                data.rows,
-                data.signals.len()
-            )
+            format!("{} CSV rows available", data.rows)
         } else {
-            format!(
-                "Loaded {} rows / {} signals in {:.2}s · {}",
-                data.rows,
-                data.signals.len(),
-                self.load_started.elapsed().as_secs_f64(),
-                if self.load_progress.cache_hit.load(Ordering::Relaxed) {
-                    format!("{} · index/cache hit", data.storage)
-                } else {
-                    data.storage.clone()
-                }
-            )
+            format!("{} CSV rows · complete", data.rows)
         };
         self.data = Some(data);
         self.load_has_data = true;
@@ -338,55 +771,155 @@ impl PlotterApp {
             Err(mpsc::TryRecvError::Empty) => None,
         };
         if let Some(result) = result {
+            let success = result.is_ok();
+            let stopped = self.load_progress.cancelled.load(Ordering::Relaxed);
+            if !success || stopped {
+                self.csv_link_request = None;
+                self.csv_link_indexing = false;
+                self.csv_link_cancel.store(true, Ordering::Relaxed);
+            }
             match result {
                 Ok(data) => self.accept_data(data, false),
                 Err(err) => {
-                    let stopped = self.load_progress.cancelled.load(Ordering::Relaxed);
                     self.status = if stopped {
-                        "Loading cancelled.".into()
+                        "CSV reading stopped.".into()
                     } else {
-                        format!("Load error: {err:#}")
+                        format!("CSV: {err:#}")
                     };
                     if self.load_has_data {
-                        self.status.push_str(&format!(" {} loaded rows remain usable; this is an incomplete file. Reload CSV to finish.", self.data.as_ref().unwrap().rows));
+                        self.status.push_str(&format!(
+                            " {} rows remain available.",
+                            self.data.as_ref().unwrap().rows
+                        ));
                     }
                 }
             }
             self.loader_rx = None;
+            self.csv_full_index = false;
+            if success && !stopped && !self.csv_complete() {
+                if let Some(target) = self.csv_target {
+                    if self.data.as_ref().is_some_and(|data| data.rows < target) {
+                        self.start_csv_read(target, false, ctx);
+                        return;
+                    }
+                }
+            }
+            self.csv_target = None;
+            self.csv_advance_plot = false;
         }
     }
 
-    fn ui_left_panel(&mut self, ui: &mut Ui) {
-        ui.collapsing("CSV settings", |ui| {
-            ui.label("Storage: original CSV with a compact index (default)");
-            ui.horizontal(|ui| {
-                ui.label("Decoded RAM cache (MiB)");
-                ui.add(egui::DragValue::new(&mut self.cfg.csv.ram_cache_mib).clamp_range(1..=4096));
+    fn ui_decoder(&mut self, ui: &mut Ui) {
+        let mut mode = if self.decoder == Decoder::Csv {
+            2
+        } else if self.binary.is_python() {
+            0
+        } else {
+            1
+        };
+        let previous = mode;
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(self.commands_available(), |ui| {
+                ui.selectable_value(&mut mode, 1, "YAML");
+                ui.selectable_value(&mut mode, 0, "Python");
+                ui.selectable_value(&mut mode, 2, "CSV");
             });
-            ui.checkbox(
-                &mut self.cfg.csv.decoded_disk_cache,
-                "Keep a full decoded copy on disk",
-            );
-            if self.cfg.csv.decoded_disk_cache {
-                ui.small(
-                    "Optional: faster rereads, but the copy can exceed the original file size.",
-                );
-                ui.horizontal(|ui| {
-                    ui.label("Total decoded data limit (MiB)");
-                    ui.add(
-                        egui::DragValue::new(&mut self.cfg.csv.decoded_cache_limit_mib)
-                            .clamp_range(1..=1_048_576),
-                    );
+        });
+        if previous != mode {
+            if mode == 2 {
+                self.decoder = Decoder::Csv;
+            } else {
+                self.decoder = Decoder::Layout;
+                self.binary.select_language(if mode == 0 {
+                    DecoderLanguage::Python
+                } else {
+                    DecoderLanguage::Yaml
                 });
-                ui.small(
-                    "Uses the original CSV when the copy cannot fit. Index metadata is additional.",
-                );
+            }
+        }
+        ui.separator();
+        if self.decoder == Decoder::Csv {
+            egui::ScrollArea::vertical()
+                .id_source("csv_decoder_settings")
+                .show(ui, |ui| self.ui_csv_decoder(ui));
+        } else {
+            self.binary.decoder_controls(ui);
+        }
+    }
+
+    fn ui_csv_decoder(&mut self, ui: &mut Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    self.commands_available(),
+                    egui::Button::new("Open configuration…"),
+                )
+                .clicked()
+            {
+                self.choose_csv_config(ui.ctx());
             }
             if ui
-                .checkbox(&mut self.cfg.csv.has_header, "Has header row")
-                .changed()
+                .add_enabled(
+                    self.commands_available()
+                        && self.binary.source_path().is_some()
+                        && !self.binary.has_byte_edits(),
+                    egui::Button::new("Apply").shortcut_text("F5"),
+                )
+                .clicked()
             {
-                if self.cfg.csv.time_column == "time" || self.cfg.csv.time_column == "c0" {
+                self.run_active_decoder(ui.ctx());
+            }
+        });
+        ui.add_space(8.);
+        egui::Grid::new("csv_format_settings")
+            .num_columns(2)
+            .spacing(egui::vec2(12., 10.))
+            .show(ui, |ui| {
+                ui.label("Separator");
+                egui::ComboBox::from_id_source("csv_separator")
+                    .selected_text(match self.cfg.csv.delimiter {
+                        ',' => "Comma",
+                        '\t' => "Tab",
+                        ';' => "Semicolon",
+                        '|' => "Pipe",
+                        _ => "Custom",
+                    })
+                    .show_ui(ui, |ui| {
+                        for (value, name) in [
+                            (',', "Comma"),
+                            ('\t', "Tab"),
+                            (';', "Semicolon"),
+                            ('|', "Pipe"),
+                        ] {
+                            ui.selectable_value(&mut self.cfg.csv.delimiter, value, name);
+                        }
+                    });
+                ui.end_row();
+                ui.label("Custom separator");
+                let mut separator = if self.cfg.csv.delimiter == '\t' {
+                    String::new()
+                } else {
+                    self.cfg.csv.delimiter.to_string()
+                };
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut separator)
+                            .char_limit(1)
+                            .desired_width(35.),
+                    )
+                    .changed()
+                {
+                    if let Some(value) = separator.chars().next().filter(char::is_ascii) {
+                        self.cfg.csv.delimiter = value;
+                    }
+                }
+                ui.end_row();
+                ui.label("Column names");
+                if ui
+                    .checkbox(&mut self.cfg.csv.has_header, "First row is a header")
+                    .changed()
+                    && (self.cfg.csv.time_column == "time" || self.cfg.csv.time_column == "c0")
+                {
                     self.cfg.csv.time_column = if self.cfg.csv.has_header {
                         "time"
                     } else {
@@ -394,109 +927,90 @@ impl PlotterApp {
                     }
                     .into();
                 }
-            }
-            ui.horizontal(|ui| {
-                ui.label("Time column");
-                ui.text_edit_singleline(&mut self.cfg.csv.time_column);
+                ui.end_row();
+                ui.label("X column");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.cfg.csv.time_column).desired_width(150.),
+                );
+                ui.end_row();
             });
-            ui.horizontal(|ui| {
-                ui.label("Delimiter");
-                let mut delimiter = self.cfg.csv.delimiter.to_string();
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut delimiter)
-                            .char_limit(1)
-                            .desired_width(30.),
-                    )
-                    .changed()
-                {
-                    if let Some(delimiter) = delimiter.chars().next() {
-                        self.cfg.csv.delimiter = delimiter;
-                    }
-                }
-            });
-            if ui
-                .add_enabled(
-                    self.cfg.data_path.is_some(),
-                    egui::Button::new("Reload CSV"),
-                )
-                .clicked()
-            {
-                self.begin_load(self.cfg.clone(), ui.ctx());
-            }
-        });
-        ui.label(&self.status);
-        if self.loader_rx.is_some() {
-            let done = self.load_progress.done.load(Ordering::Relaxed);
-            let total = self.load_progress.total.load(Ordering::Relaxed);
-            ui.add(
-                egui::ProgressBar::new(if total > 0 {
-                    done as f32 / total as f32
-                } else {
-                    0.
-                })
-                .text(format!(
-                    "{:.1} / {:.1} MiB · {:.1}s",
-                    done as f64 / 1048576.,
-                    total as f64 / 1048576.,
-                    self.load_started.elapsed().as_secs_f64()
-                )),
+        if self.csv_applied.as_ref().is_some_and(|cfg| {
+            serde_json::to_value(cfg.csv.parse_options()).ok()
+                != serde_json::to_value(self.cfg.csv.parse_options()).ok()
+        }) {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Settings changed · Apply to update samples",
             );
-            if ui.button("Cancel loading").clicked() {
-                self.load_progress.cancelled.store(true, Ordering::Relaxed);
+        }
+        ui.add_space(10.);
+        if self.binary.has_byte_edits() {
+            ui.label("Save and reopen the edited copy to decode its CSV rows.");
+        } else if !self.binary.has_file() {
+            ui.label("Open a data file to decode CSV rows.");
+        }
+        ui.label(&self.status);
+        if let Some(extent) = self.data.as_ref().and_then(|data| data.csv_extent.as_ref()) {
+            if !extent.complete {
+                ui.weak(format!(
+                    "{:.1} of {:.1} MiB indexed",
+                    extent.indexed_bytes as f64 / 1048576.,
+                    extent.source_bytes as f64 / 1048576.
+                ));
             }
         }
-
-        if self.data.is_some() {
-            let (time_min, time_max, signals_len) = {
-                let ds = self.data.as_ref().unwrap();
-                (ds.time_min, ds.time_max, ds.signals.len())
-            };
-            ui.separator();
-            ui.label(format!(
-                "Time: [{:.3}, {:.3}]  signals: {}",
-                time_min, time_max, signals_len
-            ));
-            if self.loader_rx.is_some() && self.load_has_data {
-                if ui
-                    .checkbox(&mut self.follow_loading, "Follow loaded range")
-                    .changed()
-                    && self.follow_loading
-                {
-                    self.view
-                        .as_mut()
-                        .unwrap()
-                        .set_full(self.data.as_ref().unwrap());
-                }
-            }
-            self.ui_view_controls(ui);
-
+        if self.loader_rx.is_some() {
             ui.horizontal(|ui| {
-                if ui.button("Select All").clicked() {
-                    self.visible.iter_mut().for_each(|v| *v = true);
-                }
-                if ui.button("Select None").clicked() {
-                    self.visible.iter_mut().for_each(|v| *v = false);
+                ui.spinner();
+                ui.label(if self.csv_full_index {
+                    "Indexing entire file…"
+                } else {
+                    "Reading requested rows…"
+                });
+                if ui.button("Stop").clicked() {
+                    self.stop_csv_read();
                 }
             });
+            if self.csv_full_index {
+                let done = self.load_progress.done.load(Ordering::Relaxed);
+                let total = self.load_progress.total.load(Ordering::Relaxed);
+                ui.add(egui::ProgressBar::new(if total == 0 {
+                    0.
+                } else {
+                    done as f32 / total as f32
+                }));
+            }
+        } else if self.load_has_data && self.data.is_some() && !self.csv_complete() {
+            if ui.button("Index entire file").on_hover_text("Scan every row for a complete time range and row count. Browsing does not require this.").clicked() {
+                self.index_entire_csv(ui.ctx());
+            }
+        }
+    }
 
-            ui.text_edit_singleline(&mut self.search);
-            let search_lower = self.search.to_lowercase();
-
-            if let Some(ds) = &self.data {
-                for (i, s) in ds.signals.iter().enumerate() {
-                    if !search_lower.is_empty() && !s.name.to_lowercase().contains(&search_lower) {
-                        continue;
-                    }
-                    let mut vis = self.visible.get(i).copied().unwrap_or(true);
-                    if ui.checkbox(&mut vis, &s.name).changed() {
-                        if i < self.visible.len() {
-                            self.visible[i] = vis;
+    fn ui_csv_columns(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Show all").clicked() {
+                self.visible.fill(true);
+            }
+            if ui.button("Hide all").clicked() {
+                self.visible.fill(false);
+            }
+        });
+        ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Find column"));
+        let search = self.search.to_lowercase();
+        egui::ScrollArea::vertical()
+            .max_height(260.)
+            .show(ui, |ui| {
+                if let Some(data) = &self.data {
+                    for (index, signal) in data.signals.iter().enumerate() {
+                        if search.is_empty() || signal.name.to_lowercase().contains(&search) {
+                            if let Some(visible) = self.visible.get_mut(index) {
+                                ui.checkbox(visible, &signal.name);
+                            }
                         }
                     }
                 }
-            }
-        }
+            });
     }
 
     fn open_path(&mut self, path: std::path::PathBuf, ctx: &Context) {
@@ -508,6 +1022,8 @@ impl PlotterApp {
     }
 
     fn clear_csv(&mut self) {
+        self.clear_csv_selection();
+        self.displayed_decoder = Decoder::Layout;
         self.plot_cancel.store(true, Ordering::Relaxed);
         self.load_progress.cancelled.store(true, Ordering::Relaxed);
         self.loader_rx = None;
@@ -523,6 +1039,10 @@ impl PlotterApp {
         self.load_has_data = false;
         self.data_partial = false;
         self.csv_table = CsvTable::default();
+        self.csv_applied = None;
+        self.csv_target = None;
+        self.csv_full_index = false;
+        self.csv_advance_plot = false;
         self.dataset = self.dataset.wrapping_add(1);
         self.cfg.data_path = None;
         self.status = "Choose a decoder to populate Plot and Table.".into();
@@ -547,27 +1067,38 @@ impl PlotterApp {
                 if is_csv {
                     self.decoder = Decoder::Csv;
                     self.begin_load(cfg, ctx);
+                } else {
+                    self.binary.start_byte_preview(ctx);
                 }
             } else {
                 self.pending_config = None;
             }
             if self.decoder == Decoder::Layout {
                 self.binary.show_yaml();
-                self.workspace.show_decoder();
-            } else {
-                self.workspace.reveal(Pane::Inspector);
             }
+            self.workspace.show_decoder();
         }
         if self.binary.take_bytes_changed() {
             self.invalidate_csv_after_edit();
         }
+        let initial_plot_ready = self.binary.take_initial_plot_ready();
         if self.binary.take_layout_applied() {
-            self.workspace.show_samples();
-            self.decoder = Decoder::Layout;
-            self.load_progress.cancelled.store(true, Ordering::Relaxed);
+            if initial_plot_ready {
+                self.workspace.show_initial_plot();
+                self.workspace.show_decoder();
+            } else {
+                self.workspace.show_samples();
+            }
+            self.displayed_decoder = Decoder::Layout;
+            self.clear_csv_selection();
+            self.stop_csv_read();
+            // A cancelled CSV worker must not replace this successful decode later.
+            self.loader_rx = None;
+            self.load_preview = Arc::new(Mutex::new(None));
         }
         self.reveal_requested_panels();
         self.poll_loader(ctx);
+        self.poll_csv_links(ctx);
     }
 
     fn invalidate_csv_after_edit(&mut self) {
@@ -582,6 +1113,7 @@ impl PlotterApp {
 
     fn reveal_requested_panels(&mut self) {
         if self.binary.take_reveal_definition() {
+            self.decoder = Decoder::Layout;
             self.show_empty_workspace = true;
             self.workspace.show_decoder();
         }
@@ -592,47 +1124,34 @@ impl PlotterApp {
     }
 
     fn ui_inspector(&mut self, ui: &mut Ui) {
-        self.binary.selection_inspector(ui);
-        if !self.binary.has_file() {
-            return;
-        }
-        egui::CollapsingHeader::new("Data interpretation")
-            .default_open(self.decoder == Decoder::Csv)
-            .show(ui, |ui| {
+        if self.displayed_decoder == Decoder::Csv {
+            if let Some(selection) = &self.csv_selection {
+                if let Some(rows) = selection.rows {
+                    let range = rows.rows();
+                    ui.strong(format!("CSV rows {}–{}", range.start, range.end - 1));
+                    ui.label(format!("{} rows selected", range.len()));
+                } else {
+                    ui.strong(format!("CSV row {}", selection.row.index));
+                }
+                if let Some(column) = selection.column {
+                    ui.label(format!(
+                        "{}: {}",
+                        self.csv_column_name(column),
+                        selection.row.values[column]
+                    ));
+                }
+                ui.weak(format!(
+                    "{} selected bytes · 0x{:X}..0x{:X}",
+                    selection.bytes.len(),
+                    selection.bytes.start,
+                    selection.bytes.end
+                ));
                 ui.separator();
-                let previous = self.decoder;
-                ui.label("Interpretation for Plot and Table");
-                egui::ComboBox::from_id_source("workspace_decoder")
-                    .selected_text(match self.decoder {
-                        Decoder::Layout => "Decoder",
-                        Decoder::Csv => "CSV columns",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.decoder, Decoder::Layout, "Decoder");
-                        ui.add_enabled_ui(
-                            self.binary.source_path().is_some() && !self.binary.has_byte_edits(),
-                            |ui| {
-                                ui.selectable_value(&mut self.decoder, Decoder::Csv, "CSV columns");
-                            },
-                        );
-                    });
-                if self.binary.has_byte_edits() {
-                    ui.small("To interpret edited bytes as CSV, save a copy and open that file.");
-                }
-                if previous != self.decoder {
-                    if self.decoder == Decoder::Csv
-                        && self.data.is_none()
-                        && self.loader_rx.is_none()
-                    {
-                        self.begin_load(self.cfg.clone(), ui.ctx());
-                    } else if self.decoder == Decoder::Layout {
-                        self.load_progress.cancelled.store(true, Ordering::Relaxed);
-                    }
-                }
-                if self.decoder == Decoder::Csv {
-                    self.ui_left_panel(ui);
-                }
-            });
+            }
+            self.binary.source_selection_inspector(ui);
+        } else {
+            self.binary.selection_inspector(ui);
+        }
     }
 
     fn show_view(&mut self, pane: Pane) {
@@ -798,7 +1317,7 @@ impl PlotterApp {
                 }
                 ui.separator();
                 if ui.button("Decoder workspace").on_hover_text("Edit Python or YAML beside the source bytes, with decoded results below.").clicked() {
-                    self.binary.show_yaml();
+                    if self.decoder == Decoder::Layout { self.binary.show_yaml(); }
                     self.workspace = WorkspaceLayout::default();
                     self.show_empty_workspace = true;
                     ui.close_menu();
@@ -814,17 +1333,20 @@ impl PlotterApp {
             ui.menu_button("Decode", |ui| {
                 if ui.button("Edit decoder").clicked() {
                     ui.close_menu();
-                    self.binary.show_yaml();
+                    if self.decoder == Decoder::Layout {
+                        self.binary.show_yaml();
+                    }
                     self.show_view(Pane::Layout);
                 }
                 if ui
                     .add_enabled(
-                        !self.binary.is_python(),
+                        self.decoder == Decoder::Layout && !self.binary.is_python(),
                         egui::Button::new("Edit decoding steps…"),
                     )
                     .clicked()
                 {
                     ui.close_menu();
+                    self.decoder = Decoder::Layout;
                     self.binary.show_steps();
                     self.show_view(Pane::Layout);
                 }
@@ -840,13 +1362,21 @@ impl PlotterApp {
                     .clicked()
                 {
                     ui.close_menu();
+                    self.decoder = Decoder::Layout;
                     self.binary.define_selection(&ctx);
                     self.show_view(Pane::Layout);
                 }
                 if ui
                     .add_enabled(
-                        available && self.binary.can_apply_definition(),
-                        egui::Button::new(if self.binary.is_python() {
+                        available
+                            && if self.decoder == Decoder::Csv {
+                                self.binary.source_path().is_some() && !self.binary.has_byte_edits()
+                            } else {
+                                self.binary.can_apply_definition()
+                            },
+                        egui::Button::new(if self.decoder == Decoder::Csv {
+                            "Apply CSV settings"
+                        } else if self.binary.is_python() {
                             "Run script"
                         } else {
                             "Decode file"
@@ -856,7 +1386,7 @@ impl PlotterApp {
                     .clicked()
                 {
                     ui.close_menu();
-                    self.binary.apply_definition(&ctx);
+                    self.run_active_decoder(&ctx);
                 }
                 if ui.button("Decoded samples").clicked() {
                     ui.close_menu();
@@ -868,12 +1398,15 @@ impl PlotterApp {
                     .clicked()
                 {
                     ui.close_menu();
+                    self.decoder = Decoder::Layout;
                     self.binary.choose_definition(&ctx);
                     self.show_view(Pane::Layout);
                 }
                 if ui
                     .add_enabled(
-                        available && self.binary.can_save_definition(),
+                        available
+                            && self.decoder == Decoder::Layout
+                            && self.binary.can_save_definition(),
                         egui::Button::new("Save decoder…"),
                     )
                     .clicked()
@@ -882,9 +1415,19 @@ impl PlotterApp {
                     self.binary.save_definition(&ctx);
                 }
                 if ui
+                    .add_enabled(available, egui::Button::new("New YAML decoder"))
+                    .clicked()
+                {
+                    self.decoder = Decoder::Layout;
+                    self.binary.new_yaml(&ctx);
+                    self.show_view(Pane::Layout);
+                    ui.close_menu();
+                }
+                if ui
                     .add_enabled(available, egui::Button::new("New Python script"))
                     .clicked()
                 {
+                    self.decoder = Decoder::Layout;
                     self.binary.new_python(&ctx);
                     self.show_view(Pane::Layout);
                     ui.close_menu();
@@ -894,6 +1437,7 @@ impl PlotterApp {
                         .add_enabled(available, egui::Button::new("Python: Waveform container"))
                         .clicked()
                     {
+                        self.decoder = Decoder::Layout;
                         self.binary.load_python_text(
                             include_str!("../samples/decoders/python/waveform.py"),
                             &ctx,
@@ -907,6 +1451,7 @@ impl PlotterApp {
                             .clicked()
                         {
                             ui.close_menu();
+                            self.decoder = Decoder::Layout;
                             self.binary.load_definition_text(yaml, &ctx);
                             self.show_view(Pane::Layout);
                         }
@@ -959,13 +1504,15 @@ impl PlotterApp {
             ui.separator();
             if ui
                 .button("Edit decoder")
-                .on_hover_text("Open the YAML editor and decoding controls")
+                .on_hover_text("Open the active decoder and its settings")
                 .clicked()
             {
-                self.binary.show_yaml();
+                if self.decoder == Decoder::Layout {
+                    self.binary.show_yaml();
+                }
                 self.show_view(Pane::Layout);
             }
-            let results = match self.decoder {
+            let results = match self.displayed_decoder {
                 Decoder::Layout => self.binary.decoded_ready(),
                 Decoder::Csv => self.data.is_some(),
             };
@@ -1006,9 +1553,8 @@ impl PlotterApp {
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F5))
             && self.commands_available()
-            && self.binary.can_apply_definition()
         {
-            self.binary.apply_definition(ctx);
+            self.run_active_decoder(ctx);
         }
         for file in ctx.input(|i| i.raw.dropped_files.clone()) {
             if let Some(path) = file.path {
@@ -1030,16 +1576,17 @@ impl PlotterApp {
                 ui.label("Decoded structure is the result tree. It shows what the decoder read; select an element to locate it in Hex.");
                 ui.label("Save Python… or Save YAML… keeps the decoder for reuse. Decode → Examples provides starting points.");
                 ui.separator();
-                ui.small("Hex edits preserve file length. Compressed data and automatic checksum/offset rebuilding need additional support. CSV uses its existing progressive reader.");
+                ui.small("Hex edits preserve file length. Compressed data and automatic checksum/offset rebuilding need additional support. CSV reads requested rows and can index the entire file on demand.");
             });
         }
         egui::TopBottomPanel::bottom("workspace_status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if self.binary.busy() || self.loader_rx.is_some() {
+                if self.binary.busy() || self.loader_rx.is_some() || self.csv_link_request.is_some()
+                {
                     ui.spinner();
                 }
                 let (status, error) = self.binary.status();
-                let status = if error || self.decoder == Decoder::Layout {
+                let status = if error || self.displayed_decoder == Decoder::Layout {
                     status
                 } else {
                     &self.status
@@ -1072,6 +1619,7 @@ impl PlotterApp {
                 .show_inside(ui, &mut WorkspaceViewer { app: self });
         });
         self.workspace = workspace;
+        self.poll_csv_links(ctx);
         if ctx
             .data_mut(|data| data.remove_temp::<bool>(egui::Id::new("welcome_definitions")))
             .unwrap_or(false)
@@ -1102,7 +1650,9 @@ impl PlotterApp {
             ui.weak("You can also drop a file anywhere in the workspace.");
             ui.add_space(18.);
             if ui.link("Write a decoder").clicked() {
-                self.binary.show_yaml();
+                if self.decoder == Decoder::Layout {
+                    self.binary.show_yaml();
+                }
                 self.show_empty_workspace = true;
                 // The docking state is temporarily moved out while drawing.
                 // Defer this command until it has been restored below.
@@ -1113,91 +1663,73 @@ impl PlotterApp {
     }
 
     fn ui_view_controls(&mut self, ui: &mut Ui) {
-        let Some(ds) = self.data.as_ref() else {
+        let complete = self.csv_complete();
+        let Some(data) = self.data.as_ref() else {
             return;
         };
-        if self.view.is_none() {
-            self.view = Some(ViewState::from_store(ds));
-        }
-        let Some(view) = &mut self.view else {
-            return;
-        };
-
+        let view = self.view.get_or_insert_with(|| ViewState::from_store(data));
         let previous = (view.center, view.span);
-        let mut full_range = false;
-        let (xmin, xmax) = view.bounds(ds);
-        ui.separator();
-        ui.label(format!(
-            "Viewing [{:.3}, {:.3}] (span {:.3})",
-            xmin,
-            xmax,
-            (xmax - xmin).abs()
-        ));
-
-        ui.horizontal(|ui| {
-            if ui.button("Full Range").clicked() {
-                view.set_full(ds);
-                full_range = true;
+        let mut next_rows = None;
+        let mut overview = false;
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button(if complete {
+                    "Overview"
+                } else {
+                    "Available range"
+                })
+                .clicked()
+            {
+                view.set_full(data);
+                overview = true;
             }
-            if ui.button("Jump to Start").clicked() {
-                view.jump_to_start(ds);
+            if ui.button("Start").clicked() {
+                view.jump_to_start(data);
             }
-            if ui.button("Jump to End").clicked() {
-                view.jump_to_end(ds);
+            if ui.button("Previous").clicked() {
+                view.nudge_fraction(-0.8, data);
+            }
+            if ui
+                .add_enabled(self.loader_rx.is_none(), egui::Button::new("Next"))
+                .clicked()
+            {
+                if !complete && view.bounds(data).1 >= data.time_max - ViewState::MIN_SPAN {
+                    next_rows = Some(data.rows.saturating_add(CSV_INITIAL_ROWS));
+                } else {
+                    view.nudge_fraction(0.8, data);
+                }
+            }
+            if ui.button("Zoom in").clicked() {
+                view.set_center_span(view.center, view.span / 2., data);
+            }
+            if ui.button("Zoom out").clicked() {
+                view.set_center_span(view.center, view.span * 2., data);
             }
         });
-
-        let total_span = (ds.time_max - ds.time_min).abs().max(ViewState::MIN_SPAN);
-        let min_window = (total_span / 10_000.0).max(ViewState::MIN_SPAN);
-
-        let mut center = view.center;
-        let mut span = view.span;
-
-        ui.add(egui::Slider::new(&mut center, ds.time_min..=ds.time_max).text("Center"));
-        ui.add(
-            egui::Slider::new(&mut span, min_window..=total_span)
-                .logarithmic(true)
-                .text("Window"),
-        );
-
-        if (center - view.center).abs() > f64::EPSILON || (span - view.span).abs() > f64::EPSILON {
-            view.set_center_span(center, span, ds);
-        }
-
-        ui.horizontal(|ui| {
-            if ui
-                .small_button("<<")
-                .on_hover_text("Pan left by half-window")
-                .clicked()
-            {
-                view.nudge_fraction(-0.5, ds);
-            }
-            if ui
-                .small_button("<")
-                .on_hover_text("Pan left by 20%")
-                .clicked()
-            {
-                view.nudge_fraction(-0.2, ds);
-            }
-            if ui
-                .small_button(">")
-                .on_hover_text("Pan right by 20%")
-                .clicked()
-            {
-                view.nudge_fraction(0.2, ds);
-            }
-            if ui
-                .small_button(">>")
-                .on_hover_text("Pan right by half-window")
-                .clicked()
-            {
-                view.nudge_fraction(0.5, ds);
-            }
-        });
-        if full_range {
+        if overview {
             self.follow_loading = true;
         } else if previous != (view.center, view.span) {
             self.follow_loading = false;
+        }
+        let (min, max) = view.bounds(data);
+        let rows = data.rows;
+        ui.horizontal_wrapped(|ui| {
+            ui.menu_button("Columns", |ui| self.ui_csv_columns(ui));
+            ui.weak(format!(
+                "X {min:.3}–{max:.3} · {rows} rows{}",
+                if complete { "" } else { " available" }
+            ));
+            if !complete && self.loader_rx.is_none() && ui.button("Index entire file").clicked() {
+                self.index_entire_csv(ui.ctx());
+            }
+            if self.loader_rx.is_some() && ui.button("Stop").clicked() {
+                self.stop_csv_read();
+            }
+        });
+        if let Some(rows) = next_rows {
+            self.csv_advance_plot = true;
+            self.follow_loading = false;
+            self.request_csv_rows(rows, ui.ctx());
         }
     }
 
@@ -1264,27 +1796,24 @@ impl PlotterApp {
     }
 
     fn ui_plot(&mut self, ui: &mut Ui) {
+        self.ui_view_controls(ui);
+        if !self.load_has_data && self.data.is_some() {
+            ui.weak(if self.loader_rx.is_some() {
+                "Applying CSV settings… previous results shown"
+            } else {
+                "Previous results · current settings not applied"
+            });
+        }
         let Some(ds) = &self.data else {
             ui.centered_and_justified(|ui| {
                 ui.label(if self.loader_rx.is_some() {
-                    "Reading the first rows… plotting will start while loading continues."
+                    "Reading requested rows…"
                 } else {
                     "Load data to begin"
                 })
             });
             return;
         };
-        if self.data_partial {
-            ui.label(format!(
-                "Partial file: {} rows available so far. Navigation covers the loaded portion.",
-                ds.rows
-            ));
-        }
-        if self.loader_rx.is_some() && !self.load_has_data {
-            ui.label(
-                "Opening the new file; showing the previous dataset until its first rows arrive.",
-            );
-        }
         if self.view.is_none() {
             self.view = Some(ViewState::from_store(ds));
         }
@@ -1309,11 +1838,13 @@ impl PlotterApp {
         if let Some(err) = &self.plot_error {
             ui.colored_label(egui::Color32::LIGHT_RED, err);
         }
+        let selected_samples = self.csv_selected_samples();
         let response = Plot::new("plot")
+            .id(egui::Id::new(("csv_plot", self.dataset)))
             .legend(Legend::default())
             .allow_zoom(true)
             .allow_scroll(true)
-            .allow_boxed_zoom(true)
+            .allow_boxed_zoom(false)
             .allow_drag(true)
             .show(ui, |plot_ui| {
                 let pb = plot_ui.plot_bounds();
@@ -1324,10 +1855,66 @@ impl PlotterApp {
                 plot_ui.set_auto_bounds(egui::Vec2b { x: false, y: true });
                 for (i, name, points) in &self.plot_lines {
                     if self.visible.get(*i) == Some(&true) {
-                        plot_ui.line(Line::new(points.clone()).name(name));
+                        plot_ui.line(
+                            Line::new(points.iter().map(|sample| sample.point).collect::<Vec<_>>())
+                                .name(name),
+                        );
                     }
                 }
+                if let Some(selection) = &self.csv_selection {
+                    for row in std::iter::once(&selection.row).chain(selection.anchor.as_ref()) {
+                        if let Some(&x) = row.values.first().filter(|x| x.is_finite()) {
+                            plot_ui.vline(VLine::new(x).color(egui::Color32::YELLOW));
+                        }
+                    }
+                    let selected_points: Vec<_> = selected_samples
+                        .iter()
+                        .map(|(_, sample)| sample.point)
+                        .collect();
+                    plot_ui.points(
+                        Points::new(selected_points)
+                            .color(egui::Color32::YELLOW)
+                            .radius(5_f32),
+                    );
+                }
             });
+        if response.response.clicked() {
+            if let Some(pointer) = response
+                .response
+                .interact_pointer_pos()
+                .filter(|point| response.transform.frame().contains(*point))
+            {
+                let selected = selected_samples
+                    .iter()
+                    .map(|(column, sample)| (*column, sample))
+                    .chain(
+                        self.plot_lines
+                            .iter()
+                            .filter(|(column, _, _)| self.visible.get(*column) == Some(&true))
+                            .flat_map(|(column, _, samples)| {
+                                samples.iter().map(move |sample| (*column, sample))
+                            }),
+                    )
+                    .filter_map(|(column, sample)| {
+                        let position = response
+                            .transform
+                            .position_from_point(&PlotPoint::new(sample.point[0], sample.point[1]));
+                        let distance = position.distance_sq(pointer);
+                        (distance <= 144.).then_some((
+                            distance,
+                            CsvCellSelection {
+                                row: sample.record,
+                                column: Some(column + 1),
+                            },
+                        ))
+                    })
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+                    .map(|(_, selected)| selected);
+                if let Some(selected) = selected {
+                    self.request_csv_link(CsvLinkRequest::Cell(selected));
+                }
+            }
+        }
         let b = response.transform.bounds();
         let tolerance = ((bounds.1 - bounds.0).abs() * 1e-6).max(1e-9);
         if (b.min()[0] - bounds.0).abs() > tolerance || (b.max()[0] - bounds.1).abs() > tolerance {
@@ -1382,31 +1969,75 @@ impl TabViewer for WorkspaceViewer<'_> {
     }
     fn ui(&mut self, ui: &mut Ui, pane: &mut Pane) {
         match pane {
-            Pane::Structures => self.app.binary.structures(ui),
+            Pane::Structures => {
+                if self.app.displayed_decoder == Decoder::Csv {
+                    ui.heading("CSV columns");
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.label(format!("X · {}", self.app.csv_column_name(0)));
+                        if let Some(data) = &self.app.data {
+                            for signal in &data.signals {
+                                ui.label(&signal.name);
+                            }
+                        }
+                    });
+                } else {
+                    self.app.binary.structures(ui);
+                }
+            }
             Pane::Inspector => {
                 egui::ScrollArea::vertical().show(ui, |ui| self.app.ui_inspector(ui));
             }
-            Pane::Layout => self.app.binary.controls(ui),
-            Pane::Hex => self.app.binary.hex(ui),
+            Pane::Layout => self.app.ui_decoder(ui),
+            Pane::Hex => {
+                if self.app.displayed_decoder == Decoder::Csv {
+                    let highlights = self.app.csv_highlights();
+                    self.app.binary.hex_with_source_highlights(ui, &highlights);
+                } else {
+                    self.app.binary.hex(ui);
+                }
+            }
             Pane::Plot => {
-                if self.app.decoder == Decoder::Csv {
+                if self.app.displayed_decoder == Decoder::Csv {
                     self.app.ui_plot(ui);
                 } else {
                     self.app.binary.plot(ui);
                 }
             }
             Pane::Table => {
-                if self.app.decoder == Decoder::Csv {
-                    if let Some(time) = self.app.csv_table.ui(
-                        ui,
-                        self.app.data.as_ref(),
-                        self.app.dataset,
-                        &self.app.visible,
-                    ) {
-                        if let (Some(view), Some(data)) = (&mut self.app.view, &self.app.data) {
-                            view.set_center_span(time, view.span, data);
-                            self.app.follow_loading = false;
-                        }
+                if self.app.displayed_decoder == Decoder::Csv {
+                    if !self.app.load_has_data && self.app.data.is_some() {
+                        ui.weak(if self.app.loader_rx.is_some() {
+                            "Applying CSV settings… previous results shown"
+                        } else {
+                            "Previous results · current settings not applied"
+                        });
+                    }
+                    let complete = self.app.csv_complete();
+                    let response = ui
+                        .add_enabled_ui(self.app.load_has_data, |ui| {
+                            self.app.csv_table.ui(
+                                ui,
+                                self.app.data.as_ref(),
+                                self.app.dataset,
+                                &self.app.visible,
+                                complete,
+                                self.app.loader_rx.is_some(),
+                            )
+                        })
+                        .inner;
+                    if response.navigation_changed
+                        && response.requested_rows.is_none()
+                        && self.app.csv_target.is_some()
+                    {
+                        self.app.stop_csv_read();
+                    }
+                    if let Some(rows) = response.requested_rows {
+                        self.app.request_csv_rows(rows, ui.ctx());
+                    }
+                    if let Some(selection) = response.selected_rows {
+                        self.app.request_csv_link(CsvLinkRequest::Rows(selection));
+                    } else if let Some(selection) = response.selected_cell {
+                        self.app.request_csv_link(CsvLinkRequest::Cell(selection));
                     }
                 } else {
                     self.app.binary.table(ui);
@@ -1476,7 +2107,7 @@ mod tests {
                 app.poll_loader(ctx);
                 egui::SidePanel::left("controls")
                     .exact_width(350.)
-                    .show(ctx, |ui| app.ui_left_panel(ui));
+                    .show(ctx, |ui| app.ui_decoder(ui));
                 egui::CentralPanel::default().show(ctx, |ui| app.ui_plot(ui));
             },
         )
@@ -1567,6 +2198,787 @@ mod tests {
             );
         }
     }
+    fn csv_fixture(directory: &std::path::Path, rows: usize) -> std::path::PathBuf {
+        let path = directory.join("values.csv");
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        writeln!(file, "time,value").unwrap();
+        for row in 0..rows {
+            writeln!(file, "{row},{}", row * 3).unwrap();
+        }
+        file.flush().unwrap();
+        path
+    }
+
+    fn wait_csv(app: &mut PlotterApp, ctx: &Context) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            workspace_frame(app, ctx);
+            if app.binary.has_file() && !app.binary.busy() && app.loader_rx.is_none() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{}", app.status);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn wait_byte_preview(app: &mut PlotterApp, ctx: &Context) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            workspace_frame(app, ctx);
+            if app.binary.has_file()
+                && !app.binary.busy()
+                && !app.binary.is_decoding()
+                && app.binary.showing_byte_preview()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{}", app.binary.status().0);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn text(output: egui::FullOutput) -> String {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn csv_opens_a_bounded_prefix_and_only_explicit_requests_extend_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = csv_fixture(dir.path(), 30_000);
+        let ctx = Context::default();
+        let mut app = PlotterApp::default();
+        app.csv_cache_root = dir.path().join("cache");
+        app.open_path(path.clone(), &ctx);
+        wait_csv(&mut app, &ctx);
+        assert!(app.decoder == Decoder::Csv);
+        assert_eq!(app.data.as_ref().unwrap().rows, 8192);
+        assert!(!app.csv_complete());
+        assert!(app.status.contains("available"));
+        assert!(app.commands_available());
+        assert!(!app.binary.showing_byte_preview());
+        assert!(
+            !app.binary.has_layout(),
+            "CSV must keep its native bounded decoder"
+        );
+        for pane in [Pane::Plot, Pane::Hex, Pane::Table, Pane::Layout] {
+            let (surface, node, tab) = app.workspace.dock.find_tab(&pane).unwrap();
+            assert!(matches!(&app.workspace.dock[surface][node],
+                egui_dock::Node::Leaf { active, .. } if *active == tab));
+        }
+        assert_ne!(
+            app.workspace.dock.find_tab(&Pane::Plot).unwrap().1,
+            app.workspace.dock.find_tab(&Pane::Hex).unwrap().1,
+            "the initial plot must not hide the source bytes"
+        );
+        assert_eq!(
+            app.binary.file_len(),
+            std::fs::metadata(&path).unwrap().len() as usize
+        );
+        let dataset = app.dataset;
+        for _ in 0..12 {
+            workspace_frame(&mut app, &ctx);
+        }
+        assert!(
+            app.loader_rx.is_none(),
+            "idle rendering must not resume indexing"
+        );
+        assert_eq!(app.data.as_ref().unwrap().rows, 8192);
+        // Unapplied text settings must never change a continuation's schema.
+        app.cfg.csv.delimiter = ';';
+        app.follow_loading = false;
+        let old_view = app
+            .view
+            .as_ref()
+            .unwrap()
+            .bounds(app.data.as_ref().unwrap());
+        let plot = app.workspace.dock.find_tab(&Pane::Plot).unwrap();
+        app.workspace.dock.remove_tab(plot);
+        app.request_csv_rows(16_384, &ctx);
+        wait_csv(&mut app, &ctx);
+        assert!(
+            app.workspace.dock.find_tab(&Pane::Plot).is_none(),
+            "continuing CSV reads must not reopen a plot the user closed"
+        );
+        assert_eq!(app.dataset, dataset);
+        assert_eq!(app.data.as_ref().unwrap().rows, 16_384);
+        assert_eq!(
+            app.data.as_ref().unwrap().signals[0].points.point(16_383),
+            [16_383., 49_149.]
+        );
+        assert_eq!(
+            app.view
+                .as_ref()
+                .unwrap()
+                .bounds(app.data.as_ref().unwrap()),
+            old_view
+        );
+        // Opening the same source reuses its saved partial index and stays idle.
+        let mut reopened = PlotterApp::default();
+        reopened.csv_cache_root = dir.path().join("cache");
+        reopened.open_path(path, &ctx);
+        wait_csv(&mut reopened, &ctx);
+        assert_eq!(reopened.data.as_ref().unwrap().rows, 16_384);
+        assert!(!reopened.csv_complete());
+        assert!(reopened.loader_rx.is_none());
+        reopened.index_entire_csv(&ctx);
+        wait_csv(&mut reopened, &ctx);
+        assert_eq!(reopened.data.as_ref().unwrap().rows, 30_000);
+        assert!(reopened.csv_complete());
+    }
+
+    fn wait_csv_selection(app: &mut PlotterApp, ctx: &Context) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            workspace_frame(app, ctx);
+            if app.csv_link_request.is_none()
+                && app.csv_link_rx.is_none()
+                && app.loader_rx.is_none()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "selection did not finish: {}",
+                app.status
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn csv_cells_hex_and_editor_switches_keep_one_selection_and_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = csv_fixture(dir.path(), 300);
+        let raw = std::fs::read(&path).unwrap();
+        let ctx = Context::default();
+        let mut app = PlotterApp::default();
+        app.csv_cache_root = dir.path().join("cache");
+        app.open_path(path, &ctx);
+        wait_csv(&mut app, &ctx);
+        app.show_view(Pane::Plot);
+        let data = app.data.as_ref().unwrap();
+        app.view.as_mut().unwrap().set_center_span(20., 20., data);
+        app.request_csv_link(CsvLinkRequest::Cell(CsvCellSelection {
+            row: 200,
+            column: Some(1),
+        }));
+        wait_csv_selection(&mut app, &ctx);
+        let selection = app.csv_selection.as_ref().unwrap();
+        assert_eq!(selection.row.index, 200);
+        assert_eq!(selection.column, Some(1));
+        let selected = app.binary.byte_selection().unwrap();
+        assert_eq!(&raw[selected.clone()], b"600");
+        assert_eq!(app.csv_highlights().len(), 2);
+        let dataset = app.dataset;
+        let bounds = app
+            .view
+            .as_ref()
+            .unwrap()
+            .bounds(app.data.as_ref().unwrap());
+        assert!(bounds.0 <= 200. && bounds.1 >= 200.);
+        assert_eq!(bounds.1 - bounds.0, 20.);
+        for mode in ["Python", "YAML", "CSV", "Python"] {
+            workspace_click(&mut app, &ctx, mode);
+            assert!(app.displayed_decoder == Decoder::Csv);
+            assert_eq!(app.dataset, dataset);
+            assert_eq!(app.binary.byte_selection(), Some(selected.clone()));
+            assert_eq!(app.csv_selection.as_ref().unwrap().row.index, 200);
+            assert_eq!(
+                app.view
+                    .as_ref()
+                    .unwrap()
+                    .bounds(app.data.as_ref().unwrap()),
+                bounds
+            );
+            assert!(app.loader_rx.is_none());
+            assert!(!text(workspace_frame(&mut app, &ctx)).contains("Run a decoder to plot"));
+        }
+        app.binary
+            .load_python_text("raise RuntimeError('intentional test error')", &ctx);
+        app.run_active_decoder(&ctx);
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while app.binary.is_decoding() {
+            workspace_frame(&mut app, &ctx);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        workspace_frame(&mut app, &ctx);
+        assert!(app.displayed_decoder == Decoder::Csv);
+        assert_eq!(app.dataset, dataset);
+        assert_eq!(app.binary.byte_selection(), Some(selected));
+        let row = app
+            .data
+            .as_ref()
+            .unwrap()
+            .csv_rows
+            .as_ref()
+            .unwrap()
+            .row(27, &AtomicBool::new(false))
+            .unwrap();
+        let byte = row.fields[1].start;
+        app.binary.select_source_range(byte..byte + 1, false);
+        wait_csv_selection(&mut app, &ctx);
+        assert_eq!(app.csv_selection.as_ref().unwrap().row.index, 27);
+        assert_eq!(app.csv_selection.as_ref().unwrap().column, Some(1));
+        assert_eq!(
+            app.binary.byte_selection(),
+            Some(byte..byte + 1),
+            "reverse linking preserves the user's exact bytes"
+        );
+        app.request_csv_link(CsvLinkRequest::Cell(CsvCellSelection {
+            row: 27,
+            column: None,
+        }));
+        wait_csv_selection(&mut app, &ctx);
+        assert_eq!(&raw[app.binary.byte_selection().unwrap()], b"27,81\n");
+        app.binary.select_source_range(0..1, false);
+        wait_csv_selection(&mut app, &ctx);
+        assert!(
+            app.csv_selection.is_none(),
+            "header is not a numeric sample"
+        );
+    }
+
+    #[test]
+    fn csv_row_ranges_link_exact_bytes_and_plot_records_with_two_endpoint_reads() {
+        #[derive(Debug)]
+        struct TrackedRows {
+            source: Arc<dyn crate::data::CsvRows>,
+            reads: Mutex<Vec<usize>>,
+        }
+        impl crate::data::CsvRows for TrackedRows {
+            fn row(&self, index: usize, cancel: &AtomicBool) -> Result<CsvRow> {
+                self.reads.lock().unwrap().push(index);
+                self.source.row(index, cancel)
+            }
+            fn find_byte(&self, offset: usize, cancel: &AtomicBool) -> Result<Option<CsvRow>> {
+                self.source.find_byte(offset, cancel)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ranges.csv");
+        let mut raw = b"time,value,note\r\n".to_vec();
+        let mut expected_bytes = Vec::new();
+        for row in 0..300 {
+            let start = raw.len();
+            raw.extend_from_slice(
+                format!("{},\"{}\",\"line\r\n\"\"quoted\"\"\"\r\n", row % 5, row * 3).as_bytes(),
+            );
+            expected_bytes.push(start..raw.len());
+        }
+        std::fs::write(&path, &raw).unwrap();
+        let ctx = Context::default();
+        let mut app = PlotterApp::default();
+        app.csv_cache_root = dir.path().join("cache");
+        app.open_path(path, &ctx);
+        wait_csv(&mut app, &ctx);
+        let tracked = Arc::new(TrackedRows {
+            source: app.data.as_ref().unwrap().csv_rows.clone().unwrap(),
+            reads: Mutex::new(Vec::new()),
+        });
+        app.data.as_mut().unwrap().csv_rows = Some(tracked.clone());
+        app.show_view(Pane::Plot);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while app.plot_lines.is_empty() || app.plot_rx.is_some() {
+            workspace_frame(&mut app, &ctx);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        for active in [205, 3, 210] {
+            tracked.reads.lock().unwrap().clear();
+            let rows = CsvRowSelection {
+                anchor: 200,
+                active,
+            };
+            app.request_csv_link(CsvLinkRequest::Rows(rows));
+            wait_csv_selection(&mut app, &ctx);
+            assert_eq!(*tracked.reads.lock().unwrap(), [active, 200]);
+            let range = rows.rows();
+            let expected = expected_bytes[range.start].start..expected_bytes[range.end - 1].end;
+            assert_eq!(app.binary.byte_selection(), Some(expected.clone()));
+            assert_eq!(
+                &raw[expected.clone()],
+                &raw[app.csv_selection.as_ref().unwrap().bytes.clone()]
+            );
+            let selection = app.csv_selection.as_ref().unwrap();
+            assert_eq!(selection.rows, Some(rows));
+            assert_eq!(selection.row.index, active);
+            assert_eq!(selection.anchor.as_ref().unwrap().index, 200);
+            assert_eq!(selection.column, None);
+            let samples = app.csv_selected_samples();
+            assert!(!samples.is_empty());
+            assert!(samples
+                .iter()
+                .all(|(_, sample)| range.contains(&sample.record)));
+            for record in range.clone() {
+                assert!(samples.iter().any(|(_, sample)| sample.record == record));
+            }
+            assert!(
+                !samples.iter().any(|(_, sample)| sample.record == 0),
+                "duplicate X values outside the selected rows must not be highlighted"
+            );
+        }
+        app.request_csv_link(CsvLinkRequest::Cell(CsvCellSelection {
+            row: 17,
+            column: Some(1),
+        }));
+        wait_csv_selection(&mut app, &ctx);
+        assert_eq!(&raw[app.binary.byte_selection().unwrap()], b"\"51\"");
+        assert!(app.csv_selection.as_ref().unwrap().rows.is_none());
+        assert_eq!(app.csv_selected_samples().len(), 1);
+        // A new Hex selection leaves the whole-row range and keeps its exact bytes.
+        let row = app
+            .data
+            .as_ref()
+            .unwrap()
+            .csv_rows
+            .as_ref()
+            .unwrap()
+            .row(9, &AtomicBool::new(false))
+            .unwrap();
+        let byte = row.fields[1].start + 1;
+        app.binary.select_source_range(byte..byte + 1, false);
+        wait_csv_selection(&mut app, &ctx);
+        assert!(app.csv_selection.as_ref().unwrap().rows.is_none());
+        assert_eq!(app.csv_selection.as_ref().unwrap().row.index, 9);
+        assert_eq!(app.binary.byte_selection(), Some(byte..byte + 1));
+    }
+
+    #[test]
+    fn csv_plot_click_reveals_exact_record_when_x_values_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repeated.csv");
+        let raw = b"time,value\n1,10\n1,20\n0,30\n2,40\n";
+        std::fs::write(&path, raw).unwrap();
+        let ctx = Context::default();
+        let mut app = PlotterApp::default();
+        app.csv_cache_root = dir.path().join("cache");
+        app.open_path(path, &ctx);
+        wait_csv(&mut app, &ctx);
+        app.show_view(Pane::Plot);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            workspace_frame(&mut app, &ctx);
+            if !app.plot_lines.is_empty() && app.plot_rx.is_none() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        workspace_frame(&mut app, &ctx);
+        let transform = egui_plot::PlotMemory::load(&ctx, egui::Id::new(("csv_plot", app.dataset)))
+            .unwrap()
+            .transform();
+        let pos = transform.position_from_point(&PlotPoint::new(1., 20.));
+        workspace_events(&mut app, &ctx, vec![egui::Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            workspace_events(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        wait_csv_selection(&mut app, &ctx);
+        assert_eq!(app.csv_selection.as_ref().unwrap().row.index, 1);
+        assert_eq!(app.csv_selection.as_ref().unwrap().column, Some(1));
+        assert_eq!(&raw[app.binary.byte_selection().unwrap()], b"20");
+        app.plot_lines[0].2.retain(|sample| sample.record != 1);
+        workspace_frame(&mut app, &ctx);
+        for pressed in [true, false] {
+            workspace_events(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        wait_csv_selection(&mut app, &ctx);
+        assert_eq!(
+            app.csv_selection.as_ref().unwrap().row.index,
+            1,
+            "explicit marker retains its identity after decimation"
+        );
+        let (surface, node, plot_tab) = app.workspace.dock.find_tab(&Pane::Plot).unwrap();
+        match &app.workspace.dock[surface][node] {
+            egui_dock::Node::Leaf { active, .. } => {
+                assert_eq!(*active, plot_tab, "linking bytes must not hide the plot")
+            }
+            _ => panic!("plot is not docked in a leaf"),
+        }
+    }
+
+    #[test]
+    fn csv_hex_selection_extends_only_until_its_record_and_can_be_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = csv_fixture(dir.path(), 30_000);
+        let raw = std::fs::read(&path).unwrap();
+        let ctx = Context::default();
+        let mut app = PlotterApp::default();
+        app.csv_cache_root = dir.path().join("cache");
+        app.open_path(path, &ctx);
+        wait_csv(&mut app, &ctx);
+        let target = raw
+            .windows(b"19000,57000".len())
+            .position(|bytes| bytes == b"19000,57000")
+            .unwrap();
+        app.binary
+            .select_source_range(target + 6..target + 7, false);
+        wait_csv_selection(&mut app, &ctx);
+        assert_eq!(app.csv_selection.as_ref().unwrap().row.index, 19_000);
+        assert_eq!(app.csv_selection.as_ref().unwrap().column, Some(1));
+        assert_eq!(app.data.as_ref().unwrap().rows, 24_576);
+        assert!(!app.csv_complete());
+        // Deterministically leave an old selection-owned loader in flight.
+        let (old_tx, old_rx) = mpsc::channel();
+        app.loader_rx = Some(old_rx);
+        app.csv_link_indexing = true;
+        app.csv_link_request = Some(CsvLinkRequest::Bytes(raw.len() - 2..raw.len() - 1));
+        app.request_csv_link(CsvLinkRequest::Cell(CsvCellSelection {
+            row: 4,
+            column: Some(0),
+        }));
+        let _ = old_tx.send(Err(anyhow::anyhow!("cancelled obsolete request")));
+        wait_csv_selection(&mut app, &ctx);
+        assert_eq!(app.csv_selection.as_ref().unwrap().row.index, 4);
+        assert_eq!(&raw[app.binary.byte_selection().unwrap()], b"4");
+        // Stop cancels an explicit distant selection without restart on future frames.
+        app.request_csv_link(CsvLinkRequest::Bytes(raw.len() - 2..raw.len() - 1));
+        app.stop_csv_read();
+        wait_csv_selection(&mut app, &ctx);
+        for _ in 0..5 {
+            workspace_frame(&mut app, &ctx);
+        }
+        assert!(app.csv_link_request.is_none());
+        assert!(app.loader_rx.is_none());
+        assert_eq!(app.data.as_ref().unwrap().rows, 24_576);
+        // Explicit indexing takes ownership from any earlier selection request.
+        app.csv_link_indexing = true;
+        app.index_entire_csv(&ctx);
+        app.request_csv_link(CsvLinkRequest::Cell(CsvCellSelection {
+            row: 2,
+            column: None,
+        }));
+        assert!(!app.load_progress.cancelled.load(Ordering::Relaxed));
+        wait_csv_selection(&mut app, &ctx);
+        assert!(app.csv_complete());
+        assert_eq!(app.csv_selection.as_ref().unwrap().row.index, 2);
+    }
+
+    #[test]
+    fn csv_byte_lookup_failure_keeps_prefix_and_does_not_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = csv_fixture(dir.path(), 8192);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"invalid,row\n10000,30000\n").unwrap();
+        drop(file);
+        let size = std::fs::metadata(&path).unwrap().len() as usize;
+        let ctx = Context::default();
+        let mut app = PlotterApp::default();
+        app.csv_cache_root = dir.path().join("cache");
+        app.open_path(path, &ctx);
+        wait_csv(&mut app, &ctx);
+        app.binary.select_source_range(size - 3..size - 2, false);
+        wait_csv_selection(&mut app, &ctx);
+        assert!(app.status.contains("CSV:"), "{}", app.status);
+        assert_eq!(app.data.as_ref().unwrap().rows, 8192);
+        assert!(app.csv_selection.is_none());
+        for _ in 0..5 {
+            workspace_frame(&mut app, &ctx);
+        }
+        assert!(app.loader_rx.is_none());
+        assert!(app.csv_link_request.is_none());
+    }
+
+    #[test]
+    fn csv_crlf_boundary_and_empty_cell_do_not_select_unrelated_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crlf.csv");
+        let mut raw = b"time,value\r\n0,\r\n".to_vec();
+        for row in 1..8192 {
+            raw.extend_from_slice(format!("{row},{}\r\n", row * 3).as_bytes());
+        }
+        let last_lf = raw.len() - 1;
+        raw.extend_from_slice(b"invalid,tail\r\n");
+        std::fs::write(&path, &raw).unwrap();
+        let ctx = Context::default();
+        let mut app = PlotterApp::default();
+        app.csv_cache_root = dir.path().join("cache");
+        app.open_path(path, &ctx);
+        wait_csv(&mut app, &ctx);
+        app.binary.select_source_range(last_lf..last_lf + 1, false);
+        wait_csv_selection(&mut app, &ctx);
+        assert_eq!(app.csv_selection.as_ref().unwrap().row.index, 8191);
+        assert_eq!(app.csv_selection.as_ref().unwrap().column, None);
+        assert!(
+            !app.status.contains("CSV:"),
+            "must not scan invalid tail: {}",
+            app.status
+        );
+        assert_eq!(app.data.as_ref().unwrap().rows, 8192);
+        app.request_csv_link(CsvLinkRequest::Cell(CsvCellSelection {
+            row: 0,
+            column: Some(1),
+        }));
+        wait_csv_selection(&mut app, &ctx);
+        assert!(app.csv_selection.as_ref().unwrap().bytes.is_empty());
+        assert!(
+            app.binary.byte_selection().is_none(),
+            "empty cell has no bytes to edit/export"
+        );
+        assert_eq!(app.csv_selection.as_ref().unwrap().row.index, 0);
+    }
+
+    #[test]
+    fn successful_binary_decode_replaces_csv_but_editor_changes_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = csv_fixture(dir.path(), 12);
+        let ctx = Context::default();
+        let mut app = PlotterApp::default();
+        app.csv_cache_root = dir.path().join("cache");
+        app.open_path(path, &ctx);
+        wait_csv(&mut app, &ctx);
+        workspace_click(&mut app, &ctx, "Python");
+        app.binary.load_python_text("from plottermax import Struct\nByte = Struct('Byte', [('value', 'u8')])\nfile.records('bytes', Byte, count=file.size)", &ctx);
+        assert!(app.displayed_decoder == Decoder::Csv);
+        app.run_active_decoder(&ctx);
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while app.displayed_decoder != Decoder::Layout {
+            workspace_frame(&mut app, &ctx);
+            assert!(
+                Instant::now() < deadline,
+                "binary decode did not replace CSV"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(app.binary.decoded_ready());
+        for mode in ["CSV", "YAML", "Python"] {
+            workspace_click(&mut app, &ctx, mode);
+            assert!(app.displayed_decoder == Decoder::Layout);
+            assert!(app.binary.decoded_ready());
+            assert!(app.loader_rx.is_none());
+        }
+    }
+
+    #[test]
+    fn plain_python_keeps_csv_result_selection_and_plot_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = csv_fixture(dir.path(), 300);
+        let ctx = Context::default();
+        let mut app = PlotterApp::default();
+        app.csv_cache_root = dir.path().join("cache");
+        app.open_path(path, &ctx);
+        wait_csv(&mut app, &ctx);
+        app.show_view(Pane::Plot);
+        app.request_csv_link(CsvLinkRequest::Cell(CsvCellSelection {
+            row: 42,
+            column: Some(1),
+        }));
+        wait_csv_selection(&mut app, &ctx);
+        let selection = app.binary.byte_selection();
+        let dataset = app.dataset;
+        let bounds = app
+            .view
+            .as_ref()
+            .unwrap()
+            .bounds(app.data.as_ref().unwrap());
+        workspace_click(&mut app, &ctx, "Python");
+        for code in ["test = 5", "test = 5\nprint(test)", "print(file.size)"] {
+            app.binary.load_python_text(code, &ctx);
+            if text(workspace_frame(&mut app, &ctx)).contains("Replace decoder") {
+                workspace_click(&mut app, &ctx, "Replace decoder");
+            }
+            workspace_click(&mut app, &ctx, "Run script");
+            wait_csv(&mut app, &ctx);
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while app.binary.is_decoding() {
+                workspace_frame(&mut app, &ctx);
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let shown = text(workspace_frame(&mut app, &ctx));
+            assert!(shown.contains("Script finished"), "{shown}");
+            assert!(!shown.contains("ValueError"));
+            assert!(app.displayed_decoder == Decoder::Csv);
+            assert_eq!(app.dataset, dataset);
+            assert_eq!(app.binary.byte_selection(), selection);
+            assert_eq!(app.csv_selection.as_ref().unwrap().row.index, 42);
+            assert_eq!(
+                app.view
+                    .as_ref()
+                    .unwrap()
+                    .bounds(app.data.as_ref().unwrap()),
+                bounds
+            );
+            let (surface, node, plot_tab) = app.workspace.dock.find_tab(&Pane::Plot).unwrap();
+            match &app.workspace.dock[surface][node] {
+                egui_dock::Node::Leaf { active, .. } => assert_eq!(*active, plot_tab),
+                _ => panic!("plot is not docked in a leaf"),
+            }
+        }
+    }
+
+    #[test]
+    fn csv_decoder_controls_and_f5_follow_the_visible_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = csv_fixture(dir.path(), 12_000);
+        let ctx = Context::default();
+        let mut app = PlotterApp::default();
+        app.csv_cache_root = dir.path().join("cache");
+        app.open_path(path, &ctx);
+        wait_csv(&mut app, &ctx);
+        let visible = text(workspace_frame(&mut app, &ctx));
+        for label in [
+            "Python",
+            "YAML",
+            "CSV",
+            "Separator",
+            "X column",
+            "Open configuration…",
+            "Apply",
+        ] {
+            assert!(
+                visible.contains(label),
+                "missing CSV decoder control {label}"
+            );
+        }
+        assert!(!visible.contains("Decoded RAM cache"));
+        assert!(!visible.contains("Data interpretation"));
+        let inspected = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.ui_inspector(ui));
+        });
+        assert!(
+            !text(inspected).contains("X column"),
+            "Inspector must not contain decoder controls"
+        );
+        workspace_click(&mut app, &ctx, "Python");
+        app.binary
+            .load_python_text("raise RuntimeError('hidden decoder must not run')", &ctx);
+        workspace_frame(&mut app, &ctx);
+        workspace_click(&mut app, &ctx, "CSV");
+        app.cfg.csv.time_column = "value".into();
+        workspace_events(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::F5,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        wait_csv(&mut app, &ctx);
+        assert!(app.decoder == Decoder::Csv);
+        assert_eq!(app.csv_applied.as_ref().unwrap().csv.time_column, "value");
+        assert_eq!(
+            app.data.as_ref().unwrap().signals[0].points.point(1),
+            [3., 1.]
+        );
+        assert!(!app.binary.is_decoding());
+        assert!(!app.binary.decoded_ready());
+        workspace_click(&mut app, &ctx, "Python");
+        assert!(text(workspace_frame(&mut app, &ctx)).contains("hidden decoder must not run"));
+        workspace_click(&mut app, &ctx, "YAML");
+        assert!(text(workspace_frame(&mut app, &ctx)).contains("Save YAML…"));
+        workspace_click(&mut app, &ctx, "CSV");
+        assert_eq!(app.cfg.csv.time_column, "value");
+        assert!(app.loader_rx.is_none());
+    }
+
+    #[test]
+    fn failed_csv_settings_keep_previous_results_marked_until_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = csv_fixture(dir.path(), 12_000);
+        let ctx = Context::default();
+        let mut app = PlotterApp::default();
+        app.csv_cache_root = dir.path().join("cache");
+        app.open_path(path, &ctx);
+        wait_csv(&mut app, &ctx);
+        app.cfg.csv.time_column = "missing".into();
+        app.run_active_decoder(&ctx);
+        wait_csv(&mut app, &ctx);
+        assert!(!app.load_has_data);
+        assert!(app.status.contains("not found"));
+        assert_eq!(
+            app.csv_column_name(0),
+            "time",
+            "previous results retain their actual X name"
+        );
+        app.show_view(Pane::Table);
+        assert!(text(workspace_frame(&mut app, &ctx)).contains("Previous results"));
+        assert_eq!(
+            app.data.as_ref().unwrap().signals[0].points.point(2),
+            [2., 6.]
+        );
+        app.request_csv_rows(20_000, &ctx);
+        app.index_entire_csv(&ctx);
+        assert!(
+            app.loader_rx.is_none(),
+            "old results must not drive reads with failed settings"
+        );
+        app.cfg.csv.time_column = "time".into();
+        app.run_active_decoder(&ctx);
+        wait_csv(&mut app, &ctx);
+        assert!(app.load_has_data);
+        assert!(!text(workspace_frame(&mut app, &ctx)).contains("Previous results"));
+    }
+
+    #[test]
+    fn stopped_csv_demand_never_restarts_and_late_errors_keep_rows_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = csv_fixture(dir.path(), 10_000);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"invalid,time\n")
+            .unwrap();
+        let ctx = Context::default();
+        let mut app = PlotterApp::default();
+        app.csv_cache_root = dir.path().join("cache");
+        app.open_path(path, &ctx);
+        wait_csv(&mut app, &ctx);
+        assert_eq!(app.data.as_ref().unwrap().rows, 8192);
+        app.request_csv_rows(9000, &ctx);
+        app.stop_csv_read();
+        wait_csv(&mut app, &ctx);
+        assert!(app.csv_target.is_none());
+        for _ in 0..5 {
+            workspace_frame(&mut app, &ctx);
+        }
+        assert!(app.loader_rx.is_none());
+        app.index_entire_csv(&ctx);
+        wait_csv(&mut app, &ctx);
+        assert!(app.status.contains("CSV:"));
+        assert!(app.data.as_ref().unwrap().rows >= 8192);
+        assert!(!app.csv_complete());
+        assert_eq!(
+            app.data.as_ref().unwrap().signals[0].points.point(10),
+            [10., 30.]
+        );
+        assert!(app.binary.has_file());
+    }
+
     #[test]
     fn file_menu_and_apply_shortcut_show_samples_beside_the_bytes() {
         let ctx = Context::default();
@@ -1705,10 +3117,12 @@ mod tests {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            wait_byte_preview(&mut app, &ctx);
             assert!(app.data.is_none());
             assert!(app.loader_rx.is_none());
             assert!(app.binary.has_file());
-            assert!(!app.binary.has_layout());
+            assert!(app.binary.has_layout());
+            assert!(app.binary.decoded_ready());
             let output = workspace_frame(&mut app, &ctx);
             let labels: Vec<_> = output
                 .shapes
@@ -1723,9 +3137,13 @@ mod tests {
             let (surface, node, _) = app.workspace.dock.find_tab(&Pane::Inspector).unwrap();
             assert!(app.workspace.dock[surface][node].rect().unwrap().width() > 400.);
             let (surface, node, _) = app.workspace.dock.find_tab(&Pane::Hex).unwrap();
-            assert!(app.workspace.dock[surface][node].rect().unwrap().height() > 650.);
+            let hex_rect = app.workspace.dock[surface][node].rect().unwrap();
+            assert!(hex_rect.height() > 250.);
             assert!(app.workspace.dock.find_tab(&Pane::Layout).is_some());
-            assert!(app.workspace.dock.find_tab(&Pane::Plot).is_none());
+            let (plot_surface, plot_node, _) = app.workspace.dock.find_tab(&Pane::Plot).unwrap();
+            let plot_rect = app.workspace.dock[plot_surface][plot_node].rect().unwrap();
+            assert!(plot_rect.height() > hex_rect.height());
+            assert!(plot_rect.bottom() <= hex_rect.top());
             assert!(app.workspace.dock.find_tab(&Pane::Table).is_none());
             for pane in [Pane::Hex, Pane::Layout, Pane::Structures, Pane::Inspector] {
                 assert!(
@@ -1740,6 +3158,60 @@ mod tests {
         }
         assert!(old_progress.cancelled.load(Ordering::Relaxed));
         assert!(tx.send(Ok(store(10))).is_err());
+    }
+
+    #[test]
+    fn opening_raw_data_preserves_loaded_decoders_without_running_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("capture.raw");
+        std::fs::write(&data, [1u8, 0, 2, 0, 3, 0, 4, 0]).unwrap();
+        for (extension, mode, code) in [
+            ("py", "Python", "raise RuntimeError('saved_python_must_not_run')\n"),
+            ("yaml", "YAML", "endian: little\nstructures:\n  Custom:\n    fields:\n      - {name: saved_yaml_field, type: u16}\nactions:\n  - read: {name: custom, type: Custom, repeat: until end}\n"),
+        ] {
+            let ctx = Context::default();
+            let mut app = PlotterApp::default();
+            let definition = dir.path().join(format!("custom.{extension}"));
+            std::fs::write(&definition, code).unwrap();
+            app.binary.load_yaml(definition, &ctx);
+            workspace_frame(&mut app, &ctx);
+            app.open_path(data.clone(), &ctx);
+            wait_byte_preview(&mut app, &ctx);
+            assert!(!app.binary.status().1, "{}", app.binary.status().0);
+            assert!(!app.binary.is_dirty());
+            assert!(app.workspace.dock.find_tab(&Pane::Plot).is_some());
+            workspace_click(&mut app, &ctx, mode);
+            let shown = text(workspace_frame(&mut app, &ctx));
+            let saved_field = if extension == "py" {
+                "saved_python_must_not_run"
+            } else {
+                "saved_yaml_field"
+            };
+            assert!(shown.contains(saved_field), "saved decoder was replaced: {shown}");
+            assert!(app.binary.showing_byte_preview(), "choosing an editor must retain the preview");
+        }
+    }
+
+    #[test]
+    fn empty_raw_file_keeps_hex_and_decoder_available_without_an_empty_plot() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("empty.raw");
+        std::fs::write(&data, []).unwrap();
+        let ctx = Context::default();
+        let mut app = PlotterApp::default();
+        app.open_path(data, &ctx);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !app.binary.has_file() || app.binary.busy() {
+            workspace_frame(&mut app, &ctx);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        workspace_frame(&mut app, &ctx);
+        assert!(!app.binary.showing_byte_preview());
+        assert!(!app.binary.is_decoding());
+        assert!(app.workspace.dock.find_tab(&Pane::Plot).is_none());
+        assert!(app.workspace.dock.find_tab(&Pane::Hex).is_some());
+        assert!(app.workspace.dock.find_tab(&Pane::Layout).is_some());
     }
 
     #[test]
@@ -1774,7 +3246,7 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(app.status.contains("Load error"), "{}", app.status);
+        assert!(app.status.contains("CSV:"), "{}", app.status);
         assert_eq!(app.binary.source_path(), Some(path.as_path()));
         assert_eq!(app.binary.file_len(), 17);
         assert!(!app.binary.has_layout());
@@ -1797,13 +3269,14 @@ mod tests {
             .unwrap()
             .is_empty());
         // The actual egui signal controls and navigator are active before EOF.
-        click(&mut app, &ctx, "Select None");
+        click(&mut app, &ctx, "Columns");
+        click(&mut app, &ctx, "Hide all");
         assert_eq!(app.visible, [false, false]);
         app.view
             .as_mut()
             .unwrap()
             .set_center_span(50., 20., app.data.as_ref().unwrap());
-        click(&mut app, &ctx, "<");
+        click(&mut app, &ctx, "Previous");
         assert!(!app.follow_loading);
         let view = app.view.as_ref().unwrap().clone();
         *app.load_preview.lock().unwrap() = Some(store(200));
@@ -1843,7 +3316,7 @@ mod tests {
         tx.send(Err(anyhow::anyhow!("Loading cancelled"))).unwrap();
         app.poll_loader(&ctx);
         assert!(app.data_partial);
-        assert!(app.status.contains("200 loaded rows remain usable"));
+        assert!(app.status.contains("200 rows remain available"));
         assert_eq!(
             app.data.as_ref().unwrap().signals[0].points.point(199),
             [199., 398.]
@@ -1885,10 +3358,21 @@ mod tests {
             !cancellation.load(Ordering::Relaxed),
             "index growth must let the existing query finish"
         );
-        tx.send((old, Ok(vec![(0, "a".into(), vec![[1., 2.]])])))
-            .unwrap();
+        tx.send((
+            old,
+            Ok(vec![(
+                0,
+                "a".into(),
+                vec![crate::plot_index::Sample {
+                    record: 1,
+                    byte_offset: 0,
+                    point: [1., 2.],
+                }],
+            )]),
+        ))
+        .unwrap();
         app.prepare_plot(next.clone(), &ctx);
-        assert_eq!(app.plot_lines[0].2, [[1., 2.]]);
+        assert_eq!(app.plot_lines[0].2[0].point, [1., 2.]);
         assert!(
             app.plot_rx.is_some(),
             "latest index is queried after showing the completed prefix"
@@ -2129,13 +3613,22 @@ mod tests {
                 })
                 .collect()
         };
-        let opened = labels(workspace_frame(&mut app, &ctx));
-        for label in ["Decoder", "Open decoder…", "Run script", "Python"] {
+        let opened_output = workspace_frame(&mut app, &ctx);
+        let (surface, node, _) = app.workspace.dock.find_tab(&Pane::Layout).unwrap();
+        let decoder_rect = app.workspace.dock[surface][node].rect().unwrap();
+        assert!(
+            !opened_output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text)
+                if decoder_rect.contains(text.pos) && text.galley.text() == "Overview")
+            }),
+            "the decoder should open directly in its source editor"
+        );
+        let opened = labels(opened_output);
+        for label in ["Decoder", "Open decoder…", "Decode file", "YAML"] {
             assert!(opened.iter().any(|text| text == label), "missing {label}");
         }
-        assert!(!opened
-            .iter()
-            .any(|text| text == "Overview" || text.contains("All definitions")));
+        assert!(!opened.iter().any(|text| text.contains("All definitions")));
+        wait_byte_preview(&mut app, &ctx);
         app.binary.load_yaml(yaml_path, &ctx);
         let loaded = labels(workspace_frame(&mut app, &ctx));
         assert!(loaded.iter().any(|text| text.contains("waveform.yaml")));
@@ -2143,14 +3636,15 @@ mod tests {
             loaded.iter().any(|text| text.contains("structures:")),
             "loading must display source, without another tab click"
         );
-        assert!(!app.binary.decoded_ready());
+        assert!(app.binary.showing_byte_preview());
         workspace_click(&mut app, &ctx, "Decode file");
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
-        while !app.binary.decoded_ready() {
+        while app.binary.is_decoding() {
             workspace_frame(&mut app, &ctx);
             assert!(Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        assert!(!app.binary.showing_byte_preview());
         let decoded = labels(workspace_frame(&mut app, &ctx));
         assert!(decoded.iter().any(|text| text == "amplitude"));
         assert!(
@@ -2182,6 +3676,7 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        wait_byte_preview(&mut app, &ctx);
         app.binary.load_yaml(script, &ctx);
         let output = workspace_frame(&mut app, &ctx);
         let labels: Vec<_> = output
@@ -2197,15 +3692,16 @@ mod tests {
         }
         assert!(!labels.contains(&"Fields") && !labels.contains(&"Steps"));
         assert!(!app.binary.is_decoding());
-        assert!(!app.binary.decoded_ready());
+        assert!(app.binary.showing_byte_preview());
         workspace_click(&mut app, &ctx, "Run script");
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while !app.binary.decoded_ready() {
+        while app.binary.is_decoding() {
             workspace_frame(&mut app, &ctx);
             assert!(Instant::now() < deadline, "{}", app.binary.status().0);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let output = workspace_frame(&mut app, &ctx);
+        assert!(!app.binary.showing_byte_preview());
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "amplitude")));
         assert!(app.workspace.dock.find_tab(&Pane::Table).is_some());
         let (_, editor, _) = app.workspace.dock.find_tab(&Pane::Layout).unwrap();
@@ -2231,6 +3727,7 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        wait_byte_preview(&mut app, &ctx);
         app.binary.load_yaml(script, &ctx);
         workspace_click(&mut app, &ctx, "Run script");
         for _ in 0..30 {
@@ -2240,7 +3737,7 @@ mod tests {
         }
         workspace_click(&mut app, &ctx, "Stop");
         assert!(!app.binary.is_decoding());
-        assert!(!app.binary.decoded_ready());
+        assert!(app.binary.showing_byte_preview());
         assert!(app.binary.can_apply_definition());
     }
 
@@ -2266,6 +3763,86 @@ mod tests {
             serde_json::to_vec(&capture).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    #[ignore = "writes an egui CSV workspace capture to /tmp"]
+    fn capture_csv_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = csv_fixture(dir.path(), 30_000);
+        let ctx = Context::default();
+        let mut app = PlotterApp::default();
+        app.show_empty_workspace = true;
+        for _ in 0..10 {
+            workspace_frame(&mut app, &ctx);
+        }
+        capture_workspace(&mut app, &ctx, "yaml-starter");
+        workspace_click(&mut app, &ctx, "Python");
+        for _ in 0..10 {
+            workspace_frame(&mut app, &ctx);
+        }
+        capture_workspace(&mut app, &ctx, "python-starter");
+        workspace_click(&mut app, &ctx, "YAML");
+        app.csv_cache_root = dir.path().join("cache");
+        app.open_path(path, &ctx);
+        wait_csv(&mut app, &ctx);
+        capture_workspace(&mut app, &ctx, "csv-decoder");
+        app.show_view(Pane::Plot);
+        for _ in 0..20 {
+            workspace_frame(&mut app, &ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        capture_workspace(&mut app, &ctx, "csv-plot");
+        app.request_csv_link(CsvLinkRequest::Cell(CsvCellSelection {
+            row: 42,
+            column: Some(1),
+        }));
+        wait_csv_selection(&mut app, &ctx);
+        workspace_click(&mut app, &ctx, "Python");
+        for _ in 0..45 {
+            workspace_frame(&mut app, &ctx);
+        }
+        capture_workspace(&mut app, &ctx, "csv-linked-python");
+        app.binary.load_python_text("test = 5\nprint(test)", &ctx);
+        app.run_active_decoder(&ctx);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while app.binary.is_decoding() {
+            workspace_frame(&mut app, &ctx);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        for _ in 0..10 {
+            workspace_frame(&mut app, &ctx);
+        }
+        capture_workspace(&mut app, &ctx, "python-simple-script");
+        app.show_view(Pane::Hex);
+        for _ in 0..15 {
+            workspace_frame(&mut app, &ctx);
+        }
+        capture_workspace(&mut app, &ctx, "csv-linked-hex");
+    }
+
+    #[test]
+    #[ignore = "writes an egui initial byte-plot capture to /tmp"]
+    fn capture_initial_byte_plot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.raw");
+        let bytes: Vec<_> = (0..8192)
+            .map(|index| {
+                let phase = index as f64 * std::f64::consts::TAU / 240.;
+                (128. + 100. * phase.sin()) as u8
+            })
+            .collect();
+        std::fs::write(&path, bytes).unwrap();
+        let ctx = Context::default();
+        let mut app = PlotterApp::default();
+        app.open_path(path, &ctx);
+        wait_byte_preview(&mut app, &ctx);
+        for _ in 0..40 {
+            workspace_frame(&mut app, &ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        capture_workspace(&mut app, &ctx, "initial-byte-plot");
     }
 
     /// A renderer-independent capture for reviewing the actual egui workspace.

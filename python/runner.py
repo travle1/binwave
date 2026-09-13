@@ -381,7 +381,7 @@ class Reader:
 
     def program(self):
         if not self._actions:
-            raise ValueError("the decoder did not describe any data; call file.read_struct() or file.records()")
+            return None
         program = {"endian": "little", "structures": self._structures, "actions": self._actions}
         if len(json.dumps(program, ensure_ascii=False).encode("utf-8")) > PROGRAM_LIMIT:
             raise ValueError("emitted decoder exceeds 256 KiB; reuse Struct types and records() instead of emitting each sample")
