@@ -31,16 +31,17 @@ until the first successful export.
 ## Browser port constraint
 
 The full workspace runs natively on Linux and Windows. A browser WebAssembly
-preview now provides worker-backed hex inspection, bounded byte plots, sparse
-single-byte edits, and streamed exports in supporting browsers. It shares the
-egui dock layout, but decoder and full desktop UI parity are still pending.
+preview provides YAML decoding, decoded sample tables and structures, numeric
+channel plots, hex inspection, sparse edits, and streamed exports. It shares the
+native YAML interpreter, plot reducer, trace renderer, source editor, and dock
+layout. Full desktop UI parity is still pending.
 
 The browser backend must read bounded file ranges and stream exports; it must
 never require loading a whole data file into WebAssembly or JavaScript memory.
 File offsets remain 64-bit independently of the memory address size, with bounded
 caches and background work to keep the interface responsive. The preview uses
 64 KiB pages and 1 MiB export chunks and rejects browser offsets above `2^53 - 1`
-rather than rounding them. Native Python, YAML, and CSV decoding are unavailable
+rather than rounding them. Native Python and CSV decoding are unavailable
 in this browser preview.
 
 See [platform builds and limitations](docs/platforms.md) for Windows packaging,

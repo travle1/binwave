@@ -8,8 +8,13 @@ mod binary;
 mod binary_ui;
 #[cfg(target_arch = "wasm32")]
 mod browser;
+#[cfg(target_arch = "wasm32")]
+mod browser_decoder;
 mod byte_display;
 #[cfg(not(target_arch = "wasm32"))]
+mod byte_store;
+#[cfg(target_arch = "wasm32")]
+#[path = "browser_bytes.rs"]
 mod byte_store;
 #[cfg(not(target_arch = "wasm32"))]
 mod cache;
@@ -32,15 +37,13 @@ mod hex_editor;
 mod loaders;
 #[cfg(not(target_arch = "wasm32"))]
 mod plot_index;
-#[cfg(not(target_arch = "wasm32"))]
 mod plot_trace;
 #[cfg(not(target_arch = "wasm32"))]
 mod plotting;
 #[cfg(not(target_arch = "wasm32"))]
 mod python_decoder;
-#[cfg(not(target_arch = "wasm32"))]
+mod source_editor;
 mod structure;
-#[cfg(not(target_arch = "wasm32"))]
 mod structure_plot;
 #[cfg(not(target_arch = "wasm32"))]
 mod structure_ui;
@@ -71,6 +74,9 @@ fn main() -> eframe::Result<()> {
 #[cfg(target_arch = "wasm32")]
 fn main() {
     console_error_panic_hook::set_once();
+    if browser_decoder::in_worker() {
+        return;
+    }
     wasm_bindgen_futures::spawn_local(async {
         let runner = eframe::WebRunner::new();
         if let Err(error) = runner

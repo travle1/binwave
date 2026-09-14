@@ -62,3 +62,33 @@ use Binwave. Legacy Python imports and environment variables remain aliases;
 persistent storage identifiers are retained. The renamed build passed 364 Rust
 tests, 12 Python tests (including the legacy SDK alias), both JavaScript test
 suites, the Windows test cross-check, and the Trunk release build.
+
+## Shared browser decoding and plots
+
+After checkpoint `5e9bc61`, the browser now compiles the native YAML engine,
+lazy array reader, plot sampling/min/max reducer, adaptive trace renderer, and
+source editor. The UI supports YAML apply, decoded structures, paged samples,
+field-to-byte selection, numeric channels, and explicit plot-range refinement.
+
+Validation of this slice:
+
+- `BINWAVE_CACHE_DIR=/tmp/binwave-test-cache cargo test --locked`: 322 unit and
+  42 integration tests passed; 12 existing ignored tests. The first run without
+  a writable cache had one read-only-filesystem failure; the cache override
+  resolved it without changing application code.
+- `cargo check --locked --tests --target x86_64-pc-windows-gnu`: passed. This is
+  a cross-check, not a Windows executable launch or MSVC package test.
+- Trunk release build: passed.
+- Existing browser backend and startup tests: passed.
+- Two new worker lifecycle tests: passed (failed-apply retention, cancellation,
+  source-edit invalidation, and sparse patch forwarding beyond 4 GiB).
+- Actual generated WASM API executed in Node against a synthetic 40 GiB file:
+  YAML, lazy offsets, patched values, table paging, exact plots, bounded overview,
+  and failed-apply retention passed. Only 129 bounded slices were read across
+  the test; whole-file reads are forbidden by the fixture.
+- localhost:8080 returned HTTP 200. The updated UI has not been visually verified
+  through automation; embedded browser control was unavailable. User browser
+  smoke testing remains necessary, including real file picker/export behavior.
+
+The browser remains short of full native parity; see `platforms.md` and
+`architecture.md` for the current boundaries. No deployment or push was performed.

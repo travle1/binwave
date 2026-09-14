@@ -77,14 +77,21 @@ Do not omit the `web/` worker files when copying the output.
 The browser version uses eframe/egui, egui_plot, the existing shared pane model
 and dock layout/persistence, and shared byte display conventions. It has a
 separate asynchronous adapter and bounded hex view; it does **not** yet reuse
-all of the desktop `BinwaveApp`, `HexEditor`, or decoder engine.
+all of the desktop `BinwaveApp` or `HexEditor`. YAML interpretation, numeric plot
+planning/reduction, adaptive traces, and the syntax-highlighted source editor are
+shared with native code. See [architecture boundaries](architecture.md).
 
 ### Available in this preview
 
 - Open a user-selected local file without reading it in full.
 - Inspect a 64 KiB page of hex/text, jump to decimal or hexadecimal absolute
-  offsets, and move between pages. Byte preview plots at most 1,024 bytes from
-  the current page. Scrolling is virtualized within the page.
+  offsets, and move between pages. Scrolling is virtualized within the page.
+- Edit YAML and apply with F5; inspect decoded structures and 128-record sample
+  pages. Selecting a decoded field selects its byte range in Hex.
+- Plot numeric channels from a decoded collection with the native min/max and
+  sampled overview algorithm. Toggle channels, zoom/pan, then right-click and
+  choose Decode visible sample range for finer detail. Explicit sample ranges
+  and Overview are also available. Quality labels distinguish sampled results.
 - Select and replace individual bytes, undo/redo, and extract an explicit range
   whose end offset is exclusive. Edits remain worker-owned sparse patches.
 - Stream an edited copy or extraction to a user-selected destination, with
@@ -97,10 +104,12 @@ all of the desktop `BinwaveApp`, `HexEditor`, or decoder engine.
 ### Memory and offset contract
 
 The worker retains the `File`/file handle, not a copy of its contents. Every read
-uses `File.slice(start, end).arrayBuffer()` on a bounded slice. The UI holds only
+uses bounded `File.slice` ranges. Decoding uses `FileReaderSync` in a dedicated
+worker, with four cached 64 KiB pages and a 1 MiB read ceiling. The UI holds only
 one 64 KiB page; export buffers are at most 1 MiB, with one write in flight.
 There is no whole-file `File.arrayBuffer()`, Blob download fallback, memory map,
-full-file cache, or full-file scan. The bridge briefly represents the bounded
+full-file cache. Explicit YAML actions may scan data in bounded chunks; cancelling
+terminates the decoder worker. Plot overviews inspect at most 65,536 records. The bridge briefly represents the bounded
 page as JSON for WASM transfer; this adds bounded temporary overhead. One file
 operation runs at a time and worker progress is throttled. Read errors require
 an explicit retry/navigation; no automatic retry loop repeatedly reads a broken
@@ -140,13 +149,12 @@ Source size and modification time are checked before reads and before/after
 export; browsers can also invalidate reads when a source changes. Keep source
 files unchanged while working.
 
-YAML, CSV, native Python, decoded structures/tables, full-file searching, multi-byte
-replacement, automatic full-file plot loading, and the desktop's continuous
-whole-file hex scroll are not implemented in this browser preview. The UI states
-these limits and does not show runnable decoder controls. Python cannot run as a
-native subprocess in a browser. Supporting decoders requires a resumable worker
-execution model and u64 file ranges throughout their plans, not a JS/wasm memory
-copy of a large file.
+CSV, native Python, full-file Hex searching, multi-byte replacement, automatic
+viewport refinement, and continuous whole-file hex scrolling are not implemented
+in the browser yet. Python cannot run as a native subprocess in a browser. Byte
+edits invalidate decoded results; apply YAML again to decode the new revision.
+Failed YAML applies retain the previous successful worker session and results.
+Source drafts are persisted up to 256 KiB; file contents and edits are not.
 
 ## Validation
 

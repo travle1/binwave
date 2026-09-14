@@ -608,6 +608,7 @@ dependencies = [
  "tempfile",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-time",
  "wgpu",
  "windows-sys 0.59.0",
 ]

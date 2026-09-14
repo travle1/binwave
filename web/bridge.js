@@ -4,6 +4,7 @@
     const events = [];
     let failed = false, graphicsReady = false;
     let busy = false, dirty = false, opened = false, exportable = false;
+    let runtime = null;
     let size = '0', selectedStart = '0', selectedEnd = '0';
     const status = document.getElementById('status');
     const open = document.getElementById('open');
@@ -21,6 +22,7 @@
         if (busy || failed) return false;
         busy = true;
         controls();
+        if (m.type === 'decode') m.runtime = runtime;
         worker.postMessage(m);
         return true;
     }
@@ -84,6 +86,11 @@
     window.addEventListener('beforeunload', event => {
         if (dirty || busy) { event.preventDefault(); event.returnValue = ''; }
     });
+    window.addEventListener('TrunkApplicationStarted', () => {
+        const js = document.querySelector('link[rel="modulepreload"]');
+        const wasm = document.querySelector('link[type="application/wasm"]');
+        if (js && wasm) runtime = {js:js.href, wasm:wasm.href};
+    });
     window.binwave = {
         poll() {
             const event = events.shift();
@@ -91,7 +98,12 @@
             if (event.bytes) event.bytes = Array.from(new Uint8Array(event.bytes));
             return JSON.stringify(event);
         },
-        send(json) { return submit(JSON.parse(json)); },
+        send(json) {
+            const command = JSON.parse(json);
+            if (command.type === 'cancel') { worker.postMessage(command); return true; }
+            if (command.type === 'decode' && !runtime) return false;
+            return submit(command);
+        },
         selection(start, end) { selectedStart = start; selectedEnd = end; controls(); },
         error(message) {
             graphicsReady = false;

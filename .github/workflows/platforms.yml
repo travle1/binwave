@@ -45,9 +45,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: node --test tests/browser_backend.mjs tests/browser_startup.mjs
+      - run: node --test tests/browser_backend.mjs tests/browser_startup.mjs tests/browser_decoder_worker.mjs
       - run: cargo install --locked trunk --version 0.21.14
       - run: trunk build --release --locked
+      - run: node --experimental-default-type=module tests/browser_decoder.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: Binwave-browser-preview
