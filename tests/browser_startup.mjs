@@ -102,3 +102,21 @@ test('embedded demo opens its bytes without a file picker and respects cancellat
     assert.equal(cancelled.app.openDemo(data, true), false);
     assert.equal(cancelled.commands.length, 0);
 });
+
+test('graphics fallback replaces the claimed canvas and gates controls until ready', () => {
+    const {app, get} = bridge();
+    const old = get('binwave');
+    const fresh = {hidden:true};
+    let replacement;
+    old.cloneNode = deep => { assert.equal(deep, false); return fresh; };
+    old.replaceWith = canvas => { replacement = canvas; };
+    app.ready();
+    app.freshCanvas();
+    assert.equal(replacement, fresh, 'Retry needs a new canvas, not the WebGPU-bound context');
+    assert.equal(fresh.hidden, false);
+    assert.equal(get('open').disabled, true);
+    assert.equal(get('graphics-error').hidden, true);
+    assert.match(get('status').textContent, /WebGL2/);
+    app.ready();
+    assert.equal(get('open').disabled, false);
+});

@@ -147,6 +147,16 @@
             document.getElementById('binwave').hidden = true;
             controls();
         },
+        freshCanvas() {
+            graphicsReady = false;
+            controls();
+            const old = document.getElementById('binwave');
+            const canvas = old.cloneNode(false);
+            canvas.hidden = false;
+            old.replaceWith(canvas);
+            document.getElementById('graphics-error').hidden = true;
+            status.textContent = 'Trying WebGL2 graphics…';
+        },
         ready() {
             graphicsReady = true;
             if (!failed) status.textContent = 'Ready · files stay on your computer';

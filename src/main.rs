@@ -81,16 +81,28 @@ fn main() {
         return;
     }
     wasm_bindgen_futures::spawn_local(async {
-        let runner = eframe::WebRunner::new();
-        if let Err(error) = runner
-            .start(
-                "binwave",
-                eframe::WebOptions::default(),
-                Box::new(|cc| Box::new(browser::BrowserApp::new(cc))),
-            )
-            .await
-        {
-            browser::startup_error(&format!("Could not start graphics: {error:?}"));
+        let mut failures = Vec::new();
+        for (name, backend) in [("WebGPU", wgpu::Backends::BROWSER_WEBGPU), ("WebGL2", wgpu::Backends::GL)] {
+            // Backend selection alone does not retry a rejected requestDevice.
+            // A failed WebGPU surface can also claim the canvas context type.
+            let runner = eframe::WebRunner::new();
+            let mut options = eframe::WebOptions::default();
+            options.wgpu_options.supported_backends = backend;
+            match runner.start("binwave", options,
+                Box::new(|cc| Box::new(browser::BrowserApp::new(cc)))).await {
+                Ok(()) => return,
+                Err(error) => {
+                    failures.push(format!("{name}: {error:?}"));
+                    runner.destroy();
+                    if backend == wgpu::Backends::BROWSER_WEBGPU {
+                        if let Err(error) = browser::fresh_canvas() {
+                            failures.push(format!("Canvas reset: {error:?}"));
+                            break;
+                        }
+                    }
+                }
+            }
         }
+        browser::startup_error(&format!("Could not start graphics:\n{}", failures.join("\n\n")));
     });
 }

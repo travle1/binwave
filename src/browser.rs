@@ -18,6 +18,8 @@ extern "C" {
     pub fn startup_error(message: &str);
     #[wasm_bindgen(js_namespace = binwave, js_name = ready)]
     fn browser_ready();
+    #[wasm_bindgen(catch, js_namespace = binwave, js_name = freshCanvas)]
+    pub fn fresh_canvas() -> Result<(), JsValue>;
     #[wasm_bindgen(js_namespace = binwave, js_name = openDemo)]
     fn open_embedded_demo(bytes: &[u8], replace_decoder: bool);
 }
