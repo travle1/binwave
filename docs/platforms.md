@@ -110,8 +110,11 @@ Decoder, Plot, Samples, and Hex, with collapsible sections for each pane and
 additional structure/inspector sections. Layout offers Auto, Stacked, and Docked;
 the choice is saved. Desktop dock geometry is retained independently of the
 stacked layout. Opening a decoder focuses its section; applying it focuses Plot.
-File buttons wrap into two columns, with 44-pixel minimum heights and safe-area
-padding. Plot dragging/pinch gestures remain available; wheel scrolling over a
+The compact file toolbar exposes Open data and Decoder; More contains save,
+extraction, and cancellation. Explicit button styling avoids platform-default
+pill buttons. Empty panels stay hidden until data is available, and the editor
+uses the available viewport height. Secondary workspace controls and the editor
+color legend live in menus on narrow screens. Plot dragging/pinch gestures remain available; wheel scrolling over a
 stacked plot scrolls the page instead of panning the plot.
 
 ### Memory and offset contract

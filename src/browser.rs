@@ -437,14 +437,14 @@ impl BrowserApp {
     }
     fn decoder(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.strong("YAML decoder");
+            ui.strong("YAML");
             if ui
-                .add_enabled(!self.decoding, egui::Button::new("Apply · F5"))
+                .add_enabled(!self.decoding, egui::Button::new(if self.stacked { "Apply" } else { "Apply · F5" }))
                 .clicked()
             {
                 self.apply_decoder();
             }
-            if ui.button("Stop").clicked() {
+            if self.decoding && ui.button("Stop").clicked() {
                 self.pending.clear();
                 self.command(serde_json::json!({"type":"cancel"}));
                 self.decoding = false;
@@ -480,7 +480,6 @@ impl BrowserApp {
                     }
                 });
         });
-        ui.label("Shared YAML engine · bounded reads · Python subprocess decoders require the native app.");
         self.editor.editor(
             ui,
             &mut self.yaml,
@@ -730,6 +729,7 @@ impl eframe::App for BrowserApp {
         egui::TopBottomPanel::top("browser-menu").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.strong("Binwave");
+                ui.menu_button("Workspace", |ui| {
                 egui::ComboBox::from_id_source("browser-layout-mode").selected_text(match self.layout_mode.as_str() {
                     "stacked" => "Stacked", "docked" => "Docked", _ => "Layout: Auto",
                 }).show_ui(ui, |ui| {
@@ -752,29 +752,35 @@ impl eframe::App for BrowserApp {
                 {
                     self.command(serde_json::json!({"type":"redo"}));
                 }
-                ui.label(format!(
+                });
+                if !self.name.is_empty() { ui.add(egui::Label::new(format!(
                     "{} · {} bytes{}",
                     self.name,
                     self.size,
                     if self.dirty { " · unsaved edits" } else { "" }
-                ));
+                )).truncate(true)); }
             });
         });
+        if !self.stacked || !self.name.is_empty() {
         egui::TopBottomPanel::bottom("browser-status").show(ctx, |ui| {
-            ui.label(&self.status);
+            ui.add(egui::Label::new(&self.status).truncate(true));
         });
+        }
         if self.stacked {
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.spacing_mut().interact_size.y = 40.;
+                ui.spacing_mut().interact_size.y = 32.;
                 ui.spacing_mut().item_spacing.y = 8.;
                 let target = self.mobile_target.take();
                 egui::ScrollArea::vertical().id_source("mobile-workspace").auto_shrink([false,false]).show(ui, |ui| {
                     let width = ui.available_width();
+                    let editor_height = (ui.clip_rect().height()-56.).clamp(300.,560.);
                     for (pane, height, open) in [
-                        (Pane::Layout, 400., true), (Pane::Plot, 430., true),
+                        (Pane::Layout, editor_height, true), (Pane::Plot, 430., true),
                         (Pane::Table, 310., true), (Pane::Hex, 290., true),
                         (Pane::Structures, 300., false), (Pane::Inspector, 300., false),
                     ] {
+                        if pane != Pane::Layout && self.name.is_empty() { continue; }
+                        if matches!(pane, Pane::Plot | Pane::Table | Pane::Structures) && self.decoded.is_null() { continue; }
                         ui.push_id(("mobile-pane", pane), |ui| {
                             let header = egui::CollapsingHeader::new(egui::RichText::new(pane.title()).strong())
                                 .default_open(open).open(if target == Some(pane) { Some(true) } else { None })

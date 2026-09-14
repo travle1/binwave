@@ -14,10 +14,20 @@
     header { flex-shrink: 0; height: 48px; box-sizing: border-box; display: flex; align-items: center; gap: 10px; padding: 8px; overflow-x: auto; }
     button { padding: 5px 12px; flex-shrink: 0; white-space: nowrap; } #status { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
     #workspace { position: relative; flex: 1; min-height: 0; width: 100%; }
+    button, summary { -webkit-appearance: none; appearance: none; font: inherit; color: #e9edef; background: #303438; border: 1px solid #4a5055; border-radius: 7px; }
+    button:disabled { color: #858c91; background: #25282b; border-color: #353a3e; }
+    button:focus-visible, summary:focus-visible { outline: 2px solid #61d5c8; outline-offset: 2px; }
+    #file-more { position: relative; flex-shrink: 0; }
+    #file-more summary { list-style: none; cursor: pointer; padding: 5px 12px; }
+    #file-more summary::-webkit-details-marker { display: none; }
+    #file-more .actions { position: absolute; right: 0; top: calc(100% + 8px); z-index: 20; width: 210px; padding: 8px; display: grid; gap: 8px; background: #202427; border: 1px solid #4a5055; border-radius: 9px; box-shadow: 0 8px 24px #0008; }
+    header { overflow: visible; z-index: 10; }
     @media (max-width: 899px) {
-      header { height: auto; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; padding: max(6px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) 6px max(8px, env(safe-area-inset-left)); }
-      header button { min-height: 44px; min-width: 0; padding: 6px; }
-      #status { grid-column: 1 / -1; font-size: 12px; }
+      header { height: auto; display: flex; flex-wrap: wrap; gap: 8px; padding: 8px max(10px, env(safe-area-inset-right)) 8px max(10px, env(safe-area-inset-left)); border-bottom: 1px solid #353a3e; }
+      #open, #open-decoder { flex: 1; min-width: 0; min-height: 40px; padding: 8px 10px; }
+      #file-more summary { height: 40px; box-sizing: border-box; display: flex; align-items: center; }
+      #file-more button { min-height: 40px; text-align: left; }
+      #status { flex-basis: 100%; font-size: 12px; color: #b6bec3; }
       #workspace { padding-bottom: env(safe-area-inset-bottom); box-sizing: border-box; }
     }
     #binwave:not([hidden]) { display: block; }
@@ -27,11 +37,16 @@
 </head>
 <body>
   <header aria-label="File operations">
-    <button id="open" disabled>Open file…</button><input type="file" id="file" hidden>
-    <button id="open-decoder" disabled>Open decoder…</button><input type="file" id="decoder-file" aria-label="Choose a YAML decoder" hidden>
-    <button id="save" disabled>Save edited copy…</button>
-    <button id="extract" disabled>Extract selection…</button>
-    <button id="cancel" disabled>Cancel operation</button>
+    <button id="open" disabled>Open data…</button><input type="file" id="file" hidden>
+    <button id="open-decoder" disabled>Decoder…</button><input type="file" id="decoder-file" aria-label="Choose a YAML decoder" hidden>
+    <details id="file-more">
+      <summary aria-label="More file actions">More</summary>
+      <div class="actions">
+        <button id="save" disabled>Save edited copy…</button>
+        <button id="extract" disabled>Extract selection…</button>
+        <button id="cancel" disabled>Cancel operation</button>
+      </div>
+    </details>
     <span id="status" role="status">Starting Binwave…</span>
   </header>
   <main id="workspace">
