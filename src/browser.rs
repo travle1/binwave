@@ -71,6 +71,9 @@ pub struct BrowserApp {
     reveal_decoder: bool,
     plot_request: u64,
     reset_plot: bool,
+    layout_mode: String,
+    stacked: bool,
+    mobile_target: Option<Pane>,
     viewport: crate::browser_viewport::ViewportRefresh,
 }
 impl BrowserApp {
@@ -120,6 +123,9 @@ impl BrowserApp {
             reveal_decoder: false,
             plot_request: 0,
             reset_plot: false,
+            layout_mode: cc.storage.and_then(|s|s.get_string("browser-layout-mode")).filter(|s|matches!(s.as_str(),"auto"|"stacked"|"docked")).unwrap_or_else(||"auto".into()),
+            stacked: false,
+            mobile_target: None,
             viewport: Default::default(),
         }
     }
@@ -192,6 +198,7 @@ impl BrowserApp {
                     if event.source.len() <= 256 * 1024 {
                         self.yaml = event.source;
                         self.reveal_decoder = true;
+                        self.mobile_target = Some(Pane::Layout);
                         self.status = format!("Loaded {}. Tap Apply to decode the open data file.", event.name);
                     } else {
                         self.status = "Decoder source is limited to 256 KiB.".into();
@@ -203,6 +210,7 @@ impl BrowserApp {
                     self.table = Default::default();
                     self.plot = Default::default();
                     self.reveal_results = true;
+                    self.mobile_target = Some(Pane::Plot);
                     let path = self.decoded["collections"]
                         .as_array()
                         .and_then(|a| a.first())
@@ -247,7 +255,7 @@ impl BrowserApp {
         }
     }
     fn hex(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(self.offset > 0, egui::Button::new("Previous page"))
                 .clicked()
@@ -264,7 +272,7 @@ impl BrowserApp {
                 self.navigate(self.offset + PAGE as u64);
             }
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Byte offset");
             ui.add(egui::TextEdit::singleline(&mut self.jump).desired_width(160.0));
             if ui.button("Go").clicked() {
@@ -288,7 +296,7 @@ impl BrowserApp {
                 for row in range {
                     let start = row * 16;
                     let end = (start + 16).min(self.bytes.len());
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.monospace(format!("{:016X}", self.offset + start as u64));
                         for i in start..end {
                             let at = self.offset + i as u64;
@@ -318,7 +326,7 @@ impl BrowserApp {
     fn inspector(&mut self, ui: &mut egui::Ui) {
         if let Some(at) = self.selected {
             ui.monospace(format!("Selected byte: {at} / 0x{at:X}"));
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Replace with hex byte:");
                 ui.add(egui::TextEdit::singleline(&mut self.replacement).desired_width(40.0).char_limit(2));
                 if ui.button("Apply").clicked() {
@@ -428,7 +436,7 @@ impl BrowserApp {
         self.navigate(start);
     }
     fn decoder(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.strong("YAML decoder");
             if ui
                 .add_enabled(!self.decoding, egui::Button::new("Apply · F5"))
@@ -505,7 +513,7 @@ impl BrowserApp {
     }
     fn samples(&mut self, ui: &mut egui::Ui) {
         self.collection_picker(ui);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(self.table_start > 0, egui::Button::new("Previous 128"))
                 .clicked()
@@ -655,7 +663,7 @@ impl BrowserApp {
                 }
             });
             let mut plot = egui_plot::Plot::new(("decoded-plot", &self.collection))
-                .legend(egui_plot::Legend::default());
+                .legend(egui_plot::Legend::default()).allow_scroll(!self.stacked);
             if std::mem::take(&mut self.reset_plot) { plot = plot.reset(); }
             let response = plot
             .show(ui, |plot| {
@@ -679,7 +687,7 @@ impl BrowserApp {
             });
             let now = ui.input(|i| i.time);
             let interacting = response.response.dragged() || response.response.drag_stopped() ||
-                (response.response.hovered() && ui.input(|i| i.smooth_scroll_delta != egui::Vec2::ZERO || i.zoom_delta() != 1.0));
+                (response.response.hovered() && ui.input(|i| (!self.stacked && i.smooth_scroll_delta != egui::Vec2::ZERO) || i.zoom_delta() != 1.0));
             if interacting {
                 let bounds = response.transform.bounds();
                 self.viewport.observe(bounds.min()[0], bounds.max()[0], self.count(), now);
@@ -704,6 +712,7 @@ fn parse_offset(text: &str) -> Option<u64> {
 }
 impl eframe::App for BrowserApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.stacked = self.layout_mode == "stacked" || (self.layout_mode == "auto" && ctx.screen_rect().width() < 900.);
         self.events();
         if self.reveal_decoder {
             self.layout.show_decoder();
@@ -719,8 +728,15 @@ impl eframe::App for BrowserApp {
             self.reveal_results = false;
         }
         egui::TopBottomPanel::top("browser-menu").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.strong("Binwave");
+                egui::ComboBox::from_id_source("browser-layout-mode").selected_text(match self.layout_mode.as_str() {
+                    "stacked" => "Stacked", "docked" => "Docked", _ => "Layout: Auto",
+                }).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.layout_mode,"auto".into(),"Auto");
+                    ui.selectable_value(&mut self.layout_mode,"stacked".into(),"Stacked");
+                    ui.selectable_value(&mut self.layout_mode,"docked".into(),"Docked");
+                });
                 if ui.button("Reset workspace").clicked() {
                     self.layout = WorkspaceLayout::plot_and_bytes();
                 }
@@ -747,14 +763,45 @@ impl eframe::App for BrowserApp {
         egui::TopBottomPanel::bottom("browser-status").show(ctx, |ui| {
             ui.label(&self.status);
         });
-        // Move the dock state temporarily so its viewer can borrow the application.
-        let mut layout = std::mem::take(&mut self.layout);
-        DockArea::new(&mut layout.dock).show(ctx, self);
-        self.layout = layout;
+        if self.stacked {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.spacing_mut().interact_size.y = 40.;
+                ui.spacing_mut().item_spacing.y = 8.;
+                let target = self.mobile_target.take();
+                egui::ScrollArea::vertical().id_source("mobile-workspace").auto_shrink([false,false]).show(ui, |ui| {
+                    let width = ui.available_width();
+                    for (pane, height, open) in [
+                        (Pane::Layout, 400., true), (Pane::Plot, 430., true),
+                        (Pane::Table, 310., true), (Pane::Hex, 290., true),
+                        (Pane::Structures, 300., false), (Pane::Inspector, 300., false),
+                    ] {
+                        ui.push_id(("mobile-pane", pane), |ui| {
+                            let header = egui::CollapsingHeader::new(egui::RichText::new(pane.title()).strong())
+                                .default_open(open).open(if target == Some(pane) { Some(true) } else { None })
+                                .show(ui, |ui| {
+                                    ui.allocate_ui_with_layout(egui::vec2((width-24.).max(100.),height),egui::Layout::top_down(egui::Align::Min), |ui| {
+                                        ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+                                        self.ui(ui, &mut pane.clone());
+                                    });
+                                });
+                            if target == Some(pane) { header.header_response.scroll_to_me(Some(egui::Align::Min)); }
+                            ui.separator();
+                        });
+                    }
+                });
+            });
+        } else {
+            // Desktop docking remains independently arranged while mobile stacks
+            // the same pane implementations into one scrollable column.
+            let mut layout = std::mem::take(&mut self.layout);
+            DockArea::new(&mut layout.dock).show(ctx, self);
+            self.layout = layout;
+        }
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.layout.save(storage);
+        storage.set_string("browser-layout-mode", self.layout_mode.clone());
         if self.yaml.len() <= 256 * 1024 {
             storage.set_string("browser-decoder-yaml", self.yaml.clone());
         }
