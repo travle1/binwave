@@ -68,6 +68,28 @@ assert.equal(JSON.parse(session.pick(path, String(size/2-1))).start, String(size
 session.free();
 console.log(`Browser WASM: YAML, lazy 40 GiB offsets, sparse edits, tables, exact plots, bounded overview, and failed-apply retention passed (${reads.length} bounded slices).`);
 
+// Incremental reverse engineering: a failed count-based guess can be replaced
+// with a header-only decoder, without consuming the unknown remainder.
+const headerBytes = new Uint8Array([0x45, 0x44, 0x46, 0x4c, 0, 0, 0, 0]);
+globalThis.binwaveDecoder = {read(start,length) { return headerBytes.slice(Number(start), Number(start)+length); }};
+const headerSession = new bindings.DecoderSession('8');
+assert.throws(() => headerSession.decode(`endian: little
+structures:
+  - name: Header
+    fields: [{name: count, type: u32}]
+actions:
+  - read: {name: header, type: {structure: Header}}
+  - read: {name: samples, type: f64, repeat: {ref: header.count}}
+`));
+const partial = JSON.parse(headerSession.decode(`actions:
+  - read: {name: signature, type: text, length: 4}
+#  - read: {name: samples, type: f64, repeat: until end}
+`));
+assert.equal(partial.consumed, '4');
+assert.equal(partial.collections.length, 0);
+assert.equal(partial.nodes[0].value, 'EDFL');
+headerSession.free();
+
 // The shipped beginner pair must produce the documented plot and byte links.
 const simpleBytes = await readFile('samples/quickstart/simple_wave.bin');
 assert.equal(simpleBytes.length, 2048);

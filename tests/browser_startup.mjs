@@ -6,6 +6,7 @@ import {readFileSync} from 'node:fs';
 
 function bridge(allowReplace = true) {
     const commands = [];
+    let worker;
     const elements = new Map();
     const document = {
         currentScript: {src: 'http://localhost:8080/web/bridge.js'},
@@ -15,11 +16,11 @@ function bridge(allowReplace = true) {
         },
     };
     const window = {addEventListener() {}, location: {href: 'http://localhost:8080/'}};
-    class Worker { postMessage(message) { commands.push(message); } }
+    class Worker { constructor() { worker = this; } postMessage(message) { commands.push(message); } }
     vm.runInNewContext(readFileSync(new URL('../web/bridge.js', import.meta.url), 'utf8'), {
         document, window, Worker, URL, File, confirm: () => allowReplace,
     });
-    return {commands, app: window.binwave, get: id => document.getElementById(id)};
+    return {receive: data => worker.onmessage({data}), commands, app: window.binwave, get: id => document.getElementById(id)};
 }
 
 test('file opening waits until the graphics workspace is ready', () => {
@@ -119,4 +120,14 @@ test('graphics fallback replaces the claimed canvas and gates controls until rea
     assert.match(get('status').textContent, /WebGL2/);
     app.ready();
     assert.equal(get('open').disabled, false);
+});
+
+test('successful partial decode replaces a previous range error', () => {
+    const {app, get, receive} = bridge();
+    app.ready();
+    receive({type:'opened', name:'unknown.bin', size:'799659845', dirty:false, exportable:false});
+    receive({type:'error', message:'read samples exceeds enclosing region'});
+    assert.match(get('status').textContent, /exceeds/);
+    receive({type:'decoded', result:{consumed:'4', collections:[], nodes:[]}});
+    assert.equal(get('status').textContent, 'Decoded 4 of 799659845 bytes · inspect Decoded structure');
 });

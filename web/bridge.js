@@ -25,7 +25,7 @@
         if (busy || failed) return false;
         busy = true;
         controls();
-        if (m.type === 'decode') m.runtime = runtime;
+        if (m.type === 'decode') { m.runtime = runtime; status.textContent = 'Decoding…'; }
         worker.postMessage(m);
         return true;
     }
@@ -38,6 +38,10 @@
             if (data.type === 'opened') selectedStart = selectedEnd = '0';
         }
         if (data.type === 'error') status.textContent = data.message;
+        if (data.type === 'decoded') {
+            status.textContent = `Decoded ${data.result.consumed} of ${size} bytes`;
+            if (!data.result.collections.length) status.textContent += ' · inspect Decoded structure';
+        }
         if (data.type === 'exported') status.textContent = 'Export complete';
         if (data.type === 'opened') status.textContent = exportable ? 'Local file opened' : 'Inspection available; safe streaming export needs a supported file-system picker';
         // The UI consumes at 30 Hz and only one worker request can be outstanding.

@@ -225,7 +225,6 @@ impl BrowserApp {
                     self.table = Default::default();
                     self.plot = Default::default();
                     self.reveal_results = true;
-                    self.mobile_target = Some(Pane::Plot);
                     let path = self.decoded["collections"]
                         .as_array()
                         .and_then(|a| a.first())
@@ -233,9 +232,10 @@ impl BrowserApp {
                         .unwrap_or("")
                         .to_owned();
                     self.select_collection(path);
-                    self.status =
-                        "Decoder applied. Select a collection to inspect samples and channels."
-                            .into();
+                    self.mobile_target = Some(if self.collection.is_empty() { Pane::Structures } else { Pane::Plot });
+                    self.status = format!("Decoded {} of {} bytes. {}", self.decoded["consumed"].as_str().unwrap_or("0"), self.size,
+                        if self.collection.is_empty() { "Inspect the fields in Decoded structure; unread bytes are allowed." }
+                        else { "Select samples to inspect their values and bytes." });
                 }
                 "pick" => {
                     if event.request == self.probe_request.to_string()
@@ -679,7 +679,7 @@ impl BrowserApp {
                         }
                     });
             } else {
-                ui.label("Apply a decoder to populate samples.");
+                ui.label(if self.decoded.is_null() { "Apply a decoder to populate samples." } else { "No repeated samples yet. Your decoded fields are in Decoded structure." });
             }
         });
         if let Some((start, end)) = selection {
@@ -737,6 +737,11 @@ impl BrowserApp {
         }
     }
     fn decoded_plot(&mut self, ui: &mut egui::Ui) {
+        if self.collection.is_empty() {
+            ui.label(if self.decoded.is_null() { "Apply a decoder to inspect this file." }
+                else { "Fields decoded successfully. Inspect Decoded structure; add repeated numeric samples when ready to plot." });
+            return;
+        }
         self.collection_picker(ui);
         ui.horizontal_wrapped(|ui| {
             if ui.button("Fit all").clicked() {
@@ -842,9 +847,13 @@ impl eframe::App for BrowserApp {
             self.apply_decoder();
         }
         if self.reveal_results {
-            self.layout.show_samples();
-            self.layout.show_initial_plot();
-            self.layout.show_decoder();
+            if self.collection.is_empty() {
+                self.layout.reveal(Pane::Structures);
+            } else {
+                self.layout.show_samples();
+                self.layout.show_initial_plot();
+                self.layout.show_decoder();
+            }
             self.reveal_results = false;
         }
         egui::TopBottomPanel::top("browser-menu").show(ctx, |ui| {
