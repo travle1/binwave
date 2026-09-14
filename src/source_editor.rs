@@ -1,6 +1,17 @@
 //! Shared decoder source editor and starter templates for native and browser shells.
 use egui::{Color32, Ui};
 use std::sync::Arc;
+/// One catalog for the native and browser example menus.
+pub const YAML_EXAMPLES: &[(&str, &str)] = &[
+    ("Start here · Simple wave", include_str!("../samples/quickstart/simple_wave.yaml")),
+    ("PNG · Chunk structure", include_str!("../samples/decoders/yaml/png_chunks.yaml")),
+    ("WAV · RIFF structure", include_str!("../samples/decoders/yaml/riff_chunks.yaml")),
+    ("Nested records · Byte walkthrough", include_str!("../samples/decoders/yaml/nested_records.yaml")),
+    ("Advanced · Primitive records", include_str!("../samples/decoders/yaml/generic_primitives.yaml")),
+    ("Advanced · Types from earlier sections", include_str!("../samples/decoders/yaml/generic_sections.yaml")),
+    ("Advanced · Waveform container", include_str!("../samples/decoders/yaml/waveform.yaml")),
+];
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum DecoderLanguage {
     #[default]
@@ -49,6 +60,13 @@ print(f"Registered {len(samples):,} samples")
     }
 
     pub fn starter(self) -> &'static str {
+        match self {
+            Self::Yaml => include_str!("../samples/quickstart/simple_wave.yaml"),
+            Self::Python => self.header_example(),
+        }
+    }
+
+    pub fn header_example(self) -> &'static str {
         match self {
             Self::Yaml => {
                 r#"## Adapt this example to your binary file.

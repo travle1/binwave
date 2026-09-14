@@ -34,6 +34,14 @@ test('failed candidate preserves the previous decoder; edits invalidate it',asyn
     assert.equal(h.workers[1].terminated,true);
     await h.send({type:'table',path:'samples',start:'0'});
     assert.equal(first.commands.at(-1).type,'table');
+    const probe={type:'probe',path:'samples',start:'4294967297',end:'4294967298',request:'7'};
+    await h.send(probe);
+    assert.deepEqual(first.commands.at(-1),probe,'Byte selection must reach the retained decoder intact');
+    assert.equal(h.messages.at(-2).type,'probe');
+    const pick={type:'pick',path:'samples',index:'536870912',request:'8'};
+    await h.send(pick);
+    assert.deepEqual(first.commands.at(-1),pick);
+    assert.equal(h.messages.at(-2).type,'pick');
     await h.send({type:'replace',offset:'4294967297',value:9});
     assert.equal(first.terminated,true);
     await h.send({type:'table',path:'samples',start:'0'});

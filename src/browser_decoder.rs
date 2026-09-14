@@ -125,6 +125,31 @@ impl DecoderSession {
         })()
         .map_err(js_error)
     }
+    /// Locate selected original bytes within a decoded collection without scanning data.
+    pub fn probe(&self, path: &str, start: &str, end: &str) -> Result<String, JsValue> {
+        (|| -> Result<String> {
+            let output = self.output.as_ref().context("Apply a decoder first")?;
+            let node = find(&output.nodes, path).context("Collection not found")?;
+            let range = start.parse::<u64>()?..end.parse::<u64>()?;
+            let samples = crate::structure_selection::sample_indices_for_bytes(node, &range);
+            json_result(json!({"path":path,"first":samples.as_ref().map(|r| r.start.to_string()),
+                "end":samples.map(|r| r.end.to_string())}))
+        })().map_err(js_error)
+    }
+
+    pub fn pick(&self, path: &str, index: &str) -> Result<String, JsValue> {
+        (|| -> Result<String> {
+            let node = find(&self.output.as_ref().context("Apply a decoder first")?.nodes, path)
+                .context("Unknown collection")?;
+            let index = index.parse::<u64>()?;
+            let end = index.checked_add(1).context("Sample index overflow")?;
+            let bytes = crate::structure_selection::sample_bytes(node, index..end)
+                .context("Sample outside collection")?;
+            json_result(json!({"path":path,"index":index.to_string(),
+                "start":bytes.start.to_string(),"end":bytes.end.to_string()}))
+        })().map_err(js_error)
+    }
+
     pub fn table(&self, path: &str, start: &str) -> Result<String, JsValue> {
         (|| {
             let node = find(&self.output.as_ref().context("Apply a decoder first")?.nodes, path).context("Unknown collection")?;

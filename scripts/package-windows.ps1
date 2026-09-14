@@ -22,7 +22,7 @@ try {
     # Whitelist public fixtures; never package generated/private samples/data files.
     New-Item -ItemType Directory -Path "$Package/samples/data" -Force | Out-Null
     Copy-Item samples/data/sample.csv,samples/data/sensors.bin "$Package/samples/data"
-    Copy-Item samples/decoders,samples/configs,samples/generators -Destination "$Package/samples" -Recurse
+    Copy-Item samples/decoders,samples/configs,samples/generators,samples/quickstart -Destination "$Package/samples" -Recurse
     Copy-Item samples/*.md "$Package/samples"
     New-Item -ItemType Directory -Path "$Package/python" -Force | Out-Null
     Copy-Item python/README.md,python/runner.py "$Package/python"

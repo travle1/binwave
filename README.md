@@ -4,6 +4,16 @@ A local Rust desktop workspace using eframe/egui and egui_plot. Inspect and edit
 bytes from any file, write Python or YAML decoders using reusable data structures,
 and plot large binary and CSV datasets. No backend, accounts, telemetry, or runtime AI.
 
+## First plot
+
+Choose **Open simple demo** in the browser workspace or **File → Open simple demo**
+on desktop. The embedded 2 KB file and matching YAML open and plot automatically,
+with eight sine-wave cycles between −1 and +1. No download or file picker is needed.
+[Step-by-step guide](samples/quickstart/README.txt).
+
+PNG and WAV/RIFF structure decoders are also bundled in both versions;
+see their [coverage and limits](samples/README.md#common-file-formats).
+
 ## Launch
 
 Use a recent stable Rust toolchain (Rust 1.88 or newer) and a desktop session:

@@ -18,6 +18,8 @@ extern "C" {
     pub fn startup_error(message: &str);
     #[wasm_bindgen(js_namespace = binwave, js_name = ready)]
     fn browser_ready();
+    #[wasm_bindgen(js_namespace = binwave, js_name = openDemo)]
+    fn open_embedded_demo(bytes: &[u8], replace_decoder: bool);
 }
 
 #[derive(Default, Deserialize)]
@@ -32,6 +34,7 @@ struct Event {
     bytes: Vec<u8>,
     message: String,
     dirty: bool,
+    demo: bool,
     undo: bool,
     redo: bool,
     result: serde_json::Value,
@@ -48,6 +51,9 @@ pub struct BrowserApp {
     needs_read: bool,
     jump: String,
     selected: Option<u64>,
+    selected_sample: Option<u64>,
+    plot_visible: Option<[f64; 2]>,
+    probe_request: u64,
     range_start: String,
     range_end: String,
     replacement: String,
@@ -91,6 +97,9 @@ impl BrowserApp {
             needs_read: false,
             jump: "0".into(),
             selected: None,
+            selected_sample: None,
+            plot_visible: None,
+            probe_request: 0,
             range_start: "0".into(),
             range_end: "0".into(),
             replacement: String::new(),
@@ -105,7 +114,7 @@ impl BrowserApp {
                 .filter(|s| s.len() <= 256 * 1024)
                 .unwrap_or_else(|| {
                     crate::source_editor::DecoderLanguage::Yaml
-                        .byte_preview()
+                        .starter()
                         .into()
                 }),
             editor: Default::default(),
@@ -168,6 +177,10 @@ impl BrowserApp {
                         self.status =
                             "File opened. Choose a YAML example or write a decoder, then press F5."
                                 .into();
+                        if event.demo {
+                            self.yaml = crate::source_editor::DecoderLanguage::Yaml.starter().into();
+                            self.apply_decoder();
+                        }
                     } else if event.kind == "edited" {
                         self.clear_results();
                         self.bytes.clear();
@@ -221,6 +234,40 @@ impl BrowserApp {
                     self.status =
                         "Decoder applied. Select a collection to inspect samples and channels."
                             .into();
+                }
+                "pick" => {
+                    if event.request == self.probe_request.to_string()
+                        && event.result["path"].as_str() == Some(&self.collection) {
+                        if let Some((start, end)) = event.result["start"].as_str().and_then(parse_offset)
+                            .zip(event.result["end"].as_str().and_then(parse_offset)) {
+                            self.selected = Some(start);
+                            self.range_start = start.to_string();
+                            self.range_end = end.to_string();
+                            export_selection(&self.range_start, &self.range_end);
+                            self.navigate(start);
+                            self.table_start = self.selected_sample.unwrap_or(0) / 128 * 128;
+                            self.request_table();
+                        }
+                    }
+                }
+                "probe" => {
+                    if event.request == self.probe_request.to_string()
+                        && event.result["path"].as_str() == Some(&self.collection) {
+                        self.selected_sample = event.result["first"].as_str().and_then(parse_offset);
+                        if let Some(index) = self.selected_sample {
+                            self.table_start = index / 128 * 128;
+                            self.request_table();
+                            let first = parse_offset(&self.first).unwrap_or(0);
+                            let last = parse_offset(&self.last).unwrap_or(0);
+                            if self.plot_visible.map_or(index < first || index >= last, |[left, right]| (index as f64) < left || (index as f64) > right) {
+                                let width = 512.min(self.count());
+                                let start = index.saturating_sub(width / 2).min(self.count().saturating_sub(width));
+                                self.first = start.to_string();
+                                self.last = (start + width).to_string();
+                                self.request_plot(1200);
+                            }
+                        }
+                    }
                 }
                 "table" => {
                     if event.result["path"].as_str() == Some(&self.collection) {
@@ -289,37 +336,67 @@ impl BrowserApp {
             self.offset,
             self.bytes.len()
         ));
-        let rows = self.bytes.len().div_ceil(16);
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let digit = ui.fonts(|fonts| fonts.layout_no_wrap("0".into(), font.clone(), egui::Color32::WHITE).size().x);
+        // Keep full addresses, but omit padding that adds no information.
+        let digits = format!("{:X}", self.size.saturating_sub(1)).len().max(4);
+        let address_width = digits as f32 * digit + 8.;
+        let cell_width = (2. * digit + 12.).max(if self.stacked { 30. } else { 24. });
+        let available = ui.available_width();
+        let columns = if !self.stacked && available >= address_width + 16. * cell_width {
+            16
+        } else if available >= address_width + 8. * cell_width {
+            8
+        } else { 4 };
+        let ascii_width = columns as f32 * digit + 12.;
+        let show_ascii = available >= address_width + columns as f32 * cell_width + ascii_width;
+        let row_height = ui.spacing().interact_size.y.max(if self.stacked { 32. } else { 22. });
+        let rows = self.bytes.len().div_ceil(columns);
+        let selected_start = parse_offset(&self.range_start);
+        let selected_end = parse_offset(&self.range_end);
         egui::ScrollArea::both()
-            .id_source("browser-hex")
-            .show_rows(ui, 22.0, rows, |ui, range| {
+            .id_source(("browser-hex", columns))
+            .show_rows(ui, row_height, rows, |ui, range| {
                 for row in range {
-                    let start = row * 16;
-                    let end = (start + 16).min(self.bytes.len());
-                    ui.horizontal_wrapped(|ui| {
-                        ui.monospace(format!("{:016X}", self.offset + start as u64));
-                        for i in start..end {
-                            let at = self.offset + i as u64;
-                            let label =
-                                egui::RichText::new(format!("{:02X}", self.bytes[i])).monospace();
-                            if ui
-                                .selectable_label(self.selected == Some(at), label)
-                                .clicked()
-                            {
-                                self.selected = Some(at);
-                                self.replacement = format!("{:02X}", self.bytes[i]);
-                                self.range_start = at.to_string();
-                                self.range_end = (at + 1).to_string();
-                                export_selection(&self.range_start, &self.range_end);
-                            }
+                    let start = row * columns;
+                    let end = (start + columns).min(self.bytes.len());
+                    // A row always occupies exactly one line. Painting fixed cells
+                    // also gives each mobile byte a predictable touch target.
+                    let width = address_width + columns as f32 * cell_width
+                        + if show_ascii { ascii_width } else { 0. };
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::hover());
+                    ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER,
+                        format!("{:0digits$X}", self.offset + start as u64), font.clone(), ui.visuals().weak_text_color());
+                    for i in start..end {
+                        let at = self.offset + i as u64;
+                        let cell = egui::Rect::from_min_size(
+                            egui::pos2(rect.left() + address_width + (i-start) as f32 * cell_width, rect.top()),
+                            egui::vec2(cell_width, row_height));
+                        let response = ui.interact(cell, ui.id().with(("byte", at)), egui::Sense::click());
+                        let selected = selected_start.zip(selected_end).is_some_and(|(first,last)| at >= first && at < last);
+                        if selected || response.hovered() {
+                            ui.painter().rect_filled(cell.shrink(1.), 3., if selected {
+                                ui.visuals().selection.bg_fill
+                            } else { ui.visuals().widgets.hovered.bg_fill });
                         }
-                        ui.monospace(
-                            self.bytes[start..end]
-                                .iter()
-                                .map(|&b| crate::byte_display::ascii(b))
-                                .collect::<String>(),
-                        );
-                    });
+                        ui.painter().text(cell.center(), egui::Align2::CENTER_CENTER,
+                            format!("{:02X}", self.bytes[i]), font.clone(),
+                            if selected { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() });
+                        if response.clicked() {
+                            self.probe_selection(at, at + 1);
+                            self.selected = Some(at);
+                            self.replacement = format!("{:02X}", self.bytes[i]);
+                            self.range_start = at.to_string();
+                            self.range_end = (at + 1).to_string();
+                            export_selection(&self.range_start, &self.range_end);
+                        }
+                    }
+                    if show_ascii {
+                        ui.painter().text(egui::pos2(rect.left() + address_width + columns as f32 * cell_width + 12., rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            self.bytes[start..end].iter().map(|&b| crate::byte_display::ascii(b)).collect::<String>(),
+                            font.clone(), ui.visuals().weak_text_color());
+                    }
                 }
             });
     }
@@ -361,6 +438,8 @@ impl BrowserApp {
         ui.label("Edits are sparse: up to 65,536 byte positions and 4,096 undo steps. Unsaved edits are lost on reload.");
     }
     fn clear_results(&mut self) {
+        self.selected_sample = None;
+        self.probe_request = self.probe_request.wrapping_add(1);
         self.decoded = Default::default();
         self.table = Default::default();
         self.plot = Default::default();
@@ -400,6 +479,9 @@ impl BrowserApp {
             .unwrap_or(0)
     }
     fn select_collection(&mut self, path: String) {
+        self.plot_visible = None;
+        self.selected_sample = None;
+        self.probe_request = self.probe_request.wrapping_add(1);
         self.collection = path;
         self.table_start = 0;
         self.first = "0".into();
@@ -428,12 +510,25 @@ impl BrowserApp {
             _ => self.status = "Choose a nonempty sample range within the collection.".into(),
         }
     }
+    fn probe_selection(&mut self, start: u64, end: u64) {
+        self.selected_sample = None;
+        self.probe_request = self.probe_request.wrapping_add(1);
+        if !self.collection.is_empty() {
+            self.queue(serde_json::json!({"type":"probe","path":self.collection,
+                "start":start.to_string(),"end":end.to_string(),"request":self.probe_request.to_string()}));
+        }
+    }
     fn select_range(&mut self, start: u64, end: u64) {
+        self.probe_selection(start, end);
         self.selected = Some(start);
         self.range_start = start.to_string();
         self.range_end = end.to_string();
         export_selection(&self.range_start, &self.range_end);
         self.navigate(start);
+    }
+    fn open_simple_demo(&self) {
+        open_embedded_demo(include_bytes!("../samples/quickstart/simple_wave.bin"),
+            self.yaml != crate::source_editor::DecoderLanguage::Yaml.starter());
     }
     fn decoder(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
@@ -452,13 +547,16 @@ impl BrowserApp {
             egui::ComboBox::from_id_source("decoder-example")
                 .selected_text("Examples")
                 .show_ui(ui, |ui| {
-                    if ui.button("Nested records · byte walkthrough").clicked() {
-                    self.yaml = include_str!("../samples/decoders/yaml/nested_records.yaml").into();
-                }
-                if ui.button("Waveform demo").clicked() {
-                    self.yaml = include_str!("../samples/decoders/yaml/waveform.yaml").into();
-                }
-                if ui.button("Unsigned byte samples").clicked() {
+                    if ui.button("Open simple demo · data + decoder").clicked() {
+                        self.open_simple_demo();
+                    }
+                    ui.separator();
+                    for (title, yaml) in crate::source_editor::YAML_EXAMPLES {
+                        if ui.button(*title).clicked() {
+                            self.yaml = (*yaml).into();
+                        }
+                    }
+                    if ui.button("Unsigned byte samples").clicked() {
                         self.yaml = crate::source_editor::DecoderLanguage::Yaml
                             .byte_preview()
                             .into();
@@ -475,11 +573,17 @@ impl BrowserApp {
                     }
                     if ui.button("Header and records").clicked() {
                         self.yaml = crate::source_editor::DecoderLanguage::Yaml
-                            .starter()
+                            .header_example()
                             .replace("# ", "");
                     }
                 });
         });
+        if self.size == 0 {
+            if ui.button("Open simple demo").clicked() {
+                self.open_simple_demo();
+            }
+            ui.label("512 samples · 2 KB · opens and plots automatically");
+        }
         self.editor.editor(
             ui,
             &mut self.yaml,
@@ -559,8 +663,8 @@ impl BrowserApp {
                             for key in &columns {
                                 let cell = &row["cells"][*key];
                                 if ui
-                                    .selectable_label(false, cell["text"].as_str().unwrap_or("—"))
-                                    .on_hover_text("Select bytes in Hex")
+                                    .selectable_label(self.selected_sample == row["index"].as_str().and_then(parse_offset), cell["text"].as_str().unwrap_or("—"))
+                                    .on_hover_text("Select in Hex and Plot")
                                     .clicked()
                                 {
                                     selection = cell["start"]
@@ -638,7 +742,7 @@ impl BrowserApp {
                 self.last = self.count().to_string();
                 self.request_plot(1200);
             }
-            ui.label("Drag to pan · scroll or pinch to zoom");
+            ui.label("Tap to select · drag to pan · scroll or pinch to zoom");
         });
         ui.label(format!(
             "{} · {} records inspected",
@@ -666,6 +770,9 @@ impl BrowserApp {
             if std::mem::take(&mut self.reset_plot) { plot = plot.reset(); }
             let response = plot
             .show(ui, |plot| {
+                if let Some(index) = self.selected_sample {
+                    plot.vline(egui_plot::VLine::new(index as f64).color(egui::Color32::WHITE).name(format!("Selected sample {index}")));
+                }
                 let colors = [
                     egui::Color32::LIGHT_BLUE,
                     egui::Color32::LIGHT_GREEN,
@@ -684,6 +791,7 @@ impl BrowserApp {
                         self.plot["estimated"].as_bool().unwrap_or(false).then_some(bands.as_slice()));
                 }
             });
+            self.plot_visible = Some([response.transform.bounds().min()[0], response.transform.bounds().max()[0]]);
             let now = ui.input(|i| i.time);
             let interacting = response.response.dragged() || response.response.drag_stopped() ||
                 (response.response.hovered() && ui.input(|i| (!self.stacked && i.smooth_scroll_delta != egui::Vec2::ZERO) || i.zoom_delta() != 1.0));
@@ -694,6 +802,17 @@ impl BrowserApp {
             if let Some((first, last)) = self.viewport.ready(now) {
                 self.first = first.to_string(); self.last = last.to_string();
                 self.request_plot_view(response.response.rect.width().max(100.) as u32, false);
+            }
+            if response.response.clicked() && !response.response.double_clicked() && self.count() > 0 {
+                if let Some(pointer) = response.response.interact_pointer_pos() {
+                    let x = response.transform.value_from_position(pointer).x;
+                    if let Some(index) = crate::browser_viewport::clicked_sample(x, self.count()) {
+                        self.selected_sample = Some(index);
+                        self.probe_request = self.probe_request.wrapping_add(1);
+                        self.queue(serde_json::json!({"type":"pick","path":self.collection,
+                            "index":index.to_string(),"request":self.probe_request.to_string()}));
+                    }
+                }
             }
             if response.response.double_clicked() {
                 self.first = "0".into(); self.last = self.count().to_string();

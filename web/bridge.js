@@ -118,6 +118,13 @@
         if (js && wasm) runtime = {js:js.href, wasm:wasm.href};
     });
     window.binwave = {
+        openDemo(bytes, replaceDecoder = false) {
+            if (busy || loadingDecoder || failed || !graphicsReady) return false;
+            if ((dirty || replaceDecoder) && !confirm('Replace the current data and decoder with the simple demo? Unsaved edits will be discarded.')) return false;
+            if (bytes.length !== 2048) throw Error('Invalid bundled demo size');
+            const file = new File([bytes], 'simple_wave.bin', {type:'application/octet-stream'});
+            return submit({type:'open', file, demo:true});
+        },
         poll() {
             const event = events.shift();
             if (!event) return '';

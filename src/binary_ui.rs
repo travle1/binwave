@@ -31,6 +31,7 @@ const ROWS_PER_PAGE: usize = 100;
 enum Action {
     Open(PathBuf),
     Demo,
+    SimpleDemo,
     Apply(ResolvedLayout, String),
     LoadYaml(PathBuf),
     ReplaceYaml(String),
@@ -60,6 +61,7 @@ pub enum OpenedFile {
 
 enum IoResult {
     Opened(Arc<FileSource>),
+    SimpleDemo(Arc<Original>),
     Validated(ResolvedLayout, String, Arc<Original>),
     Loaded(Arc<Original>, Option<PathBuf>, bool),
     SavedBinary(ByteSnapshot, PathBuf),
@@ -628,6 +630,9 @@ impl BinaryWorkspace {
     pub fn open(&mut self, path: PathBuf, ctx: &Context) {
         self.request(Action::Open(path), ctx);
     }
+    pub fn open_simple_demo(&mut self, ctx: &Context) {
+        self.request(Action::SimpleDemo, ctx);
+    }
     pub fn open_demo(&mut self, ctx: &Context) {
         self.request(Action::Demo, ctx);
     }
@@ -718,6 +723,12 @@ impl BinaryWorkspace {
                 self.start_io(ctx, move || {
                     Ok(IoResult::Opened(Arc::new(FileSource::open(&path)?)))
                 });
+            }
+            Action::SimpleDemo => {
+                self.report(Ok("Opening simple wave demo…".into()));
+                self.start_io(ctx, || Ok(IoResult::SimpleDemo(Original::from_bytes(
+                    include_bytes!("../samples/quickstart/simple_wave.bin"),
+                )?)));
             }
             Action::Demo => {
                 self.report(Ok("Opening embedded sensor demo…".into()));
@@ -1006,6 +1017,12 @@ impl BinaryWorkspace {
                     }
                     self.original = Some(original);
                     self.request(Action::Apply(layout, yaml), ctx)
+                }
+                Ok(IoResult::SimpleDemo(original)) => {
+                    self.finish_open(Some(original), None, None, true, false);
+                    self.yaml = DecoderLanguage::Yaml.starter().into();
+                    self.saved_yaml.clone_from(&self.yaml);
+                    self.apply_definition(ctx);
                 }
                 Ok(IoResult::Opened(source)) => {
                     let path = source.path.clone();
@@ -2643,6 +2660,17 @@ impl BinaryWorkspace {
                     if self.structure_ui.authoring_dirty() {
                         self.structure_ui.show_authoring_draft();
                     } else {
+                        // An untouched, unapplied starter is a placeholder when
+                        // the user chooses to describe their own selected bytes.
+                        if self.yaml == DecoderLanguage::Yaml.starter()
+                            && self.saved_yaml == self.yaml
+                            && self.yaml_path.is_none()
+                            && !self.yaml_is_example
+                            && !self.structure_ui.has_published_program()
+                        {
+                            self.yaml.clear();
+                            self.saved_yaml.clear();
+                        }
                         self.structure_ui.begin_definition(range);
                     }
                     self.reveal_definition = true;
@@ -3017,6 +3045,20 @@ fn data_bounds(data: &PlotData) -> PlotBounds {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_simple_demo_opens_and_decodes_without_a_path_or_manual_apply() {
+        let ctx = Context::default();
+        let mut workspace = BinaryWorkspace::default();
+        workspace.open_simple_demo(&ctx);
+        settle(&mut workspace, &ctx);
+        assert_eq!(workspace.file_len(), 2048);
+        assert!(workspace.source_path().is_none());
+        assert!(workspace.decoded_ready(), "{}", workspace.message);
+        assert_eq!(workspace.yaml, DecoderLanguage::Yaml.starter());
+        assert!(!workspace.is_dirty());
+        assert!(workspace.take_layout_applied());
+    }
 
     #[test]
     fn byte_preview_small_files_are_linked_and_both_starters_decode_the_same_values() {
@@ -3886,7 +3928,7 @@ mod tests {
         assert!(visible_control_text(&mut workspace, &ctx).contains("Replace the YAML draft"));
         click(&mut workspace, &ctx, "Replace decoder");
         assert_eq!(workspace.yaml, DecoderLanguage::Yaml.starter());
-        assert!(!workspace.has_definition());
+        assert!(workspace.has_definition(), "The simple YAML starter is ready to apply");
         assert!(!workspace.is_dirty());
         workspace.switch_language(DecoderLanguage::Python);
         assert_eq!(workspace.yaml, python);

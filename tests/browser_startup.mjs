@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
+import {File} from 'node:buffer';
 import {readFileSync} from 'node:fs';
 
-function bridge() {
+function bridge(allowReplace = true) {
+    const commands = [];
     const elements = new Map();
     const document = {
         currentScript: {src: 'http://localhost:8080/web/bridge.js'},
@@ -13,11 +15,11 @@ function bridge() {
         },
     };
     const window = {addEventListener() {}, location: {href: 'http://localhost:8080/'}};
-    class Worker { postMessage() {} }
+    class Worker { postMessage(message) { commands.push(message); } }
     vm.runInNewContext(readFileSync(new URL('../web/bridge.js', import.meta.url), 'utf8'), {
-        document, window, Worker, URL,
+        document, window, Worker, URL, File, confirm: () => allowReplace,
     });
-    return {app: window.binwave, get: id => document.getElementById(id)};
+    return {commands, app: window.binwave, get: id => document.getElementById(id)};
 }
 
 test('file opening waits until the graphics workspace is ready', () => {
@@ -80,4 +82,23 @@ test('cancelled and failed decoder reads leave the current draft alone', async (
     assert.equal(app.poll(), '');
     assert.match(get('status').textContent,/File unavailable/);
     assert.equal(get('open-decoder').disabled, false);
+});
+
+test('embedded demo opens its bytes without a file picker and respects cancellation', async () => {
+    const {app, commands} = bridge();
+    const data = readFileSync(new URL('../samples/quickstart/simple_wave.bin', import.meta.url));
+    assert.equal(app.openDemo(data), false, 'Graphics startup gates demo opening too');
+    app.ready();
+    assert.equal(app.openDemo(data), true);
+    const command = commands.at(-1);
+    assert.equal(command.type, 'open');
+    assert.equal(command.demo, true);
+    assert.equal(command.file.name, 'simple_wave.bin');
+    assert.equal(command.file.size, 2048);
+    assert.deepEqual(Buffer.from(await command.file.arrayBuffer()), data);
+    assert.equal(app.openDemo(data), false, 'Do not overlap an in-flight file operation');
+    const cancelled = bridge(false);
+    cancelled.app.ready();
+    assert.equal(cancelled.app.openDemo(data, true), false);
+    assert.equal(cancelled.commands.length, 0);
 });

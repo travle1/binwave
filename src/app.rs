@@ -23,25 +23,6 @@ use std::thread;
 #[cfg(test)]
 use std::time::Instant;
 
-const DEFINITION_EXAMPLES: &[(&str, &str)] = &[
-    (
-        "Primitive records",
-        include_str!("../samples/decoders/yaml/generic_primitives.yaml"),
-    ),
-    (
-        "Types described by earlier sections",
-        include_str!("../samples/decoders/yaml/generic_sections.yaml"),
-    ),
-    (
-        "PNG chunks",
-        include_str!("../samples/decoders/yaml/png_chunks.yaml"),
-    ),
-    (
-        "RIFF chunks",
-        include_str!("../samples/decoders/yaml/riff_chunks.yaml"),
-    ),
-];
-
 #[derive(Debug, Clone)]
 struct ViewState {
     center: f64,
@@ -1254,6 +1235,11 @@ impl BinwaveApp {
                     self.binary.save_copy(&ctx);
                 }
                 ui.separator();
+                if ui.add_enabled(available, egui::Button::new("Open simple demo")).clicked() {
+                    ui.close_menu();
+                    self.pending_config = None;
+                    self.binary.open_simple_demo(&ctx);
+                }
                 if ui
                     .add_enabled(available, egui::Button::new("Open sensor demo"))
                     .clicked()
@@ -1433,19 +1419,7 @@ impl BinwaveApp {
                     ui.close_menu();
                 }
                 ui.menu_button("Examples", |ui| {
-                    if ui
-                        .add_enabled(available, egui::Button::new("Python: Waveform container"))
-                        .clicked()
-                    {
-                        self.decoder = Decoder::Layout;
-                        self.binary.load_python_text(
-                            include_str!("../samples/decoders/python/waveform.py"),
-                            &ctx,
-                        );
-                        self.show_view(Pane::Layout);
-                        ui.close_menu();
-                    }
-                    for (title, yaml) in DEFINITION_EXAMPLES {
+                    for (title, yaml) in crate::source_editor::YAML_EXAMPLES {
                         if ui
                             .add_enabled(available, egui::Button::new(*title))
                             .clicked()
@@ -1455,6 +1429,18 @@ impl BinwaveApp {
                             self.binary.load_definition_text(yaml, &ctx);
                             self.show_view(Pane::Layout);
                         }
+                    }
+                    if ui
+                        .add_enabled(available, egui::Button::new("Advanced · Python waveform container"))
+                        .clicked()
+                    {
+                        self.decoder = Decoder::Layout;
+                        self.binary.load_python_text(
+                            include_str!("../samples/decoders/python/waveform.py"),
+                            &ctx,
+                        );
+                        self.show_view(Pane::Layout);
+                        ui.close_menu();
                     }
                 });
             });
@@ -1481,7 +1467,7 @@ impl BinwaveApp {
             let title = source
                 .and_then(|path| path.file_name())
                 .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Sensor demo".into());
+                .unwrap_or_else(|| "Embedded demo".into());
             ui.strong(title).on_hover_text(
                 source
                     .map(|path| path.display().to_string())

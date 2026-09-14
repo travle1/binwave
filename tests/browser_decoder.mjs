@@ -63,8 +63,38 @@ assert.throws(()=>session.decode('actions: [{read: {name: x, type: Sample}}]'));
 assert.equal(JSON.parse(session.table(path,String(size/2-1))).rows[0].cells.value.number,65535,'Failed apply retains successful session');
 assert.ok(source.cache.size<=4);
 assert.throws(()=>source.read('0',1024**2+1));
+assert.equal(JSON.parse(session.probe(path, String(size-1), String(size))).first, String(size/2-1));
+assert.equal(JSON.parse(session.pick(path, String(size/2-1))).start, String(size-2));
 session.free();
 console.log(`Browser WASM: YAML, lazy 40 GiB offsets, sparse edits, tables, exact plots, bounded overview, and failed-apply retention passed (${reads.length} bounded slices).`);
+
+// The shipped beginner pair must produce the documented plot and byte links.
+const simpleBytes = await readFile('samples/quickstart/simple_wave.bin');
+assert.equal(simpleBytes.length, 2048);
+globalThis.binwaveDecoder = {read(start, length) {
+    return new Uint8Array(simpleBytes.subarray(Number(start), Number(start) + length));
+}};
+const simple = new bindings.DecoderSession(String(simpleBytes.length));
+const simpleYaml = await readFile('samples/quickstart/simple_wave.yaml', 'utf8');
+const simpleDecoded = JSON.parse(simple.decode(simpleYaml));
+assert.equal(simpleDecoded.collections[0].count, '512');
+const simplePlot = JSON.parse(simple.plot('samples', '0', '512', 800));
+assert.equal(simplePlot.estimated, false);
+assert.equal(simplePlot.series.length, 1);
+assert.equal(simplePlot.series[0].points.length, 512);
+for (let i = 0; i < 512; i++) {
+    assert.ok(Math.abs(simplePlot.series[0].points[i][1] - Math.sin(2 * Math.PI * i / 64)) < 1e-6);
+}
+const simpleTable = JSON.parse(simple.table('samples', '16'));
+assert.equal(simpleTable.rows[0].start, '64');
+assert.equal(simpleTable.rows[0].cells.value.number, 1);
+assert.deepEqual(JSON.parse(simple.probe('samples', '64', '68')), {path:'samples', first:'16', end:'17'});
+assert.equal(JSON.parse(simple.probe('samples', '67', '68')).first, '16');
+assert.deepEqual(JSON.parse(simple.pick('samples', '16')), {path:'samples', index:'16', start:'64', end:'68'});
+assert.throws(() => simple.pick('samples', '512'));
+assert.equal(JSON.parse(simple.probe('samples', '2048', '2049')).first, null);
+simple.free();
+console.log('Shipped simple wave: 512 float32 samples, eight sine cycles and exact byte links passed.');
 
 // Optional generated PWAV fixture: run the user's real schema through WASM,
 // then check both a resolvable waveform and the estimated overview bands.

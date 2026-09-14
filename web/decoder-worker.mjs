@@ -10,6 +10,10 @@ self.onmessage = async ({data: m}) => {
             await bindings.default({module_or_path: m.runtime.wasm});
             session = new bindings.DecoderSession(String(m.file.size));
             self.postMessage({type:'decoded', result:JSON.parse(session.decode(m.yaml))});
+        } else if (m.type === 'pick') {
+            self.postMessage({type:'pick', request:m.request, result:JSON.parse(session.pick(m.path, m.index))});
+        } else if (m.type === 'probe') {
+            self.postMessage({type:'probe', request:m.request, result:JSON.parse(session.probe(m.path, m.start, m.end))});
         } else if (m.type === 'table') {
             self.postMessage({type:'table', result:JSON.parse(session.table(m.path, m.start))});
         } else if (m.type === 'plot') {

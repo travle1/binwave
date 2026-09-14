@@ -1,5 +1,28 @@
 # Sample files
 
+Start with **Open simple demo** in the browser workspace or **File → Open simple demo**
+on desktop. It loads the embedded 2 KB file and matching decoder and plots automatically.
+Expect eight sine-wave cycles between −1 and +1. No download or file picker is needed.
+
+The [walkthrough](quickstart/README.txt), [data file](quickstart/simple_wave.bin),
+and [decoder](quickstart/simple_wave.yaml) are also included for practicing manual
+file opening. Larger generated fixtures remain optional advanced examples.
+
+## Common file formats
+
+Both app versions expose the same bundled YAML examples:
+
+| Decoder | What it reads | Limits |
+| --- | --- | --- |
+| [PNG](decoders/yaml/png_chunks.yaml) | Chunk boundaries and image header fields | Compressed pixels remain bytes; CRCs are not verified or recalculated |
+| [WAV / RIFF](decoders/yaml/riff_chunks.yaml) | Little-endian RIFF/WAVE chunks and format fields | Audio remains bytes; no sample decoding, playback, RF64 or RIFX support |
+
+Use **Open file** for your PNG/WAV file, choose the matching **Examples** entry,
+then **Apply** and inspect **Decoded structure**. These examples demonstrate
+container inspection, rather than waveform plotting.
+
+## More examples
+
 | Folder | Contents | Open with |
 | --- | --- | --- |
 | [data/](data/) | CSV and binary data, including generated large fixtures | **File → Open file…** |

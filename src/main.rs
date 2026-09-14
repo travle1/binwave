@@ -47,6 +47,7 @@ mod python_decoder;
 mod source_editor;
 mod structure;
 mod structure_plot;
+mod structure_selection;
 #[cfg(not(target_arch = "wasm32"))]
 mod structure_ui;
 #[cfg(not(target_arch = "wasm32"))]

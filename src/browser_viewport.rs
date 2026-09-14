@@ -46,3 +46,23 @@ mod tests {
         assert_eq!(v.ready(3.),None);
     }
 }
+
+/// A tap chooses the nearest sample by horizontal position; drags are handled separately.
+pub fn clicked_sample(x: f64, count: u64) -> Option<u64> {
+    (x.is_finite() && count > 0).then(|| (x.round().max(0.) as u64).min(count - 1))
+}
+
+#[cfg(test)]
+mod click_tests {
+    use super::clicked_sample;
+    #[test]
+    fn clicks_round_clamp_and_keep_large_indices() {
+        assert_eq!(clicked_sample(16.2, 512), Some(16));
+        assert_eq!(clicked_sample(16.8, 512), Some(17));
+        assert_eq!(clicked_sample(-2., 512), Some(0));
+        assert_eq!(clicked_sample(600., 512), Some(511));
+        assert_eq!(clicked_sample(5_000_000_000., 6_000_000_000), Some(5_000_000_000));
+        assert_eq!(clicked_sample(f64::NAN, 512), None);
+        assert_eq!(clicked_sample(0., 0), None);
+    }
+}

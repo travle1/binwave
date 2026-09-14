@@ -1,0 +1,12 @@
+# Open simple_wave.bin, then Apply this decoder.
+# Each sample is one 4-byte float. There is no header.
+endian: little
+structures:
+  - name: Sample
+    fields:
+      - {name: value, type: f32}
+actions:
+  - read:
+      name: samples
+      type: {structure: Sample}
+      repeat: until end

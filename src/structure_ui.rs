@@ -3299,7 +3299,7 @@ mod tests {
     #[test]
     fn builder_uses_selection_and_preserves_existing_types() {
         let mut builder = Builder::from_range(16..20);
-        let yaml = builder.generate(DecoderLanguage::Yaml.starter()).unwrap();
+        let yaml = builder.generate("").unwrap();
         let program = Program::parse(&yaml).unwrap();
         assert!(program.structures.contains_key("Record"));
         let Action::Read(read) = &program.actions[0] else {
@@ -4334,7 +4334,7 @@ print(f'{len(samples)} samples')
         for language in [DecoderLanguage::Yaml, DecoderLanguage::Python] {
             let ctx = Context::default();
             let mut cache = YamlLayoutCache::default();
-            let mut source = language.starter().to_owned();
+            let mut source = language.header_example().to_owned();
             let original = source.clone();
             let mut frame = |source: &mut String, events: Vec<egui::Event>| {
                 ctx.run(
@@ -4426,7 +4426,7 @@ print(f'{len(samples)} samples')
             );
             assert_eq!(source, uncommented);
 
-            // The actual starter must decode after the documented keyboard sequence.
+            // The commented header example decodes after the documented keyboard sequence.
             let mut data = 2_u32.to_le_bytes().to_vec();
             for (time, value) in [(100_u32, 1.5_f32), (200, -2.5)] {
                 data.extend_from_slice(&time.to_le_bytes());
