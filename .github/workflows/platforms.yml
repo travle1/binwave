@@ -3,6 +3,12 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Platforms to validate
+        type: choice
+        default: windows
+        options: [windows, all]
 permissions:
   contents: read
 jobs:
@@ -10,8 +16,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: ${{ fromJSON(inputs.platform == 'windows' && '["windows-latest"]' || '["ubuntu-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -31,11 +38,16 @@ jobs:
         if: runner.os == 'Windows'
         with:
           name: Binwave-windows-x64
+          retention-days: 14
+          if-no-files-found: error
           path: |
             dist/*.zip
             dist/*.sha256
+            dist/Binwave-*-windows-x64/Binwave.exe
   browser:
+    if: inputs.platform != 'windows'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
