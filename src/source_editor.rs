@@ -140,6 +140,14 @@ impl YamlLayoutCache {
     }
 
     pub(crate) fn editor(&mut self, ui: &mut Ui, yaml: &mut String, language: DecoderLanguage) {
+        if language == DecoderLanguage::Yaml {
+            ui.horizontal_wrapped(|ui| {
+                let dark = ui.visuals().dark_mode;
+                ui.colored_label(if dark { Color32::from_rgb(140,194,238) } else { Color32::from_rgb(25,89,149) }, "Keyword");
+                ui.colored_label(builtin_color(dark), "Built-in type");
+                ui.label("User-defined name");
+            });
+        }
         let mut font = egui::TextStyle::Monospace.resolve(ui.style());
         font.size = font.size.max(13.);
         let lines = yaml.bytes().filter(|byte| *byte == b'\n').count() + 1;
@@ -335,6 +343,20 @@ pub(crate) fn toggle_source_comments(
 }
 
 /// A small, lossless lexer for display only. Unknown YAML remains editable and unmodified.
+fn builtin_color(dark: bool) -> Color32 {
+    if dark { Color32::from_rgb(97, 213, 200) } else { Color32::from_rgb(0, 113, 103) }
+}
+
+// Recognize type values, including numeric type-choice mappings. A field named
+// "u32", a reference, or expected literal text must not become a built-in token.
+fn yaml_type_position(text: &str, start: usize) -> bool {
+    let prefix = text[..start].trim_end();
+    let Some(before) = prefix.strip_suffix(':') else { return false; };
+    let key = before.trim_end().rsplit(|c: char| c.is_whitespace() || "{},[".contains(c)).next().unwrap_or("")
+        .trim_matches(['\'', '"']);
+    key == "type" || key == "otherwise" || key.parse::<i64>().is_ok()
+}
+
 pub(crate) fn source_layout(
     text: &str,
     font: egui::FontId,
@@ -416,7 +438,11 @@ pub(crate) fn source_layout(
                         i += 1;
                     }
                 }
-                string
+                let token = text[start..i].trim_matches(['\'', '"']);
+                if language == DecoderLanguage::Yaml && crate::structure::is_builtin_type(token)
+                    && yaml_type_position(text, start) {
+                    builtin_color(dark)
+                } else { string }
             }
             b'{' | b'}' | b'[' | b']' | b',' | b':' | b'|' | b'>' => {
                 i += 1;
@@ -481,6 +507,9 @@ pub(crate) fn source_layout(
                     key
                 } else if language == DecoderLanguage::Yaml && followed_by_colon {
                     key
+                } else if language == DecoderLanguage::Yaml
+                    && crate::structure::is_builtin_type(token) && yaml_type_position(text, start) {
+                    builtin_color(dark)
                 } else if matches!(
                     token,
                     "true" | "false" | "null" | "~" | "True" | "False" | "None"
@@ -506,4 +535,27 @@ pub(crate) fn source_layout(
         );
     }
     job
+}
+
+#[cfg(test)]
+mod highlighting_tests {
+    use super::*;
+    #[test]
+    fn builtin_type_values_are_distinct_in_both_themes() {
+        let text = "type: u32\ntype: \"f32\"\ntype: RecordType\nname: u32\nexpect: 'u32'\n# type: u32\ncases: {'1': i16, '2': f64}\notherwise: bytes\n";
+        for dark in [true, false] {
+            let normal=if dark {Color32::WHITE} else {Color32::BLACK};
+            let job=source_layout(text,egui::FontId::monospace(13.),dark,normal,DecoderLanguage::Yaml);
+            assert_eq!(job.text,text);
+            let color_at=|index|job.sections.iter().find(|s|s.byte_range.contains(&index)).unwrap().format.color;
+            for needle in ["u32", "\"f32\"", "i16", "f64", "bytes"] {
+                assert_eq!(color_at(text.find(needle).unwrap()),builtin_color(dark));
+            }
+            assert_eq!(color_at(text.find("RecordType").unwrap()),normal);
+            assert_eq!(color_at(text.find("name: u32").unwrap()+6),normal);
+            assert_ne!(color_at(text.find("'u32'").unwrap()),builtin_color(dark));
+            assert_ne!(color_at(text.find("# type").unwrap()),builtin_color(dark));
+            assert_ne!(color_at(0),builtin_color(dark));
+        }
+    }
 }

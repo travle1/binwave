@@ -5,6 +5,15 @@ file extensions. Existing `sections` YAML remains a separate, compatible reader.
 Open any file, load one of the example YAML definitions, edit it for that file,
 and apply it. Hex remains available when no definition exists or a read fails.
 
+## Reading the editor colors
+
+The base app and browser share the same editor. YAML keys use blue, built-in type
+values such as `u32`, `f32`, and `text` use teal, and user-defined type names use
+the normal text color. The legend above the editor identifies these categories.
+Quoted built-in type values and numeric type-choice mappings use the same teal.
+Comments, literal strings, and a field merely named `u32` retain their own colors.
+These are Binwave decoder types; YAML itself does not define them.
+
 ## Fields and simple actions
 
 A structure contains `fields`, optional `actions` after its fields, and an optional

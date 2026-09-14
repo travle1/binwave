@@ -683,8 +683,7 @@ impl Program {
         for (name, structure) in &program.structures {
             valid_name(name)?;
             ensure!(
-                primitive_width(name).is_none()
-                    && !matches!(name.as_str(), "bytes" | "text" | "cstring" | "varuint"),
+                !is_builtin_type(name),
                 "structure name {name:?} is reserved"
             );
             ensure!(
@@ -1585,6 +1584,11 @@ fn align(cursor: Address, alignment: Address, end: Address) -> Result<Address> {
     let padding = (alignment - cursor % alignment) % alignment;
     checked_end(cursor, padding, end)
 }
+/// The editor uses the same built-in type vocabulary as the interpreter.
+pub(crate) fn is_builtin_type(kind: &str) -> bool {
+    primitive_width(kind).is_some() || matches!(kind, "bytes" | "text" | "cstring" | "varuint")
+}
+
 fn primitive_width(kind: &str) -> Option<Address> {
     match kind {
         "u8" | "i8" => Some(1),
