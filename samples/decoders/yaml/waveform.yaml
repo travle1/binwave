@@ -4,7 +4,7 @@
 # Section IDs, names, and numeric formats come from this definition and the file.
 endian: little
 structures:
-  Header:
+  - name: Header
     fields:
       - {name: signature, type: text, length: 4, expect: PWAV}
       - {name: version, type: u32, expect: 1}
@@ -13,16 +13,16 @@ structures:
       - {name: section_count, type: u32}
       - {name: descriptor_count, type: u32}
 
-  Descriptor:
+  - name: Field
     fields:
       - {name: name, type: text, length: 16}
       - {name: format, type: u32}
       - {name: byte_width, type: u32}
 
-  Descriptions:
+  - name: RecordType
     fields:
       - name: entries
-        type: Descriptor
+        type: {structure: Field}
         repeat: {ref: /header.descriptor_count}
     actions:
       - define:
@@ -35,13 +35,13 @@ structures:
               cases: {'1': u64, '2': i64, '3': f64, '4': f32, '5': u32, '6': i32}
             length: {ref: byte_width}
 
-  Samples:
+  - name: Samples
     fields:
       # The region belongs to this whole collection; each dynamically defined
       # Sample consumes 64 bytes. Even a 40 GB collection stays deferred.
-      - {name: records, type: Sample, repeat: until end}
+      - {name: records, type: {structure: Sample}, repeat: until end}
 
-  Footer:
+  - name: Footer
     fields:
       - {name: marker, type: text, length: 8, expect: PWAV-END}
       - {name: sample_count, type: u64}
@@ -50,7 +50,7 @@ structures:
       - {name: final_index, type: u64}
       - {name: generator_seed, type: u64}
 
-  Section:
+  - name: Section
     fields:
       - {name: id, type: u32}
       - {name: flags, type: u32}
@@ -59,10 +59,10 @@ structures:
         type:
           choose:
             ref: id
-            cases: {'1': Descriptions, '2': Samples, '3': Footer}
+            cases: {'1': {structure: RecordType}, '2': {structure: Samples}, '3': {structure: Footer}}
             otherwise: bytes
         length: {ref: payload_bytes}
 
 actions:
-  - read: {name: header, type: Header}
-  - read: {name: sections, type: Section, repeat: {ref: /header.section_count}}
+  - read: {name: header, type: {structure: Header}}
+  - read: {name: sections, type: {structure: Section}, repeat: {ref: /header.section_count}}

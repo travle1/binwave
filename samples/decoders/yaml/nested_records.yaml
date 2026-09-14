@@ -1,0 +1,17 @@
+# Explicit declarations and references. Position and Record are user-defined type names.
+# See samples/generic_structures.md for the byte-by-byte walkthrough.
+endian: little
+structures:
+  - name: Position
+    fields:
+      - {name: x, type: u16}
+      - {name: y, type: u16}
+  - name: Record
+    fields:
+      - {name: id, type: u8}
+      - {name: position, type: {structure: Position}}
+actions:
+  - read:
+      name: records
+      type: {structure: Record}
+      repeat: 2

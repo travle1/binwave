@@ -2148,18 +2148,18 @@ mod tests {
     fn records() -> (ByteStore, ParseOutput) {
         let yaml = r#"
 structures:
-  Header:
+  - name: Header
     fields: [{name: version, type: u16}, {name: count, type: u16}]
-  Descriptor:
+  - name: Descriptor
     fields: [{name: code, type: u8}, {name: size, type: u8}]
-  Pair:
+  - name: Pair
     fields: [{name: z, type: i16}, {name: a, type: u16}]
-  Sample:
-    fields: [{name: timestamp, type: u32}, {name: pair, type: Pair}]
+  - name: Sample
+    fields: [{name: timestamp, type: u32}, {name: pair, type: {structure: Pair}}]
 actions:
-  - read: {name: header, type: Header}
-  - read: {name: descriptors, type: Descriptor, repeat: 2}
-  - read: {name: samples, type: Sample, repeat: 256}
+  - read: {name: header, type: {structure: Header}}
+  - read: {name: descriptors, type: {structure: Descriptor}, repeat: 2}
+  - read: {name: samples, type: {structure: Sample}, repeat: 256}
 "#;
         let bytes = vec![0; 8 + 256 * 8];
         let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
@@ -2490,7 +2490,7 @@ actions:
             .map(|index| format!("{{name: value_{index}, type: u8}}"))
             .collect::<Vec<_>>()
             .join(",");
-        let yaml = format!("structures: {{Sample: {{fields: [{fields}]}}}}\nactions: [{{read: {{name: samples, type: Sample, repeat: 2}}}}]");
+        let yaml = format!("structures: [{{name: Sample, fields: [{fields}]}}]\nactions: [{{read: {{name: samples, type: {{structure: Sample}}, repeat: 2}}}}]");
         let store = ByteStore::from_snapshot(Original::from_bytes(&[0; 80]).unwrap());
         let output = Program::parse(&yaml)
             .unwrap()
@@ -2839,9 +2839,9 @@ actions:
         let output = Program::parse(
             r#"
 structures:
-  Sample:
+  - name: Sample
     fields: [{name: sine, type: f64}, {name: ramp, type: f64}, {name: square, type: f64}]
-actions: [{read: {name: samples, type: Sample, repeat: until end}}]
+actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
 "#,
         )
         .unwrap()

@@ -92,7 +92,7 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(reader.tell(), 5, "indexing must not move the file cursor")
         self.assertEqual(calls, [(0, 5)])
         read = reader.program()["actions"][1]["read"]
-        self.assertEqual(read, {"name": "samples", "type": "Sample", "at": 1, "length": 2, "repeat": 2})
+        self.assertEqual(read, {"name": "samples", "type": {"structure": "Sample"}, "at": 1, "length": 2, "repeat": 2})
 
     def test_large_collection_registration_performs_no_reads(self):
         calls = []
@@ -122,7 +122,7 @@ class ReaderTests(unittest.TestCase):
         value = reader.read_struct("header", outer)
         self.assertEqual(value.nested.value, 0x1234)
         self.assertEqual(value.tail, "A\0")
-        fields = reader.program()["structures"]["Outer"]["fields"]
+        fields = next(s for s in reader.program()["structures"] if s["name"] == "Outer")["fields"]
         self.assertEqual(fields[1], {"name": "_padding_1", "type": "bytes", "length": 3})
         self.assertEqual(fields[2]["length"], 2)
         self.assertEqual(fields[2]["endian"], "little")
@@ -192,8 +192,8 @@ class ReaderTests(unittest.TestCase):
             self.assertEqual(dict(result[17]), waveform_values(17))
             self.assertEqual(dict(result[-1]), waveform_values(16_318))
         self.assertEqual(decoded[0][1], decoded[1][1])
-        first_fields = decoded[0][2]["structures"]["Sample"]["fields"]
-        reversed_fields = decoded[1][2]["structures"]["Sample"]["fields"]
+        first_fields = next(s for s in decoded[0][2]["structures"] if s["name"] == "Sample")["fields"]
+        reversed_fields = next(s for s in decoded[1][2]["structures"] if s["name"] == "Sample")["fields"]
         self.assertEqual(first_fields, list(reversed(reversed_fields)))
 
 

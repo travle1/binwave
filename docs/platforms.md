@@ -91,10 +91,9 @@ shared with native code. See [architecture boundaries](architecture.md).
   data-file picker and uses a standard file input on LAN HTTP.
 - Inspect decoded structures and 128-record sample pages. Selecting a decoded field selects its byte range in Hex.
 - Plot numeric channels from a decoded collection with the native min/max and
-  sampled overview algorithm. Collections initially display 512 samples. Detail
-  returns to a 512-sample window; Overview covers the collection. Zoom/pan reloads
-  the visible sample range after gestures settle. Explicit ranges remain
-  available. Quality labels distinguish sampled amplitude bands from traces.
+  sampled overview algorithm. Collections initially display 512 samples. Zoom/pan reloads
+  the visible sample range after gestures settle. Fit all (or double-click) fits
+  the full collection. There are no separate detail/overview navigation modes. Quality labels distinguish sampled amplitude bands from traces.
 - Select and replace individual bytes, undo/redo, and extract an explicit range
   whose end offset is exclusive. Edits remain worker-owned sparse patches.
 - Stream an edited copy or extraction to a user-selected destination, with

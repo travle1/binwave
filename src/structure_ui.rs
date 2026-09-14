@@ -3406,16 +3406,16 @@ mod tests {
     fn mapping_form_decodes_later_payload_from_a_nested_description_list() {
         let base = r#"
 structures:
-  Description:
+  - name: Description
     fields:
       - {name: label, type: text, length: 4}
       - {name: code, type: u8}
       - {name: count, type: u8}
-  Header:
+  - name: Header
     fields:
-      - {name: items, type: Description, repeat: 2}
+      - {name: items, type: {structure: Description}, repeat: 2}
 actions:
-  - read: {name: header, type: Header}
+  - read: {name: header, type: {structure: Header}}
 "#;
         let mut builder = Builder::from_range(12..18);
         builder.mapping_type = true;
@@ -3457,7 +3457,7 @@ actions:
         ));
         let cancellation = workspace.cancel.clone();
         assert!(!workspace.apply(
-            "actions: [{read: {name: x, type: missing, typo: true}}]",
+            "actions: [{read: {name: x, type: {structure: missing}, typo: true}}]",
             source.view(),
             &ctx
         ));
@@ -3623,10 +3623,10 @@ actions:
     fn editing_forms_preserve_existing_checks_expressions_and_nested_branches() {
         let yaml = r#"
 structures:
-  Header:
+  - name: Header
     fields: [{name: count, type: u16}]
 actions:
-  - read: {name: header, type: Header, endian: big}
+  - read: {name: header, type: {structure: Header}, endian: big}
   - read:
       name: bytes
       type: bytes
@@ -3954,7 +3954,7 @@ actions:
         assert!(!workspace.is_parsing());
         assert!(workspace.is_ready());
 
-        assert!(!workspace.apply("actions: [{read: {type: missing}}]", source.view(), &ctx));
+        assert!(!workspace.apply("actions: [{read: {type: {structure: missing}}}]", source.view(), &ctx));
         assert!(matches!(
             workspace.take_run_finished(),
             Some(RunOutcome::Failed(_))
@@ -4163,7 +4163,7 @@ print(f'{len(samples)} samples')
         // traceback to that draft, and switching back retains the run output.
         for language in [DecoderLanguage::Yaml, DecoderLanguage::Python] {
             let mut draft = if language == DecoderLanguage::Yaml {
-                "structures: {}\nactions: []\n".to_owned()
+                "structures: []\nactions: []\n".to_owned()
             } else {
                 code.clone()
             };
@@ -4238,7 +4238,7 @@ print(f'{len(samples)} samples')
     fn yaml_is_the_default_editor_and_modes_preserve_uncommitted_fields() {
         let ctx = Context::default();
         let mut workspace = StructureWorkspace::default();
-        let mut yaml = "structures: {}\nactions: []\n".to_owned();
+        let mut yaml = "structures: []\nactions: []\n".to_owned();
         assert!(workspace.editor_page == EditorPage::Yaml);
         let output = editor_frame(&mut workspace, &mut yaml, &ctx, vec![]);
         assert!(output.shapes.iter().any(|shape| {
@@ -4515,17 +4515,17 @@ print(f'{len(samples)} samples')
         let mut yaml = r#"
 endian: big
 structures:
-  Header:
+  - name: Header
     endian: little
     fields:
       - {name: count, type: u16, endian: big, expect: 2}
       - {name: payload, type: bytes, length: {ref: count}, relative: 2, align: 2}
     actions:
       - calculate: {name: computed, value: {add: [1, 2]}}
-  Other:
+  - name: Other
     fields: [{name: trailing, type: u8}]
 actions:
-  - read: {name: header, type: Header}
+  - read: {name: header, type: {structure: Header}}
 "#
         .to_owned();
         let original: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
@@ -4566,7 +4566,7 @@ actions:
 
     #[test]
     fn reusable_format_editor_rejects_stale_and_invalid_changes() {
-        let yaml = "structures: {Header: {fields: [{name: value, type: u16}]}}\nactions: []\n";
+        let yaml = "structures: [{name: Header, fields: [{name: value, type: u16}]}]\nactions: []\n";
         let mut editor = FormatEditor::default();
         editor.begin("Header", yaml).unwrap();
         editor.editing.as_mut().unwrap().fields[0].name = "changed".into();
@@ -4619,12 +4619,12 @@ actions:
         let program = Program::parse(
             r#"
 structures:
-  Item:
+  - name: Item
     fields: [{name: count, type: u16}]
-  Header:
-    fields: [{name: items, type: Item, repeat: 2}]
+  - name: Header
+    fields: [{name: items, type: {structure: Item}, repeat: 2}]
 actions:
-  - read: {name: header, type: Header}
+  - read: {name: header, type: {structure: Header}}
   - read: {name: later, type: u8}
 "#,
         )

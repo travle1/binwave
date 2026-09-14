@@ -13,17 +13,18 @@ impl DecoderLanguage {
         match self {
             Self::Yaml => {
                 r#"# Byte preview: edit this to match your data.
-# Field types: u8, i16, u16, i32, f32, f64.
+# Built-in types: u8, i16, u16, i32, f32, f64.
+# Declare: - name: Sample. Reference: type: {structure: Sample}.
 # F5 updates the plot, samples, and Hex links.
 endian: little
 structures:
-  Sample:
+  - name: Sample
     fields:
       - {name: value, type: u8}
 actions:
   - read:
       name: samples
-      type: Sample
+      type: {structure: Sample}
       at: 0
       repeat: until end
 "#
@@ -57,18 +58,18 @@ print(f"Registered {len(samples):,} samples")
 #
 # endian: little
 # structures:
-#   Header:
+#   - name: Header
 #     fields:
 #       - {name: count, type: u32}
-#   Sample:
+#   - name: Sample
 #     fields:
 #       - {name: time, type: u32}
 #       - {name: value, type: f32}
 # actions:
-#   - read: {name: header, type: Header}
+#   - read: {name: header, type: {structure: Header}}
 #   - read:
 #       name: samples
-#       type: Sample
+#       type: {structure: Sample}
 #       repeat: {ref: header.count}
 "#
             }
@@ -146,6 +147,13 @@ impl YamlLayoutCache {
                 ui.colored_label(if dark { Color32::from_rgb(140,194,238) } else { Color32::from_rgb(25,89,149) }, "Keyword");
                 ui.colored_label(builtin_color(dark), "Built-in type");
                 ui.label("User-defined name");
+                ui.menu_button("YAML help", |ui| {
+                    ui.set_max_width(420.);
+                    ui.label("Declare a reusable type with name; use structure to reference it.");
+                    ui.code("structures:\n  - name: RecordType\n    fields:\n      - {name: value, type: u16}\nactions:\n  - read: {name: records, type: {structure: RecordType}, repeat: 2}");
+                    ui.label("Declarations read no bytes. Actions start reads; fields consume bytes in order. A field using a structure creates nested values.");
+                    ui.label("repeat counts items; length bounds each item in bytes. ref uses an earlier decoded value. Names are chosen by you.");
+                });
             });
         }
         let mut font = egui::TextStyle::Monospace.resolve(ui.style());
@@ -542,7 +550,7 @@ mod highlighting_tests {
     use super::*;
     #[test]
     fn builtin_type_values_are_distinct_in_both_themes() {
-        let text = "type: u32\ntype: \"f32\"\ntype: RecordType\nname: u32\nexpect: 'u32'\n# type: u32\ncases: {'1': i16, '2': f64}\notherwise: bytes\n";
+        let text = "type: u32\ntype: \"f32\"\ntype: {structure: RecordType}\nname: u32\nexpect: 'u32'\n# type: u32\ncases: {'1': i16, '2': f64}\notherwise: bytes\n";
         for dark in [true, false] {
             let normal=if dark {Color32::WHITE} else {Color32::BLACK};
             let job=source_layout(text,egui::FontId::monospace(13.),dark,normal,DecoderLanguage::Yaml);

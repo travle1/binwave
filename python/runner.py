@@ -272,7 +272,7 @@ class Reader:
                 fields.append({"name": padding_name, "type": "bytes", "length": start - cursor})
             if isinstance(field.type, Struct):
                 self._register(field.type, depth + 1)
-                kind = field.type.name
+                kind = {"structure": field.type.name}
             else:
                 kind = field.type
             entry = {"name": field.name, "type": kind}
@@ -305,7 +305,7 @@ class Reader:
         if len(self._actions) >= 4096:
             raise ValueError("a decoder may emit at most 4096 reads; group samples with records()")
         self._register(definition)
-        entry = {"name": name, "type": definition.name, "at": offset, "length": definition.size}
+        entry = {"name": name, "type": {"structure": definition.name}, "at": offset, "length": definition.size}
         if count is not None:
             entry["repeat"] = count
         self._actions.append({"read": entry})
@@ -382,7 +382,7 @@ class Reader:
     def program(self):
         if not self._actions:
             return None
-        program = {"endian": "little", "structures": self._structures, "actions": self._actions}
+        program = {"endian": "little", "structures": [{"name": name, **definition} for name, definition in self._structures.items()], "actions": self._actions}
         if len(json.dumps(program, ensure_ascii=False).encode("utf-8")) > PROGRAM_LIMIT:
             raise ValueError("emitted decoder exceeds 256 KiB; reuse Struct types and records() instead of emitting each sample")
         return program

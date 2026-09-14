@@ -38,9 +38,47 @@ pub enum Endian {
 pub struct Program {
     #[serde(default)]
     pub endian: Endian,
-    #[serde(default)]
+    #[serde(default, with = "named_structures")]
     pub structures: BTreeMap<String, Structure>,
     pub actions: Vec<Action>,
+}
+
+// YAML declares named records; the execution engine retains an indexed catalog.
+mod named_structures {
+    use super::*;
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Named {
+        name: String,
+        #[serde(default)]
+        fields: Vec<Field>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        actions: Vec<Action>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endian: Option<Endian>,
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, Structure>, D::Error> {
+        let value = serde_yaml_ng::Value::deserialize(d)?;
+        if !value.is_sequence() {
+            return Err(serde::de::Error::custom("structures must be a list of declarations beginning with '- name: RecordType'; mapping-style declarations are no longer supported"));
+        }
+        let entries: Vec<Named> = serde_yaml_ng::from_value(value).map_err(serde::de::Error::custom)?;
+        let mut map = BTreeMap::new();
+        for entry in entries {
+            let name = entry.name;
+            if map.contains_key(&name) {
+                return Err(serde::de::Error::custom(format!("duplicate structure name {name:?}")));
+            }
+            map.insert(name, Structure { fields: entry.fields, actions: entry.actions, endian: entry.endian });
+        }
+        Ok(map)
+    }
+    pub fn serialize<S: serde::Serializer>(map: &BTreeMap<String, Structure>, s: S) -> Result<S::Ok, S::Error> {
+        map.iter().map(|(name, structure)| Named {
+            name: name.clone(), fields: structure.fields.clone(),
+            actions: structure.actions.clone(), endian: structure.endian,
+        }).collect::<Vec<_>>().serialize(s)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -92,11 +130,86 @@ impl Field {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub enum TypeSpec {
     Name(String),
     Select { choose: TypeChoice },
+}
+
+// Explicit references are a wire-format distinction, not a second execution path.
+#[derive(Debug, Clone)]
+struct TypeReference(String);
+impl<'de> Deserialize<'de> for TypeReference {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged, deny_unknown_fields)]
+        enum Wire { Primitive(String), Structure { structure: String } }
+        match Wire::deserialize(d)? {
+            Wire::Primitive(name) if is_builtin_type(&name) => Ok(Self(name)),
+            Wire::Primitive(name) => Err(serde::de::Error::custom(format!("{name:?} is not a built-in type; reference a declared structure with {{structure: {name}}}"))),
+            Wire::Structure { structure } => {
+                if is_builtin_type(&structure) {
+                    return Err(serde::de::Error::custom(format!("{structure:?} is built in; use type: {structure} directly")));
+                }
+                valid_name(&structure).map_err(serde::de::Error::custom)?;
+                Ok(Self(structure))
+            }
+        }
+    }
+}
+impl Serialize for TypeReference {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        if is_builtin_type(&self.0) { return s.serialize_str(&self.0); }
+        let mut map = s.serialize_map(Some(1))?;
+        map.serialize_entry("structure", &self.0)?;
+        map.end()
+    }
+}
+impl<'de> Deserialize<'de> for TypeSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = serde_yaml_ng::Value::deserialize(d)?;
+        if value.as_mapping().is_some_and(|m|m.contains_key(serde_yaml_ng::Value::String("choose".into()))) {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Choice { choose: TypeChoice }
+            let choice: Choice = serde_yaml_ng::from_value(value).map_err(serde::de::Error::custom)?;
+            Ok(Self::Select {choose: choice.choose})
+        } else {
+            let reference: TypeReference = serde_yaml_ng::from_value(value).map_err(serde::de::Error::custom)?;
+            Ok(Self::Name(reference.0))
+        }
+    }
+}
+impl Serialize for TypeSpec {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self {
+            Self::Name(name) => TypeReference(name.clone()).serialize(s),
+            Self::Select {choose} => {
+                let mut map=s.serialize_map(Some(1))?;
+                map.serialize_entry("choose", choose)?; map.end()
+            }
+        }
+    }
+}
+mod type_cases {
+    use super::*;
+    pub fn deserialize<'de,D:serde::Deserializer<'de>>(d:D)->Result<BTreeMap<String,String>,D::Error> {
+        Ok(BTreeMap::<String,TypeReference>::deserialize(d)?.into_iter().map(|(k,v)|(k,v.0)).collect())
+    }
+    pub fn serialize<S:serde::Serializer>(cases:&BTreeMap<String,String>,s:S)->Result<S::Ok,S::Error> {
+        cases.iter().map(|(k,v)|(k,TypeReference(v.clone()))).collect::<BTreeMap<_,_>>().serialize(s)
+    }
+}
+mod optional_type {
+    use super::*;
+    pub fn deserialize<'de,D:serde::Deserializer<'de>>(d:D)->Result<Option<String>,D::Error> {
+        Ok(Option::<TypeReference>::deserialize(d)?.map(|v|v.0))
+    }
+    pub fn serialize<S:serde::Serializer>(v:&Option<String>,s:S)->Result<S::Ok,S::Error> {
+        v.as_ref().map(|v|TypeReference(v.clone())).serialize(s)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -104,9 +217,9 @@ pub enum TypeSpec {
 pub struct TypeChoice {
     #[serde(rename = "ref")]
     pub reference: String,
-    #[serde(default)]
+    #[serde(default, with = "type_cases")]
     pub cases: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "optional_type")]
     pub otherwise: Option<String>,
 }
 
@@ -1679,17 +1792,17 @@ mod tests {
     const DYNAMIC: &str = r#"
 endian: little
 structures:
-  Entry:
+  - name: Entry
     fields:
       - {name: label, type: text, length: 4}
       - {name: code, type: u8}
       - {name: count, type: u8}
-  Catalog:
+  - name: Catalog
     fields:
       - {name: count, type: u8}
-      - {name: entries, type: Entry, repeat: {ref: count}}
+      - {name: entries, type: {structure: Entry}, repeat: {ref: count}}
 actions:
-  - read: {name: catalog, type: Catalog}
+  - read: {name: catalog, type: {structure: Catalog}}
   - define:
       name: Discovered
       from: catalog.entries
@@ -1697,8 +1810,39 @@ actions:
         name: {ref: label}
         type: {ref: code, cases: {'1': u16, '2': i16}}
         repeat: {ref: count}
-  - read: {name: payload, type: Discovered}
+  - read: {name: payload, type: {structure: Discovered}}
 "#;
+    #[test]
+    fn explicit_names_references_and_nested_byte_paths_round_trip() {
+        let yaml = include_str!("../samples/decoders/yaml/nested_records.yaml");
+        let program = Program::parse(yaml).unwrap();
+        let saved = serde_yaml_ng::to_string(&program).unwrap();
+        assert!(saved.contains("- name: Position"));
+        assert!(saved.contains("structure: Position"));
+        let output = run(&saved, vec![7,10,0,20,0,8,30,0,40,0]).unwrap();
+        assert_eq!(output.consumed, 10);
+        let records = &output.nodes[0].children;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].children[1].children[0].path, "records[0].position.x");
+        assert_eq!(records[0].children[1].children[0].numeric(), Some(10.));
+        assert_eq!(records[1].children[1].children[1].numeric(), Some(40.));
+        assert_eq!(records[1].children[1].children[1].range, 8..10);
+    }
+
+    #[test]
+    fn old_and_ambiguous_type_forms_are_rejected() {
+        for yaml in [
+            "structures: {Record: {fields: []}}\nactions: [{skip: 0}]",
+            "structures: [{fields: []}]\nactions: [{skip: 0}]",
+            "structures: [{name: Record}, {name: Record}]\nactions: [{skip: 0}]",
+            "structures: [{name: u32}]\nactions: [{skip: 0}]",
+            "actions: [{read: {name: x, type: Record}}]",
+            "actions: [{read: {name: x, type: {structure: u32}}}]",
+            "actions: [{read: {name: x, type: {choose: {ref: tag, cases: {'1': Record}}}}}]",
+            "actions: [{read: {name: x, type: {choose: {ref: tag, otherwise: Record}}}}]",
+        ] { assert!(Program::parse(yaml).is_err(), "unexpectedly accepted {yaml}"); }
+    }
+
     #[test]
     fn nested_description_collection_builds_reusable_structure_and_tracks_edits() {
         let mut bytes = vec![2];
@@ -1726,18 +1870,18 @@ actions:
     fn decoded_text_can_name_types_and_definition_can_be_reused() {
         let yaml = r#"
 structures:
-  Entry:
+  - name: Entry
     fields:
       - {name: format, type: text, length: 3}
 actions:
-  - read: {name: definitions, type: Entry, repeat: 2}
+  - read: {name: definitions, type: {structure: Entry}, repeat: 2}
   - define:
       name: Pair
       from: definitions
       fields:
         type: {ref: format}
-  - read: {name: first, type: Pair}
-  - read: {name: second, type: Pair}
+  - read: {name: first, type: {structure: Pair}}
+  - read: {name: second, type: {structure: Pair}}
 "#;
         let out = run(yaml, b"u16i16\x01\x00\xff\xff\x02\x00\xfe\xff".to_vec()).unwrap();
         assert_eq!(out.nodes[1].children[1].value, Some(Value::Signed(-1)));
@@ -1793,21 +1937,21 @@ actions:
     fn regions_choices_alignment_and_prior_lengths_decode_chunks() {
         let yaml = r#"
 structures:
-  Chunk:
+  - name: Chunk
     fields:
       - {name: id, type: u8}
       - {name: size, type: u8}
       - name: payload
-        type: {choose: {ref: id, cases: {'1': Pair}, otherwise: bytes}}
+        type: {choose: {ref: id, cases: {'1': {structure: Pair}}, otherwise: bytes}}
         length: {ref: size}
     actions:
       - align: 2
-  Pair:
+  - name: Pair
     fields:
       - {name: first, type: u16}
       - {name: second, type: u16}
 actions:
-  - read: {name: chunks, type: Chunk, repeat: until end}
+  - read: {name: chunks, type: {structure: Chunk}, repeat: until end}
 "#;
         let out = run(yaml, vec![1, 4, 2, 0, 3, 0, 9, 1, 255, 0]).unwrap();
         assert_eq!(out.nodes[0].children.len(), 2);
@@ -1858,7 +2002,7 @@ actions:
             vec![1]
         )
         .is_err());
-        assert!(run("structures: {Loop: {fields: [{name: loop, type: Loop}]}}\nactions: [{read: {name: x, type: Loop}}]", vec![1]).is_err());
+        assert!(run("structures: [{name: Loop, fields: [{name: loop, type: {structure: Loop}}]}]\nactions: [{read: {name: x, type: {structure: Loop}}}]", vec![1]).is_err());
         assert!(run("actions: [{read: {name: x, type: u8, expect: 2}}]", vec![1]).is_err());
     }
     #[test]
@@ -1876,7 +2020,7 @@ actions:
         )
         .is_err());
         assert!(run("actions: [{read: {name: x, type: varuint}}]", vec![255; 10]).is_err());
-        let yaml = "structures: {Region: {fields: [{name: x, type: u8, at: 0}]}}\nactions: [{skip: 2}, {read: {name: region, type: Region, length: 1}}]";
+        let yaml = "structures: [{name: Region, fields: [{name: x, type: u8, at: 0}]}]\nactions: [{skip: 2}, {read: {name: region, type: {structure: Region}, length: 1}}]";
         assert!(run(yaml, vec![1, 2, 3]).is_err());
     }
     #[test]
@@ -1949,7 +2093,7 @@ actions:
 
     #[test]
     fn record_local_lengths_never_reuse_an_outer_namesake_as_fixed_stride() {
-        let yaml = "structures: {Record: {fields: [{name: count, type: u8}, {name: data, type: bytes, length: {ref: count}}]}}\nactions: [{read: {name: count, type: u8}}, {read: {name: records, type: Record, repeat: 129}}]";
+        let yaml = "structures: [{name: Record, fields: [{name: count, type: u8}, {name: data, type: bytes, length: {ref: count}}]}]\nactions: [{read: {name: count, type: u8}}, {read: {name: records, type: {structure: Record}, repeat: 129}}]";
         let mut bytes = vec![255];
         bytes.extend(std::iter::repeat_n(0, 129));
         let out = run(yaml, bytes).unwrap();

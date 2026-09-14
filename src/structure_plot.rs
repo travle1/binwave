@@ -963,9 +963,9 @@ mod tests {
             &store.view(),
             r#"
 structures:
-  Sample:
+  - name: Sample
     fields: [{name: counter, type: f64}, {name: sine, type: f64}, {name: spike, type: f64}]
-actions: [{read: {name: samples, type: Sample, repeat: until end}}]
+actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
 "#,
         );
         let mut request = request(store.view(), node, range.clone(), false);
@@ -1221,27 +1221,27 @@ actions: [{read: {name: samples, type: Sample, repeat: until end}}]
             &source,
             r#"
 structures:
-  Row:
+  - name: Row
     fields:
       - {name: tag, type: u32}
       - name: sine
         type: {choose: {ref: tag, cases: {"0": f64, "1": f64}}}
       - {name: ramp, type: u32}
 actions:
-  - read: {name: samples, type: Row, length: 16, repeat: until end}
+  - read: {name: samples, type: {structure: Row}, length: 16, repeat: until end}
 "#,
         );
         let numeric = parse(
             &source,
             r#"
 structures:
-  Row:
+  - name: Row
     fields:
       - {name: tag, type: u32}
       - {name: sine, type: f64}
       - {name: ramp, type: u32}
 actions:
-  - read: {name: samples, type: Row, length: 16, repeat: until end}
+  - read: {name: samples, type: {structure: Row}, length: 16, repeat: until end}
 "#,
         );
         assert!(generic.lazy.as_ref().unwrap().numeric_plan().is_none());
@@ -1305,12 +1305,12 @@ actions:
             &store.view(),
             r#"
 structures:
-  Row:
+  - name: Row
     fields:
       - {name: value, type: u32}
       - {name: padding, type: bytes, length: 4092}
 actions:
-  - read: {name: samples, type: Row, repeat: until end}
+  - read: {name: samples, type: {structure: Row}, repeat: until end}
 "#,
         );
         let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
@@ -1471,18 +1471,18 @@ actions:
             r#"
 endian: little
 structures:
-  Inner:
+  - name: Inner
     endian: big
     fields:
       - {name: count, type: u16, length: 4}
       - {name: amplitude, type: f32, endian: little}
-  Row:
+  - name: Row
     fields:
-      - {name: sensor, type: Inner}
+      - {name: sensor, type: {structure: Inner}}
       - {name: tail, type: u16, endian: big}
       - {name: pad, type: bytes, length: 2}
 actions:
-  - read: {name: rows, type: Row, repeat: until end}
+  - read: {name: rows, type: {structure: Row}, repeat: until end}
 "#,
         );
         let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
@@ -1533,13 +1533,13 @@ actions:
             &store.view(),
             r#"
 structures:
-  Row:
+  - name: Row
     fields:
       - {name: tag, type: u32}
       - name: value
         type: {choose: {ref: tag, cases: {"0": f32, "1": u32}}}
 actions:
-  - read: {name: rows, type: Row, length: 8, repeat: until end}
+  - read: {name: rows, type: {structure: Row}, length: 8, repeat: until end}
 "#,
         );
         assert!(node.lazy.as_ref().unwrap().numeric_plan().is_none());
@@ -1559,11 +1559,11 @@ actions:
             &store.view(),
             r#"
 structures:
-  Row:
+  - name: Row
     fields:
       - {name: value, type: i32, expect: -8}
 actions:
-  - read: {name: rows, type: Row, length: 4, repeat: until end}
+  - read: {name: rows, type: {structure: Row}, length: 4, repeat: until end}
 "#,
         );
         assert!(expected.lazy.as_ref().unwrap().numeric_plan().is_none());

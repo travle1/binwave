@@ -2,7 +2,7 @@
 # Audio data and unknown chunks remain bytes; this is not an audio decoder.
 endian: little
 structures:
-  Format:
+  - name: Format
     fields:
       - {name: encoding, type: u16}
       - {name: channels, type: u16}
@@ -10,7 +10,7 @@ structures:
       - {name: bytes_per_second, type: u32}
       - {name: block_alignment, type: u16}
       - {name: bits_per_sample, type: u16}
-  Chunk:
+  - name: Chunk
     fields:
       - {name: id, type: text, length: 4}
       - {name: length, type: u32}
@@ -18,16 +18,16 @@ structures:
         type:
           choose:
             ref: id
-            cases: {'fmt ': Format}
+            cases: {'fmt ': {structure: Format}}
             otherwise: bytes
         length: {ref: length}
     actions:
       - align: 2
-  Wave:
+  - name: Wave
     fields:
       - {name: format, type: text, length: 4, expect: WAVE}
-      - {name: chunks, type: Chunk, repeat: until end}
+      - {name: chunks, type: {structure: Chunk}, repeat: until end}
 actions:
   - read: {name: signature, type: text, length: 4, expect: RIFF}
   - read: {name: length, type: u32}
-  - read: {name: container, type: Wave, length: {ref: length}}
+  - read: {name: container, type: {structure: Wave}, length: {ref: length}}

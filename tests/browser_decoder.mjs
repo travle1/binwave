@@ -28,13 +28,13 @@ await bindings.default({module_or_path:await readFile(resolve('dist/web',wasm))}
 const session=new bindings.DecoderSession(String(size));
 const yaml=`endian: little
 structures:
-  Sample:
+  - name: Sample
     fields:
       - {name: value, type: u16}
 actions:
   - read:
       name: samples
-      type: Sample
+      type: {structure: Sample}
       at: 0
       repeat: until end
 `;
@@ -57,7 +57,9 @@ assert.equal(overview.series[0].bands.length,128);
 assert.ok(overview.series[0].bands.every(([left,right,low,high])=>left<right && low<=high));
 assert.ok(overview.scanned<=65536,'Overview work must be bounded');
 assert.ok(overview.series[0].points.length<10000,'Plot response must be bounded');
-assert.throws(()=>session.decode('invalid: schema'));
+assert.throws(()=>session.decode('invalid: definition'));
+assert.throws(()=>session.decode('structures: {Sample: {fields: []}}\nactions: [{skip: 0}]'));
+assert.throws(()=>session.decode('actions: [{read: {name: x, type: Sample}}]'));
 assert.equal(JSON.parse(session.table(path,String(size/2-1))).rows[0].cells.value.number,65535,'Failed apply retains successful session');
 assert.ok(source.cache.size<=4);
 assert.throws(()=>source.read('0',1024**2+1));

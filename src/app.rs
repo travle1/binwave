@@ -3167,7 +3167,7 @@ mod tests {
         std::fs::write(&data, [1u8, 0, 2, 0, 3, 0, 4, 0]).unwrap();
         for (extension, mode, code) in [
             ("py", "Python", "raise RuntimeError('saved_python_must_not_run')\n"),
-            ("yaml", "YAML", "endian: little\nstructures:\n  Custom:\n    fields:\n      - {name: saved_yaml_field, type: u16}\nactions:\n  - read: {name: custom, type: Custom, repeat: until end}\n"),
+            ("yaml", "YAML", "endian: little\nstructures:\n  - name: Custom\n    fields:\n      - {name: saved_yaml_field, type: u16}\nactions:\n  - read: {name: custom, type: {structure: Custom}, repeat: until end}\n"),
         ] {
             let ctx = Context::default();
             let mut app = BinwaveApp::default();
@@ -3594,7 +3594,7 @@ mod tests {
         let data_path = directory.path().join("waveform.data");
         std::fs::write(&data_path, [1u8, 0, 2, 0, 3, 0, 4, 0]).unwrap();
         let yaml_path = directory.path().join("waveform.yaml");
-        let yaml = "endian: little\nstructures:\n  Sample:\n    fields:\n      - {name: amplitude, type: u16}\nactions:\n  - read: {name: samples, type: Sample, repeat: until end}\n";
+        let yaml = "endian: little\nstructures:\n  - name: Sample\n    fields:\n      - {name: amplitude, type: u16}\nactions:\n  - read: {name: samples, type: {structure: Sample}, repeat: until end}\n";
         std::fs::write(&yaml_path, yaml).unwrap();
         app.open_path(data_path, &ctx);
         let deadline = Instant::now() + std::time::Duration::from_secs(5);

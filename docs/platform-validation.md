@@ -123,3 +123,23 @@ when fresh data arrives. Explicit Detail/Overview/range requests reset bounds.
 Two controller tests pass for settled/coalesced gestures, repeated-range
 suppression, clamping, and offsets above 4 GiB. WASM compilation and Trunk build
 pass. Actual touch gestures still require browser smoke testing.
+
+## Explicit decoder declarations and references
+
+The shared parser now requires named declaration lists and explicit structure
+references, including type choices and define mappings. Old mapping declarations
+and bare custom-type references are rejected. Serialization, native editing
+producers, Python-emitted plans, shared starters, and bundled examples emit the
+new syntax. Saved drafts and user files are never silently rewritten.
+
+The reference now documents declaration versus decoded nesting, a ten-byte
+walkthrough, exact decoded paths, cursor movement, per-item lengths, parent
+bounds, reference scope, and types generated from data. A checked-in runnable
+nested-record decoder is exercised in a parse/serialize/decode test.
+
+Validation: 327 native unit tests and 44 integration tests pass (12 existing
+ignored); twelve Python SDK tests pass. Tests include explicit syntax round trips,
+old-form rejection, reserved/duplicate names, nested byte ranges, dynamic formats,
+and large-file reads. The Windows test cross-check, Trunk release, browser worker tests, and actual
+WASM tests with the 40 GiB synthetic source and generated waveform fixture all
+passed. These are not real Windows or iPhone launch tests.

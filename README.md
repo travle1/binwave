@@ -274,24 +274,33 @@ explains the selection workflow. Saved definitions may include unfinished drafts
 syntax is checked when decoding. Legacy layouts remain editable in YAML; save and
 clear a legacy draft before starting a generic definition.
 
+**Decoder syntax:** declare each structure with `- name: RecordType`; reference
+custom types with `type: {structure: RecordType}`. Bare types such as `u16` are
+built in. The old mapping declarations and bare custom-type references are
+rejected; update saved decoders before applying them.
+
+Start with the [byte-by-byte nesting walkthrough](samples/generic_structures.md#worked-example-declarations--bytes--decoded-paths)
+to distinguish type declarations, field nesting, and cursor movement. It also
+explains repetition boundaries and types generated from file data.
+
 For example, this definition reads a header, then uses its values to locate and
 size a collection without scanning its payload first:
 
 ```yaml
 endian: little
 structures:
-  Header:
+  - name: Header
     fields:
       - {name: count, type: u16}
       - {name: offset, type: u32}
-  Value:
+  - name: Value
     fields:
       - {name: sample, type: i16}
 actions:
-  - read: {name: header, type: Header}
+  - read: {name: header, type: {structure: Header}}
   - read:
       name: values
-      type: Value
+      type: {structure: Value}
       at: {ref: header.offset}
       repeat: {ref: header.count}
 ```

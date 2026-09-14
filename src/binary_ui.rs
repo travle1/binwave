@@ -3238,7 +3238,7 @@ mod tests {
             assert!(!workspace.take_layout_applied());
         }
         workspace.switch_language(DecoderLanguage::Yaml);
-        workspace.yaml = "actions: [{read: {name: broken, type: MissingType}}]".into();
+        workspace.yaml = "actions: [{read: {name: broken, type: {structure: MissingType}}}]".into();
         workspace.apply_definition(&ctx);
         settle(&mut workspace, &ctx);
         assert!(workspace.decode_error.is_some());
@@ -3764,7 +3764,7 @@ mod tests {
 
     #[test]
     fn python_attempts_keep_legacy_and_generic_results_and_applied_identity() {
-        let generic = "structures: {Sample: {fields: [{name: value, type: u8}]}}\nactions: [{read: {name: samples, type: Sample, repeat: until end}}]";
+        let generic = "structures: [{name: Sample, fields: [{name: value, type: u8}]}]\nactions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]";
         for decoder in [binary::DEMO_YAML, generic] {
             let ctx = Context::default();
             let mut workspace = BinaryWorkspace::default();
@@ -4209,7 +4209,7 @@ mod tests {
         let mut workspace = BinaryWorkspace::default();
         workspace.open(path.clone(), &ctx);
         settle(&mut workspace, &ctx);
-        workspace.yaml = "endian: big\nstructures:\n  Sample:\n    fields: [{name: triangle, type: f64}, {name: counter, type: u64}]\nactions: [{read: {name: samples, type: Sample, repeat: until end}}]".into();
+        workspace.yaml = "endian: big\nstructures:\n  - name: Sample\n    fields: [{name: triangle, type: f64}, {name: counter, type: u64}]\nactions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]".into();
         workspace.validate_layout(&ctx);
         settle(&mut workspace, &ctx);
         assert!(workspace.message.starts_with("Decoded."));
@@ -4600,7 +4600,7 @@ mod tests {
         let mut workspace = BinaryWorkspace::default();
         workspace.open(source.clone(), &ctx);
         settle(&mut workspace, &ctx);
-        workspace.yaml = "structures:\n  Sample:\n    fields: [{name: a, type: u64}, {name: b, type: u64}]\nactions:\n  - read: {name: samples, type: Sample, repeat: until end}\n".into();
+        workspace.yaml = "structures:\n  - name: Sample\n    fields: [{name: a, type: u64}, {name: b, type: u64}]\nactions:\n  - read: {name: samples, type: {structure: Sample}, repeat: until end}\n".into();
         workspace.validate_layout(&ctx);
         settle(&mut workspace, &ctx);
         let view = workspace.bytes.as_ref().unwrap().view();

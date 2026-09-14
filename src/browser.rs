@@ -444,7 +444,13 @@ impl BrowserApp {
             egui::ComboBox::from_id_source("decoder-example")
                 .selected_text("Examples")
                 .show_ui(ui, |ui| {
-                    if ui.button("Unsigned byte samples").clicked() {
+                    if ui.button("Nested records · byte walkthrough").clicked() {
+                    self.yaml = include_str!("../samples/decoders/yaml/nested_records.yaml").into();
+                }
+                if ui.button("Waveform demo").clicked() {
+                    self.yaml = include_str!("../samples/decoders/yaml/waveform.yaml").into();
+                }
+                if ui.button("Unsigned byte samples").clicked() {
                         self.yaml = crate::source_editor::DecoderLanguage::Yaml
                             .byte_preview()
                             .into();
@@ -620,24 +626,12 @@ impl BrowserApp {
     fn decoded_plot(&mut self, ui: &mut egui::Ui) {
         self.collection_picker(ui);
         ui.horizontal_wrapped(|ui| {
-            ui.label("Samples");
-            ui.add(egui::TextEdit::singleline(&mut self.first).desired_width(90.));
-            ui.label("to");
-            ui.add(egui::TextEdit::singleline(&mut self.last).desired_width(90.));
-            if ui.button("Read range").clicked() {
-                self.request_plot(ui.available_width().max(600.) as u32);
-            }
-            if ui.button("Detail · 512 samples").clicked() {
-                let start = parse_offset(&self.first).unwrap_or(0).min(self.count().saturating_sub(1));
-                self.first = start.to_string();
-                self.last = start.saturating_add(512).min(self.count()).to_string();
-                self.request_plot(1200);
-            }
-            if ui.button("Overview").clicked() {
+            if ui.button("Fit all").clicked() {
                 self.first = "0".into();
                 self.last = self.count().to_string();
                 self.request_plot(1200);
             }
+            ui.label("Drag to pan · scroll or pinch to zoom");
         });
         ui.label(format!(
             "{} · {} records inspected",
@@ -646,10 +640,6 @@ impl BrowserApp {
                 .unwrap_or("Apply a decoder to graph its numeric channels"),
             self.plot["scanned"]
         ));
-        if self.plot["estimated"].as_bool() == Some(true) {
-            ui.label("Amplitude overview: zoom in or tap Detail to see waveform cycles.");
-        }
-        let mut visible = None;
         if let Some(series) = self.plot["series"].as_array() {
             ui.horizontal_wrapped(|ui| {
                 for channel in series {
@@ -686,11 +676,9 @@ impl BrowserApp {
                     crate::plot_trace::decoded_channel(plot, name, colors[i % colors.len()], points,
                         self.plot["estimated"].as_bool().unwrap_or(false).then_some(bands.as_slice()));
                 }
-                let bounds = plot.plot_bounds();
-                visible = Some((bounds.min()[0], bounds.max()[0]));
             });
             let now = ui.input(|i| i.time);
-            let interacting = response.response.dragged() ||
+            let interacting = response.response.dragged() || response.response.drag_stopped() ||
                 (response.response.hovered() && ui.input(|i| i.smooth_scroll_delta != egui::Vec2::ZERO || i.zoom_delta() != 1.0));
             if interacting {
                 let bounds = response.transform.bounds();
@@ -700,19 +688,10 @@ impl BrowserApp {
                 self.first = first.to_string(); self.last = last.to_string();
                 self.request_plot_view(response.response.rect.width().max(100.) as u32, false);
             }
-            response.response.context_menu(|ui| {
-                if ui.button("Decode visible sample range").clicked() {
-                    if let Some((first, last)) = visible {
-                        self.first = (first.max(0.).floor() as u64).min(self.count()).to_string();
-                        self.last = (last.max(0.).ceil() as u64)
-                            .saturating_add(1)
-                            .min(self.count())
-                            .to_string();
-                        self.request_plot(1200);
-                    }
-                    ui.close_menu();
-                }
-            });
+            if response.response.double_clicked() {
+                self.first = "0".into(); self.last = self.count().to_string();
+                self.request_plot(1200);
+            }
         }
     }
 }
