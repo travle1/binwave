@@ -126,8 +126,19 @@ pub(crate) struct YamlLayoutCache {
     dark: bool,
     foreground: Color32,
     language: DecoderLanguage,
+    edit_action: Option<&'static str>,
+    paste: Arc<std::sync::Mutex<Option<String>>>,
 }
 impl YamlLayoutCache {
+    fn edit_menu(&mut self, ui: &mut Ui) {
+        for action in ["Undo", "Redo", "Cut", "Copy", "Paste", "Select all", "Toggle comments"] {
+            if action == "Paste" && !cfg!(target_arch = "wasm32") { continue; }
+            if ui.button(action).clicked() {
+                self.edit_action = Some(action);
+                ui.close_menu();
+            }
+        }
+    }
     pub(crate) fn layout(
         &mut self,
         ui: &Ui,
@@ -159,6 +170,9 @@ impl YamlLayoutCache {
     }
 
     pub(crate) fn editor(&mut self, ui: &mut Ui, yaml: &mut String, language: DecoderLanguage) {
+        ui.horizontal_wrapped(|ui| {
+            ui.menu_button("Edit", |ui| { self.edit_menu(ui); });
+        });
         if language == DecoderLanguage::Yaml {
             ui.horizontal_wrapped(|ui| {
                 let dark = ui.visuals().dark_mode;
@@ -205,6 +219,28 @@ impl YamlLayoutCache {
                                 "decoder_source_text",
                                 language,
                             )));
+                            if let Some(paste) = self.paste.lock().unwrap().take() {
+                                edit_source(ui.ctx(), editor_id, yaml, "Paste", Some(&paste));
+                            }
+                            if let Some(action) = self.edit_action.take() {
+                                if action == "Paste" {
+                                    #[cfg(target_arch = "wasm32")]
+                                    {
+                                        let pending = self.paste.clone();
+                                        let ctx = ui.ctx().clone();
+                                        wasm_bindgen_futures::spawn_local(async move {
+                                            if let Ok(value) = wasm_bindgen_futures::JsFuture::from(crate::browser::paste_text()).await {
+                                                *pending.lock().unwrap() = value.as_string();
+                                                ctx.request_repaint();
+                                            }
+                                        });
+                                    }
+
+                                    ui.memory_mut(|m| m.request_focus(editor_id));
+                                } else {
+                                    edit_source(ui.ctx(), editor_id, yaml, action, None);
+                                }
+                            }
                             let focused = ui.memory(|memory| memory.has_focus(editor_id));
                             let toggle = focused
                                 && ui.input_mut(|input| {
@@ -267,6 +303,7 @@ impl YamlLayoutCache {
                                     }
                                 })
                                 .show(ui);
+                            output.response.context_menu(|ui| { self.edit_menu(ui); });
                             if shortcut_changed {
                                 output.response.mark_changed();
                             }
@@ -298,6 +335,43 @@ impl YamlLayoutCache {
                     });
             });
     }
+}
+
+// Menu actions use the same cursor and undo history as keyboard editing.
+fn edit_source(ctx: &egui::Context, id: egui::Id, text: &mut String, action: &str, paste: Option<&str>) {
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    let mut range = state.cursor.char_range().unwrap_or_default();
+    let mut undo = state.undoer();
+    if action != "Undo" && action != "Redo" { undo.add_undo(&(range, text.clone())); }
+    let [first, last] = range.sorted();
+    if matches!(action, "Copy" | "Cut") {
+        let selected: String = text.chars().skip(first.index).take(last.index - first.index).collect();
+        #[cfg(target_arch = "wasm32")]
+        crate::browser::copy_text(&selected);
+        #[cfg(not(target_arch = "wasm32"))]
+        ctx.output_mut(|out| out.copied_text = selected);
+    }
+    match action {
+        "Cut" | "Paste" => {
+            let insert = paste.unwrap_or("");
+            let chars: Vec<char> = text.chars().collect();
+            *text = chars[..first.index.min(chars.len())].iter().collect::<String>()
+                + insert + &chars[last.index.min(chars.len())..].iter().collect::<String>();
+            range = egui::text::CCursorRange::one(egui::text::CCursor::new(first.index + insert.chars().count()));
+        }
+        "Select all" => range = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count())),
+        "Toggle comments" => range = toggle_source_comments(text, range),
+        "Undo" | "Redo" => {
+            let current = (range, text.clone());
+            let next = if action == "Undo" { undo.undo(&current) } else { undo.redo(&current) };
+            if let Some((cursor, value)) = next.cloned() { range = cursor; *text = value; }
+        }
+        _ => {}
+    }
+    state.cursor.set_char_range(Some(range));
+    state.set_undoer(undo);
+    state.store(ctx, id);
+    ctx.memory_mut(|m| m.request_focus(id));
 }
 
 /// Toggle complete source lines, using character indices to match egui's cursors.
@@ -588,5 +662,80 @@ mod highlighting_tests {
             assert_ne!(color_at(text.find("# type").unwrap()),builtin_color(dark));
             assert_ne!(color_at(0),builtin_color(dark));
         }
+    }
+}
+
+/// Add an independent read without reserializing the user's comments or structures.
+#[cfg(any(test, target_arch = "wasm32"))]
+pub(crate) fn add_selected_read(source: &str, name: &str, kind: &str, start: u64, end: u64) -> Result<String, String> {
+    if name.trim().is_empty() || end <= start { return Err("Choose a name and a nonempty byte selection.".into()); }
+    let width = match kind { "bytes" | "text" | "u8" => 1, "u16" | "i16" => 2, "u32" | "i32" | "f32" => 4, "u64" | "f64" => 8, _ => return Err("Choose a supported type.".into()) };
+    let span = end - start;
+    if span % width != 0 { return Err(format!("The selection must contain a multiple of {width} bytes for {kind}.")); }
+    let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(source).map_err(|e| format!("Fix YAML syntax before adding a read: {e}"))?;
+    if value["actions"].as_sequence().is_some_and(|a| a.iter().any(|a| a["read"]["name"].as_str() == Some(name))) {
+        return Err(format!("A read named {name} already exists. Choose another name."));
+    }
+    let extra = if matches!(kind, "bytes" | "text") { format!(", length: {span}") }
+        else if span > width { format!(", repeat: {}", span / width) } else { String::new() };
+    let action = format!("  - read: {{name: {}, type: {kind}, at: {start}{extra}}}\n", serde_json::to_string(name).unwrap());
+    let mut result = String::new();
+    let mut found = false;
+    let mut in_actions = false;
+    let mut inserted = false;
+    for line in source.split_inclusive('\n') {
+        if line.starts_with("actions:") {
+            if found { return Err("Duplicate actions blocks.".into()); }
+            let tail = line[8..].trim();
+            if !(tail.is_empty() || tail.starts_with('#') || tail == "[]") { return Err("Expand actions into a YAML list before adding a read.".into()); }
+            found = true; in_actions = true;
+            if tail == "[]" { result.push_str("actions:\n"); } else { result.push_str(line); if !line.ends_with('\n') { result.push('\n'); } }
+            continue;
+        }
+        if in_actions && !line.starts_with(char::is_whitespace) && !line.starts_with('#') && !line.trim().is_empty() {
+            result.push_str(&action); inserted = true; in_actions = false;
+        }
+        result.push_str(line);
+    }
+    if !result.ends_with('\n') { result.push('\n'); }
+    if !found { result.push_str("actions:\n"); }
+    if !inserted { result.push_str(&action); }
+    crate::structure::Program::parse(&result).map_err(|e| e.to_string())?;
+    Ok(result)
+}
+
+#[cfg(test)]
+mod selected_read_tests {
+    use super::*;
+    #[test]
+    fn menu_edits_use_unicode_cursor_and_support_undo_redo() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("test-editor");
+        let mut text = "aé猫z".to_string();
+        let mut state = egui::text_edit::TextEditState::default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(1), egui::text::CCursor::new(3))));
+        state.store(&ctx, id);
+        edit_source(&ctx, id, &mut text, "Paste", Some("hello"));
+        assert_eq!(text, "ahelloz");
+        edit_source(&ctx, id, &mut text, "Undo", None);
+        assert_eq!(text, "aé猫z");
+        edit_source(&ctx, id, &mut text, "Redo", None);
+        assert_eq!(text, "ahelloz");
+        edit_source(&ctx, id, &mut text, "Select all", None);
+        edit_source(&ctx, id, &mut text, "Cut", None);
+        assert_eq!(text, "");
+        edit_source(&ctx, id, &mut text, "Undo", None);
+        assert_eq!(text, "ahelloz");
+    }
+    #[test]
+    fn adds_reads_preserving_comments_and_checks_width_and_names() {
+        let source = "# my notes\nendian: little\nactions: []\n";
+        let first = add_selected_read(source, "signature", "text", 0, 4).unwrap();
+        assert!(first.starts_with("# my notes\n"));
+        let next = add_selected_read(&first, "version", "u16", 4, 6).unwrap();
+        assert!(next.contains("at: 4"));
+        assert!(next.find("signature").unwrap() < next.find("version").unwrap());
+        assert!(add_selected_read(&next, "version", "u16", 6, 8).is_err());
+        assert!(add_selected_read(&next, "bad", "u32", 6, 9).is_err());
     }
 }

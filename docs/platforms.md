@@ -206,3 +206,33 @@ using `from plottermax import ...` still work through a compatibility alias.
 `PLOTTERMAX_` equivalents. Existing cache directories and settings keys are retained
 to preserve user state. The generated worktree folder name is independent of the
 application name and may still contain `plottermaxx`.
+
+### Editing and developing a browser decoder
+
+The YAML editor has an **Edit** menu and a right-click menu for selection,
+copy, cut, paste, undo/redo, and toggling comments. Keyboard editing remains
+available. Paste opens a native browser text box so touch paste and LAN HTTP
+work without clipboard API permission. **Save YAML** (or Ctrl/Cmd+S) downloads the current
+source as `decoder.yaml`; this is separate from exporting edited binary data.
+
+To investigate an unfamiliar file incrementally:
+
+1. Save any decoder you want to keep, then choose **New decoder → Start empty decoder**.
+2. Drag over bytes in Hex, or click the first byte and Shift-click the last.
+   On touch devices, the Inspector's start/end range controls also allow an
+   exact selection (end is exclusive).
+3. Use **Selection → Describe selection** (also available by right-click).
+   Give the read a name and choose a type. **Add read to YAML** adds a read at
+   the selected absolute byte offset, preserving existing reads and comments.
+4. Apply and inspect **Decoded structure**. Select another range and add another
+   read as you learn the format. Numeric reads repeat when the selection holds
+   several complete values; text and bytes use the selected byte length.
+5. Refactor these independent reads into reusable structures in YAML when the
+   relationships become clear. The selection helper does not infer nesting or
+   file-format semantics.
+
+You do not need to decode the entire file or produce a plot. Errors leave the
+last successful results available, and edited source is marked as needing Apply.
+Hex can copy a selected range within the loaded 64 KiB page; larger ranges use
+streaming extraction where supported. This adds core authoring controls, not full
+parity with the native guided structure editor or native binary editing tools.

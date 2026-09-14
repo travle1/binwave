@@ -10,6 +10,14 @@ const PAGE: usize = 64 * 1024;
 extern "C" {
     #[wasm_bindgen(js_namespace = binwave, js_name = poll)]
     fn poll_event() -> String;
+    #[wasm_bindgen(js_namespace = binwave, js_name = pasteText)]
+    pub fn paste_text() -> js_sys::Promise;
+    #[wasm_bindgen(js_namespace = binwave, js_name = copyText)]
+    pub fn copy_text(text: &str);
+    #[wasm_bindgen(js_namespace = binwave, js_name = saveDecoder)]
+    fn save_decoder(text: &str);
+    #[wasm_bindgen(js_namespace = binwave, js_name = decoderDraft)]
+    fn decoder_draft(text: &str);
     #[wasm_bindgen(js_namespace = binwave, js_name = send)]
     fn send_command(command: &str) -> bool;
     #[wasm_bindgen(js_namespace = binwave, js_name = selection)]
@@ -53,6 +61,9 @@ pub struct BrowserApp {
     needs_read: bool,
     jump: String,
     selected: Option<u64>,
+    selection_anchor: Option<u64>,
+    field_name: String,
+    field_type: String,
     selected_sample: Option<u64>,
     plot_visible: Option<[f64; 2]>,
     probe_request: u64,
@@ -64,6 +75,9 @@ pub struct BrowserApp {
     undo: bool,
     redo: bool,
     yaml: String,
+    sent_yaml: Option<String>,
+    applied_yaml: String,
+    decoding_yaml: String,
     editor: crate::source_editor::YamlLayoutCache,
     decoded: serde_json::Value,
     table: serde_json::Value,
@@ -77,6 +91,7 @@ pub struct BrowserApp {
     decoding: bool,
     reveal_results: bool,
     reveal_decoder: bool,
+    reveal_inspector: bool,
     plot_request: u64,
     reset_plot: bool,
     layout_mode: String,
@@ -99,6 +114,9 @@ impl BrowserApp {
             needs_read: false,
             jump: "0".into(),
             selected: None,
+            selection_anchor: None,
+            field_name: "field".into(),
+            field_type: "bytes".into(),
             selected_sample: None,
             plot_visible: None,
             probe_request: 0,
@@ -119,6 +137,9 @@ impl BrowserApp {
                         .starter()
                         .into()
                 }),
+            sent_yaml: None,
+            applied_yaml: String::new(),
+            decoding_yaml: String::new(),
             editor: Default::default(),
             decoded: Default::default(),
             table: Default::default(),
@@ -132,6 +153,7 @@ impl BrowserApp {
             decoding: false,
             reveal_results: false,
             reveal_decoder: false,
+            reveal_inspector: false,
             plot_request: 0,
             reset_plot: false,
             layout_mode: cc.storage.and_then(|s|s.get_string("browser-layout-mode")).filter(|s|matches!(s.as_str(),"auto"|"stacked"|"docked")).unwrap_or_else(||"auto".into()),
@@ -220,6 +242,7 @@ impl BrowserApp {
                     }
                 }
                 "decoded" => {
+                    self.applied_yaml = self.decoding_yaml.clone();
                     self.decoding = false;
                     self.decoded = event.result;
                     self.table = Default::default();
@@ -338,6 +361,10 @@ impl BrowserApp {
             self.offset,
             self.bytes.len()
         ));
+        ui.horizontal_wrapped(|ui| {
+            ui.menu_button("Selection", |ui| self.hex_menu(ui));
+            ui.label(format!("Bytes {}..{}", self.range_start, self.range_end));
+        });
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         let digit = ui.fonts(|fonts| fonts.layout_no_wrap("0".into(), font.clone(), egui::Color32::WHITE).size().x);
         // Keep full addresses, but omit padding that adds no information.
@@ -374,7 +401,7 @@ impl BrowserApp {
                         let cell = egui::Rect::from_min_size(
                             egui::pos2(rect.left() + address_width + (i-start) as f32 * cell_width, rect.top()),
                             egui::vec2(cell_width, row_height));
-                        let response = ui.interact(cell, ui.id().with(("byte", at)), egui::Sense::click());
+                        let response = ui.interact(cell, ui.id().with(("byte", at)), egui::Sense::click_and_drag());
                         let selected = selected_start.zip(selected_end).is_some_and(|(first,last)| at >= first && at < last);
                         if selected || response.hovered() {
                             ui.painter().rect_filled(cell.shrink(1.), 3., if selected {
@@ -384,14 +411,24 @@ impl BrowserApp {
                         ui.painter().text(cell.center(), egui::Align2::CENTER_CENTER,
                             format!("{:02X}", self.bytes[i]), font.clone(),
                             if selected { ui.visuals().selection.stroke.color } else { ui.visuals().text_color() });
-                        if response.clicked() {
-                            self.probe_selection(at, at + 1);
-                            self.selected = Some(at);
+                        if response.drag_started() || response.clicked() {
+                            if !ui.input(|i| i.modifiers.shift) || self.selection_anchor.is_none() {
+                                self.selection_anchor = Some(at);
+                            }
+                            let anchor = self.selection_anchor.unwrap_or(at);
+                            self.set_hex_range(anchor.min(at), anchor.max(at) + 1);
                             self.replacement = format!("{:02X}", self.bytes[i]);
-                            self.range_start = at.to_string();
-                            self.range_end = (at + 1).to_string();
-                            export_selection(&self.range_start, &self.range_end);
                         }
+                        if ui.input(|i| i.pointer.primary_down() && i.pointer.is_decidedly_dragging()
+                            && i.pointer.interact_pos().is_some_and(|p| cell.contains(p))) {
+                            if let Some(anchor) = self.selection_anchor {
+                                self.set_hex_range(anchor.min(at), anchor.max(at) + 1);
+                            }
+                        }
+                        response.context_menu(|ui| {
+                            if !selected { self.selection_anchor = Some(at); self.set_hex_range(at, at + 1); }
+                            self.hex_menu(ui);
+                        });
                     }
                     if show_ascii {
                         ui.painter().text(egui::pos2(rect.left() + address_width + columns as f32 * cell_width + 12., rect.center().y),
@@ -402,7 +439,54 @@ impl BrowserApp {
                 }
             });
     }
+    fn set_hex_range(&mut self, start: u64, end: u64) {
+        self.selected = Some(start);
+        self.range_start = start.to_string();
+        self.range_end = end.to_string();
+        export_selection(&self.range_start, &self.range_end);
+        self.probe_selection(start, end);
+    }
+    fn hex_menu(&mut self, ui: &mut egui::Ui) {
+        if ui.button("Copy selected hex").clicked() {
+            let start = parse_offset(&self.range_start).unwrap_or(0);
+            let end = parse_offset(&self.range_end).unwrap_or(start);
+            if start >= self.offset && end <= self.offset + self.bytes.len() as u64 {
+                copy_text(&self.bytes[(start-self.offset) as usize..(end-self.offset) as usize]
+                    .iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" "));
+            } else { self.status = "Copy supports the loaded 64 KiB page; use Extract selection for larger ranges.".into(); }
+            ui.close_menu();
+        }
+        if ui.button("Describe selection…").clicked() {
+            self.reveal_inspector = true;
+            self.mobile_target = Some(Pane::Inspector);
+            ui.close_menu();
+        }
+        if ui.button("Select loaded page").clicked() {
+            self.selection_anchor = Some(self.offset);
+            self.set_hex_range(self.offset, self.offset + self.bytes.len() as u64);
+            ui.close_menu();
+        }
+    }
     fn inspector(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Describe selection");
+        ui.label("Add a named read at the selected byte offset. Existing reads stay in the decoder.");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Name"); ui.text_edit_singleline(&mut self.field_name);
+            egui::ComboBox::from_id_source("selection-type").selected_text(&self.field_type).show_ui(ui, |ui| {
+                for kind in ["bytes", "text", "u8", "u16", "u32", "u64", "i16", "i32", "f32", "f64"] {
+                    ui.selectable_value(&mut self.field_type, kind.into(), kind);
+                }
+            });
+        });
+        if ui.button("Add read to YAML").clicked() {
+            let start = parse_offset(&self.range_start).unwrap_or(0);
+            let end = parse_offset(&self.range_end).unwrap_or(0);
+            match crate::source_editor::add_selected_read(&self.yaml, &self.field_name, &self.field_type, start, end) {
+                Ok(yaml) => { self.yaml = yaml; self.reveal_decoder = true; self.status = "Read added. Apply to inspect it; continue selecting and naming more bytes.".into(); }
+                Err(error) => self.status = error,
+            }
+        }
+        ui.separator();
         if let Some(at) = self.selected {
             ui.monospace(format!("Selected byte: {at} / 0x{at:X}"));
             ui.horizontal_wrapped(|ui| {
@@ -429,7 +513,8 @@ impl BrowserApp {
                 parse_offset(&self.range_end),
             ) {
                 (Some(start), Some(end)) if start <= end && end <= self.size => {
-                    export_selection(&start.to_string(), &end.to_string());
+                    self.selection_anchor = Some(start);
+                    self.set_hex_range(start, end);
                     self.status = format!(
                         "Extraction range {start}..{end} set. Use Extract selection above."
                     );
@@ -466,6 +551,7 @@ impl BrowserApp {
         }
         self.pending.clear();
         self.decoding = true;
+        self.decoding_yaml = self.yaml.clone();
         self.queue(serde_json::json!({"type":"decode","yaml":self.yaml}));
         self.status = "Decoding in worker…".into();
     }
@@ -535,6 +621,15 @@ impl BrowserApp {
     fn decoder(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.strong("YAML");
+            if ui.button("Save YAML…").clicked() { save_decoder(&self.yaml); }
+            ui.menu_button("New decoder…", |ui| {
+                ui.label("Save your current YAML first if you want to keep it.");
+                if ui.button("Start empty decoder").clicked() {
+                    self.yaml = "endian: little\nactions: []\n".into();
+                    self.status = "Select bytes in Hex, then use Describe selection to add a read.".into();
+                    ui.close_menu();
+                }
+            });
             if ui
                 .add_enabled(!self.decoding, egui::Button::new(if self.stacked { "Apply" } else { "Apply · F5" }))
                 .clicked()
@@ -585,6 +680,10 @@ impl BrowserApp {
                 self.open_simple_demo();
             }
             ui.label("512 samples · 2 KB · opens and plots automatically");
+        }
+        ui.label(&self.status);
+        if !self.decoded.is_null() && self.yaml != self.applied_yaml {
+            ui.colored_label(ui.visuals().warn_fg_color, "Results show the last successful decode. Apply to test these edits.");
         }
         self.editor.editor(
             ui,
@@ -841,7 +940,12 @@ impl eframe::App for BrowserApp {
         self.events();
         if self.reveal_decoder {
             self.layout.show_decoder();
+            self.mobile_target = Some(Pane::Layout);
             self.reveal_decoder = false;
+        }
+        if self.reveal_inspector {
+            self.layout.reveal(Pane::Inspector);
+            self.reveal_inspector = false;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
             self.apply_decoder();
@@ -933,6 +1037,10 @@ impl eframe::App for BrowserApp {
             DockArea::new(&mut layout.dock).show(ctx, self);
             self.layout = layout;
         }
+        if self.sent_yaml.as_ref() != Some(&self.yaml) {
+            decoder_draft(&self.yaml);
+            self.sent_yaml = Some(self.yaml.clone());
+        }
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -952,7 +1060,7 @@ impl TabViewer for BrowserApp {
         match pane {
             Pane::Hex => self.hex(ui),
             Pane::Layout => self.decoder(ui),
-            Pane::Inspector => self.inspector(ui),
+            Pane::Inspector => { egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui)); },
             Pane::Plot => self.decoded_plot(ui),
             Pane::Table => self.samples(ui),
             Pane::Structures => self.structures(ui),

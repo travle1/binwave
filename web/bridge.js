@@ -5,6 +5,7 @@
     let failed = false, graphicsReady = false;
     let busy = false, dirty = false, opened = false, exportable = false;
     let runtime = null, loadingDecoder = false;
+    let decoderSource = '';
     let size = '0', selectedStart = '0', selectedEnd = '0';
     const status = document.getElementById('status');
     const open = document.getElementById('open');
@@ -121,7 +122,60 @@
         const wasm = document.querySelector('link[type="application/wasm"]');
         if (js && wasm) runtime = {js:js.href, wasm:wasm.href};
     });
+    // A DOM dialog keeps native clipboard menus and touch paste available even
+    // on LAN HTTP, where navigator.clipboard is unavailable.
+    function clipboardDialog(text, paste) {
+        return new Promise(resolve => {
+            const dialog = document.createElement('dialog');
+            dialog.style.cssText = 'background:#242424;color:#eee;border:1px solid #666;border-radius:8px;padding:20px;font:16px system-ui;max-width:90vw';
+            const label = document.createElement('p');
+            label.textContent = paste ? 'Paste here, then Insert into decoder.' : 'Copy this selected text.';
+            const area = document.createElement('textarea');
+            area.value = text;
+            area.setAttribute('aria-label', paste ? 'Text to paste' : 'Text to copy');
+            area.style.cssText = 'width: min(75vw, 600px); height: 180px; font: 16px monospace';
+            area.readOnly = !paste;
+            const apply = document.createElement('button');
+            apply.textContent = paste ? 'Insert into decoder' : 'Copy';
+            const close = document.createElement('button'); close.textContent = 'Close';
+            function finish(value) { dialog.close(); dialog.remove(); resolve(value); }
+            apply.onclick = async () => {
+                if (paste) { if (area.value.length > 256 * 1024) { label.textContent = 'Paste is limited to 256 KiB.'; return; } finish(area.value); }
+                else {
+                    area.select();
+                    try { await navigator.clipboard.writeText(area.value); finish(null); }
+                    catch { if (document.execCommand('copy')) finish(null); else label.textContent = 'Use your browser’s Copy command on the selected text.'; }
+                }
+            };
+            close.onclick = () => finish(null);
+            dialog.oncancel = event => { event.preventDefault(); finish(null); };
+            dialog.append(label, area, apply, close); document.body.append(dialog);
+            dialog.showModal(); area.focus(); if (!paste) area.select();
+        });
+    }
+    window.addEventListener('keydown', event => {
+        if (graphicsReady && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+            event.preventDefault();
+            window.binwave.saveDecoder(decoderSource);
+        }
+    });
     window.binwave = {
+        decoderDraft(text) { decoderSource = text; },
+        pasteText() { return clipboardDialog('', true); },
+        copyText(text) {
+            if (!text) return;
+            if (typeof navigator !== 'undefined' && navigator.clipboard) {
+                navigator.clipboard.writeText(text).catch(() => clipboardDialog(text, false));
+            } else clipboardDialog(text, false);
+        },
+        saveDecoder(text) {
+            const blob = new Blob([text], {type:'text/yaml;charset=utf-8'});
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url; link.download = 'decoder.yaml'; document.body.append(link); link.click(); link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 60000);
+            status.textContent = 'Decoder downloaded as decoder.yaml';
+        },
         openDemo(bytes, replaceDecoder = false) {
             if (busy || loadingDecoder || failed || !graphicsReady) return false;
             if ((dirty || replaceDecoder) && !confirm('Replace the current data and decoder with the simple demo? Unsaved edits will be discarded.')) return false;

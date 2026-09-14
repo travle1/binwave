@@ -1,26 +1,39 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
-import {File} from 'node:buffer';
+import {File, Blob} from 'node:buffer';
 import {readFileSync} from 'node:fs';
 
 function bridge(allowReplace = true) {
     const commands = [];
     let worker;
     const elements = new Map();
+    const created = [];
+    let savedBlob;
+    class BrowserURL extends URL {
+        static createObjectURL(blob) { savedBlob = blob; return 'blob:local'; }
+        static revokeObjectURL() {}
+    }
     const document = {
+        body: {append() {}},
+        createElement(tag) {
+            const el = {tag, children: [], style: {}, value:'', append(...children) { this.children.push(...children); },
+                setAttribute() {}, click() { this.clicked = true; }, remove() {}, close() {}, showModal() {}, focus() {}, select() {}};
+            created.push(el); return el;
+        },
         currentScript: {src: 'http://localhost:8080/web/bridge.js'},
         getElementById(id) {
             if (!elements.has(id)) elements.set(id, {disabled: false, hidden: true, textContent: ''});
             return elements.get(id);
         },
     };
-    const window = {addEventListener() {}, location: {href: 'http://localhost:8080/'}};
+    const listeners = {};
+    const window = {addEventListener(name, callback) { listeners[name] = callback; }, location: {href: 'http://localhost:8080/'}};
     class Worker { constructor() { worker = this; } postMessage(message) { commands.push(message); } }
     vm.runInNewContext(readFileSync(new URL('../web/bridge.js', import.meta.url), 'utf8'), {
-        document, window, Worker, URL, File, confirm: () => allowReplace,
+        document, window, Worker, URL:BrowserURL, File, Blob, setTimeout() {}, confirm: () => allowReplace,
     });
-    return {receive: data => worker.onmessage({data}), commands, app: window.binwave, get: id => document.getElementById(id)};
+    return {listeners, created, savedBlob: () => savedBlob, receive: data => worker.onmessage({data}), commands, app: window.binwave, get: id => document.getElementById(id)};
 }
 
 test('file opening waits until the graphics workspace is ready', () => {
@@ -130,4 +143,33 @@ test('successful partial decode replaces a previous range error', () => {
     assert.match(get('status').textContent, /exceeds/);
     receive({type:'decoded', result:{consumed:'4', collections:[], nodes:[]}});
     assert.equal(get('status').textContent, 'Decoded 4 of 799659845 bytes · inspect Decoded structure');
+});
+
+test('decoder save downloads the exact YAML without a filesystem picker', async () => {
+    const {app, created, savedBlob} = bridge();
+    const yaml = '# notes\nendian: little\nactions: []\n';
+    app.saveDecoder(yaml);
+    assert.equal(await savedBlob().text(), yaml);
+    const link = created.find(e => e.tag === 'a');
+    assert.equal(link.download, 'decoder.yaml');
+    assert.equal(link.clicked, true);
+});
+test('paste dialog supports native browser paste and cancellation', async () => {
+    const {app, created} = bridge();
+    const pending = app.pasteText();
+    created.find(e => e.tag === 'textarea').value = 'name: café';
+    await created.find(e => e.textContent === 'Insert into decoder').onclick();
+    assert.equal(await pending, 'name: café');
+    const cancelled = app.pasteText();
+    created.filter(e => e.textContent === 'Close').at(-1).onclick();
+    assert.equal(await cancelled, null);
+});
+
+test('save shortcut downloads the current decoder and suppresses browser Save Page', async () => {
+    const {app, listeners, savedBlob} = bridge();
+    app.ready(); app.decoderDraft('actions: []\n');
+    let prevented = false;
+    listeners.keydown({ctrlKey:true, key:'s', preventDefault(){prevented=true;}});
+    assert.equal(prevented, true);
+    assert.equal(await savedBlob().text(), 'actions: []\n');
 });
