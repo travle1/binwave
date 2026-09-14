@@ -13,7 +13,7 @@ self.onmessage = async ({data: m}) => {
         } else if (m.type === 'table') {
             self.postMessage({type:'table', result:JSON.parse(session.table(m.path, m.start))});
         } else if (m.type === 'plot') {
-            self.postMessage({type:'plot', result:JSON.parse(session.plot(m.path, m.start, m.end, m.width))});
+            self.postMessage({type:'plot', request:m.request, reset:m.reset, result:JSON.parse(session.plot(m.path, m.start, m.end, m.width))});
         } else throw Error('Unknown decoding request');
     } catch (error) {
         self.postMessage({type:'error', message:String(error.message || error)});

@@ -112,3 +112,14 @@ schema produces twelve channels, the expected sine at 0/16/48, 384 exact samples
 and 128 estimated bands spanning −4 to +4. The generated-fixture check also runs
 in browser CI. The LAN server serves the rebuilt output; real browser visual
 verification remains with the user.
+
+## Detail-first browser plotting
+
+Collections now initially load up to 512 samples rather than the full overview.
+A Detail button restores a 512-sample window. Plot gestures debounce for 250 ms,
+then request the visible range with the shared decoder/reducer. Request IDs
+reject superseded plot responses; the stable plot ID preserves gesture bounds
+when fresh data arrives. Explicit Detail/Overview/range requests reset bounds.
+Two controller tests pass for settled/coalesced gestures, repeated-range
+suppression, clamping, and offsets above 4 GiB. WASM compilation and Trunk build
+pass. Actual touch gestures still require browser smoke testing.

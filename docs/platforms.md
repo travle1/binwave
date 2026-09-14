@@ -91,9 +91,10 @@ shared with native code. See [architecture boundaries](architecture.md).
   data-file picker and uses a standard file input on LAN HTTP.
 - Inspect decoded structures and 128-record sample pages. Selecting a decoded field selects its byte range in Hex.
 - Plot numeric channels from a decoded collection with the native min/max and
-  sampled overview algorithm. Toggle channels, zoom/pan, then right-click and
-  choose Decode visible sample range for finer detail. Explicit sample ranges
-  and Overview are also available. Quality labels distinguish sampled results.
+  sampled overview algorithm. Collections initially display 512 samples. Detail
+  returns to a 512-sample window; Overview covers the collection. Zoom/pan reloads
+  the visible sample range after gestures settle. Explicit ranges remain
+  available. Quality labels distinguish sampled amplitude bands from traces.
 - Select and replace individual bytes, undo/redo, and extract an explicit range
   whose end offset is exclusive. Edits remain worker-owned sparse patches.
 - Stream an edited copy or extraction to a user-selected destination, with
@@ -151,8 +152,8 @@ Source size and modification time are checked before reads and before/after
 export; browsers can also invalidate reads when a source changes. Keep source
 files unchanged while working.
 
-CSV, native Python, full-file Hex searching, multi-byte replacement, automatic
-viewport refinement, and continuous whole-file hex scrolling are not implemented
+CSV, native Python, full-file Hex searching, multi-byte replacement,
+and continuous whole-file hex scrolling are not implemented
 in the browser yet. Python cannot run as a native subprocess in a browser. Byte
 edits invalidate decoded results; apply YAML again to decode the new revision.
 Failed YAML applies retain the previous successful worker session and results.

@@ -8,6 +8,8 @@ mod binary;
 mod binary_ui;
 #[cfg(target_arch = "wasm32")]
 mod browser;
+#[cfg(any(test, target_arch = "wasm32"))]
+mod browser_viewport;
 #[cfg(target_arch = "wasm32")]
 mod browser_decoder;
 mod byte_display;
