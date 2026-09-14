@@ -92,3 +92,23 @@ Validation of this slice:
 
 The browser remains short of full native parity; see `platforms.md` and
 `architecture.md` for the current boundaries. No deployment or push was performed.
+
+## Decoder picker and sampled overview correction
+
+Added a standard decoder file input, bounded to 256 KiB and independent of the
+data-file picker. Five startup/picker tests pass, including cancellation, failed
+reads, and rejecting oversized/Python inputs before reading them.
+
+The browser had dropped `PlotData.envelopes` and rendered sampled overviews as
+continuous traces. It now transports those bands and both native and browser
+shells call the same `plot_trace::decoded_channel` renderer. Sampled overview
+bands never join individual observations across unread gaps. Exact and min/max
+traces retain their existing adaptive rendering.
+
+Validation: 322 native unit tests pass, including overview shape assertions;
+Trunk release succeeds; actual WASM tests pass against both the synthetic 40 GiB
+source and an 8 MB fixture from the repository waveform generator. The real YAML
+schema produces twelve channels, the expected sine at 0/16/48, 384 exact samples,
+and 128 estimated bands spanning −4 to +4. The generated-fixture check also runs
+in browser CI. The LAN server serves the rebuilt output; real browser visual
+verification remains with the user.

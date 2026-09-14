@@ -145,10 +145,18 @@ impl DecoderSession {
             let end = last.parse::<u64>()?.min(total);
             ensure!(start <= end, "Invalid plot range");
             let data = crate::structure_plot::read_for_viewport(self.source.clone(), node.clone(), start..end, u64::from(width))?;
-            let series: Vec<Value> = data.series.iter().map(|(name,points)|
-                json!({"name":name,"points":points.iter().map(|point|[point.index as f64,point.value]).collect::<Vec<_>>()})).collect();
+            let estimated = data.quality == crate::structure_plot::PlotQuality::SampledPreview;
+            let series: Vec<Value> = data.series.iter().map(|(name,points)| {
+                let bands: Vec<[f64;4]> = if estimated {
+                    data.envelopes.get(name).into_iter().flatten().map(|band|[
+                        band.range.start as f64 - 0.5, band.range.end as f64 - 0.5,
+                        band.min.value, band.max.value,
+                    ]).collect()
+                } else { Vec::new() };
+                json!({"name":name,"points":points.iter().map(|point|[point.index as f64,point.value]).collect::<Vec<_>>(),"bands":bands})
+            }).collect();
             json_result(json!({"path":path,"start":start.to_string(),"end":end.to_string(),
-                "scanned":data.scanned,"quality":data.quality.label(),"series":series}))
+                "scanned":data.scanned,"quality":data.quality.label(),"estimated":estimated,"series":series}))
         })().map_err(js_error)
     }
 }

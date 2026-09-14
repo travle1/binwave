@@ -3,6 +3,38 @@ use egui::{Color32, Id, Rect, Shape, Ui};
 use egui_plot::{Line, PlotBounds, PlotGeometry, PlotItem, PlotPoint, PlotTransform};
 use std::ops::RangeInclusive;
 
+/// Render a decoded channel consistently across platform shells. Estimated
+/// bands describe observed ranges, never a continuous path across unread data.
+pub fn decoded_channel(
+    plot: &mut egui_plot::PlotUi,
+    name: &str,
+    color: Color32,
+    points: Vec<[f64; 2]>,
+    estimated_bands: Option<&[[f64; 4]]>,
+) {
+    if let Some(bands) = estimated_bands {
+        for &[left, right, low, high] in bands {
+            if ![left, right, low, high].iter().all(|x| x.is_finite()) || left >= right || low > high {
+                continue;
+            }
+            // Flat polygons have no area and can tessellate to non-finite vertices.
+            if low < high {
+                plot.polygon(egui_plot::Polygon::new(vec![
+                    [left, low], [right, low], [right, high], [left, high],
+                ]).name(name).fill_color(color.gamma_multiply(0.23))
+                    .stroke(egui::Stroke::new(0_f32, color)));
+            }
+            for (i, value) in [low, high].into_iter().enumerate() {
+                if i == 1 && low == high { continue; }
+                plot.line(Line::new(vec![[left, value], [right, value]])
+                    .name(name).color(color).width(0.8_f32));
+            }
+        }
+    } else {
+        plot.add(AdaptiveTrace::new(points, name, color));
+    }
+}
+
 const MIN_CYCLE_PIXELS: f64 = 4.0;
 const MAX_COLUMNS: usize = 16_384;
 const ENVELOPE_RADIUS: usize = 2;

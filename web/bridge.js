@@ -4,7 +4,7 @@
     const events = [];
     let failed = false, graphicsReady = false;
     let busy = false, dirty = false, opened = false, exportable = false;
-    let runtime = null;
+    let runtime = null, loadingDecoder = false;
     let size = '0', selectedStart = '0', selectedEnd = '0';
     const status = document.getElementById('status');
     const open = document.getElementById('open');
@@ -12,7 +12,10 @@
     const extract = document.getElementById('extract');
     const cancel = document.getElementById('cancel');
     const input = document.getElementById('file');
+    const openDecoder = document.getElementById('open-decoder');
+    const decoderInput = document.getElementById('decoder-file');
     function controls() {
+        openDecoder.disabled = busy || loadingDecoder || failed || !graphicsReady;
         open.disabled = busy || failed || !graphicsReady;
         save.disabled = busy || failed || !graphicsReady || !opened || !exportable;
         extract.disabled = save.disabled || selectedStart === selectedEnd;
@@ -69,6 +72,29 @@
     input.onchange = () => {
         if (input.files[0]) submit({type: 'open', file: input.files[0]});
         input.value = '';
+    };
+    // A plain file input works on LAN HTTP and mobile Safari, without the
+    // secure-context File System Access API. Keep decoder text independently
+    // bounded; it must never become the data-file backend's open source.
+    openDecoder.onclick = () => decoderInput.click();
+    decoderInput.onchange = async () => {
+        const file = decoderInput.files[0];
+        decoderInput.value = '';
+        if (!file) return;
+        loadingDecoder = true; controls();
+        try {
+            if (/\.py$/i.test(file.name)) throw Error('Python decoders require the native app. Choose a YAML decoder.');
+            if (file.size > 256 * 1024) throw Error('Decoder source is limited to 256 KiB. Choose a YAML decoder, not the data file.');
+            const source = await file.text();
+            if (source.includes('\0')) throw Error('This looks like binary data. Choose a YAML decoder.');
+            const old = events.findIndex(e => e.type === 'decoder-source');
+            if (old >= 0) events.splice(old, 1);
+            if (events.length >= 16) events.shift();
+            events.push({type:'decoder-source', name:file.name, source});
+            status.textContent = `Decoder loaded: ${file.name} · tap Apply`;
+        } catch (error) {
+            status.textContent = String(error.message || error);
+        } finally { loadingDecoder = false; controls(); }
     };
     async function exportFile(selection) {
         const start = selection ? selectedStart : '0';

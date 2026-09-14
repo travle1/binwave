@@ -86,8 +86,10 @@ shared with native code. See [architecture boundaries](architecture.md).
 - Open a user-selected local file without reading it in full.
 - Inspect a 64 KiB page of hex/text, jump to decimal or hexadecimal absolute
   offsets, and move between pages. Scrolling is virtualized within the page.
-- Edit YAML and apply with F5; inspect decoded structures and 128-record sample
-  pages. Selecting a decoded field selects its byte range in Hex.
+- Use Open decoder to select a local YAML file (up to 256 KiB), or edit YAML
+  directly; tap Apply or press F5. The decoder picker works independently of the
+  data-file picker and uses a standard file input on LAN HTTP.
+- Inspect decoded structures and 128-record sample pages. Selecting a decoded field selects its byte range in Hex.
 - Plot numeric channels from a decoded collection with the native min/max and
   sampled overview algorithm. Toggle channels, zoom/pan, then right-click and
   choose Decode visible sample range for finer detail. Explicit sample ranges

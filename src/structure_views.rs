@@ -1,11 +1,11 @@
 //! Shared selection and bounded, asynchronous pages for decoded structure views.
 use crate::byte_store::ByteView;
 use crate::hex_editor::HexHighlight;
-use crate::plot_trace::AdaptiveTrace;
+use crate::plot_trace::decoded_channel;
 use crate::structure::{LazyArray, Node, ParseOutput, Value};
 use crate::structure_plot::{PlotQuality, PlotReader};
 use egui::{Color32, Ui};
-use egui_plot::{Legend, Line, Plot, PlotBounds, PlotPoint, PlotTransform, Points, Polygon};
+use egui_plot::{Legend, Plot, PlotBounds, PlotPoint, PlotTransform, Points};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::{
@@ -1295,52 +1295,15 @@ impl StructureViews {
                             .map(|point| [point.index as f64, point.value])
                             .collect();
                         let color = field_color(name);
-                        if matches!(data.quality, PlotQuality::Exact | PlotQuality::MinMax) {
-                            // Preserve the source geometry for inspection; the final
-                            // transform determines whether cycles fit as lines or bands.
-                            plot_ui.add(AdaptiveTrace::new(points.clone(), name, color));
-                            if data.quality == PlotQuality::Exact
-                                && values.len() <= canvas_width as usize / 5
-                            {
-                                plot_ui.points(
-                                    Points::new(points).name(name).color(color).radius(2.5_f32),
-                                );
-                            }
-                        } else if let Some(envelopes) = data.envelopes.get(name) {
-                            // Each convex band represents a bucket's observed range. No
-                            // line interpolates individual samples across unread gaps.
-                            for band in envelopes {
-                                let left = band.range.start as f64 - 0.5;
-                                let right = band.range.end as f64 - 0.5;
-                                let low = band.min.value;
-                                let high = band.max.value;
-                                // Flat bands have no area; a zero-height polygon can
-                                // produce non-finite vertices during tessellation.
-                                if low < high {
-                                    plot_ui.polygon(
-                                        Polygon::new(vec![
-                                            [left, low],
-                                            [right, low],
-                                            [right, high],
-                                            [left, high],
-                                        ])
-                                        .name(name)
-                                        .fill_color(color.gamma_multiply(0.23))
-                                        .stroke(egui::Stroke::new(0_f32, color)),
-                                    );
-                                }
-                                for (index, value) in [low, high].into_iter().enumerate() {
-                                    if index == 1 && low == high {
-                                        continue;
-                                    }
-                                    plot_ui.line(
-                                        Line::new(vec![[left, value], [right, value]])
-                                            .name(name)
-                                            .color(color)
-                                            .width(0.8_f32),
-                                    );
-                                }
-                            }
+                        let bands = (data.quality == PlotQuality::SampledPreview).then(|| {
+                            data.envelopes.get(name).into_iter().flatten().map(|band| [
+                                band.range.start as f64 - 0.5, band.range.end as f64 - 0.5,
+                                band.min.value, band.max.value,
+                            ]).collect::<Vec<_>>()
+                        });
+                        decoded_channel(plot_ui, name, color, points.clone(), bands.as_deref());
+                        if data.quality == PlotQuality::Exact && values.len() <= canvas_width as usize / 5 {
+                            plot_ui.points(Points::new(points).name(name).color(color).radius(2.5_f32));
                         }
                     }
                 }

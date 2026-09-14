@@ -25,6 +25,7 @@ extern "C" {
 struct Event {
     #[serde(rename = "type")]
     kind: String,
+    source: String,
     name: String,
     size: String,
     offset: String,
@@ -65,6 +66,7 @@ pub struct BrowserApp {
     hidden: std::collections::BTreeSet<String>,
     decoding: bool,
     reveal_results: bool,
+    reveal_decoder: bool,
 }
 impl BrowserApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -110,6 +112,7 @@ impl BrowserApp {
             hidden: Default::default(),
             decoding: false,
             reveal_results: false,
+            reveal_decoder: false,
         }
     }
     fn command(&self, value: serde_json::Value) -> bool {
@@ -175,6 +178,15 @@ impl BrowserApp {
                                 self.replacement = format!("{byte:02X}");
                             }
                         }
+                    }
+                }
+                "decoder-source" => {
+                    if event.source.len() <= 256 * 1024 {
+                        self.yaml = event.source;
+                        self.reveal_decoder = true;
+                        self.status = format!("Loaded {}. Tap Apply to decode the open data file.", event.name);
+                    } else {
+                        self.status = "Decoder source is limited to 256 KiB.".into();
                     }
                 }
                 "decoded" => {
@@ -648,11 +660,9 @@ impl BrowserApp {
                     }
                     let points: Vec<[f64; 2]> =
                         serde_json::from_value(channel["points"].clone()).unwrap_or_default();
-                    plot.add(crate::plot_trace::AdaptiveTrace::new(
-                        points,
-                        name,
-                        colors[i % colors.len()],
-                    ));
+                    let bands: Vec<[f64;4]> = serde_json::from_value(channel["bands"].clone()).unwrap_or_default();
+                    crate::plot_trace::decoded_channel(plot, name, colors[i % colors.len()], points,
+                        self.plot["estimated"].as_bool().unwrap_or(false).then_some(bands.as_slice()));
                 }
                 let bounds = plot.plot_bounds();
                 visible = Some((bounds.min()[0], bounds.max()[0]));
@@ -683,6 +693,10 @@ fn parse_offset(text: &str) -> Option<u64> {
 impl eframe::App for BrowserApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.events();
+        if self.reveal_decoder {
+            self.layout.show_decoder();
+            self.reveal_decoder = false;
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
             self.apply_decoder();
         }

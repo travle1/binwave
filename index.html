@@ -9,8 +9,8 @@
   <link data-trunk rel="copy-dir" href="web">
   <style>
     html, body { margin: 0; height: 100%; overflow: hidden; background: #202020; color: #eee; font: 14px system-ui; }
-    header { height: 48px; box-sizing: border-box; display: flex; align-items: center; gap: 10px; padding: 8px; }
-    button { padding: 5px 12px; } #status { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    header { height: 48px; box-sizing: border-box; display: flex; align-items: center; gap: 10px; padding: 8px; overflow-x: auto; }
+    button { padding: 5px 12px; flex-shrink: 0; white-space: nowrap; } #status { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
     #workspace { position: absolute; top: 48px; left: 0; width: 100%; height: calc(100% - 48px); }
     #binwave:not([hidden]) { display: block; }
     #graphics-error { max-width: 680px; margin: 48px auto; padding: 24px; background: #292929; border-radius: 8px; }
@@ -20,6 +20,7 @@
 <body>
   <header aria-label="File operations">
     <button id="open" disabled>Open file…</button><input type="file" id="file" hidden>
+    <button id="open-decoder" disabled>Open decoder…</button><input type="file" id="decoder-file" aria-label="Choose a YAML decoder" hidden>
     <button id="save" disabled>Save edited copy…</button>
     <button id="extract" disabled>Extract selection…</button>
     <button id="cancel" disabled>Cancel operation</button>

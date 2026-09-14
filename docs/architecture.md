@@ -7,7 +7,7 @@ must not introduce another decoder or a second plot-reduction algorithm.
 | --- | --- | --- |
 | YAML syntax, execution, lazy arrays, numeric plans | `structure.rs` | Native `ByteView`; browser bounded worker reader |
 | Viewport sampling, exact reads, min/max reduction | `structure_plot.rs` | Native thread scheduler; browser decoder worker |
-| Dense trace rendering | `plot_trace.rs` | Both egui shells use `AdaptiveTrace` |
+| Dense trace rendering | `plot_trace.rs` | Both shells use `decoded_channel`; sampled bands never connect unread gaps |
 | Source editor, highlighting, shortcuts, templates | `source_editor.rs` | Native language controls; browser YAML controls |
 | Dock arrangement and persistence | `workspace_layout.rs` | Native and browser application state |
 | File identity, dialogs, patches, streaming export | Shared range validation; platform-specific I/O | Native OS files versus browser handles/workers |
