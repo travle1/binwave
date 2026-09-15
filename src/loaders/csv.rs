@@ -785,12 +785,12 @@ mod tests {
     #[test]
     #[ignore]
     fn benchmark_csv_cache() {
-        let dir = if let Some(parent) = std::env::var_os("BINWAVE_BENCH_CACHE_PARENT") {
+        let dir = if let Some(parent) = std::env::var_os("BINWAVE_BENCH_CACHE_PARENT").or_else(|| std::env::var_os("PLOTTERMAX_BENCH_CACHE_PARENT")) {
             tempfile::tempdir_in(parent).unwrap()
         } else {
             tempfile::tempdir().unwrap()
         };
-        let path = if let Some(path) = std::env::var_os("BINWAVE_BENCH_CSV") {
+        let path = if let Some(path) = std::env::var_os("BINWAVE_BENCH_CSV").or_else(|| std::env::var_os("PLOTTERMAX_BENCH_CSV")) {
             path.into()
         } else {
             let path = dir.path().join("benchmark.csv");
@@ -877,12 +877,12 @@ mod tests {
     #[test]
     #[ignore]
     fn benchmark_csv_first_rows() {
-        let dir = if let Some(parent) = std::env::var_os("BINWAVE_BENCH_CACHE_PARENT") {
+        let dir = if let Some(parent) = std::env::var_os("BINWAVE_BENCH_CACHE_PARENT").or_else(|| std::env::var_os("PLOTTERMAX_BENCH_CACHE_PARENT")) {
             tempfile::tempdir_in(parent).unwrap()
         } else {
             tempfile::tempdir().unwrap()
         };
-        let path = if let Some(path) = std::env::var_os("BINWAVE_BENCH_CSV") {
+        let path = if let Some(path) = std::env::var_os("BINWAVE_BENCH_CSV").or_else(|| std::env::var_os("PLOTTERMAX_BENCH_CSV")) {
             path.into()
         } else {
             let path = dir.path().join("benchmark.csv");

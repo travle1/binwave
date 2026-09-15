@@ -78,12 +78,13 @@ impl SourceStamp {
 
 pub fn root() -> PathBuf {
     let base = std::env::var_os("BINWAVE_CACHE_DIR")
+        .or_else(|| std::env::var_os("PLOTTERMAX_CACHE_DIR"))
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from))
         .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".cache")))
         .unwrap_or_else(std::env::temp_dir);
-    base.join("binwave-v1")
+    base.join("plottermax-v1")
 }
 
 fn pointer_path(root: &Path, key: &str) -> PathBuf {
@@ -191,9 +192,14 @@ impl Drop for PendingDirectory {
 
 pub fn freeze(file: &File) -> Result<()> {
     file.sync_all()?;
-    let mut permissions = file.metadata()?.permissions();
-    permissions.set_readonly(true);
-    file.set_permissions(permissions)?;
+    // Windows' read-only attribute blocks deletion of disposable cache files.
+    // Read-only mappings and immutable publication still protect their contents.
+    #[cfg(not(windows))]
+    {
+        let mut permissions = file.metadata()?.permissions();
+        permissions.set_readonly(true);
+        file.set_permissions(permissions)?;
+    }
     Ok(())
 }
 
@@ -241,7 +247,7 @@ pub fn clear() -> Result<()> {
         return Ok(());
     }
     // Only this dedicated application directory is removed, never the user's
-    // BINWAVE_CACHE_DIR / XDG_CACHE_HOME parent. Existing mappings remain valid.
+    // PLOTTERMAX_CACHE_DIR / XDG_CACHE_HOME parent. Existing mappings remain valid.
     fs::remove_dir_all(&root).with_context(|| {
         format!(
             "clear cache {} (close files if your OS keeps them locked)",
@@ -275,4 +281,33 @@ impl<W: Write> Write for LimitedWriter<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
+}
+
+/// Large test fixtures must be sparse on Windows too; set_len alone can reserve
+/// tens of gigabytes on NTFS. This helper is never used for user exports.
+#[cfg(test)]
+pub fn set_fixture_len(file: &File, length: u64) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::{Ioctl::FSCTL_SET_SPARSE, IO::DeviceIoControl};
+        let mut returned = 0;
+        // SAFETY: a live file handle, synchronous operation, no input/output buffer.
+        let ok = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                FSCTL_SET_SPARSE,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    file.set_len(length)
 }

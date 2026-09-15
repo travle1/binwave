@@ -31,6 +31,7 @@ const ROWS_PER_PAGE: usize = 100;
 enum Action {
     Open(PathBuf),
     Demo,
+    SimpleDemo,
     Apply(ResolvedLayout, String),
     LoadYaml(PathBuf),
     ReplaceYaml(String),
@@ -60,6 +61,7 @@ pub enum OpenedFile {
 
 enum IoResult {
     Opened(Arc<FileSource>),
+    SimpleDemo(Arc<Original>),
     Validated(ResolvedLayout, String, Arc<Original>),
     Loaded(Arc<Original>, Option<PathBuf>, bool),
     SavedBinary(ByteSnapshot, PathBuf),
@@ -103,6 +105,8 @@ pub struct BinaryWorkspace {
     raw_source: Option<Arc<FileSource>>,
     bytes: Option<ByteStore>,
     hex_editor: HexEditor,
+    authoring: crate::direct_authoring::DirectAuthoring,
+    author_in_structure: bool,
     structure_ui: StructureWorkspace,
     generic_value_edit: Option<GenericValueEdit>,
     bytes_changed: bool,
@@ -122,6 +126,8 @@ pub struct BinaryWorkspace {
     other_draft: DecoderDraft,
     applied_language: Option<DecoderLanguage>,
     submitted_decoder: Option<(DecoderLanguage, String)>,
+    direct_pending: Option<(String, crate::direct_authoring::Interpretation)>,
+    interpretation_ready: bool,
     completed_python: Option<String>,
     saved_yaml: String,
     yaml_path: Option<PathBuf>,
@@ -169,6 +175,8 @@ impl Default for BinaryWorkspace {
             raw_source: None,
             bytes: None,
             hex_editor: HexEditor::default(),
+            authoring: Default::default(),
+            author_in_structure: false,
             structure_ui: StructureWorkspace::default(),
             generic_value_edit: None,
             bytes_changed: false,
@@ -188,6 +196,8 @@ impl Default for BinaryWorkspace {
             other_draft: DecoderDraft::starter(DecoderLanguage::Python),
             applied_language: None,
             submitted_decoder: None,
+            direct_pending: None,
+            interpretation_ready: false,
             completed_python: None,
             saved_yaml: DecoderLanguage::Yaml.starter().into(),
             yaml_path: None,
@@ -373,6 +383,7 @@ impl BinaryWorkspace {
         self.validate_layout_for(ctx, false);
     }
     fn validate_layout_for(&mut self, ctx: &Context, refresh: bool) {
+        self.direct_pending = None;
         if !refresh {
             self.initial_plot_pending = false;
             self.initial_plot_ready = false;
@@ -628,12 +639,16 @@ impl BinaryWorkspace {
     pub fn open(&mut self, path: PathBuf, ctx: &Context) {
         self.request(Action::Open(path), ctx);
     }
+    pub fn open_simple_demo(&mut self, ctx: &Context) {
+        self.request(Action::SimpleDemo, ctx);
+    }
     pub fn open_demo(&mut self, ctx: &Context) {
         self.request(Action::Demo, ctx);
     }
     pub fn take_opened_file(&mut self) -> Option<OpenedFile> {
         self.opened_file.take()
     }
+    pub fn take_interpretation_ready(&mut self) -> bool { std::mem::take(&mut self.interpretation_ready) }
     pub fn take_layout_applied(&mut self) -> bool {
         std::mem::take(&mut self.layout_applied)
     }
@@ -718,6 +733,12 @@ impl BinaryWorkspace {
                 self.start_io(ctx, move || {
                     Ok(IoResult::Opened(Arc::new(FileSource::open(&path)?)))
                 });
+            }
+            Action::SimpleDemo => {
+                self.report(Ok("Opening simple wave demo…".into()));
+                self.start_io(ctx, || Ok(IoResult::SimpleDemo(Original::from_bytes(
+                    include_bytes!("../samples/quickstart/simple_wave.bin"),
+                )?)));
             }
             Action::Demo => {
                 self.report(Ok("Opening embedded sensor demo…".into()));
@@ -946,6 +967,7 @@ impl BinaryWorkspace {
         self.applied_yaml = None;
         self.applied_language = None;
         self.submitted_decoder = None;
+        self.direct_pending = None;
         self.completed_python = None;
         self.decode_error = None;
         self.other_draft.error = None;
@@ -1006,6 +1028,12 @@ impl BinaryWorkspace {
                     }
                     self.original = Some(original);
                     self.request(Action::Apply(layout, yaml), ctx)
+                }
+                Ok(IoResult::SimpleDemo(original)) => {
+                    self.finish_open(Some(original), None, None, true, false);
+                    self.yaml = DecoderLanguage::Yaml.starter().into();
+                    self.saved_yaml.clone_from(&self.yaml);
+                    self.apply_definition(ctx);
                 }
                 Ok(IoResult::Opened(source)) => {
                     let path = source.path.clone();
@@ -1089,6 +1117,19 @@ impl BinaryWorkspace {
             let initial_plot = std::mem::take(&mut self.initial_plot_pending);
             if let Some((language, source)) = self.submitted_decoder.take() {
                 let published = matches!(&outcome, RunOutcome::Published);
+                if let Some((before, interpretation)) = self.direct_pending.take() {
+                    if published && self.yaml == before {
+                        self.yaml = source.clone();
+                        if let Some(range) = self.structure_ui.root_range(&interpretation.name) {
+                            self.hex_editor.select_range(range.clone(), true);
+                            self.structure_ui.select_bytes(range);
+                        }
+                        self.structure_ui.expand_root(&interpretation.name);
+                        self.authoring.created(interpretation.name);
+                        self.author_in_structure = true;
+                        self.interpretation_ready = true;
+                    }
+                }
                 match outcome {
                     RunOutcome::Published => {
                         self.initial_plot_ready = initial_plot;
@@ -1556,6 +1597,7 @@ impl BinaryWorkspace {
         } else {
             self.initial_plot_pending = false;
             self.submitted_decoder = None;
+        self.direct_pending = None;
             if let Some(error) = self.structure_ui.decode_error() {
                 self.report(Err(anyhow::anyhow!(error.to_owned())));
             }
@@ -1686,31 +1728,17 @@ impl BinaryWorkspace {
     pub fn replace_selected_bytes(&mut self) {
         self.hex_editor.show_replace();
     }
-    pub fn edit_menu(&mut self, ui: &mut Ui) {
-        let ctx = ui.ctx().clone();
-        let enabled = self.commands_available() && !self.cell_dirty();
-        if ui
-            .add_enabled(
-                enabled && self.bytes.as_ref().is_some_and(ByteStore::can_undo),
-                egui::Button::new("Undo byte edit"),
-            )
-            .clicked()
-        {
-            ui.close_menu();
-            self.history(&ctx, false);
-        }
-        if ui
-            .add_enabled(
-                enabled && self.bytes.as_ref().is_some_and(ByteStore::can_redo),
-                egui::Button::new("Redo byte edit"),
-            )
-            .clicked()
-        {
-            ui.close_menu();
-            self.history(&ctx, true);
+    pub fn menu_history(&self) -> (bool,bool) { (self.bytes.as_ref().is_some_and(ByteStore::can_undo),self.bytes.as_ref().is_some_and(ByteStore::can_redo)) }
+    pub fn menu_action(&mut self, command: crate::app_menu::Command, ctx: &Context) {
+        use crate::app_menu::Command::*;
+        if let Some(action)=command.editor_action() { self.show_yaml(); self.structure_ui.code_action(action); return; }
+        match command {
+            Undo => self.history(ctx,false), Redo => self.history(ctx,true),
+            CopyHex => if let Some(bytes)=&self.bytes { self.hex_editor.copy_hex(&bytes.view()); },
+            Extract => if let Some(range)=self.hex_editor.selection() { self.choose_export(ctx,range); },
+            _ => {}
         }
     }
-
     #[cfg(test)]
     pub fn file_toolbar(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
@@ -1817,6 +1845,7 @@ impl BinaryWorkspace {
                 response.on_hover_text(path.display().to_string());
             }
         });
+        if show_language {
         ui.add_enabled_ui(enabled, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("New").clicked() {
@@ -1866,6 +1895,9 @@ impl BinaryWorkspace {
                 }
             });
         });
+        } else if let Some(command)=crate::app_menu::decoder_controls(ui,self.can_apply_definition() && enabled,self.is_decoding()) {
+            match command { crate::app_menu::Command::Apply=>self.apply_definition(&ctx),crate::app_menu::Command::Cancel=>self.stop_decoding(),_=>{} }
+        }
         ui.horizontal_wrapped(|ui| {
             if self.structure_ui.is_parsing() || self.decoding_layout {
                 ui.spinner();
@@ -2575,7 +2607,46 @@ impl BinaryWorkspace {
         self.hex_actions(actions, ui.ctx());
     }
 
+    fn direct_controls(&mut self, ui: &mut Ui, in_structure: bool) {
+        if in_structure != self.author_in_structure { return; }
+        if self.is_python() { return; }
+        let range = self.hex_editor.selection();
+        let preview = range.clone().and_then(|r| self.hex_editor.interpretation_preview(r));
+        let placeholder = self.yaml_path.is_none() && !self.yaml_is_example && self.yaml == self.saved_yaml
+            && ((self.yaml == DecoderLanguage::Yaml.starter() && self.applied_yaml.is_none())
+                || self.yaml == DecoderLanguage::Yaml.byte_preview());
+        let source = if placeholder { "endian: little\nactions: []\n" } else { &self.yaml };
+        let enabled = self.commands_available() && !self.is_decoding() && !self.active_authoring_dirty() && !self.cell_dirty();
+        let size = self.file_len() as u64;
+        let mut edit = None;
+        ui.add_enabled_ui(enabled, |ui| {
+            edit = self.authoring.ui(ui, source, range.map(|r| r.start as u64..r.end as u64), preview.as_deref(), size);
+        });
+        if let Some(error) = self.decode_error.as_deref().or_else(|| self.structure_ui.decode_error()) {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        match edit {
+            Some(crate::direct_authoring::Edit::Commit(source)) => {
+                self.yaml = source;
+                let empty = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&self.yaml).ok().is_some_and(|v| v["actions"].as_sequence().is_some_and(|a| a.is_empty()));
+                if empty { self.structure_ui.clear_program(); self.applied_yaml = None; self.submitted_decoder = None; }
+                else { self.validate_layout(ui.ctx()); self.structure_ui.keep_navigation(); }
+            }
+            Some(crate::direct_authoring::Edit::Interpret(source, interpretation)) => {
+                if let Some(bytes) = &self.bytes {
+                    self.direct_pending = Some((self.yaml.clone(), interpretation.clone()));
+                    self.submitted_decoder = Some((DecoderLanguage::Yaml, source.clone()));
+                    self.structure_ui.apply_interpretation(&source, bytes.view(), ui.ctx(), interpretation);
+                    self.structure_ui.keep_navigation();
+                }
+            }
+            Some(crate::direct_authoring::Edit::Code) => { self.show_yaml(); self.reveal_definition = true; }
+            None => {}
+        }
+    }
+
     pub fn hex(&mut self, ui: &mut Ui) {
+        self.direct_controls(ui, false);
         self.hex_editor.set_python_mode(self.is_python());
         let mut highlights = self.structure_ui.highlights();
         if !self.interpretation_stale && !self.structure_ui.has_published_program() {
@@ -2643,12 +2714,24 @@ impl BinaryWorkspace {
                     if self.structure_ui.authoring_dirty() {
                         self.structure_ui.show_authoring_draft();
                     } else {
+                        // An untouched, unapplied starter is a placeholder when
+                        // the user chooses to describe their own selected bytes.
+                        if self.yaml == DecoderLanguage::Yaml.starter()
+                            && self.saved_yaml == self.yaml
+                            && self.yaml_path.is_none()
+                            && !self.yaml_is_example
+                            && !self.structure_ui.has_published_program()
+                        {
+                            self.yaml.clear();
+                            self.saved_yaml.clear();
+                        }
                         self.structure_ui.begin_definition(range);
                     }
                     self.reveal_definition = true;
                 }
                 HexAction::Extract(range) => self.choose_export(ctx, range),
                 HexAction::Selection(range) => {
+                    self.author_in_structure = false;
                     self.structure_ui.select_bytes(range.clone());
                     if !self.interpretation_stale && !self.structure_ui.has_published_program() {
                         self.select_byte_range(range, false);
@@ -2662,6 +2745,7 @@ impl BinaryWorkspace {
         let restart_preview = std::mem::take(&mut self.initial_plot_pending);
         self.initial_plot_ready = false;
         self.submitted_decoder = None;
+        self.direct_pending = None;
         self.completed_python = None;
         self.bytes_changed = true;
         if let (Some(doc), Some(store)) = (&mut self.document, &self.bytes) {
@@ -2731,9 +2815,21 @@ impl BinaryWorkspace {
     }
 
     pub fn structures(&mut self, ui: &mut Ui) {
+        self.direct_controls(ui, true);
         if self.structure_ui.has_published_program() {
-            if let Some(range) = self.structure_ui.tree(ui, self.hex_editor.selection()) {
+            let mut edit = None;
+            let source = &self.yaml;
+            let authoring = &mut self.authoring;
+            if let Some(range) = self.structure_ui.tree(ui, self.hex_editor.selection(), &mut |ui, node| {
+                let (response, change) = if node.path == node.name { authoring.name_ui(ui, source, &node.name, node.range.start as u64..node.range.end as u64) } else { (ui.selectable_label(false, &node.name), None) };
+                if change.is_some() { edit = change; }
+                response
+            }) {
+                self.author_in_structure = true;
                 self.hex_editor.select_range(range, true);
+            }
+            if let Some(crate::direct_authoring::Edit::Commit(source)) = edit {
+                self.yaml = source; self.validate_layout(ui.ctx()); self.structure_ui.keep_navigation();
             }
         } else if let Some(doc) = &self.document {
             ui.label("Decoded structure");
@@ -2759,7 +2855,7 @@ impl BinaryWorkspace {
             }
         } else {
             ui.strong("No decoded structure yet");
-            ui.weak("Run the decoder to show sections and fields.");
+            ui.weak("Select bytes in Hex, choose an interpretation, and name a field.");
             if ui.button("Open decoder").clicked() {
                 self.open_decoder();
             }
@@ -3019,6 +3115,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn embedded_simple_demo_opens_and_decodes_without_a_path_or_manual_apply() {
+        let ctx = Context::default();
+        let mut workspace = BinaryWorkspace::default();
+        workspace.open_simple_demo(&ctx);
+        settle(&mut workspace, &ctx);
+        assert_eq!(workspace.file_len(), 2048);
+        assert!(workspace.source_path().is_none());
+        assert!(workspace.decoded_ready(), "{}", workspace.message);
+        assert_eq!(workspace.yaml, DecoderLanguage::Yaml.starter());
+        assert!(!workspace.is_dirty());
+        assert!(workspace.take_layout_applied());
+    }
+
+    #[test]
     fn byte_preview_small_files_are_linked_and_both_starters_decode_the_same_values() {
         fn numeric_leaves(nodes: &[Node]) -> Vec<(Range<usize>, f64)> {
             nodes
@@ -3115,7 +3225,7 @@ mod tests {
         let path = directory.path().join("large-source.raw");
         let length = 40_usize * 1024 * 1024 * 1024;
         let mut file = std::fs::File::create(&path).unwrap();
-        file.set_len(length as u64).unwrap();
+        crate::cache::set_fixture_len(&file, length as u64).unwrap();
         file.seek(SeekFrom::End(-1)).unwrap();
         file.write_all(&[231]).unwrap();
         drop(file);
@@ -3238,7 +3348,7 @@ mod tests {
             assert!(!workspace.take_layout_applied());
         }
         workspace.switch_language(DecoderLanguage::Yaml);
-        workspace.yaml = "actions: [{read: {name: broken, type: MissingType}}]".into();
+        workspace.yaml = "actions: [{read: {name: broken, type: {structure: MissingType}}}]".into();
         workspace.apply_definition(&ctx);
         settle(&mut workspace, &ctx);
         assert!(workspace.decode_error.is_some());
@@ -3764,7 +3874,7 @@ mod tests {
 
     #[test]
     fn python_attempts_keep_legacy_and_generic_results_and_applied_identity() {
-        let generic = "structures: {Sample: {fields: [{name: value, type: u8}]}}\nactions: [{read: {name: samples, type: Sample, repeat: until end}}]";
+        let generic = "structures: [{name: Sample, fields: [{name: value, type: u8}]}]\nactions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]";
         for decoder in [binary::DEMO_YAML, generic] {
             let ctx = Context::default();
             let mut workspace = BinaryWorkspace::default();
@@ -3886,7 +3996,7 @@ mod tests {
         assert!(visible_control_text(&mut workspace, &ctx).contains("Replace the YAML draft"));
         click(&mut workspace, &ctx, "Replace decoder");
         assert_eq!(workspace.yaml, DecoderLanguage::Yaml.starter());
-        assert!(!workspace.has_definition());
+        assert!(workspace.has_definition(), "The simple YAML starter is ready to apply");
         assert!(!workspace.is_dirty());
         workspace.switch_language(DecoderLanguage::Python);
         assert_eq!(workspace.yaml, python);
@@ -4209,7 +4319,7 @@ mod tests {
         let mut workspace = BinaryWorkspace::default();
         workspace.open(path.clone(), &ctx);
         settle(&mut workspace, &ctx);
-        workspace.yaml = "endian: big\nstructures:\n  Sample:\n    fields: [{name: triangle, type: f64}, {name: counter, type: u64}]\nactions: [{read: {name: samples, type: Sample, repeat: until end}}]".into();
+        workspace.yaml = "endian: big\nstructures:\n  - name: Sample\n    fields: [{name: triangle, type: f64}, {name: counter, type: u64}]\nactions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]".into();
         workspace.validate_layout(&ctx);
         settle(&mut workspace, &ctx);
         assert!(workspace.message.starts_with("Decoded."));
@@ -4592,7 +4702,7 @@ mod tests {
         let size = 40_000_000_000usize;
         let mut file = std::fs::File::create(&source).unwrap();
         // The logical address is genuinely beyond 32 bits without writing 40 GB in a test.
-        file.set_len(size as u64).unwrap();
+        crate::cache::set_fixture_len(&file, size as u64).unwrap();
         file.seek(SeekFrom::Start((size - 16) as u64)).unwrap();
         file.write_all(&17u64.to_le_bytes()).unwrap();
         file.write_all(&29u64.to_le_bytes()).unwrap();
@@ -4600,7 +4710,7 @@ mod tests {
         let mut workspace = BinaryWorkspace::default();
         workspace.open(source.clone(), &ctx);
         settle(&mut workspace, &ctx);
-        workspace.yaml = "structures:\n  Sample:\n    fields: [{name: a, type: u64}, {name: b, type: u64}]\nactions:\n  - read: {name: samples, type: Sample, repeat: until end}\n".into();
+        workspace.yaml = "structures:\n  - name: Sample\n    fields: [{name: a, type: u64}, {name: b, type: u64}]\nactions:\n  - read: {name: samples, type: {structure: Sample}, repeat: until end}\n".into();
         workspace.validate_layout(&ctx);
         settle(&mut workspace, &ctx);
         let view = workspace.bytes.as_ref().unwrap().view();

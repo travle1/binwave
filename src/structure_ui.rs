@@ -1,4 +1,8 @@
-//! Workspace state for generic definitions. Parsing runs against immutable byte revisions.
+pub use crate::source_editor::DecoderLanguage;
+use crate::source_editor::YamlLayoutCache;
+#[cfg(test)]
+use crate::source_editor::{source_layout, toggle_source_comments};
+// Workspace state for generic definitions. Parsing runs against immutable byte revisions.
 use crate::byte_store::ByteView;
 use crate::field_preview::{FieldPreview, PreviewField};
 use crate::hex_editor::HexHighlight;
@@ -88,105 +92,6 @@ pub fn encode_value(node: &Node, text: &str) -> Result<(Vec<u8>, String)> {
     })
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum DecoderLanguage {
-    #[default]
-    Yaml,
-    Python,
-}
-
-impl DecoderLanguage {
-    pub fn byte_preview(self) -> &'static str {
-        match self {
-            Self::Yaml => {
-                r#"# Byte preview: edit this to match your data.
-# Field types: u8, i16, u16, i32, f32, f64.
-# F5 updates the plot, samples, and Hex links.
-endian: little
-structures:
-  Sample:
-    fields:
-      - {name: value, type: u8}
-actions:
-  - read:
-      name: samples
-      type: Sample
-      at: 0
-      repeat: until end
-"#
-            }
-            Self::Python => {
-                r#"# Byte preview: edit this to match your data.
-# Field types: u8, i16, u16, i32, f32, f64.
-# F5 runs this script; print() uses Console.
-from binwave import Struct
-
-Sample = Struct("Sample", [
-    ("value", "u8"),
-], endian="little")
-
-samples = file.records(
-    "samples", Sample, offset=0,
-)
-print(f"Registered {len(samples):,} samples")
-"#
-            }
-        }
-    }
-
-    pub fn starter(self) -> &'static str {
-        match self {
-            Self::Yaml => {
-                r#"## Adapt this example to your binary file.
-## Header: u32 count. Samples: u32 time, f32 value.
-## Select all, then Ctrl+/ to uncomment.
-## On Mac use Cmd+/. F5 decodes.
-#
-# endian: little
-# structures:
-#   Header:
-#     fields:
-#       - {name: count, type: u32}
-#   Sample:
-#     fields:
-#       - {name: time, type: u32}
-#       - {name: value, type: f32}
-# actions:
-#   - read: {name: header, type: Header}
-#   - read:
-#       name: samples
-#       type: Sample
-#       repeat: {ref: header.count}
-"#
-            }
-            Self::Python => {
-                r#"## Adapt this example to your binary file.
-## `file` is the open file. print() uses Console.
-## Select all, then Ctrl+/ to uncomment.
-## On Mac use Cmd+/. F5 runs.
-#
-# from binwave import Struct
-#
-# Header = Struct("Header", [
-#     ("count", "u32"),
-# ], endian="little")
-#
-# Sample = Struct("Sample", [
-#     ("time", "u32"),
-#     ("value", "f32"),
-# ], endian="little")
-#
-# header = file.read_struct("header", Header)
-# samples = file.records(
-#     "samples", Sample, count=header.count,
-# )
-# print(f"Decoded {len(samples)} samples")
-"#
-            }
-        }
-    }
-}
-
 pub fn has_decoder_code(source: &str) -> bool {
     source.lines().any(|line| {
         let line = line.trim();
@@ -246,6 +151,7 @@ pub struct StructureWorkspace {
     decoded_ready: bool,
     explicit_apply_pending: bool,
     pending_source: Option<RunSource>,
+    interpretation_check: Option<crate::direct_authoring::Interpretation>,
     last_run_language: Option<DecoderLanguage>,
     run_finished: Option<RunOutcome>,
     source: Option<ByteView>,
@@ -313,6 +219,17 @@ impl StructureWorkspace {
     }
     pub fn clear_file(&mut self) {
         *self = Self::default();
+    }
+    /// Direct edits refresh results without requesting a tab or viewport change.
+    pub fn keep_navigation(&mut self) {
+        self.explicit_apply_pending = false;
+        self.decoded_ready = false;
+    }
+    pub fn apply_interpretation(&mut self, yaml: &str, source: ByteView, ctx: &Context, check: crate::direct_authoring::Interpretation) -> bool {
+        self.interpretation_check = Some(check);
+        let result = self.apply(yaml, source, ctx);
+        self.interpretation_check = None;
+        result
     }
     pub fn apply(&mut self, yaml: &str, source: ByteView, ctx: &Context) -> bool {
         self.stop_worker();
@@ -391,6 +308,7 @@ impl StructureWorkspace {
         self.started = Some(Instant::now());
         self.pending_revision = Some(source.revision);
         let ctx = ctx.clone();
+        let interpretation_check = self.interpretation_check.take();
         std::thread::spawn(move || {
             let result = source
                 .validate()
@@ -410,6 +328,7 @@ impl StructureWorkspace {
                         }
                         RunSource::Yaml(program) => {
                             let output = program.run(&source, &cancel)?;
+                            if let Some(check) = &interpretation_check { check.validate(&output)?; }
                             Decoded {
                                 data: Some((program, output)),
                                 stdout: String::new(),
@@ -600,12 +519,12 @@ impl StructureWorkspace {
             }
         }
     }
-    pub fn tree(&mut self, ui: &mut Ui, selection: Option<Range<usize>>) -> Option<Range<usize>> {
+    pub fn tree(&mut self, ui: &mut Ui, selection: Option<Range<usize>>, names: &mut dyn FnMut(&mut Ui, &Node) -> egui::Response) -> Option<Range<usize>> {
         self.selection = selection.clone();
         let selected = self
             .output
             .as_ref()
-            .and_then(|output| self.views.tree(ui, output, selection));
+            .and_then(|output| self.views.tree(ui, output, selection, names));
         if let Some(range) = &selected {
             self.selection = Some(range.clone());
         }
@@ -634,6 +553,13 @@ impl StructureWorkspace {
     pub fn take_plot_action(&mut self) -> Option<PlotAction> {
         self.views.take_plot_action()
     }
+    pub fn expand_root(&mut self, name: &str) {
+        if let Some(node) = self.output.as_ref().and_then(|o| o.nodes.iter().find(|n| n.name == name)) { self.views.expand(&node.path); }
+    }
+    pub fn root_range(&self, name: &str) -> Option<Range<usize>> {
+        self.output.as_ref()?.nodes.iter().find(|n| n.name == name).map(|n| n.range.clone())
+    }
+    pub fn code_action(&mut self, action: &'static str) { self.yaml_layout.command(action); }
     pub fn selected_node(&self) -> Option<Node> {
         self.output
             .as_ref()
@@ -1226,415 +1152,6 @@ impl FormatEditor {
 }
 
 /// Highlighting is cosmetic and cached by the draft and theme; the parser only runs on Decode.
-#[derive(Default)]
-struct YamlLayoutCache {
-    job: Option<egui::text::LayoutJob>,
-    font: egui::FontId,
-    dark: bool,
-    foreground: Color32,
-    language: DecoderLanguage,
-}
-impl YamlLayoutCache {
-    fn layout(
-        &mut self,
-        ui: &Ui,
-        text: &str,
-        font: &egui::FontId,
-        language: DecoderLanguage,
-    ) -> Arc<egui::Galley> {
-        let dark = ui.visuals().dark_mode;
-        let foreground = ui.visuals().text_color();
-        if self.job.as_ref().is_none_or(|job| job.text != text)
-            || self.font != *font
-            || self.dark != dark
-            || self.foreground != foreground
-            || self.language != language
-        {
-            self.job = Some(source_layout(
-                text,
-                font.clone(),
-                dark,
-                foreground,
-                language,
-            ));
-            self.language = language;
-            self.font = font.clone();
-            self.dark = dark;
-            self.foreground = foreground;
-        }
-        ui.fonts(|fonts| fonts.layout_job(self.job.as_ref().unwrap().clone()))
-    }
-
-    fn editor(&mut self, ui: &mut Ui, yaml: &mut String, language: DecoderLanguage) {
-        let mut font = egui::TextStyle::Monospace.resolve(ui.style());
-        font.size = font.size.max(13.);
-        let lines = yaml.bytes().filter(|byte| *byte == b'\n').count() + 1;
-        let gutter_width = ui.fonts(|fonts| fonts.glyph_width(&font, '0'))
-            * lines.to_string().len().max(2) as f32
-            + 20.;
-        egui::Frame::none()
-            .fill(ui.visuals().extreme_bg_color)
-            .inner_margin(egui::Margin::same(6.))
-            .show(ui, |ui| {
-                let size = ui.available_size();
-                egui::ScrollArea::both()
-                    .id_source(("decoder_source", language))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.horizontal_top(|ui| {
-                            let (gutter, _) = ui.allocate_exact_size(
-                                egui::vec2(gutter_width, 0.),
-                                egui::Sense::hover(),
-                            );
-                            let text_width =
-                                (size.x - gutter_width - ui.spacing().item_spacing.x).max(80.);
-                            let editor_id = ui.make_persistent_id(egui::Id::new((
-                                "decoder_source_text",
-                                language,
-                            )));
-                            let focused = ui.memory(|memory| memory.has_focus(editor_id));
-                            let toggle = focused
-                                && ui.input_mut(|input| {
-                                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::Slash)
-                                });
-                            // egui 0.27 also matches Shift+Command+Z as Undo; handle Redo
-                            // first so the standard shortcut works in the source editors.
-                            let redo = focused
-                                && ui.input_mut(|input| {
-                                    input.consume_key(
-                                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
-                                        egui::Key::Z,
-                                    )
-                                });
-                            let mut shortcut_changed = false;
-                            if toggle || redo {
-                                if let Some(mut state) =
-                                    egui::TextEdit::load_state(ui.ctx(), editor_id)
-                                {
-                                    if let Some(selection) = state.cursor.char_range() {
-                                        let mut undoer = state.undoer();
-                                        let next = if toggle {
-                                            undoer.add_undo(&(selection, yaml.clone()));
-                                            let selection = toggle_source_comments(yaml, selection);
-                                            undoer.feed_state(
-                                                ui.input(|input| input.time),
-                                                &(selection, yaml.clone()),
-                                            );
-                                            Some((selection, yaml.clone()))
-                                        } else {
-                                            undoer.redo(&(selection, yaml.clone())).cloned()
-                                        };
-                                        if let Some((selection, source)) = next {
-                                            *yaml = source;
-                                            state.cursor.set_char_range(Some(selection));
-                                            shortcut_changed = true;
-                                        }
-                                        state.set_undoer(undoer);
-                                        state.store(ui.ctx(), editor_id);
-                                    }
-                                }
-                            }
-                            let mut layouter = |ui: &Ui, text: &str, _width: f32| {
-                                self.layout(ui, text, &font, language)
-                            };
-                            let mut output = egui::TextEdit::multiline(yaml)
-                                .id(editor_id)
-                                .code_editor()
-                                .font(font.clone())
-                                .frame(false)
-                                .desired_width(text_width)
-                                .min_size(egui::vec2(text_width, size.y))
-                                .layouter(&mut layouter)
-                                .hint_text(match language {
-                                    DecoderLanguage::Yaml => {
-                                        "Write decoder YAML here, or open a YAML file."
-                                    }
-                                    DecoderLanguage::Python => {
-                                        "Write Python here, or open a Python decoder."
-                                    }
-                                })
-                                .show(ui);
-                            if shortcut_changed {
-                                output.response.mark_changed();
-                            }
-                            let gutter = egui::Rect::from_min_max(
-                                gutter.min,
-                                egui::pos2(gutter.right(), output.response.rect.bottom()),
-                            );
-                            ui.painter().vline(
-                                gutter.right(),
-                                gutter.y_range(),
-                                ui.visuals().widgets.noninteractive.bg_stroke,
-                            );
-                            let clip = ui.clip_rect();
-                            for (index, row) in output.galley.rows.iter().enumerate() {
-                                let y = output.galley_pos.y + row.rect.center().y;
-                                if y >= clip.top() - row.rect.height()
-                                    && y <= clip.bottom() + row.rect.height()
-                                {
-                                    ui.painter().text(
-                                        egui::pos2(gutter.right() - 8., y),
-                                        egui::Align2::RIGHT_CENTER,
-                                        (index + 1).to_string(),
-                                        font.clone(),
-                                        ui.visuals().weak_text_color(),
-                                    );
-                                }
-                            }
-                        });
-                    });
-            });
-    }
-}
-
-/// Toggle complete source lines, using character indices to match egui's cursors.
-fn toggle_source_comments(
-    text: &mut String,
-    mut selection: egui::text::CCursorRange,
-) -> egui::text::CCursorRange {
-    let chars: Vec<char> = text.chars().collect();
-    selection.primary.index = selection.primary.index.min(chars.len());
-    selection.secondary.index = selection.secondary.index.min(chars.len());
-    let [first, last] = selection.sorted();
-    // A selection ending at the start of a line excludes that following line.
-    let last = if first.index < last.index {
-        last.index - 1
-    } else {
-        last.index
-    };
-    let mut start = chars[..first.index]
-        .iter()
-        .rposition(|&ch| ch == '\n')
-        .map_or(0, |position| position + 1);
-    let mut positions = Vec::new();
-    while start <= last {
-        let end = chars[start..]
-            .iter()
-            .position(|&ch| ch == '\n')
-            .map_or(chars.len(), |position| start + position);
-        let content = (start..end).find(|&position| !matches!(chars[position], ' ' | '\t' | '\r'));
-        if let Some(position) = content {
-            positions.push(position);
-        } else if selection.primary.index == selection.secondary.index {
-            // On an empty current line, keep its indentation before inserting '# '.
-            positions.push(if end > start && chars[end - 1] == '\r' {
-                end - 1
-            } else {
-                end
-            });
-        }
-        if end == chars.len() {
-            break;
-        }
-        start = end + 1;
-    }
-    let uncomment = !positions.is_empty()
-        && positions
-            .iter()
-            .all(|&position| chars.get(position) == Some(&'#'));
-    let mut result = String::with_capacity(text.len() + positions.len() * 2);
-    let mut copied = 0;
-    let mut shift = 0_isize;
-    for position in positions {
-        result.extend(chars[copied..position].iter());
-        let removed = if uncomment {
-            1 + usize::from(chars.get(position + 1) == Some(&' '))
-        } else {
-            result.push_str("# ");
-            0
-        };
-        let added = if uncomment { 0 } else { 2 };
-        let adjusted_position = position.checked_add_signed(shift).unwrap();
-        for cursor in [&mut selection.primary, &mut selection.secondary] {
-            if cursor.index >= adjusted_position {
-                cursor.index = adjusted_position
-                    + added
-                    + cursor.index.saturating_sub(adjusted_position + removed);
-            }
-        }
-        shift += added as isize - removed as isize;
-        copied = position + removed;
-    }
-    result.extend(chars[copied..].iter());
-    *text = result;
-    selection
-}
-
-/// A small, lossless lexer for display only. Unknown YAML remains editable and unmodified.
-fn source_layout(
-    text: &str,
-    font: egui::FontId,
-    dark: bool,
-    foreground: Color32,
-    language: DecoderLanguage,
-) -> egui::text::LayoutJob {
-    let (key, string, literal, comment, punctuation) = if dark {
-        (
-            Color32::from_rgb(140, 194, 238),
-            Color32::from_rgb(173, 203, 145),
-            Color32::from_rgb(218, 175, 225),
-            Color32::from_rgb(130, 144, 139),
-            Color32::from_rgb(173, 178, 190),
-        )
-    } else {
-        (
-            Color32::from_rgb(25, 89, 149),
-            Color32::from_rgb(59, 112, 41),
-            Color32::from_rgb(132, 52, 140),
-            Color32::from_rgb(107, 117, 111),
-            Color32::from_rgb(95, 100, 111),
-        )
-    };
-    let mut job = egui::text::LayoutJob::default();
-    // Long expressions stay on their source line; the surrounding area scrolls horizontally.
-    job.wrap.max_width = f32::INFINITY;
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let start = i;
-        let color = match bytes[i] {
-            byte if byte.is_ascii_whitespace() => {
-                i += 1;
-                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                    i += 1;
-                }
-                foreground
-            }
-            b'#' if language == DecoderLanguage::Python
-                || i == 0
-                || bytes[i - 1].is_ascii_whitespace() =>
-            {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                comment
-            }
-            quote @ (b'\'' | b'"') => {
-                let triple = language == DecoderLanguage::Python
-                    && bytes.get(i + 1) == Some(&quote)
-                    && bytes.get(i + 2) == Some(&quote);
-                i += if triple { 3 } else { 1 };
-                while i < bytes.len() {
-                    if triple {
-                        if bytes[i] == b'\\' {
-                            i = (i + 2).min(bytes.len());
-                        } else if bytes[i] == quote
-                            && bytes.get(i + 1) == Some(&quote)
-                            && bytes.get(i + 2) == Some(&quote)
-                        {
-                            i += 3;
-                            break;
-                        } else {
-                            i += 1;
-                        }
-                        continue;
-                    }
-                    if quote == b'"' && bytes[i] == b'\\' {
-                        i = (i + 2).min(bytes.len());
-                    } else if bytes[i] == quote {
-                        i += 1;
-                        if quote == b'\'' && bytes.get(i) == Some(&quote) {
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-                string
-            }
-            b'{' | b'}' | b'[' | b']' | b',' | b':' | b'|' | b'>' => {
-                i += 1;
-                punctuation
-            }
-            byte if language == DecoderLanguage::Python && b"()=+-*/%<!@;".contains(&byte) => {
-                i += 1;
-                punctuation
-            }
-            _ => {
-                i += 1;
-                let delimiters: &[u8] = if language == DecoderLanguage::Python {
-                    b"{}[],:()=+-*/%<>!@;\"'"
-                } else {
-                    b"{}[],:"
-                };
-                while i < bytes.len()
-                    && !bytes[i].is_ascii_whitespace()
-                    && !delimiters.contains(&bytes[i])
-                {
-                    i += 1;
-                }
-                let token = &text[start..i];
-                let followed_by_colon = text[i..].trim_start().starts_with(':');
-                if language == DecoderLanguage::Python
-                    && matches!(
-                        token,
-                        "and"
-                            | "as"
-                            | "assert"
-                            | "async"
-                            | "await"
-                            | "break"
-                            | "class"
-                            | "continue"
-                            | "def"
-                            | "del"
-                            | "elif"
-                            | "else"
-                            | "except"
-                            | "finally"
-                            | "for"
-                            | "from"
-                            | "global"
-                            | "if"
-                            | "import"
-                            | "in"
-                            | "is"
-                            | "lambda"
-                            | "nonlocal"
-                            | "not"
-                            | "or"
-                            | "pass"
-                            | "raise"
-                            | "return"
-                            | "try"
-                            | "while"
-                            | "with"
-                            | "yield"
-                    )
-                {
-                    key
-                } else if language == DecoderLanguage::Yaml && followed_by_colon {
-                    key
-                } else if matches!(
-                    token,
-                    "true" | "false" | "null" | "~" | "True" | "False" | "None"
-                ) || token.parse::<f64>().is_ok()
-                    || token.starts_with("0x")
-                    || token.starts_with("0b")
-                {
-                    literal
-                } else {
-                    foreground
-                }
-            }
-        };
-        job.append(
-            &text[start..i],
-            0.,
-            egui::TextFormat {
-                font_id: font.clone(),
-                color,
-                line_height: Some(font.size * 1.4),
-                ..Default::default()
-            },
-        );
-    }
-    job
-}
-
-/// Keep tracebacks and output bounded while retaining the final exception message.
 fn bounded_console(text: &str) -> String {
     const LIMIT: usize = 64 * 1024;
     if text.len() <= LIMIT {
@@ -3803,7 +3320,7 @@ mod tests {
     #[test]
     fn builder_uses_selection_and_preserves_existing_types() {
         let mut builder = Builder::from_range(16..20);
-        let yaml = builder.generate(DecoderLanguage::Yaml.starter()).unwrap();
+        let yaml = builder.generate("").unwrap();
         let program = Program::parse(&yaml).unwrap();
         assert!(program.structures.contains_key("Record"));
         let Action::Read(read) = &program.actions[0] else {
@@ -3910,16 +3427,16 @@ mod tests {
     fn mapping_form_decodes_later_payload_from_a_nested_description_list() {
         let base = r#"
 structures:
-  Description:
+  - name: Description
     fields:
       - {name: label, type: text, length: 4}
       - {name: code, type: u8}
       - {name: count, type: u8}
-  Header:
+  - name: Header
     fields:
-      - {name: items, type: Description, repeat: 2}
+      - {name: items, type: {structure: Description}, repeat: 2}
 actions:
-  - read: {name: header, type: Header}
+  - read: {name: header, type: {structure: Header}}
 "#;
         let mut builder = Builder::from_range(12..18);
         builder.mapping_type = true;
@@ -3961,7 +3478,7 @@ actions:
         ));
         let cancellation = workspace.cancel.clone();
         assert!(!workspace.apply(
-            "actions: [{read: {name: x, type: missing, typo: true}}]",
+            "actions: [{read: {name: x, type: {structure: missing}, typo: true}}]",
             source.view(),
             &ctx
         ));
@@ -4127,10 +3644,10 @@ actions:
     fn editing_forms_preserve_existing_checks_expressions_and_nested_branches() {
         let yaml = r#"
 structures:
-  Header:
+  - name: Header
     fields: [{name: count, type: u16}]
 actions:
-  - read: {name: header, type: Header, endian: big}
+  - read: {name: header, type: {structure: Header}, endian: big}
   - read:
       name: bytes
       type: bytes
@@ -4274,6 +3791,25 @@ actions:
             .contains_key("Record"));
         let invalid = "structures: [broken YAML";
         assert!(update_steps(invalid, StepChange::Remove(0)).is_err());
+    }
+
+    #[test]
+    fn interpretation_failure_preserves_published_structure() {
+        let source = bytes(&[3, 65, 66, 67, 0, 0, 0, 0]);
+        let ctx = Context::default();
+        let mut workspace = StructureWorkspace::default();
+        workspace.apply("actions: [{read: {name: previous, type: u8}}]", source.view(), &ctx);
+        settle(&mut workspace, source.view(), &ctx);
+        let yaml = "structures: [{name: Header, fields: [{name: count, type: u8}, {name: data, type: bytes, length: {ref: count}}]}]\nactions:\n  - read: {name: field, type: {structure: Header}, at: 0}\n";
+        workspace.apply_interpretation(yaml, source.view(), &ctx, crate::direct_authoring::Interpretation {name: "field".into(), range: 0..2});
+        settle(&mut workspace, source.view(), &ctx);
+        assert!(matches!(workspace.take_run_finished(), Some(RunOutcome::Failed(_))));
+        assert_eq!(workspace.root_range("previous"), Some(0..1));
+        assert_eq!(workspace.root_range("field"), None);
+        workspace.apply_interpretation(yaml, source.view(), &ctx, crate::direct_authoring::Interpretation {name: "field".into(), range: 0..8});
+        settle(&mut workspace, source.view(), &ctx);
+        assert!(matches!(workspace.take_run_finished(), Some(RunOutcome::Published)));
+        assert_eq!(workspace.root_range("field"), Some(0..4));
     }
 
     #[test]
@@ -4458,7 +3994,7 @@ actions:
         assert!(!workspace.is_parsing());
         assert!(workspace.is_ready());
 
-        assert!(!workspace.apply("actions: [{read: {type: missing}}]", source.view(), &ctx));
+        assert!(!workspace.apply("actions: [{read: {type: {structure: missing}}}]", source.view(), &ctx));
         assert!(matches!(
             workspace.take_run_finished(),
             Some(RunOutcome::Failed(_))
@@ -4667,7 +4203,7 @@ print(f'{len(samples)} samples')
         // traceback to that draft, and switching back retains the run output.
         for language in [DecoderLanguage::Yaml, DecoderLanguage::Python] {
             let mut draft = if language == DecoderLanguage::Yaml {
-                "structures: {}\nactions: []\n".to_owned()
+                "structures: []\nactions: []\n".to_owned()
             } else {
                 code.clone()
             };
@@ -4742,7 +4278,7 @@ print(f'{len(samples)} samples')
     fn yaml_is_the_default_editor_and_modes_preserve_uncommitted_fields() {
         let ctx = Context::default();
         let mut workspace = StructureWorkspace::default();
-        let mut yaml = "structures: {}\nactions: []\n".to_owned();
+        let mut yaml = "structures: []\nactions: []\n".to_owned();
         assert!(workspace.editor_page == EditorPage::Yaml);
         let output = editor_frame(&mut workspace, &mut yaml, &ctx, vec![]);
         assert!(output.shapes.iter().any(|shape| {
@@ -4838,7 +4374,7 @@ print(f'{len(samples)} samples')
         for language in [DecoderLanguage::Yaml, DecoderLanguage::Python] {
             let ctx = Context::default();
             let mut cache = YamlLayoutCache::default();
-            let mut source = language.starter().to_owned();
+            let mut source = language.header_example().to_owned();
             let original = source.clone();
             let mut frame = |source: &mut String, events: Vec<egui::Event>| {
                 ctx.run(
@@ -4930,7 +4466,7 @@ print(f'{len(samples)} samples')
             );
             assert_eq!(source, uncommented);
 
-            // The actual starter must decode after the documented keyboard sequence.
+            // The commented header example decodes after the documented keyboard sequence.
             let mut data = 2_u32.to_le_bytes().to_vec();
             for (time, value) in [(100_u32, 1.5_f32), (200, -2.5)] {
                 data.extend_from_slice(&time.to_le_bytes());
@@ -5019,17 +4555,17 @@ print(f'{len(samples)} samples')
         let mut yaml = r#"
 endian: big
 structures:
-  Header:
+  - name: Header
     endian: little
     fields:
       - {name: count, type: u16, endian: big, expect: 2}
       - {name: payload, type: bytes, length: {ref: count}, relative: 2, align: 2}
     actions:
       - calculate: {name: computed, value: {add: [1, 2]}}
-  Other:
+  - name: Other
     fields: [{name: trailing, type: u8}]
 actions:
-  - read: {name: header, type: Header}
+  - read: {name: header, type: {structure: Header}}
 "#
         .to_owned();
         let original: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
@@ -5070,7 +4606,7 @@ actions:
 
     #[test]
     fn reusable_format_editor_rejects_stale_and_invalid_changes() {
-        let yaml = "structures: {Header: {fields: [{name: value, type: u16}]}}\nactions: []\n";
+        let yaml = "structures: [{name: Header, fields: [{name: value, type: u16}]}]\nactions: []\n";
         let mut editor = FormatEditor::default();
         editor.begin("Header", yaml).unwrap();
         editor.editing.as_mut().unwrap().fields[0].name = "changed".into();
@@ -5123,12 +4659,12 @@ actions:
         let program = Program::parse(
             r#"
 structures:
-  Item:
+  - name: Item
     fields: [{name: count, type: u16}]
-  Header:
-    fields: [{name: items, type: Item, repeat: 2}]
+  - name: Header
+    fields: [{name: items, type: {structure: Item}, repeat: 2}]
 actions:
-  - read: {name: header, type: Header}
+  - read: {name: header, type: {structure: Header}}
   - read: {name: later, type: u8}
 "#,
         )

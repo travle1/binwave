@@ -1,0 +1,69 @@
+name: Platform builds
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Platforms to validate
+        type: choice
+        default: windows
+        options: [windows, all]
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.platform == 'windows' && '["windows-latest"]' || '["ubuntu-latest", "windows-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Linux graphics dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libudev-dev
+      - run: cargo test --locked
+      - name: Build Windows portable package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: Binwave-windows-x64
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            dist/Binwave-*-windows-x64/Binwave.exe
+  browser:
+    if: inputs.platform != 'windows'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test tests/browser_backend.mjs tests/browser_startup.mjs tests/browser_decoder_worker.mjs
+      - run: cargo install --locked trunk --version 0.21.14
+      - run: trunk build --release --locked
+      - run: rustc --edition=2021 -O samples/generators/generate_waveform_stress.rs -o /tmp/binwave-waveform-generator
+      - run: /tmp/binwave-waveform-generator --output /tmp/binwave-browser-plot-regression.bin --size-bytes 8000000
+      - run: node --experimental-default-type=module tests/browser_decoder.mjs /tmp/binwave-browser-plot-regression.bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Binwave-browser-preview
+          path: dist/web

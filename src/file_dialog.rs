@@ -94,6 +94,12 @@ impl FileLocations {
         if let Ok(cwd) = std::env::current_dir() {
             roots.push(cwd);
         }
+        // Portable packages keep samples beside the executable, regardless of cwd.
+        if let Ok(executable) = std::env::current_exe() {
+            if let Some(parent) = executable.parent() {
+                roots.push(parent.to_path_buf());
+            }
+        }
         roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
         self.directory_from(kind, &roots)
     }

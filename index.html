@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Binwave — Browser Preview</title>
+  <base data-trunk-public-url>
+  <link data-trunk rel="rust" data-bin="binwave">
+  <link data-trunk rel="copy-dir" href="web">
+  <link data-trunk rel="copy-dir" href="samples/decoders/yaml" data-target-path="decoders">
+  <link data-trunk rel="copy-dir" href="samples/quickstart" data-target-path="examples">
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #202020; color: #eee; font: 14px system-ui; }
+    body { display: flex; flex-direction: column; height: 100dvh; }
+    header { flex-shrink: 0; position: relative; z-index: 10; padding: 6px 12px; border-bottom: 1px solid #3b3b3b; }
+    .menu-row { display:flex; align-items:center; min-height:32px; gap:14px; }
+    .brand { font-weight:600; font-size:16px; }
+    #app-menus { display:flex; gap:4px; }
+    button, summary { -webkit-appearance:none; appearance:none; font:inherit; color:#eee; }
+    button { background:#292929; border:1px solid #484848; border-radius:3px; padding:6px 10px; }
+    button:disabled { color:#777; }
+    button:focus-visible, summary:focus-visible { outline:2px solid #61cbd6; outline-offset:-2px; }
+    summary { cursor:pointer; list-style:none; padding:7px 10px; border-radius:3px; white-space:nowrap; }
+    summary::-webkit-details-marker { display:none; }
+    summary:hover, details[open]>summary, .menu-items button:hover:not(:disabled) { background:#383838; }
+    .app-menu { position:relative; }
+    .menu-items { display:grid; gap:2px; padding:5px; background:#242424; border:1px solid #484848; border-radius:4px; }
+    .app-menu>.menu-items { position:absolute; left:0; top:calc(100% + 4px); min-width:220px; max-height:70dvh; overflow:auto; box-shadow:0 5px 16px #0006; }
+    details:not([open])>.menu-items { display:none; }
+    .menu-items button { border:0; border-radius:2px; text-align:left; background:transparent; min-height:30px; white-space:normal; }
+    .submenu>summary:after { content:' +'; color:#999; }
+    .submenu[open]>summary:after { content:' -'; }
+    .submenu>.menu-items { border:0; border-left:1px solid #484848; margin-left:10px; }
+    #file-context { font-size:12px; color:#aaa; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+    #file-context:empty { display:none; }
+    #status { margin:0; padding:3px 12px; color:#aaa; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:12px; }
+    #workspace { position:relative; flex:1; min-height:0; width:100%; }
+    @media (max-width: 899px) {
+      header { padding:4px max(8px, env(safe-area-inset-right)) 4px max(8px, env(safe-area-inset-left)); }
+      .brand { display:none; }
+      #app-menus { width:100%; justify-content:space-between; }
+      summary, .menu-items button { min-height:40px; box-sizing:border-box; display:flex; align-items:center; }
+      .app-menu>.menu-items { position:fixed; left:8px; right:8px; top:50px; width:auto; min-width:0; }
+      #workspace { padding-bottom:env(safe-area-inset-bottom); box-sizing:border-box; }
+    }
+    #binwave:not([hidden]) { display: block; }
+    #graphics-error { max-width: 680px; margin: 48px auto; padding: 24px; background: #292929; border-radius: 8px; }
+    #graphics-error pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #bbb; }
+  </style>
+</head>
+<body>
+  <header aria-label="Application commands">
+    <div class="menu-row"><span class="brand">Binwave</span><nav id="app-menus" aria-label="Main menu"></nav></div>
+    <div id="file-context"></div>
+  </header>
+  <div hidden aria-hidden="true">
+    <button id="open" disabled>Open file...</button><input type="file" id="file">
+    <button id="open-decoder" disabled>Open decoder...</button><input type="file" id="decoder-file" aria-label="Choose a YAML decoder">
+    <button id="save" disabled>Save edited copy...</button><button id="extract" disabled>Extract selection...</button><button id="cancel" disabled>Cancel operation</button>
+  </div>
+  <main id="workspace">
+    <canvas id="binwave" aria-label="Binwave editing workspace"></canvas>
+    <section id="graphics-error" role="alert" hidden>
+      <h1>This browser cannot start the graphics workspace</h1>
+      <p>Binwave tries WebGPU and then WebGL2. No usable renderer could start.</p>
+      <p>If you are using an embedded browser, open <strong id="graphics-url">this page’s URL</strong>
+      in a regular Chrome, Edge, or Firefox window. GPU availability can differ between browsers.</p>
+      <p>If it still fails, check your browser’s graphics acceleration setting and graphics driver,
+      then restart the browser. The egui workspace requires WebGPU or WebGL2; there is no CPU-only renderer.</p>
+      <details><summary>Technical details</summary><pre id="graphics-detail"></pre></details>
+    </section>
+  </main>
+  <p id="status" role="status">Starting Binwave...</p>
+  <script src="web/menu.js"></script>
+  <script src="web/bridge.js"></script>
+</body>
+</html>

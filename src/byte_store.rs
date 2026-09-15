@@ -83,6 +83,10 @@ impl Origin {
                 .join(path.file_name().context("choose an output filename")?)
         };
         ensure!(canonical != self.path, "Choose a different output file: Save edited copy and Extract cannot replace the open source file.");
+        if path.exists() && self.path.exists() {
+            ensure!(!same_file::is_same_file(&self.path, path).context("compare output with source")?,
+                "Choose a different output file: this destination is a link to the open source file.");
+        }
         #[cfg(unix)]
         if let (Some(identity), Ok(metadata)) = (self.identity, std::fs::metadata(path)) {
             use std::os::unix::fs::MetadataExt;
@@ -301,12 +305,12 @@ mod tests {
         std::fs::create_dir(&subdir).unwrap();
         std::fs::write(&source_path, b"original").unwrap();
         let mut aliases = vec![source_path.clone(), subdir.join("../source.dat")];
+        let hard = dir.path().join("hard.dat");
+        std::fs::hard_link(&source_path, &hard).unwrap();
+        aliases.push(hard);
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
-            let hard = dir.path().join("hard.dat");
-            std::fs::hard_link(&source_path, &hard).unwrap();
-            aliases.push(hard);
             let sym = dir.path().join("symlink.dat");
             symlink(&source_path, &sym).unwrap();
             aliases.push(sym);
@@ -421,7 +425,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("large");
         let file = std::fs::File::create(&path).unwrap();
-        file.set_len(20 * 1024 * 1024 * 1024).unwrap();
+        crate::cache::set_fixture_len(&file, 20 * 1024 * 1024 * 1024).unwrap();
         drop(file);
         let mut store = ByteStore::from_file(Arc::new(FileSource::open(&path).unwrap()));
         let end = store.view().len() - 1;

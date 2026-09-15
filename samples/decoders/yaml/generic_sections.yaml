@@ -3,14 +3,14 @@
 # Synthetic example bytes are described in generic_structures.md.
 endian: little
 structures:
-  Description:
+  - name: Description
     fields:
       - {name: name, type: text, length: 4}
       - {name: format, type: u8}
       - {name: count, type: u8}
-  Definitions:
+  - name: Definitions
     fields:
-      - {name: entries, type: Description, repeat: until end}
+      - {name: entries, type: {structure: Description}, repeat: until end}
     actions:
       - define:
           name: Discovered
@@ -21,7 +21,7 @@ structures:
               ref: format
               cases: {'1': u16, '2': i16, '3': f32}
             repeat: {ref: count}
-  Section:
+  - name: Section
     fields:
       - {name: id, type: u8}
       - {name: length, type: u8}
@@ -29,8 +29,8 @@ structures:
         type:
           choose:
             ref: id
-            cases: {'1': Definitions, '2': Discovered}
+            cases: {'1': {structure: Definitions}, '2': {structure: Discovered}}
             otherwise: bytes
         length: {ref: length}
 actions:
-  - read: {name: sections, type: Section, repeat: until end}
+  - read: {name: sections, type: {structure: Section}, repeat: until end}

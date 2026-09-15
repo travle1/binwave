@@ -1,6 +1,6 @@
 # Waveform parser stress fixture
 
-PWAV is a synthetic tagged container for testing BinWave's reusable decoders.
+PWAV is a synthetic tagged container for testing Binwave's reusable decoders.
 Its numeric samples are generated from mathematical waveform formulas. The file
 carries names, types, widths, counts, and section lengths so the decoder discovers
 the sample layout from metadata.

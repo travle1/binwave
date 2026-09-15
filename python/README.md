@@ -1,6 +1,6 @@
 # Python decoders
 
-Open a data file in BinWave, then use **Decoder → Open decoder…** to load a
+Open a data file in Binwave, then use **Decoder → Open decoder…** to load a
 `.py` file. Loading only displays its source. **Run script** (F5) executes it;
 **Stop** cancels it. **Save Python…** saves the source. To start from scratch,
 select **Python** and choose **New**. YAML is the default editor; each language has
@@ -33,8 +33,8 @@ relative imports use the saved script's folder. Output and tracebacks appear in
 the console when execution finishes; they are not streamed while the script runs.
 Python runs with your local user permissions and is **not sandboxed**.
 
-BinWave supplies `file` and the `binwave` module during execution. They do
-not require a pip package; run these scripts inside BinWave.
+Binwave supplies `file` and the `binwave` module during execution. They do
+not require a pip package; run these scripts inside Binwave.
 
 ## Run ordinary Python
 

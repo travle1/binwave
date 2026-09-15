@@ -2,19 +2,19 @@
 # All names, field widths and values here are examples; adapt them to your file.
 endian: little
 structures:
-  Header:
+  - name: Header
     fields:
       - {name: count, type: u32}
       - {name: data_offset, type: u32}
-  Record:
+  - name: Record
     fields:
       - {name: timestamp, type: u32}
       - {name: value, type: i16}
       - {name: flags, type: u16}
 actions:
-  - read: {name: header, type: Header}
+  - read: {name: header, type: {structure: Header}}
   - read:
       name: records
-      type: Record
+      type: {structure: Record}
       at: {ref: header.data_offset}
       repeat: {ref: header.count}

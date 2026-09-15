@@ -2,7 +2,7 @@
 # CRC values are displayed, not verified or recalculated by this definition.
 endian: big
 structures:
-  ImageHeader:
+  - name: ImageHeader
     fields:
       - {name: width, type: u32}
       - {name: height, type: u32}
@@ -11,7 +11,7 @@ structures:
       - {name: compression, type: u8}
       - {name: filter, type: u8}
       - {name: interlace, type: u8}
-  Chunk:
+  - name: Chunk
     fields:
       - {name: length, type: u32}
       - {name: type, type: text, length: 4}
@@ -19,10 +19,10 @@ structures:
         type:
           choose:
             ref: type
-            cases: {IHDR: ImageHeader}
+            cases: {IHDR: {structure: ImageHeader}}
             otherwise: bytes
         length: {ref: length}
       - {name: crc, type: u32}
 actions:
   - read: {name: signature, type: u64, expect: 0x89504E470D0A1A0A}
-  - read: {name: chunks, type: Chunk, repeat: until end}
+  - read: {name: chunks, type: {structure: Chunk}, repeat: until end}

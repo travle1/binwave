@@ -1,6 +1,6 @@
-"""BinWave's standard-library Python reader and decoder-plan bridge.
+"""Binwave's standard-library Python reader and decoder-plan bridge.
 
-Executed by BinWave, which supplies the open file (including byte edits).
+Executed by Binwave, which supplies the open file (including byte edits).
 User scripts import Field/Struct from binwave and use the global ``file``.
 This is normal Python, not a security sandbox.
 """
@@ -272,7 +272,7 @@ class Reader:
                 fields.append({"name": padding_name, "type": "bytes", "length": start - cursor})
             if isinstance(field.type, Struct):
                 self._register(field.type, depth + 1)
-                kind = field.type.name
+                kind = {"structure": field.type.name}
             else:
                 kind = field.type
             entry = {"name": field.name, "type": kind}
@@ -305,7 +305,7 @@ class Reader:
         if len(self._actions) >= 4096:
             raise ValueError("a decoder may emit at most 4096 reads; group samples with records()")
         self._register(definition)
-        entry = {"name": name, "type": definition.name, "at": offset, "length": definition.size}
+        entry = {"name": name, "type": {"structure": definition.name}, "at": offset, "length": definition.size}
         if count is not None:
             entry["repeat"] = count
         self._actions.append({"read": entry})
@@ -382,7 +382,7 @@ class Reader:
     def program(self):
         if not self._actions:
             return None
-        program = {"endian": "little", "structures": self._structures, "actions": self._actions}
+        program = {"endian": "little", "structures": [{"name": name, **definition} for name, definition in self._structures.items()], "actions": self._actions}
         if len(json.dumps(program, ensure_ascii=False).encode("utf-8")) > PROGRAM_LIMIT:
             raise ValueError("emitted decoder exceeds 256 KiB; reuse Struct types and records() instead of emitting each sample")
         return program
@@ -428,13 +428,13 @@ def _main():
         send({"read": {"offset": offset, "length": length}})
         line = protocol_in.readline(4 * READ_LIMIT + 65536)
         if not line or not line.endswith("\n"):
-            raise RuntimeError("BinWave file reader closed or returned an oversized response")
+            raise RuntimeError("Binwave file reader closed or returned an oversized response")
         reply = json.loads(line)
         if "error" in reply:
             raise OSError(reply["error"])
         data = bytes(reply["data"])
         if len(data) != length:
-            raise OSError(f"BinWave returned {len(data)} bytes; requested {length}")
+            raise OSError(f"Binwave returned {len(data)} bytes; requested {length}")
         return data
 
     try:
@@ -446,10 +446,11 @@ def _main():
         if not isinstance(script, str) or len(script.encode("utf-8")) > PROGRAM_LIMIT:
             raise ValueError("Python decoder must be text of at most 256 KiB")
         reader = Reader(request["size"], request["filename"], read_bytes)
-        sdk = types.ModuleType("binwave", "Read file bytes and describe reusable structures for BinWave.")
+        sdk = types.ModuleType("binwave", "Read file bytes and describe reusable structures for Binwave.")
         sdk.Field, sdk.Struct, sdk.Record, sdk.file = Field, Struct, Record, reader
         sdk.__all__ = ["Field", "Struct", "Record", "file"]
         sys.modules["binwave"] = sdk
+        sys.modules["plottermax"] = sdk  # Compatibility with saved decoder scripts.
         sys.stdout = sys.stderr = captured
         source_name = request["filename"]
         if not isinstance(source_name, str) or not source_name:

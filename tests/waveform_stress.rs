@@ -1,6 +1,7 @@
 //! The large automated fixture is deliberately sparse. The user-facing generator
 //! writes every record; its output is checked separately by the ignored test.
 #![allow(dead_code)]
+#![cfg(not(target_arch = "wasm32"))]
 #[path = "../src/binary/document.rs"]
 mod document;
 #[path = "../src/binary/layout.rs"]
@@ -18,6 +19,8 @@ mod binary {
 mod byte_store;
 #[path = "../src/cache.rs"]
 mod cache;
+#[path = "../src/file_range.rs"]
+mod file_range;
 #[path = "../src/file_source.rs"]
 mod file_source;
 #[path = "../src/structure.rs"]
@@ -178,7 +181,7 @@ impl Fixture {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("parser-fixture.bin");
         let mut file = File::create(&path).unwrap();
-        file.set_len(data_offset + count * STRIDE + FOOTER_SIZE)
+        crate::cache::set_fixture_len(&file, data_offset + count * STRIDE + FOOTER_SIZE)
             .unwrap();
         file.write_all(&header(count, data_offset, order)).unwrap();
         let mut indices = BTreeSet::new();
@@ -405,7 +408,7 @@ fn verify_large_file(path: &Path) {
 #[ignore = "requires generated fixture; set BINWAVE_WAVEFORM_FILE to choose its path"]
 #[cfg(target_pointer_width = "64")]
 fn verify_generated_waveform_stress_file() {
-    let path = std::env::var_os("BINWAVE_WAVEFORM_FILE")
+    let path = std::env::var_os("BINWAVE_WAVEFORM_FILE").or_else(|| std::env::var_os("PLOTTERMAX_WAVEFORM_FILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/data/waveform_stress_40gb.bin")
@@ -425,7 +428,7 @@ fn verify_generated_waveform_stress_file() {
 #[cfg(target_pointer_width = "64")]
 fn verify_generated_waveform_plot_ranges() {
     use structure_plot::{PlotQuality, PlotReader};
-    let path = std::env::var_os("BINWAVE_WAVEFORM_FILE")
+    let path = std::env::var_os("BINWAVE_WAVEFORM_FILE").or_else(|| std::env::var_os("PLOTTERMAX_WAVEFORM_FILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/data/waveform_stress_40gb.bin")

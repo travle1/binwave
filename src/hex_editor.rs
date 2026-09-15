@@ -176,6 +176,16 @@ impl HexEditor {
         *self = Self::default();
     }
 
+    /// Reuse the asynchronous page cache; never read a file on the UI thread.
+    pub fn interpretation_preview(&self, range: Range<usize>) -> Option<Vec<u8>> {
+        let page = self.page.as_ref()?;
+        if self.revision != Some(page.revision) { return None; }
+        let (bytes, _) = page.result.as_ref().ok()?;
+        let start = range.start.checked_sub(page.offset)?;
+        let available = bytes.get(start..)?;
+        Some(available[..available.len().min(range.len()).min(64)].to_vec())
+    }
+
     pub fn selection(&self) -> Option<Range<usize>> {
         self.anchor
             .map(|anchor| anchor.min(self.caret)..anchor.max(self.caret).saturating_add(1))
@@ -362,6 +372,7 @@ impl HexEditor {
         Some((*bytes.get(index)?, bytes.get(index) != original.get(index)))
     }
 
+    pub fn copy_hex(&mut self, source: &ByteView) { self.copy(source, Transfer::Hex); }
     fn copy(&mut self, source: &ByteView, kind: Transfer) {
         let Some(range) = self.selection() else {
             return;
@@ -1000,11 +1011,7 @@ A gold underline marks search hits; an orange top edge marks edits.");
                     let (hex, ascii, color) = if let Some((byte, _)) = byte {
                         (
                             format!("{byte:02X}"),
-                            if (32..127).contains(&byte) {
-                                (byte as char).to_string()
-                            } else {
-                                "·".into()
-                            },
+                            crate::byte_display::ascii(byte).to_string(),
                             style.text,
                         )
                     } else {

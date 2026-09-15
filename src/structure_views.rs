@@ -1,11 +1,12 @@
 //! Shared selection and bounded, asynchronous pages for decoded structure views.
+use crate::structure_selection::{sample_indices_for_bytes, sample_bytes};
 use crate::byte_store::ByteView;
 use crate::hex_editor::HexHighlight;
-use crate::plot_trace::AdaptiveTrace;
+use crate::plot_trace::decoded_channel;
 use crate::structure::{LazyArray, Node, ParseOutput, Value};
 use crate::structure_plot::{PlotQuality, PlotReader};
 use egui::{Color32, Ui};
-use egui_plot::{Legend, Line, Plot, PlotBounds, PlotPoint, PlotTransform, Points, Polygon};
+use egui_plot::{Legend, Plot, PlotBounds, PlotPoint, PlotTransform, Points};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::{
@@ -69,6 +70,7 @@ pub struct StructureViews {
     pending_hex_selection: bool,
     reveal_selected_row: bool,
     expanded: HashSet<String>,
+    reveal_tree: Option<String>,
     table_target: String,
     table_anchor: Option<TableAnchor>,
     table_jump: usize,
@@ -389,11 +391,13 @@ impl StructureViews {
         self.pending_hex_selection = false;
     }
 
+    pub fn expand(&mut self, path: &str) { self.expanded.insert(path.into()); self.reveal_tree = Some(path.into()); }
     pub fn tree(
         &mut self,
         ui: &mut Ui,
         output: &ParseOutput,
         selection: Option<Range<usize>>,
+        names: &mut dyn FnMut(&mut Ui, &Node) -> egui::Response,
     ) -> Option<Range<usize>> {
         if self.stale(output) {
             ui.colored_label(
@@ -428,7 +432,11 @@ impl StructureViews {
         let row_height = ui.text_style_height(&egui::TextStyle::Body).max(18.) + 4.;
         let mut toggle = None;
         let mut node_click = None;
-        egui::ScrollArea::both()
+        let mut scroll = egui::ScrollArea::both();
+        if let Some(path) = self.reveal_tree.take() {
+            if let Some(index) = rows.iter().position(|(node, _)| node.path == path) { scroll = scroll.vertical_scroll_offset(index as f32 * row_height); }
+        }
+        scroll
             .id_source("decoded_structure_tree")
             .auto_shrink([false, false])
             .show_rows(ui, row_height, rows.len(), |ui, range| {
@@ -457,11 +465,8 @@ impl StructureViews {
                             } else {
                                 ui.add_space(18.);
                             }
-                            let text = format!("{}: {}", node.name, display(node, 90));
-                            let response = ui.selectable_label(
-                                self.selected.as_deref() == Some(&node.path),
-                                text,
-                            );
+                            let response = names(ui, node);
+                            let value_response = ui.selectable_label(self.selected.as_deref() == Some(&node.path), format!(": {}", display(node, 90)));
                             response.clone().on_hover_text(format!(
                                 "{}\n{} · 0x{:X}..0x{:X}\n{}",
                                 node.path,
@@ -470,7 +475,7 @@ impl StructureViews {
                                 node.range.end,
                                 node.references.join("\n")
                             ));
-                            if response.clicked() {
+                            if response.clicked() || value_response.clicked() {
                                 node_click = Some(node.clone());
                             }
                         });
@@ -1295,52 +1300,15 @@ impl StructureViews {
                             .map(|point| [point.index as f64, point.value])
                             .collect();
                         let color = field_color(name);
-                        if matches!(data.quality, PlotQuality::Exact | PlotQuality::MinMax) {
-                            // Preserve the source geometry for inspection; the final
-                            // transform determines whether cycles fit as lines or bands.
-                            plot_ui.add(AdaptiveTrace::new(points.clone(), name, color));
-                            if data.quality == PlotQuality::Exact
-                                && values.len() <= canvas_width as usize / 5
-                            {
-                                plot_ui.points(
-                                    Points::new(points).name(name).color(color).radius(2.5_f32),
-                                );
-                            }
-                        } else if let Some(envelopes) = data.envelopes.get(name) {
-                            // Each convex band represents a bucket's observed range. No
-                            // line interpolates individual samples across unread gaps.
-                            for band in envelopes {
-                                let left = band.range.start as f64 - 0.5;
-                                let right = band.range.end as f64 - 0.5;
-                                let low = band.min.value;
-                                let high = band.max.value;
-                                // Flat bands have no area; a zero-height polygon can
-                                // produce non-finite vertices during tessellation.
-                                if low < high {
-                                    plot_ui.polygon(
-                                        Polygon::new(vec![
-                                            [left, low],
-                                            [right, low],
-                                            [right, high],
-                                            [left, high],
-                                        ])
-                                        .name(name)
-                                        .fill_color(color.gamma_multiply(0.23))
-                                        .stroke(egui::Stroke::new(0_f32, color)),
-                                    );
-                                }
-                                for (index, value) in [low, high].into_iter().enumerate() {
-                                    if index == 1 && low == high {
-                                        continue;
-                                    }
-                                    plot_ui.line(
-                                        Line::new(vec![[left, value], [right, value]])
-                                            .name(name)
-                                            .color(color)
-                                            .width(0.8_f32),
-                                    );
-                                }
-                            }
+                        let bands = (data.quality == PlotQuality::SampledPreview).then(|| {
+                            data.envelopes.get(name).into_iter().flatten().map(|band| [
+                                band.range.start as f64 - 0.5, band.range.end as f64 - 0.5,
+                                band.min.value, band.max.value,
+                            ]).collect::<Vec<_>>()
+                        });
+                        decoded_channel(plot_ui, name, color, points.clone(), bands.as_deref());
+                        if data.quality == PlotQuality::Exact && values.len() <= canvas_width as usize / 5 {
+                            plot_ui.points(Points::new(points).name(name).color(color).radius(2.5_f32));
                         }
                     }
                 }
@@ -1937,52 +1905,7 @@ fn ranges_overlap(a: &Range<usize>, b: &Range<usize>) -> bool {
     a.start < b.end && b.start < a.end
 }
 
-/// Map only a selection contained by this collection. Endpoints are exclusive.
-fn sample_indices_for_bytes(node: &Node, bytes: &Range<usize>) -> Option<Range<usize>> {
-    if bytes.is_empty() || bytes.start < node.range.start || bytes.end > node.range.end {
-        return None;
-    }
-    if let Some(array) = &node.lazy {
-        if array.stride == 0 || array.count == 0 {
-            return None;
-        }
-        let first = (bytes.start - node.range.start) / array.stride;
-        let end = (bytes.end - node.range.start)
-            .div_ceil(array.stride)
-            .min(array.count);
-        return (first < end).then_some(first..end);
-    }
-    let first = node
-        .children
-        .iter()
-        .position(|row| ranges_overlap(&row.range, bytes))?;
-    let last = node
-        .children
-        .iter()
-        .rposition(|row| ranges_overlap(&row.range, bytes))?;
-    Some(first..last + 1)
-}
 
-fn sample_bytes(node: &Node, samples: Range<usize>) -> Option<Range<usize>> {
-    if samples.is_empty() || samples.end > collection_count(node) {
-        return None;
-    }
-    if let Some(array) = &node.lazy {
-        let start = node
-            .range
-            .start
-            .checked_add(samples.start.checked_mul(array.stride)?)?;
-        let end = node
-            .range
-            .start
-            .checked_add(samples.end.checked_mul(array.stride)?)?;
-        return (start < end && end <= node.range.end).then_some(start..end);
-    }
-    Some(
-        node.children.get(samples.start)?.range.start
-            ..node.children.get(samples.end - 1)?.range.end,
-    )
-}
 
 fn centered_view(center: usize, width: usize, count: usize) -> Range<usize> {
     let width = width.max(1).min(count);
@@ -2185,18 +2108,18 @@ mod tests {
     fn records() -> (ByteStore, ParseOutput) {
         let yaml = r#"
 structures:
-  Header:
+  - name: Header
     fields: [{name: version, type: u16}, {name: count, type: u16}]
-  Descriptor:
+  - name: Descriptor
     fields: [{name: code, type: u8}, {name: size, type: u8}]
-  Pair:
+  - name: Pair
     fields: [{name: z, type: i16}, {name: a, type: u16}]
-  Sample:
-    fields: [{name: timestamp, type: u32}, {name: pair, type: Pair}]
+  - name: Sample
+    fields: [{name: timestamp, type: u32}, {name: pair, type: {structure: Pair}}]
 actions:
-  - read: {name: header, type: Header}
-  - read: {name: descriptors, type: Descriptor, repeat: 2}
-  - read: {name: samples, type: Sample, repeat: 256}
+  - read: {name: header, type: {structure: Header}}
+  - read: {name: descriptors, type: {structure: Descriptor}, repeat: 2}
+  - read: {name: samples, type: {structure: Sample}, repeat: 256}
 "#;
         let bytes = vec![0; 8 + 256 * 8];
         let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
@@ -2527,7 +2450,7 @@ actions:
             .map(|index| format!("{{name: value_{index}, type: u8}}"))
             .collect::<Vec<_>>()
             .join(",");
-        let yaml = format!("structures: {{Sample: {{fields: [{fields}]}}}}\nactions: [{{read: {{name: samples, type: Sample, repeat: 2}}}}]");
+        let yaml = format!("structures: [{{name: Sample, fields: [{fields}]}}]\nactions: [{{read: {{name: samples, type: {{structure: Sample}}, repeat: 2}}}}]");
         let store = ByteStore::from_snapshot(Original::from_bytes(&[0; 80]).unwrap());
         let output = Program::parse(&yaml)
             .unwrap()
@@ -2876,9 +2799,9 @@ actions:
         let output = Program::parse(
             r#"
 structures:
-  Sample:
+  - name: Sample
     fields: [{name: sine, type: f64}, {name: ramp, type: f64}, {name: square, type: f64}]
-actions: [{read: {name: samples, type: Sample, repeat: until end}}]
+actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
 "#,
         )
         .unwrap()

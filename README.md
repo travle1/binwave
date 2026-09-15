@@ -1,8 +1,18 @@
-# BinWave
+# Binwave
 
 A local Rust desktop workspace using eframe/egui and egui_plot. Inspect and edit
 bytes from any file, write Python or YAML decoders using reusable data structures,
 and plot large binary and CSV datasets. No backend, accounts, telemetry, or runtime AI.
+
+## First plot
+
+Choose **Open simple demo** in the browser workspace or **File → Open simple demo**
+on desktop. The embedded 2 KB file and matching YAML open and plot automatically,
+with eight sine-wave cycles between −1 and +1. No download or file picker is needed.
+[Step-by-step guide](samples/quickstart/README.txt).
+
+PNG and WAV/RIFF structure decoders are also bundled in both versions;
+see their [coverage and limits](samples/README.md#common-file-formats).
 
 ## Launch
 
@@ -30,11 +40,22 @@ until the first successful export.
 
 ## Browser port constraint
 
-The application currently runs as a native desktop program. A future browser
-backend must read bounded file ranges and stream exports; it must never require
-loading a whole data file into WebAssembly or JavaScript memory. File offsets must
-remain 64-bit independently of the memory address size, with bounded caches and
-background work to keep the interface responsive.
+The full workspace runs natively on Linux and Windows. A browser WebAssembly
+preview provides YAML decoding, decoded sample tables and structures, numeric
+channel plots, hex inspection, sparse edits, and streamed exports. It shares the
+native YAML interpreter, plot reducer, trace renderer, source editor, and dock
+layout. Full desktop UI parity is still pending.
+
+The browser backend must read bounded file ranges and stream exports; it must
+never require loading a whole data file into WebAssembly or JavaScript memory.
+File offsets remain 64-bit independently of the memory address size, with bounded
+caches and background work to keep the interface responsive. The preview uses
+64 KiB pages and 1 MiB export chunks and rejects browser offsets above `2^53 - 1`
+rather than rounding them. Native Python and CSV decoding are unavailable
+in this browser preview.
+
+See [platform builds and limitations](docs/platforms.md) for Windows packaging,
+`trunk serve`, static browser builds, browser compatibility, and validation.
 
 ## Editing workspace
 
@@ -149,7 +170,7 @@ Failed saves preserve the destination. An extraction does not mark the whole fil
 saved. Undo/Redo history remains shared across byte and legacy numeric edits;
 changing a decoder preserves that byte history. Unsaved bytes, Python/YAML source,
 and pending legacy table edits are guarded when replacing the open file or closing
-BinWave.
+Binwave.
 
 `.csv` files read an initial portion automatically while Hex remains available.
 Select **CSV** in Decoder and press **Apply** for delimited numeric text with another extension.
@@ -169,7 +190,7 @@ also available as **File → Load CSV configuration…**.
 ## Python decoders
 
 Python decoders use ordinary Python imports, functions, loops, and installed
-libraries. BinWave supplies `file` for reading the open file, including unsaved
+libraries. Binwave supplies `file` for reading the open file, including unsaved
 byte edits, and `Struct`/`Field` for describing byte-backed results:
 
 ```python
@@ -263,24 +284,33 @@ explains the selection workflow. Saved definitions may include unfinished drafts
 syntax is checked when decoding. Legacy layouts remain editable in YAML; save and
 clear a legacy draft before starting a generic definition.
 
+**Decoder syntax:** declare each structure with `- name: RecordType`; reference
+custom types with `type: {structure: RecordType}`. Bare types such as `u16` are
+built in. The old mapping declarations and bare custom-type references are
+rejected; update saved decoders before applying them.
+
+Start with the [byte-by-byte nesting walkthrough](samples/generic_structures.md#worked-example-declarations--bytes--decoded-paths)
+to distinguish type declarations, field nesting, and cursor movement. It also
+explains repetition boundaries and types generated from file data.
+
 For example, this definition reads a header, then uses its values to locate and
 size a collection without scanning its payload first:
 
 ```yaml
 endian: little
 structures:
-  Header:
+  - name: Header
     fields:
       - {name: count, type: u16}
       - {name: offset, type: u32}
-  Value:
+  - name: Value
     fields:
       - {name: sample, type: i16}
 actions:
-  - read: {name: header, type: Header}
+  - read: {name: header, type: {structure: Header}}
   - read:
       name: values
-      type: Value
+      type: {structure: Value}
       at: {ref: header.offset}
       repeat: {ref: header.count}
 ```
@@ -413,7 +443,7 @@ python3 samples/generators/generate_binary_demo.py
 Under **Decoder → Record layout**, the **Section** selector starts on
 `samples`. Switch to `header` to inspect its uninterpreted bytes, or `footer` to inspect and edit its ordinary `checksum` field.
 The marker is at **0x970** (2416); checksum bytes start at **0x974** (2420).
-The checksum value is illustrative: BinWave neither verifies nor recalculates it.
+The checksum value is illustrative: Binwave neither verifies nor recalculates it.
 Switching sections resets the plot/table selection; undo/redo follows the edited
 field back to its section. The layout summary lists each section's physical range,
 record size, payload offset, count, markers, gaps, and trailing byte count. The hex
@@ -670,7 +700,7 @@ Examples: `samples/data/sample.csv` and `samples/configs/sample_config.md`.
 A Markdown configuration contains a fenced JSON block:
 
 ````markdown
-# BinWave Config
+# Binwave Config
 
 ```json
 {
@@ -696,7 +726,7 @@ python3 samples/generators/generate_large_csv.py --gb 20 --signals 8 --out sampl
 
 ## CSV storage and large-file reading
 
-**CSV values stay in the original file.** BinWave keeps a compact index of row
+**CSV values stay in the original file.** Binwave keeps a compact index of row
 positions and plot summaries for the portion it has read. Neither normal browsing
 nor **Index entire file** creates a full numeric copy.
 
@@ -727,7 +757,7 @@ decoded-copy settings.
 
 ### Cache location and clearing
 
-The directory is `binwave-v1` beneath `BINWAVE_CACHE_DIR`, otherwise
+The directory is `plottermax-v1` beneath `BINWAVE_CACHE_DIR`, otherwise
 `$XDG_CACHE_HOME`, `$LOCALAPPDATA`, or `~/.cache` (in that order; the temporary
 directory is the final fallback). Processing and caches remain local. Keys include
 canonical source path, size, modification time, Unix identity/change time when

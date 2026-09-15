@@ -1,32 +1,37 @@
 //! Viewport-driven plotting of generic decoded collections. Workers retain only
 //! bounded pages and extrema; opening a large range never starts a full scan.
 use crate::byte_store::{ByteView, READ_LIMIT};
-use crate::structure::{Node, NumericPlan};
+use crate::structure::{Address, Node, NumericPlan};
 use anyhow::{ensure, Result};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
-};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
-const MIN_EXACT_LIMIT: usize = 2048;
-const MAX_EXACT_LIMIT: usize = 8192;
-const AUTO_SCAN_LIMIT: usize = 65_536;
-const PREVIEW_LIMIT: usize = 65_536;
-const PREVIEW_WINDOWS: usize = 128;
-const PREVIEW_WINDOW_SIZE: usize = PREVIEW_LIMIT / PREVIEW_WINDOWS;
-const MAX_BUCKETS: usize = 4096;
-const MAX_SERIES: usize = 32;
-const CACHE_ENTRIES: usize = 3;
+const MIN_EXACT_LIMIT: Address = 2048;
+const MAX_EXACT_LIMIT: Address = 8192;
+const AUTO_SCAN_LIMIT: Address = 65_536;
+const PREVIEW_LIMIT: Address = 65_536;
+const PREVIEW_WINDOWS: Address = 128;
+const PREVIEW_WINDOW_SIZE: Address = PREVIEW_LIMIT / PREVIEW_WINDOWS;
+const MAX_BUCKETS: Address = 4096;
+const MAX_SERIES: Address = 32;
+const CACHE_ENTRIES: Address = 3;
 
 #[derive(Clone, Debug)]
 pub struct PlotSample {
-    pub index: usize,
+    pub index: Address,
     pub value: f64,
-    pub bytes: Range<usize>,
+    pub bytes: Range<Address>,
     pub path: String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,18 +53,18 @@ impl PlotQuality {
 /// observed samples; SampledPreview does not claim to have seen every peak.
 #[derive(Clone, Debug)]
 pub struct PlotEnvelope {
-    pub range: Range<usize>,
+    pub range: Range<Address>,
     pub min: PlotSample,
     pub max: PlotSample,
 }
 #[derive(Clone, Debug)]
 pub struct PlotData {
-    pub range: Range<usize>,
+    pub range: Range<Address>,
     pub series: BTreeMap<String, Vec<PlotSample>>,
     pub envelopes: BTreeMap<String, Vec<PlotEnvelope>>,
     pub quality: PlotQuality,
-    pub scanned: usize,
-    pub total: usize,
+    pub scanned: Address,
+    pub total: Address,
     pub complete: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,9 +72,9 @@ struct Key {
     revision: u64,
     definition: u64,
     path: String,
-    range: Range<usize>,
-    buckets: usize,
-    exact_limit: usize,
+    range: Range<Address>,
+    buckets: Address,
+    exact_limit: Address,
     refine: bool,
 }
 #[derive(Clone)]
@@ -78,19 +83,23 @@ struct Request {
     source: ByteView,
     node: Node,
 }
+#[cfg(not(target_arch = "wasm32"))]
 struct Cached {
     request: Request,
     data: Arc<PlotData>,
 }
+#[cfg(not(target_arch = "wasm32"))]
 struct Outcome {
     key: Key,
     result: std::result::Result<PlotData, String>,
 }
+#[cfg(not(target_arch = "wasm32"))]
 struct Running {
     cancel: Arc<AtomicBool>,
     latest: Arc<Mutex<Option<Outcome>>>,
     finished: Arc<AtomicBool>,
 }
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 pub struct PlotReader {
     desired: Option<Request>,
@@ -99,6 +108,7 @@ pub struct PlotReader {
     error: Option<String>,
     cache: VecDeque<Cached>,
 }
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for PlotReader {
     fn drop(&mut self) {
         if let Some(running) = &self.running {
@@ -106,6 +116,7 @@ impl Drop for PlotReader {
         }
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 impl PlotReader {
     /// `pixel_width` is the plot canvas width in physical display pixels.
     pub fn request(
@@ -113,8 +124,8 @@ impl PlotReader {
         ctx: &egui::Context,
         source: ByteView,
         node: Node,
-        range: Range<usize>,
-        pixel_width: usize,
+        range: Range<Address>,
+        pixel_width: Address,
         refine: bool,
     ) {
         let count = node
@@ -319,14 +330,14 @@ impl Bucket {
     }
 }
 struct Reduction {
-    range: Range<usize>,
+    range: Range<Address>,
     quality: PlotQuality,
-    buckets: usize,
+    buckets: Address,
     exact: BTreeMap<String, Vec<PlotSample>>,
     reduced: BTreeMap<String, Vec<Option<Bucket>>>,
 }
 impl Reduction {
-    fn new(range: Range<usize>, quality: PlotQuality, buckets: usize) -> Self {
+    fn new(range: Range<Address>, quality: PlotQuality, buckets: Address) -> Self {
         Self {
             range,
             quality,
@@ -337,26 +348,27 @@ impl Reduction {
     }
     fn push(&mut self, name: String, point: PlotSample) {
         if self.quality == PlotQuality::Exact {
-            if self.exact.len() < MAX_SERIES || self.exact.contains_key(&name) {
+            if (self.exact.len() as Address) < MAX_SERIES || self.exact.contains_key(&name) {
                 self.exact.entry(name).or_default().push(point);
             }
         } else {
-            if self.reduced.len() >= MAX_SERIES && !self.reduced.contains_key(&name) {
+            if self.reduced.len() as Address >= MAX_SERIES && !self.reduced.contains_key(&name) {
                 return;
             }
             let bucket = ((point.index - self.range.start) as u128 * self.buckets as u128
-                / self.range.len().max(1) as u128) as usize;
+                / (self.range.end - self.range.start).max(1) as u128)
+                as Address;
             let buckets = self
                 .reduced
                 .entry(name)
-                .or_insert_with(|| vec![None; self.buckets]);
-            match &mut buckets[bucket.min(self.buckets - 1)] {
+                .or_insert_with(|| vec![None; self.buckets as usize]);
+            match &mut buckets[bucket.min(self.buckets - 1) as usize] {
                 Some(bucket) => bucket.push(point),
                 slot => *slot = Some(Bucket::new(point)),
             }
         }
     }
-    fn node(&mut self, node: &Node, prefix: &str, index: usize) {
+    fn node(&mut self, node: &Node, prefix: &str, index: Address) {
         if let Some(value) = node.numeric().filter(|value| value.is_finite()) {
             self.push(
                 if prefix.is_empty() {
@@ -381,7 +393,7 @@ impl Reduction {
             self.node(child, &prefix, index);
         }
     }
-    fn data(&self, scanned: usize, complete: bool) -> PlotData {
+    fn data(&self, scanned: Address, complete: bool) -> PlotData {
         let mut envelopes = BTreeMap::new();
         let series = if self.quality != PlotQuality::Exact {
             self.reduced
@@ -395,7 +407,11 @@ impl Reduction {
                             .filter_map(|(index, bucket)| {
                                 let bucket = bucket.as_ref()?;
                                 Some(PlotEnvelope {
-                                    range: bucket_range(&self.range, self.buckets, index),
+                                    range: bucket_range(
+                                        &self.range,
+                                        self.buckets,
+                                        index as Address,
+                                    ),
                                     min: bucket.min.clone(),
                                     max: bucket.max.clone(),
                                 })
@@ -417,28 +433,28 @@ impl Reduction {
             envelopes,
             quality: self.quality,
             scanned,
-            total: self.range.len(),
+            total: (self.range.end - self.range.start),
             complete,
         }
     }
 }
-fn node_count(node: &Node) -> usize {
-    1 + node.children.iter().map(node_count).sum::<usize>()
+fn node_count(node: &Node) -> Address {
+    1 + node.children.iter().map(node_count).sum::<Address>()
 }
 
 // The push reducers use floor(index * buckets / length). Ceil boundaries
 // describe precisely the sample indices assigned to that display bucket.
-fn bucket_range(range: &Range<usize>, buckets: usize, index: usize) -> Range<usize> {
-    let length = range.len() as u128;
-    let start = (index as u128 * length).div_ceil(buckets as u128) as usize;
-    let end = ((index + 1) as u128 * length).div_ceil(buckets as u128) as usize;
+fn bucket_range(range: &Range<Address>, buckets: Address, index: Address) -> Range<Address> {
+    let length = (range.end - range.start) as u128;
+    let start = (index as u128 * length).div_ceil(buckets as u128) as Address;
+    let end = ((index + 1) as u128 * length).div_ceil(buckets as u128) as Address;
     range.start + start..range.start + end
 }
 
 // Preserve individual samples while there is useful screen resolution. The
 // 64-pixel quantization keeps small pane resizes from restarting plot queries;
 // the cap bounds exact point storage even on very large displays.
-fn exact_limit(pixel_width: usize) -> usize {
+fn exact_limit(pixel_width: Address) -> Address {
     pixel_width
         .clamp(MIN_EXACT_LIMIT / 2, MAX_EXACT_LIMIT / 2)
         .div_ceil(64)
@@ -449,7 +465,7 @@ fn exact_limit(pixel_width: usize) -> usize {
 // Subpixel buckets preserve local turning points before the renderer chooses
 // between individual traces and dense amplitude ranges. Quantization limits
 // resize churn; saturation bounds storage on large or high-DPI displays.
-fn display_buckets(pixel_width: usize) -> usize {
+fn display_buckets(pixel_width: Address) -> Address {
     pixel_width
         .saturating_mul(2)
         .clamp(128, MAX_BUCKETS)
@@ -457,7 +473,7 @@ fn display_buckets(pixel_width: usize) -> usize {
         * 64
 }
 
-fn reduction_buckets(quality: PlotQuality, requested: usize) -> usize {
+fn reduction_buckets(quality: PlotQuality, requested: Address) -> Address {
     if quality == PlotQuality::SampledPreview {
         requested.clamp(2, PREVIEW_WINDOWS)
     } else {
@@ -468,15 +484,16 @@ fn reduction_buckets(quality: PlotQuality, requested: usize) -> usize {
 // Contiguous windows capture local waveform amplitude instead of isolated
 // phases. Starts vary within evenly distributed strata; exact endpoints are
 // included without claiming that any unread interval has been scanned.
-fn preview_windows(range: Range<usize>, buckets: usize) -> Vec<Range<usize>> {
+fn preview_windows(range: Range<Address>, buckets: Address) -> Vec<Range<Address>> {
     if range.is_empty() {
         return Vec::new();
     }
-    let count = reduction_buckets(PlotQuality::SampledPreview, buckets).min(range.len());
+    let count =
+        reduction_buckets(PlotQuality::SampledPreview, buckets).min(range.end - range.start);
     (0..count)
         .map(|bucket| {
             let stratum = bucket_range(&range, count, bucket);
-            let width = stratum.len().min(PREVIEW_WINDOW_SIZE);
+            let width = (stratum.end - stratum.start).min(PREVIEW_WINDOW_SIZE);
             let start = if bucket == 0 {
                 stratum.start
             } else if bucket + 1 == count {
@@ -488,7 +505,7 @@ fn preview_windows(range: Range<usize>, buckets: usize) -> Vec<Range<usize>> {
                 hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
                 hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d049bb133111eb);
                 hash ^= hash >> 31;
-                stratum.start + hash as usize % (stratum.len() - width + 1)
+                stratum.start + hash as Address % ((stratum.end - stratum.start) - width + 1)
             };
             start..start + width
         })
@@ -502,9 +519,9 @@ fn read_plot(
     request.source.validate()?;
     ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
     let range = &request.key.range;
-    let quality = if range.len() <= request.key.exact_limit {
+    let quality = if (range.end - range.start) <= request.key.exact_limit {
         PlotQuality::Exact
-    } else if range.len() <= AUTO_SCAN_LIMIT || request.key.refine {
+    } else if (range.end - range.start) <= AUTO_SCAN_LIMIT || request.key.refine {
         PlotQuality::MinMax
     } else {
         PlotQuality::SampledPreview
@@ -525,7 +542,7 @@ fn read_plot(
     );
     let mut scanned = 0;
     let mut last_publish = Instant::now();
-    let mut add = |node: &Node, index: usize, reduction: &mut Reduction| {
+    let mut add = |node: &Node, index: Address, reduction: &mut Reduction| {
         reduction.node(node, "", index);
         scanned += 1;
         if last_publish.elapsed() >= Duration::from_millis(250) {
@@ -555,16 +572,20 @@ fn read_plot(
                     batch = Some((16_000 / node_count(&rows[0]).max(1)).clamp(1, 128));
                 }
                 for (offset, row) in rows.iter().enumerate() {
-                    add(row, index + offset, &mut reduction);
+                    add(row, index + offset as Address, &mut reduction);
                 }
-                index += rows.len();
+                index += rows.len() as Address;
             }
         }
     } else {
         for window in windows {
             for index in window {
                 ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
-                if let Some(node) = request.node.children.get(index) {
+                if let Some(node) = request
+                    .node
+                    .children
+                    .get(usize::try_from(index).unwrap_or(usize::MAX))
+                {
                     add(node, index, &mut reduction);
                 }
             }
@@ -577,7 +598,7 @@ fn read_plot(
 
 #[derive(Clone, Copy)]
 struct NumericPoint {
-    index: usize,
+    index: Address,
     value: f64,
 }
 #[derive(Clone, Copy)]
@@ -600,14 +621,19 @@ impl NumericBucket {
 }
 struct NumericReduction {
     plan: NumericPlan,
-    range: Range<usize>,
+    range: Range<Address>,
     quality: PlotQuality,
-    buckets: usize,
+    buckets: Address,
     exact: Vec<Vec<NumericPoint>>,
     reduced: Vec<Vec<Option<NumericBucket>>>,
 }
 impl NumericReduction {
-    fn new(plan: NumericPlan, range: Range<usize>, quality: PlotQuality, buckets: usize) -> Self {
+    fn new(
+        plan: NumericPlan,
+        range: Range<Address>,
+        quality: PlotQuality,
+        buckets: Address,
+    ) -> Self {
         let count = plan.fields.len();
         Self {
             plan,
@@ -616,15 +642,15 @@ impl NumericReduction {
             buckets,
             exact: vec![Vec::new(); count],
             reduced: if quality != PlotQuality::Exact {
-                vec![vec![None; buckets]; count]
+                vec![vec![None; buckets as usize]; count]
             } else {
                 Vec::new()
             },
         }
     }
-    fn record(&mut self, record: &[u8], index: usize) -> Result<()> {
+    fn record(&mut self, record: &[u8], index: Address) -> Result<()> {
         let bucket = ((index - self.range.start) as u128 * self.buckets as u128
-            / self.range.len().max(1) as u128) as usize;
+            / (self.range.end - self.range.start).max(1) as u128) as Address;
         for (field_index, field) in self.plan.fields.iter().enumerate() {
             let value = field.decode(record)?;
             if !value.is_finite() {
@@ -632,7 +658,7 @@ impl NumericReduction {
             }
             let point = NumericPoint { index, value };
             if self.quality != PlotQuality::Exact {
-                match &mut self.reduced[field_index][bucket.min(self.buckets - 1)] {
+                match &mut self.reduced[field_index][bucket.min(self.buckets - 1) as usize] {
                     Some(bucket) => bucket.push(point),
                     slot => {
                         *slot = Some(NumericBucket {
@@ -649,7 +675,7 @@ impl NumericReduction {
         }
         Ok(())
     }
-    fn data(&self, scanned: usize, complete: bool) -> PlotData {
+    fn data(&self, scanned: Address, complete: bool) -> PlotData {
         let mut series = BTreeMap::new();
         let mut envelopes = BTreeMap::new();
         for (field_index, field) in self.plan.fields.iter().enumerate() {
@@ -670,7 +696,7 @@ impl NumericReduction {
                         continue;
                     };
                     bands.push(PlotEnvelope {
-                        range: bucket_range(&self.range, self.buckets, index),
+                        range: bucket_range(&self.range, self.buckets, index as Address),
                         min: sample(bucket.min),
                         max: sample(bucket.max),
                     });
@@ -698,7 +724,7 @@ impl NumericReduction {
             envelopes,
             quality: self.quality,
             scanned,
-            total: self.range.len(),
+            total: (self.range.end - self.range.start),
             complete,
         }
     }
@@ -733,7 +759,7 @@ fn read_numeric(
     };
     let batch = (READ_LIMIT / stride.max(1)).max(1);
     for window in windows {
-        for index in window.clone().step_by(batch) {
+        for index in window.clone().step_by(batch as usize) {
             let span = index..index.saturating_add(batch).min(window.end);
             ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
             let start = reduction
@@ -745,17 +771,19 @@ fn read_numeric(
                         .ok_or_else(|| anyhow::anyhow!("plot offset overflow"))?,
                 )
                 .ok_or_else(|| anyhow::anyhow!("plot offset overflow"))?;
-            let length = span
-                .len()
+            let length = (span.end - span.start)
                 .checked_mul(stride)
                 .ok_or_else(|| anyhow::anyhow!("plot length overflow"))?;
             let bytes = request.source.read(start, length)?;
-            ensure!(bytes.len() == length, "source ended during plot read");
-            for (offset, record) in bytes.chunks_exact(stride).enumerate() {
+            ensure!(
+                bytes.len() as Address == length,
+                "source ended during plot read"
+            );
+            for (offset, record) in bytes.chunks_exact(stride as usize).enumerate() {
                 if offset % 128 == 0 {
                     ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
                 }
-                reduction.record(record, span.start + offset)?;
+                reduction.record(record, span.start + offset as Address)?;
                 scanned += 1;
             }
             if last_publish.elapsed() >= Duration::from_millis(250) {
@@ -770,7 +798,35 @@ fn read_numeric(
     Ok(reduction.data(scanned, true))
 }
 
-#[cfg(test)]
+/// Shared viewport query used by native thread workers and browser Web Workers.
+pub(crate) fn read_for_viewport(
+    source: ByteView,
+    node: Node,
+    range: Range<Address>,
+    pixel_width: Address,
+) -> Result<PlotData> {
+    let count = node
+        .lazy
+        .as_ref()
+        .map_or(node.children.len() as Address, |a| a.count);
+    let start = range.start.min(count);
+    let range = start..range.end.max(start).min(count);
+    let request = Request {
+        key: Key {
+            revision: source.revision,
+            definition: identity(&node),
+            path: node.path.clone(),
+            range,
+            buckets: display_buckets(pixel_width),
+            exact_limit: exact_limit(pixel_width),
+            refine: false,
+        },
+        source,
+        node,
+    };
+    read_plot(&request, &AtomicBool::new(false), |_| {})
+}
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use crate::binary::Original;
@@ -886,8 +942,12 @@ mod tests {
             "counter" => 110. + (index % 16) as f64,
             "sine" => ((index % 64) as f64 * std::f64::consts::TAU / 64.).sin() * 4.,
             "spike" => {
-                if index == 33_451 { 10_000. } else { 0. }
-            },
+                if index == 33_451 {
+                    10_000.
+                } else {
+                    0.
+                }
+            }
             _ => unreachable!(),
         };
         let names = ["counter", "sine", "spike"];
@@ -903,9 +963,9 @@ mod tests {
             &store.view(),
             r#"
 structures:
-  Sample:
+  - name: Sample
     fields: [{name: counter, type: f64}, {name: sine, type: f64}, {name: spike, type: f64}]
-actions: [{read: {name: samples, type: Sample, repeat: until end}}]
+actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
 "#,
         );
         let mut request = request(store.view(), node, range.clone(), false);
@@ -926,7 +986,9 @@ actions: [{read: {name: samples, type: Sample, repeat: until end}}]
         assert!(data.complete);
         for index in turns {
             assert!(
-                data.series["counter"].iter().any(|point| point.index == index),
+                data.series["counter"]
+                    .iter()
+                    .any(|point| point.index == index),
                 "lost the real turning point at sample {index}"
             );
         }
@@ -972,7 +1034,14 @@ actions: [{read: {name: samples, type: Sample, repeat: until end}}]
         let ctx = egui::Context::default();
         let mut reader = PlotReader::default();
         for width in [640, 1280, 640] {
-            reader.request(&ctx, store.view(), node.clone(), 28_358..40_854, width, false);
+            reader.request(
+                &ctx,
+                store.view(),
+                node.clone(),
+                28_358..40_854,
+                width,
+                false,
+            );
             settle(&mut reader, &ctx);
             assert!(reader.error().is_none());
             let data = reader.data().unwrap();
@@ -1152,27 +1221,27 @@ actions: [{read: {name: samples, type: Sample, repeat: until end}}]
             &source,
             r#"
 structures:
-  Row:
+  - name: Row
     fields:
       - {name: tag, type: u32}
       - name: sine
         type: {choose: {ref: tag, cases: {"0": f64, "1": f64}}}
       - {name: ramp, type: u32}
 actions:
-  - read: {name: samples, type: Row, length: 16, repeat: until end}
+  - read: {name: samples, type: {structure: Row}, length: 16, repeat: until end}
 "#,
         );
         let numeric = parse(
             &source,
             r#"
 structures:
-  Row:
+  - name: Row
     fields:
       - {name: tag, type: u32}
       - {name: sine, type: f64}
       - {name: ramp, type: u32}
 actions:
-  - read: {name: samples, type: Row, length: 16, repeat: until end}
+  - read: {name: samples, type: {structure: Row}, length: 16, repeat: until end}
 "#,
         );
         assert!(generic.lazy.as_ref().unwrap().numeric_plan().is_none());
@@ -1236,12 +1305,12 @@ actions:
             &store.view(),
             r#"
 structures:
-  Row:
+  - name: Row
     fields:
       - {name: value, type: u32}
       - {name: padding, type: bytes, length: 4092}
 actions:
-  - read: {name: samples, type: Row, repeat: until end}
+  - read: {name: samples, type: {structure: Row}, repeat: until end}
 "#,
         );
         let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
@@ -1402,18 +1471,18 @@ actions:
             r#"
 endian: little
 structures:
-  Inner:
+  - name: Inner
     endian: big
     fields:
       - {name: count, type: u16, length: 4}
       - {name: amplitude, type: f32, endian: little}
-  Row:
+  - name: Row
     fields:
-      - {name: sensor, type: Inner}
+      - {name: sensor, type: {structure: Inner}}
       - {name: tail, type: u16, endian: big}
       - {name: pad, type: bytes, length: 2}
 actions:
-  - read: {name: rows, type: Row, repeat: until end}
+  - read: {name: rows, type: {structure: Row}, repeat: until end}
 "#,
         );
         let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
@@ -1464,13 +1533,13 @@ actions:
             &store.view(),
             r#"
 structures:
-  Row:
+  - name: Row
     fields:
       - {name: tag, type: u32}
       - name: value
         type: {choose: {ref: tag, cases: {"0": f32, "1": u32}}}
 actions:
-  - read: {name: rows, type: Row, length: 8, repeat: until end}
+  - read: {name: rows, type: {structure: Row}, length: 8, repeat: until end}
 "#,
         );
         assert!(node.lazy.as_ref().unwrap().numeric_plan().is_none());
@@ -1490,11 +1559,11 @@ actions:
             &store.view(),
             r#"
 structures:
-  Row:
+  - name: Row
     fields:
       - {name: value, type: i32, expect: -8}
 actions:
-  - read: {name: rows, type: Row, length: 4, repeat: until end}
+  - read: {name: rows, type: {structure: Row}, length: 4, repeat: until end}
 "#,
         );
         assert!(expected.lazy.as_ref().unwrap().numeric_plan().is_none());

@@ -68,7 +68,7 @@ fn run_python(
     source: &ByteView,
     cancel: &AtomicBool,
 ) -> Result<(Value, String)> {
-    let interpreter = std::env::var_os("BINWAVE_PYTHON").unwrap_or_else(|| {
+    let interpreter = std::env::var_os("BINWAVE_PYTHON").or_else(|| std::env::var_os("PLOTTERMAX_PYTHON")).unwrap_or_else(|| {
         if cfg!(windows) {
             "python".into()
         } else {
@@ -76,6 +76,12 @@ fn run_python(
         }
     });
     let mut command = Command::new(&interpreter);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Keep the decoder's piped console hidden in the GUI application.
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
     command.args(["-u", "-c", RUNNER]);
     command
         .stdin(Stdio::piped())
@@ -548,7 +554,7 @@ print('count:', len(samples))
         let path = dir.path().join("large-sparse.raw");
         let length = 5_u64 * 1024 * 1024 * 1024 + 16;
         let mut file = std::fs::File::create(&path).unwrap();
-        file.set_len(length).unwrap();
+        crate::cache::set_fixture_len(&file, length).unwrap();
         file.seek(SeekFrom::Start(length - 4)).unwrap();
         file.write_all(&12345_u32.to_le_bytes()).unwrap();
         drop(file);
@@ -664,7 +670,7 @@ print('count:', len(samples))
         }
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let path = std::env::var_os("BINWAVE_WAVEFORM_FILE")
+        let path = std::env::var_os("BINWAVE_WAVEFORM_FILE").or_else(|| std::env::var_os("PLOTTERMAX_WAVEFORM_FILE"))
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| root.join("samples/data/waveform_stress_40gb.bin"));
         assert!(
