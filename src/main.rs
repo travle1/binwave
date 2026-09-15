@@ -40,6 +40,7 @@ mod loaders;
 #[cfg(not(target_arch = "wasm32"))]
 mod plot_index;
 mod plot_trace;
+mod plot_presentation;
 #[cfg(not(target_arch = "wasm32"))]
 mod plotting;
 #[cfg(not(target_arch = "wasm32"))]

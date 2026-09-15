@@ -378,7 +378,17 @@ the plotted collections. Memory and processing scale with the fields selected.
 record collections: waveforms, measurements, and events, with unequal lengths.
 Its 8 KB public fixture and YAML open together; no local data file is needed.
 
-Inside the plot, drag to pan or use the mouse wheel to zoom. Right-drag marks a
+The compact plot toolbar contains **Series**, **Fit all**, **Go to…**, and **More**.
+In **Series**, choose a collection or a field's name to adjust its vertical offset
+and scale. **Stack series** normalizes the currently loaded ranges into separate
+lanes; **Reset positions** restores the original overlay. These transforms affect
+only display: tooltips and Samples retain original values, and byte links stay exact.
+Drag a trace vertically to change its offset; drag empty plot space to pan.
+The Y axis says **Display position** when adjustments are active. Stack uses the
+currently loaded values (or estimated ranges at wide zoom), and stays fixed while
+navigating; use Stack again to fit different ranges.
+
+Use the mouse wheel to zoom. Right-drag marks a
 horizontal zoom range and zooms to it on release, preserving the vertical scale;
 **Escape** cancels the gesture.
 

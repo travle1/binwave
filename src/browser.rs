@@ -100,6 +100,9 @@ pub struct BrowserApp {
     last: String,
     pending: std::collections::VecDeque<serde_json::Value>,
     hidden: std::collections::BTreeSet<String>,
+    presentation: crate::plot_presentation::Presentation,
+    plot_jump: u64,
+    fit_plot_y: bool,
     decoding: bool,
     reveal_results: bool,
     reveal_decoder: bool,
@@ -163,6 +166,9 @@ impl BrowserApp {
             last: "0".into(),
             pending: Default::default(),
             hidden: Default::default(),
+            presentation: Default::default(),
+            plot_jump: 0,
+            fit_plot_y: false,
             decoding: false,
             reveal_results: false,
             reveal_decoder: false,
@@ -601,6 +607,7 @@ impl BrowserApp {
         self.collection.clear();
         self.plot_sources.clear();
         self.plot_sources_initialized = false;
+        self.presentation = Default::default();
         self.decoding = false;
     }
     fn queue(&mut self, value: serde_json::Value) {
@@ -912,58 +919,85 @@ impl BrowserApp {
             return;
         }
         let mut changed = false;
-        ui.menu_button("Plot data", |ui| {
-            for item in self.decoded["collections"].as_array().into_iter().flatten() {
-                let path = item["path"].as_str().unwrap_or("");
-                let mut enabled = self.plot_sources.contains(path);
-                if ui.checkbox(&mut enabled, path).changed() {
-                    if enabled { self.plot_sources.insert(path.into()); }
-                    else { self.plot_sources.remove(path); }
-                    changed = true;
-                }
-            }
-        });
-        if changed {
-            self.first = "0".into(); self.last = self.plot_count().min(512).to_string();
-            self.plot = Default::default();
-            self.viewport.reset();
-            if self.plot_count() > 0 { self.request_plot(1200); }
-        }
-        if self.plot_sources.is_empty() { ui.label("Use Plot data to add collections."); return; }
+        let mut series=self.plot["series"].as_array().cloned().unwrap_or_default();
+        let ranges:Vec<_>=series.iter().filter_map(|c| {
+            let values:Vec<_>=c["points"].as_array()?.iter().filter_map(|p|p[1].as_f64()).filter(|v|v.is_finite()).collect();
+            if values.is_empty() {return None;}
+            Some((c["name"].as_str()?.to_owned(),values.iter().copied().fold(f64::INFINITY,f64::min),values.iter().copied().fold(f64::NEG_INFINITY,f64::max)))
+        }).collect();
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Fit all").clicked() {
-                self.first = "0".into();
-                self.last = self.plot_count().to_string();
-                self.request_plot(1200);
-            }
-            ui.label("Tap to select · drag to pan · scroll or pinch to zoom");
-        });
-        ui.label(format!(
-            "{} · {} records inspected",
-            self.plot["quality"]
-                .as_str()
-                .unwrap_or("Apply a decoder to graph its numeric channels"),
-            self.plot["scanned"]
-        ));
-        if let Some(series) = self.plot["series"].as_array().cloned() {
-            ui.horizontal_wrapped(|ui| {
-                for channel in &series {
-                    let name = channel["name"].as_str().unwrap_or("");
-                    let mut enabled = !self.hidden.contains(name);
-                    if ui.checkbox(&mut enabled, name).changed() {
-                        if enabled {
-                            self.hidden.remove(name);
-                        } else {
-                            self.hidden.insert(name.into());
+            ui.menu_button("Series", |ui| {
+                ui.menu_button("Collections", |ui| {
+                    for item in self.decoded["collections"].as_array().into_iter().flatten() {
+                        let path=item["path"].as_str().unwrap_or("");
+                        let mut enabled=self.plot_sources.contains(path);
+                        if ui.checkbox(&mut enabled,path).changed() {
+                            if enabled {self.plot_sources.insert(path.into());} else {self.plot_sources.remove(path);}
+                            changed=true;
                         }
                     }
+                });
+                ui.menu_button("Visible fields", |ui| {
+                    for channel in &series {
+                        let name=channel["name"].as_str().unwrap_or("");
+                        let mut enabled=!self.hidden.contains(name);
+                        if ui.checkbox(&mut enabled,name).changed() {
+                            if enabled {self.hidden.remove(name);} else {self.hidden.insert(name.into());}
+                        }
+                    }
+                });
+                if self.presentation.menu(ui,&ranges) {self.fit_plot_y=true;}
+            });
+            if ui.button("Fit all").clicked() { self.first="0".into();self.last=self.plot_count().to_string();self.request_plot(1200); }
+            ui.menu_button("Go to…", |ui| {
+                ui.label("Sample index (starts at 0)");
+                let last=self.plot_count().saturating_sub(1);
+                ui.add(egui::DragValue::new(&mut self.plot_jump).clamp_range(0..=last));
+                if ui.button("Go").clicked() {
+                    let count=self.plot_count();let start=self.plot_jump.saturating_sub(128);
+                    self.first=start.to_string();self.last=start.saturating_add(256).min(count).to_string();
+                    self.request_plot(1200);ui.close_menu();
                 }
             });
+            ui.menu_button("More", |ui| {
+                ui.label("Drag a trace vertically to position it.");
+                ui.label("Drag empty space to pan; scroll or pinch to zoom.");
+                if ui.button("Inspect selected bytes").clicked() {self.layout.reveal(Pane::Inspector);self.mobile_target=Some(Pane::Inspector);ui.close_menu();}
+                ui.weak("Use Open data → Extract selection to export bytes.");
+            });
+        });
+        if changed {
+            self.first="0".into();self.last=self.plot_count().min(512).to_string();
+            self.plot=Default::default();self.viewport.reset();
+            if self.plot_count()>0 {self.request_plot(1200);}
+        }
+        if self.plot_sources.is_empty() {ui.label("Use Series to add collections.");return;}
+        ui.weak(format!("{} · {} records inspected",self.plot["quality"].as_str().unwrap_or("Reading samples"),self.plot["scanned"]));
+        {
+            for channel in &mut series {
+                let p=self.presentation.placement(channel["name"].as_str().unwrap_or(""));
+                if let Some(points)=channel["points"].as_array_mut() {for point in points {if let Some(v)=point[1].as_f64() {point[1]=serde_json::json!(p.display(v));}}}
+                if let Some(bands)=channel["bands"].as_array_mut() {for band in bands {for i in [2,3] {if let Some(v)=band[i].as_f64(){band[i]=serde_json::json!(p.display(v));}}}}
+            }
+            let placements=self.presentation.series.clone();
+            let fit_y=std::mem::take(&mut self.fit_plot_y).then(|| {
+                let values=series.iter().filter(|c|!self.hidden.contains(c["name"].as_str().unwrap_or("")))
+                    .flat_map(|c|c["points"].as_array().into_iter().flatten()).filter_map(|p|p[1].as_f64()).filter(|v|v.is_finite());
+                values.fold((f64::INFINITY,f64::NEG_INFINITY),|(min,max),v|(min.min(v),max.max(v)))
+            });
+
             let mut plot = egui_plot::Plot::new("decoded-plot-overlay").x_axis_label("Sample index")
-                .legend(egui_plot::Legend::default()).allow_scroll(!self.stacked);
+                .legend(egui_plot::Legend::default()).allow_scroll(!self.stacked)
+                .allow_drag(!self.presentation.is_dragging())
+                .y_axis_label(if self.presentation.series.is_empty() {"Value"} else {"Display position"})
+                .label_formatter(move |name,point| {let p=placements.get(name).copied().unwrap_or_default();format!("{name}\nSample: {:.0}\nValue: {}",point.x,p.original(point.y))});
             if std::mem::take(&mut self.reset_plot) { plot = plot.reset(); }
             let response = plot
             .show(ui, |plot| {
+                if let Some((min,max))=fit_y.filter(|(min,max)|min.is_finite()&&max.is_finite()) {
+                    let old=plot.plot_bounds();let pad=((max-min)*0.05).max(0.1);
+                    plot.set_plot_bounds(egui_plot::PlotBounds::from_min_max([old.min()[0],min-pad],[old.max()[0],max+pad]));
+                }
                 if let Some(index) = self.selected_sample {
                     plot.vline(egui_plot::VLine::new(index as f64).color(egui::Color32::WHITE).name(format!("Selected sample {index}")));
                 }
@@ -979,9 +1013,11 @@ impl BrowserApp {
                         self.plot["estimated"].as_bool().unwrap_or(false).then_some(bands.as_slice()));
                 }
             });
+            self.presentation.drag(ui,&response.transform,series.iter().filter(|c|!self.hidden.contains(c["name"].as_str().unwrap_or("")))
+                .flat_map(|c|c["points"].as_array().into_iter().flatten().filter_map(move |p|Some((c["name"].as_str()?.to_owned(),[p[0].as_f64()?,p[1].as_f64()?])))));
             self.plot_visible = Some([response.transform.bounds().min()[0], response.transform.bounds().max()[0]]);
             let now = ui.input(|i| i.time);
-            let interacting = response.response.dragged() || response.response.drag_stopped() ||
+            let interacting = (!self.presentation.is_dragging() && (response.response.dragged() || response.response.drag_stopped())) ||
                 (response.response.hovered() && ui.input(|i| (!self.stacked && i.smooth_scroll_delta != egui::Vec2::ZERO) || i.zoom_delta() != 1.0));
             if interacting {
                 let bounds = response.transform.bounds();

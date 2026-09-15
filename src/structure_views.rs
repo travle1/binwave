@@ -77,6 +77,7 @@ pub struct StructureViews {
     source_revision: Option<u64>,
     repaint_context: Option<egui::Context>,
     plot_reader: PlotReader,
+    presentation: crate::plot_presentation::Presentation,
     plot_target: String,
     plot_sources: std::collections::BTreeSet<String>,
     plot_sources_initialized: bool,
@@ -1012,22 +1013,10 @@ impl StructureViews {
             self.plot_sources.extend(collections.iter().filter(|n| collection_score(n, output).0).map(|n| n.path.clone()));
         }
         let mut changed = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.menu_button("Plot data", |ui| {
-                for node in &collections {
-                    let mut enabled = self.plot_sources.contains(&node.path);
-                    if ui.checkbox(&mut enabled, collection_label(node)).changed() {
-                        if enabled { self.plot_sources.insert(node.path.clone()); }
-                        else { self.plot_sources.remove(&node.path); }
-                        changed = true;
-                    }
-                }
-            });
-            ui.weak(format!("{} collections · X: sample index", self.plot_sources.len()));
-        });
         if self.plot_sources.is_empty() {
             self.extra_plot_readers.clear();
-            ui.label("Use Plot data to add collections. Toggle individual fields in the legend.");
+            ui.menu_button("Series", |ui| {plot_collection_choices(ui,&collections,&mut self.plot_sources);});
+            ui.label("Use Series to add collections. Toggle individual fields in the legend.");
             return None;
         }
         let primary = collections.iter().filter(|node| self.plot_sources.contains(&node.path))
@@ -1063,68 +1052,37 @@ impl StructureViews {
             .plot_view
             .clone()
             .unwrap_or(0..count.min(INITIAL_PLOT_SAMPLES));
+        let ranges: Vec<_> = std::iter::once((&self.plot_target, &self.plot_reader)).chain(self.extra_plot_readers.iter())
+            .flat_map(|(path,reader)| reader.data().into_iter().flat_map(move |d| d.series.iter().filter_map(move |(name,points)| {
+                numeric_bounds(points.iter().map(|p|p.value)).map(|(min,max)| (format!("{path} / {name}"),min,max))
+            }))).collect();
         ui.horizontal_wrapped(|ui| {
-            if ui
-                .button("Overview")
-                .on_hover_text(
-                    "Show amplitude ranges across the collection. Large ranges use short sampled windows.",
-                )
-                .clicked()
-            {
-                force_view = Some(0..count);
-                self.plot_fit_y = true;
-            }
-            if ui.button("Zoom in").clicked() {
-                force_view = Some(resized_view(&view, (view.len() / 2).max(1), count));
-            }
-            if ui.button("Zoom out").clicked() {
-                force_view = Some(resized_view(&view, view.len().saturating_mul(2), count));
-            }
-            let mut lock_y = !self.plot_free_y;
-            if ui.checkbox(&mut lock_y, "Lock Y").on_hover_text("Keep the vertical scale when using the plot area. The left axis wheel still adjusts Y; Fit Y fits visible channels.").changed() {
-                self.plot_free_y = !lock_y;
-            }
-            if ui
-                .button("Fit Y")
-                .on_hover_text("Fit the vertical axis to the values currently plotted.")
-                .clicked()
-            {
-                self.plot_fit_y = true;
-            }
-            if ui
-                .add_enabled(
-                    selected_samples.is_some(),
-                    egui::Button::new("Fit selection"),
-                )
-                .clicked()
-            {
-                if let Some(samples) = &selected_samples {
-                    force_view = Some(padded_selection(samples, count));
-                    self.plot_fit_y = true;
+            ui.menu_button("Series", |ui| {
+                changed |= plot_collection_choices(ui,&collections,&mut self.plot_sources);
+                if self.presentation.menu(ui,&ranges) { self.plot_fit_y=true; }
+            });
+            if ui.button("Fit all").clicked() { force_view=Some(0..count); self.plot_fit_y=true; }
+            ui.menu_button("Go to…", |ui| {
+                ui.label("Sample index (starts at 0)");
+                self.plot_jump=self.plot_jump.min(count-1);
+                ui.add(egui::DragValue::new(&mut self.plot_jump).clamp_range(0..=count-1));
+                if ui.button("Go").clicked() {
+                    force_view=Some(centered_view(self.plot_jump,view.len().min(INITIAL_PLOT_SAMPLES).max(64),count));
+                    if let Some(bytes)=sample_bytes(node,self.plot_jump..self.plot_jump+1) {picked=Some((bytes,None));}
+                    ui.close_menu();
                 }
+            });
+            ui.menu_button("More", |ui| {
+            let mut lock_y=!self.plot_free_y;
+            if ui.checkbox(&mut lock_y,"Lock vertical zoom").changed() {self.plot_free_y=!lock_y;}
+            if ui.button("Fit Y").clicked() {self.plot_fit_y=true;ui.close_menu();}
+            if ui.add_enabled(selected_samples.is_some(),egui::Button::new("Fit selection")).clicked() {
+                if let Some(samples)=&selected_samples {force_view=Some(padded_selection(samples,count));self.plot_fit_y=true;}
+                ui.close_menu();
             }
+            ui.weak("Drag a trace vertically to position it. Drag empty space to pan.");
+            ui.weak("Wheel/pinch zooms. Right-drag selects a zoom range.");
             ui.separator();
-            ui.label("Sample (0-based)");
-            self.plot_jump = self.plot_jump.min(count - 1);
-            let jump = ui.add(
-                egui::DragValue::new(&mut self.plot_jump)
-                    .clamp_range(0..=count - 1)
-                    .speed(1),
-            );
-            let enter = jump.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            if ui.button("Go").clicked() || enter {
-                force_view = Some(centered_view(
-                    self.plot_jump,
-                    view.len().min(INITIAL_PLOT_SAMPLES).max(64),
-                    count,
-                ));
-                if let Some(bytes) = sample_bytes(node, self.plot_jump..self.plot_jump + 1) {
-                    self.plot_anchor = Some(self.plot_jump);
-                    picked = Some((bytes, None));
-                }
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
             let mut first = view.start;
             let mut shown = view.len().max(1);
             ui.label("View from");
@@ -1172,6 +1130,8 @@ impl StructureViews {
                     .on_hover_text(format!("0x{:X}..0x{:X} (end exclusive). Whole-sample export includes all interleaved fields.", bytes.start, bytes.end));
             }
         });
+        });
+        if changed { self.plot_fit_y=true; }
         if let Some(forced) = &force_view {
             if self.plot_view.as_ref() != Some(forced) {
                 self.plot_refine = false;
@@ -1245,7 +1205,6 @@ impl StructureViews {
         if let Some(error) = self.plot_reader.error() {
             ui.colored_label(Color32::LIGHT_RED, error);
         }
-        ui.weak("Drag to pan · wheel to zoom · right-drag to zoom a range · Shift-click to extend selection");
         let mut combined = self.plot_reader.data().cloned();
         {
             if let Some(data) = &mut combined {
@@ -1263,6 +1222,11 @@ impl StructureViews {
                 }
             }
         }
+        if let Some(data)=&mut combined {
+            for (name,points) in &mut data.series { let p=self.presentation.placement(name); for point in points {point.value=p.display(point.value);} }
+            for (name,bands) in &mut data.envelopes {let p=self.presentation.placement(name);for band in bands {band.min.value=p.display(band.min.value);band.max.value=p.display(band.max.value);}}
+        }
+        let placements=self.presentation.series.clone();
         let data = combined.as_ref();
         let plot_id = egui::Id::new(("decoded_structure_plot", "overlay", output.revision));
         let hidden = egui_plot::PlotMemory::load(ui.ctx(), plot_id)
@@ -1297,9 +1261,14 @@ impl StructureViews {
             .auto_bounds(egui::Vec2b::new(false, false))
             .allow_double_click_reset(false)
             .allow_boxed_zoom(false)
-            .allow_drag(egui::Vec2b::new(true, self.plot_free_y))
+            .allow_drag(egui::Vec2b::new(!self.presentation.is_dragging(), self.plot_free_y && !self.presentation.is_dragging()))
             .allow_zoom(egui::Vec2b::new(true, self.plot_free_y))
             .allow_scroll(false)
+            .label_formatter(move |name, point| {
+                let p=placements.get(name).copied().unwrap_or_default();
+                format!("{name}\nSample: {:.0}\nValue: {}",point.x,p.original(point.y))
+            })
+            .y_axis_label(if self.presentation.series.is_empty() {"Value"} else {"Display position"})
             .x_axis_label("Sample index")
             .show(ui, |plot_ui| {
                 if force_view.is_some() || y_fit.is_some() {
@@ -1593,6 +1562,9 @@ impl StructureViews {
                 ui.visuals().text_color(),
             );
         }
+        self.presentation.drag(ui,&response.transform,data.into_iter().flat_map(|d|d.series.iter())
+            .filter(|(name,_)| !hidden.contains(*name))
+            .flat_map(|(name,points)|points.iter().map(move |p|(name.clone(),[p.index as f64,p.value]))));
         if response.response.clicked() {
             if let Some(pointer) = response
                 .response
@@ -1636,6 +1608,7 @@ impl StructureViews {
             }
         }
         response.response.context_menu(|ui| {
+            ui.menu_button("Series",|ui| {if self.presentation.menu(ui,&ranges) {self.plot_fit_y=true;}});
             if let Some(bytes) = &selected_bytes {
                 if ui.button("Inspect / edit selected bytes").clicked() {
                     self.plot_action = Some(PlotAction::InspectBytes(bytes.clone()));
@@ -1690,6 +1663,20 @@ impl StructureViews {
             })
             .collect()
     }
+}
+
+fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut std::collections::BTreeSet<String>) -> bool {
+    let mut changed=false;
+    ui.menu_button("Collections", |ui| {
+        for node in collections {
+            let mut enabled=selected.contains(&node.path);
+            if ui.checkbox(&mut enabled,collection_label(node)).changed() {
+                if enabled {selected.insert(node.path.clone());} else {selected.remove(&node.path);}
+                changed=true;
+            }
+        }
+    });
+    changed
 }
 
 fn field_color(path: &str) -> Color32 {
@@ -2044,6 +2031,22 @@ fn display(node: &Node, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn positioned_series_clicks_keep_original_values_and_bytes() {
+        let ctx=egui::Context::default();
+        let store=ByteStore::from_snapshot(Original::from_bytes(crate::demos::Demo::Advanced.bytes()).unwrap());
+        let output=Program::parse(crate::demos::Demo::Advanced.yaml()).unwrap().run(&store.view(),&AtomicBool::new(false)).unwrap();
+        let mut views=StructureViews::default();
+        for _ in 0..20 {render_plot(&ctx,&mut views,&output,&store,vec![],Default::default());std::thread::sleep(std::time::Duration::from_millis(5));}
+        let raw=views.extra_plot_readers["measurements"].data().unwrap().series["temperature"][10].value;
+        views.presentation.series.insert("measurements / temperature".into(),crate::plot_presentation::Placement {scale:0.5,offset:200.});
+        views.plot_fit_y=true;
+        render_plot(&ctx,&mut views,&output,&store,vec![],Default::default());
+        let selected=click_plot(&ctx,&mut views,&output,&store,10.,raw*0.5+200.,false);
+        assert_eq!(selected,Some(6240..6244));
+        assert_eq!(views.extra_plot_readers["measurements"].data().unwrap().series["temperature"][10].value,raw);
+        assert!(!store.is_dirty());
+    }
     #[test]
     fn advanced_demo_overlays_collections_and_keeps_them_when_selecting_bytes() {
         let ctx = egui::Context::default();
