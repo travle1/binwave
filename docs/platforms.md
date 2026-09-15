@@ -119,9 +119,10 @@ Web and native share the command hierarchy in `src/app_menu.rs`:
 - **Edit:** byte undo/redo, copying hex, and Code editing commands.
 - **View:** Hex, Decoded structure, Plot, Samples, Code, Inspector, and reset.
 
-Native-only tools appear in advanced submenus. The browser renders this shared
-model in a single DOM toolbar so file picker clicks retain browser activation;
-native renders it with egui. Both use the same compact Apply/Stop controls in
+Native uses a compact desktop menu bar: **File / Edit / View / Decode / Tools / Help**.
+CSV, Python, search, and workspace commands remain directly accessible in their
+menus. Web uses a touch-sized DOM toolbar so file picker clicks retain browser
+activation. Both presentations dispatch the same shared commands. Both use the same compact Apply/Stop controls in
 Code. File names and operation status have their own text lines, not button rows.
 Existing dock arrangements are preserved. **View > Reset workspace** shows Hex
 on the left and Decoded structure on the right, with Code in the supporting tab

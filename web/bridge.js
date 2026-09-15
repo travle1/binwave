@@ -199,11 +199,12 @@
             setTimeout(() => URL.revokeObjectURL(url), 60000);
             status.textContent = 'Decoder downloaded as decoder.yaml';
         },
-        openDemo(bytes, replaceDecoder = false) {
+        openDemo(bytes, replaceDecoder = false, name = 'simple_wave.bin') {
             if (busy || loadingDecoder || failed || !graphicsReady) return false;
-            if ((dirty || replaceDecoder) && !confirm('Replace the current data and decoder with the simple demo? Unsaved edits will be discarded.')) return false;
-            if (bytes.length !== 2048) throw Error('Invalid bundled demo size');
-            const file = new File([bytes], 'simple_wave.bin', {type:'application/octet-stream'});
+            if ((dirty || replaceDecoder) && !confirm('Replace the current data and decoder with this demo? Unsaved edits will be discarded.')) return false;
+            const expected = { 'simple_wave.bin': 2048, 'advanced_wave.bin': 8080 };
+            if (!Object.hasOwn(expected, name) || bytes.length !== expected[name]) throw Error('Invalid bundled demo size');
+            const file = new File([bytes], name, {type:'application/octet-stream'});
             return submit({type:'open', file, demo:true});
         },
         poll() {

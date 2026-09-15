@@ -31,7 +31,7 @@ const ROWS_PER_PAGE: usize = 100;
 enum Action {
     Open(PathBuf),
     Demo,
-    SimpleDemo,
+    EmbeddedDemo(crate::demos::Demo),
     Apply(ResolvedLayout, String),
     LoadYaml(PathBuf),
     ReplaceYaml(String),
@@ -61,7 +61,7 @@ pub enum OpenedFile {
 
 enum IoResult {
     Opened(Arc<FileSource>),
-    SimpleDemo(Arc<Original>),
+    EmbeddedDemo(Arc<Original>, crate::demos::Demo),
     Validated(ResolvedLayout, String, Arc<Original>),
     Loaded(Arc<Original>, Option<PathBuf>, bool),
     SavedBinary(ByteSnapshot, PathBuf),
@@ -640,7 +640,10 @@ impl BinaryWorkspace {
         self.request(Action::Open(path), ctx);
     }
     pub fn open_simple_demo(&mut self, ctx: &Context) {
-        self.request(Action::SimpleDemo, ctx);
+        self.request(Action::EmbeddedDemo(crate::demos::Demo::Simple), ctx);
+    }
+    pub fn open_advanced_demo(&mut self, ctx: &Context) {
+        self.request(Action::EmbeddedDemo(crate::demos::Demo::Advanced), ctx);
     }
     pub fn open_demo(&mut self, ctx: &Context) {
         self.request(Action::Demo, ctx);
@@ -734,11 +737,10 @@ impl BinaryWorkspace {
                     Ok(IoResult::Opened(Arc::new(FileSource::open(&path)?)))
                 });
             }
-            Action::SimpleDemo => {
-                self.report(Ok("Opening simple wave demo…".into()));
-                self.start_io(ctx, || Ok(IoResult::SimpleDemo(Original::from_bytes(
-                    include_bytes!("../samples/quickstart/simple_wave.bin"),
-                )?)));
+            Action::EmbeddedDemo(demo) => {
+                self.report(Ok(format!("Opening {}…", demo.name())));
+                self.start_io(ctx, move || Ok(IoResult::EmbeddedDemo(
+                    Original::from_bytes(demo.bytes())?, demo)));
             }
             Action::Demo => {
                 self.report(Ok("Opening embedded sensor demo…".into()));
@@ -1029,9 +1031,9 @@ impl BinaryWorkspace {
                     self.original = Some(original);
                     self.request(Action::Apply(layout, yaml), ctx)
                 }
-                Ok(IoResult::SimpleDemo(original)) => {
+                Ok(IoResult::EmbeddedDemo(original, demo)) => {
                     self.finish_open(Some(original), None, None, true, false);
-                    self.yaml = DecoderLanguage::Yaml.starter().into();
+                    self.yaml = demo.yaml().into();
                     self.saved_yaml.clone_from(&self.yaml);
                     self.apply_definition(ctx);
                 }
@@ -3113,6 +3115,20 @@ fn data_bounds(data: &PlotData) -> PlotBounds {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_advanced_demo_opens_and_decodes_without_manual_apply() {
+        let ctx = Context::default();
+        let mut workspace = BinaryWorkspace::default();
+        workspace.open_advanced_demo(&ctx);
+        settle(&mut workspace, &ctx);
+        assert_eq!(workspace.file_len(), 8080);
+        assert!(workspace.source_path().is_none());
+        assert!(workspace.decoded_ready(), "{}", workspace.message);
+        assert_eq!(workspace.yaml, crate::demos::Demo::Advanced.yaml());
+        assert!(!workspace.is_dirty());
+        assert!(workspace.take_layout_applied());
+    }
 
     #[test]
     fn embedded_simple_demo_opens_and_decodes_without_a_path_or_manual_apply() {

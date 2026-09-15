@@ -212,3 +212,15 @@ test('shared menu application commands enter the bounded UI mailbox',()=>{
     h.menuState.dispatch('example',2);
     assert.deepEqual(JSON.parse(h.app.poll()),{type:'menu',command:'example',argument:2});
 });
+
+test('advanced demo opens bundled data with its identity and replacement guard', () => {
+    const {app, commands} = bridge();
+    app.ready();
+    assert.equal(app.openDemo(new Uint8Array(8080), false, 'advanced_wave.bin'), true);
+    assert.equal(commands[0].file.name, 'advanced_wave.bin');
+    assert.equal(commands[0].demo, true);
+    const cancelled = bridge(false);
+    cancelled.app.ready();
+    assert.equal(cancelled.app.openDemo(new Uint8Array(8080), true, 'advanced_wave.bin'), false);
+    assert.equal(cancelled.commands.length, 0);
+});

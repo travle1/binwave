@@ -33,7 +33,7 @@ extern "C" {
     #[wasm_bindgen(catch, js_namespace = binwave, js_name = freshCanvas)]
     pub fn fresh_canvas() -> Result<(), JsValue>;
     #[wasm_bindgen(js_namespace = binwave, js_name = openDemo)]
-    fn open_embedded_demo(bytes: &[u8], replace_decoder: bool);
+    fn open_embedded_demo(bytes: &[u8], replace_decoder: bool, name: &str);
 }
 
 #[derive(Default, Deserialize)]
@@ -93,6 +93,8 @@ pub struct BrowserApp {
     table: serde_json::Value,
     plot: serde_json::Value,
     collection: String,
+    plot_sources: std::collections::BTreeSet<String>,
+    plot_sources_initialized: bool,
     table_start: u64,
     first: String,
     last: String,
@@ -154,6 +156,8 @@ impl BrowserApp {
             table: Default::default(),
             plot: Default::default(),
             collection: String::new(),
+            plot_sources: Default::default(),
+            plot_sources_initialized: false,
             table_start: 0,
             first: "0".into(),
             last: "0".into(),
@@ -211,7 +215,9 @@ impl BrowserApp {
                             "Select bytes to preview interpretations and name fields."
                                 .into();
                         if event.demo {
-                            self.yaml = crate::source_editor::DecoderLanguage::Yaml.starter().into();
+                            self.yaml = if self.name == crate::demos::Demo::Advanced.name() {
+                                crate::demos::Demo::Advanced.yaml()
+                            } else { crate::demos::Demo::Simple.yaml() }.into();
                             self.apply_decoder();
                         }
                     } else if event.kind == "edited" {
@@ -267,13 +273,15 @@ impl BrowserApp {
                     self.applied_yaml = self.decoding_yaml.clone();
                     self.decoding = false;
                     self.decoded = event.result;
+                    self.plot_sources.retain(|p| self.decoded["collections"].as_array().into_iter().flatten().any(|c| c["path"].as_str()==Some(p)));
+
                     self.table = Default::default();
                     self.plot = Default::default();
                     let inline = std::mem::take(&mut self.inline_decode);
                     self.reveal_results |= !inline;
                     let path = self.decoded["collections"]
                         .as_array()
-                        .and_then(|a| a.first())
+                        .and_then(|a| a.iter().max_by_key(|c| c["count"].as_str().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)))
                         .and_then(|v| v["path"].as_str())
                         .unwrap_or("")
                         .to_owned();
@@ -281,7 +289,7 @@ impl BrowserApp {
                         self.table_start = self.table_start.min(self.count().saturating_sub(1));
                         self.request_table();
                         self.request_plot_view(1200, false);
-                    } else { self.select_collection(path); }
+                    } else { self.select_collection(path); if !self.plot_sources.is_empty() { self.request_plot_view(1200, false); } }
                     if !inline { self.mobile_target = Some(if self.collection.is_empty() { Pane::Structures } else { Pane::Plot }); }
                     self.status = format!("Decoded {} of {} bytes. {}", self.decoded["consumed"].as_str().unwrap_or("0"), self.size,
                         if self.collection.is_empty() { "Inspect the fields in Decoded structure; unread bytes are allowed." }
@@ -327,8 +335,7 @@ impl BrowserApp {
                     }
                 }
                 "plot" => {
-                    if event.result["path"].as_str() == Some(&self.collection)
-                        && event.request == self.plot_request.to_string() {
+                    if event.request == self.plot_request.to_string() {
                         self.reset_plot = event.reset;
                         self.plot = event.result;
                     }
@@ -592,6 +599,8 @@ impl BrowserApp {
         self.plot = Default::default();
         self.pending.clear();
         self.collection.clear();
+        self.plot_sources.clear();
+        self.plot_sources_initialized = false;
         self.decoding = false;
     }
     fn queue(&mut self, value: serde_json::Value) {
@@ -630,20 +639,27 @@ impl BrowserApp {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0)
     }
+    fn plot_count(&self) -> u64 {
+        self.decoded["collections"].as_array().into_iter().flatten()
+            .filter(|c| c["path"].as_str().is_some_and(|p| self.plot_sources.contains(p)))
+            .filter_map(|c| c["count"].as_str()?.parse::<u64>().ok()).max().unwrap_or(0)
+    }
     fn select_collection(&mut self, path: String) {
-        self.plot_visible = None;
         self.selected_sample = None;
         self.probe_request = self.probe_request.wrapping_add(1);
         self.collection = path;
         self.table_start = 0;
-        self.first = "0".into();
-        self.last = self.count().min(512).to_string();
-        self.viewport.reset();
         self.table = Default::default();
-        self.plot = Default::default();
         if !self.collection.is_empty() {
             self.request_table();
-            self.request_plot(1200);
+            if !self.plot_sources_initialized {
+                self.plot_sources_initialized = true;
+                self.plot_sources.extend(self.decoded["collections"].as_array().into_iter().flatten().filter_map(|c| c["path"].as_str().map(str::to_owned)));
+                self.first = "0".into();
+                self.last = self.plot_count().min(512).to_string();
+                self.viewport.reset();
+                self.request_plot(1200);
+            }
         }
     }
     fn request_table(&mut self) {
@@ -655,9 +671,9 @@ impl BrowserApp {
     }
     fn request_plot_view(&mut self, width: u32, reset: bool) {
         match (parse_offset(&self.first), parse_offset(&self.last)) {
-            (Some(start), Some(end)) if start < end && end <= self.count() => {
+            (Some(start), Some(end)) if start < end && end <= self.plot_count() => {
                 self.plot_request = self.plot_request.wrapping_add(1);
-                self.queue(serde_json::json!({"type":"plot","path":self.collection,"start":start.to_string(),"end":end.to_string(),"width":width,"request":self.plot_request.to_string(),"reset":reset}));
+                self.queue(serde_json::json!({"type":"plot","paths":self.plot_sources,"start":start.to_string(),"end":end.to_string(),"width":width,"request":self.plot_request.to_string(),"reset":reset}));
             }
             _ => self.status = "Choose a nonempty sample range within the collection.".into(),
         }
@@ -684,6 +700,7 @@ impl BrowserApp {
         if let Some(action)=command.editor_action() { self.editor.command(action); self.layout.reveal(Pane::Layout); self.mobile_target=Some(Pane::Layout); return; }
         match command {
             SimpleDemo=>self.open_simple_demo(),
+            AdvancedDemo=>self.open_demo(crate::demos::Demo::Advanced),
             SaveDecoder=>save_decoder(&self.yaml),
             NewDecoder=>{self.yaml="endian: little\nactions: []\n".into();self.reset_decoder();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
             Apply=>self.apply_decoder(),
@@ -705,8 +722,10 @@ impl BrowserApp {
         } else {self.status="Copy supports the loaded 64 KiB page; use Extract selection for larger ranges.".into();}
     }
     fn open_simple_demo(&self) {
-        open_embedded_demo(include_bytes!("../samples/quickstart/simple_wave.bin"),
-            self.yaml != crate::source_editor::DecoderLanguage::Yaml.starter());
+        self.open_demo(crate::demos::Demo::Simple);
+    }
+    fn open_demo(&self, demo: crate::demos::Demo) {
+        open_embedded_demo(demo.bytes(), self.yaml != demo.yaml(), demo.name());
     }
     fn decoder(&mut self, ui: &mut egui::Ui) {
         if let Some(command)=crate::app_menu::decoder_controls(ui,!self.decoding && !self.name.is_empty(),self.decoding) { self.menu_action(command,0); }
@@ -892,11 +911,29 @@ impl BrowserApp {
                 else { "Fields decoded successfully. Inspect Decoded structure; add repeated numeric samples when ready to plot." });
             return;
         }
-        self.collection_picker(ui);
+        let mut changed = false;
+        ui.menu_button("Plot data", |ui| {
+            for item in self.decoded["collections"].as_array().into_iter().flatten() {
+                let path = item["path"].as_str().unwrap_or("");
+                let mut enabled = self.plot_sources.contains(path);
+                if ui.checkbox(&mut enabled, path).changed() {
+                    if enabled { self.plot_sources.insert(path.into()); }
+                    else { self.plot_sources.remove(path); }
+                    changed = true;
+                }
+            }
+        });
+        if changed {
+            self.first = "0".into(); self.last = self.plot_count().min(512).to_string();
+            self.plot = Default::default();
+            self.viewport.reset();
+            if self.plot_count() > 0 { self.request_plot(1200); }
+        }
+        if self.plot_sources.is_empty() { ui.label("Use Plot data to add collections."); return; }
         ui.horizontal_wrapped(|ui| {
             if ui.button("Fit all").clicked() {
                 self.first = "0".into();
-                self.last = self.count().to_string();
+                self.last = self.plot_count().to_string();
                 self.request_plot(1200);
             }
             ui.label("Tap to select · drag to pan · scroll or pinch to zoom");
@@ -908,9 +945,9 @@ impl BrowserApp {
                 .unwrap_or("Apply a decoder to graph its numeric channels"),
             self.plot["scanned"]
         ));
-        if let Some(series) = self.plot["series"].as_array() {
+        if let Some(series) = self.plot["series"].as_array().cloned() {
             ui.horizontal_wrapped(|ui| {
-                for channel in series {
+                for channel in &series {
                     let name = channel["name"].as_str().unwrap_or("");
                     let mut enabled = !self.hidden.contains(name);
                     if ui.checkbox(&mut enabled, name).changed() {
@@ -922,7 +959,7 @@ impl BrowserApp {
                     }
                 }
             });
-            let mut plot = egui_plot::Plot::new(("decoded-plot", &self.collection))
+            let mut plot = egui_plot::Plot::new("decoded-plot-overlay").x_axis_label("Sample index")
                 .legend(egui_plot::Legend::default()).allow_scroll(!self.stacked);
             if std::mem::take(&mut self.reset_plot) { plot = plot.reset(); }
             let response = plot
@@ -930,13 +967,7 @@ impl BrowserApp {
                 if let Some(index) = self.selected_sample {
                     plot.vline(egui_plot::VLine::new(index as f64).color(egui::Color32::WHITE).name(format!("Selected sample {index}")));
                 }
-                let colors = [
-                    egui::Color32::LIGHT_BLUE,
-                    egui::Color32::LIGHT_GREEN,
-                    egui::Color32::LIGHT_RED,
-                    egui::Color32::GOLD,
-                ];
-                for (i, channel) in series.iter().enumerate() {
+                for channel in &series {
                     let name = channel["name"].as_str().unwrap_or("");
                     if self.hidden.contains(name) {
                         continue;
@@ -944,7 +975,7 @@ impl BrowserApp {
                     let points: Vec<[f64; 2]> =
                         serde_json::from_value(channel["points"].clone()).unwrap_or_default();
                     let bands: Vec<[f64;4]> = serde_json::from_value(channel["bands"].clone()).unwrap_or_default();
-                    crate::plot_trace::decoded_channel(plot, name, colors[i % colors.len()], points,
+                    crate::plot_trace::decoded_channel(plot, name, crate::plot_trace::series_color(name), points,
                         self.plot["estimated"].as_bool().unwrap_or(false).then_some(bands.as_slice()));
                 }
             });
@@ -954,14 +985,31 @@ impl BrowserApp {
                 (response.response.hovered() && ui.input(|i| (!self.stacked && i.smooth_scroll_delta != egui::Vec2::ZERO) || i.zoom_delta() != 1.0));
             if interacting {
                 let bounds = response.transform.bounds();
-                self.viewport.observe(bounds.min()[0], bounds.max()[0], self.count(), now);
+                self.viewport.observe(bounds.min()[0], bounds.max()[0], self.plot_count(), now);
             }
             if let Some((first, last)) = self.viewport.ready(now) {
                 self.first = first.to_string(); self.last = last.to_string();
                 self.request_plot_view(response.response.rect.width().max(100.) as u32, false);
             }
-            if response.response.clicked() && !response.response.double_clicked() && self.count() > 0 {
+            if response.response.clicked() && !response.response.double_clicked() && self.plot_count() > 0 {
                 if let Some(pointer) = response.response.interact_pointer_pos() {
+                    let transform = &response.transform;
+                    let nearest = series.iter().filter(|c| !self.hidden.contains(c["name"].as_str().unwrap_or("")))
+                        .flat_map(|c| c["points"].as_array().into_iter().flatten().enumerate().filter_map(move |(i,p)| {
+                            let x=p[0].as_f64()?; let y=p[1].as_f64()?;
+                            let distance=transform.position_from_point(&egui_plot::PlotPoint::new(x,y)).distance_sq(pointer);
+                            Some((distance,c,i,x))
+                        })).min_by(|a,b| a.0.total_cmp(&b.0));
+                    if let Some((_, channel, i, x)) = nearest {
+                        if let (Some(start), Some(end)) = (channel["bytes"][i][0].as_str().and_then(parse_offset), channel["bytes"][i][1].as_str().and_then(parse_offset)) {
+                            let path=channel["path"].as_str().unwrap_or("").to_owned();
+                            self.collection=path;
+                            self.selected_sample=Some(x as u64);
+                            self.table_start=x as u64 / 128 * 128;
+                            self.request_table();
+                            self.select_range(start,end);
+                        }
+                    } else {
                     let x = response.transform.value_from_position(pointer).x;
                     if let Some(index) = crate::browser_viewport::clicked_sample(x, self.count()) {
                         self.selected_sample = Some(index);
@@ -969,10 +1017,11 @@ impl BrowserApp {
                         self.queue(serde_json::json!({"type":"pick","path":self.collection,
                             "index":index.to_string(),"request":self.probe_request.to_string()}));
                     }
+                    }
                 }
             }
             if response.response.double_clicked() {
-                self.first = "0".into(); self.last = self.count().to_string();
+                self.first = "0".into(); self.last = self.plot_count().to_string();
                 self.request_plot(1200);
             }
         }

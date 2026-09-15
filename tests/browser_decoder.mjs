@@ -175,3 +175,40 @@ assert.throws(() => variableSession.decode_interpretation(variableYaml.replace('
 assert.deepEqual(JSON.parse(variableSession.table('field', '0')), previousStructure, 'Failed interpretation must retain the published structure');
 variableSession.free();
 console.log('Browser WASM: custom structures, actual variable byte ranges, short selections and missing references passed.');
+
+
+const advancedBytes = await readFile('samples/quickstart/advanced_wave.bin');
+globalThis.binwaveDecoder = {read(start, length) {
+    return new Uint8Array(advancedBytes.subarray(Number(start), Number(start) + length));
+}};
+const advanced = new bindings.DecoderSession(String(advancedBytes.length));
+const decodedAdvanced = JSON.parse(advanced.decode(await readFile('samples/advanced/decoder.yaml', 'utf8')));
+assert.deepEqual(decodedAdvanced.collections.map(c => [c.path,c.count]), [['waves','384'],['measurements','192'],['events','96']]);
+const overlay = JSON.parse(advanced.plot_many(JSON.stringify(['waves','measurements','events']), '0','384',800));
+assert.equal(overlay.series.length, 9);
+assert.equal(overlay.estimated,false);
+const temperature = overlay.series.find(c => c.name === 'measurements / temperature');
+assert.equal(temperature.points.length,192);
+assert.deepEqual(temperature.points[0],[0,20]);
+assert.deepEqual(temperature.bytes[0],['6160','6164']);
+assert.equal(overlay.series.find(c => c.name === 'events / code').points.length,96);
+const tail = JSON.parse(advanced.plot_many('["waves","measurements","events"]','200','384',800));
+assert.ok(tail.series.filter(c => c.path !== 'waves').every(c=>c.points.length===0));
+assert.equal(JSON.parse(advanced.plot_many('["waves","waves"]','0','4',800)).series.length,5);
+advanced.free();
+const manyBytes = new Uint8Array(65*2*10000);
+const manyView = new DataView(manyBytes.buffer);
+for(let i=0;i<10000;i++) for(let f=0;f<65;f++) manyView.setUint16((i*65+f)*2,f+i,true);
+globalThis.binwaveDecoder={read(start,length){return manyBytes.slice(Number(start),Number(start)+length);}};
+const many=new bindings.DecoderSession(String(manyBytes.length));
+const manyYaml='endian: little\nstructures:\n  - name: Wide\n    fields:\n'+Array.from({length:65},(_,i)=>'      - {name: f'+i+', type: u16}').join('\n')+'\nactions:\n  - read: {name: samples, type: {structure: Wide}, repeat: until end}\n';
+many.decode(manyYaml);
+for(const end of ['4','10000']) {
+    const plotted=JSON.parse(many.plot('samples','0',end,128));
+    assert.equal(plotted.series.length,65);
+    const last=plotted.series.find(c=>c.name==='f64');
+    assert.deepEqual(last.points[0],[0,64]);
+    assert.deepEqual(last.bytes[0],['128','130']);
+}
+many.free();
+console.log('Multiple collections: unequal lengths, index alignment, byte links, and 65 exact/reduced fields passed.');

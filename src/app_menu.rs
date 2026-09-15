@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub enum Command {
     OpenFile,
     SimpleDemo,
+    AdvancedDemo,
     SensorDemo,
     SaveCopy,
     Extract,
@@ -32,6 +33,7 @@ pub enum Command {
     Samples,
     Inspector,
     Reset,
+    PlotWorkspace,
     Auto,
     Stacked,
     Docked,
@@ -116,6 +118,7 @@ pub fn menus(s: &State) -> Vec<Item> {
     let mut data = vec![
         action("Open file...", OpenFile, s.available),
         action("Open simple demo", SimpleDemo, s.available),
+        action("Open advanced demo", AdvancedDemo, s.available),
         action("Save edited copy...", SaveCopy, s.available && s.file),
         action("Extract selection...", Extract, s.available && s.selection),
         action("Cancel operation", Cancel, s.busy),
@@ -169,37 +172,30 @@ pub fn menus(s: &State) -> Vec<Item> {
         action("Reset workspace", Reset, true),
     ];
     if s.native {
-        data.push(Item::menu(
-            "Advanced",
-            vec![
-                action("Open sensor demo", SensorDemo, s.available),
-                action("Load CSV configuration...", CsvConfig, s.available),
-            ],
-        ));
-        decoder.push(Item::menu(
-            "Advanced",
-            vec![
-                action("Edit decoding steps...", Steps, s.available),
-                action("Describe selected bytes...", Describe, s.selection),
-                action("New Python script", Python, s.available),
-                action("Python waveform example", PythonExample, s.available),
-            ],
-        ));
-        edit.push(Item::menu(
-            "Find and replace",
-            vec![
-                action("Go to byte...", Jump, s.file),
-                action("Find bytes or text...", Find, s.file),
-                action("Replace selected bytes...", Replace, s.selection),
-            ],
-        ));
-        view.push(Item::menu(
-            "Tools and help",
-            vec![
-                action("Clear disk cache", ClearCache, s.available),
-                action("Decoding guide", Help, true),
-            ],
-        ));
+        data.extend([
+            action("Open sensor demo", SensorDemo, s.available),
+            action("Load CSV configuration...", CsvConfig, s.available),
+        ]);
+        decoder.extend([
+            action("Edit decoding steps...", Steps, s.available),
+            action("Describe selected bytes...", Describe, s.selection),
+            action("New Python script", Python, s.available),
+            action("Python waveform example", PythonExample, s.available),
+        ]);
+        edit.extend([
+            action("Go to byte...", Jump, s.file),
+            action("Find bytes or text...", Find, s.file),
+            action("Replace selected bytes...", Replace, s.selection),
+        ]);
+        view.push(action("Plot and bytes workspace", PlotWorkspace, s.file));
+        return vec![
+            Item::menu("File", data),
+            Item::menu("Edit", edit),
+            Item::menu("View", view),
+            Item::menu("Decode", decoder),
+            Item::menu("Tools", vec![action("Clear disk cache", ClearCache, s.available)]),
+            Item::menu("Help", vec![action("Decoding guide", Help, true)]),
+        ];
     } else {
         view.push(Item::menu(
             "Arrangement",
@@ -219,12 +215,18 @@ pub fn menus(s: &State) -> Vec<Item> {
 }
 pub fn native_bar(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)> {
     fn entries(ui: &mut egui::Ui, items: &[Item], selected: &mut Option<(Command, usize)>) {
-        ui.spacing_mut().interact_size.y = 30.;
-        ui.set_min_width(220.);
+        ui.set_min_width(200.);
         for item in items {
             if let Some(command) = item.command {
+                let shortcut = match command {
+                    Command::OpenFile => "Ctrl+O",
+                    Command::SaveCopy => "Ctrl+Shift+S",
+                    Command::Apply => "F5",
+                    Command::Jump => "Ctrl+G",
+                    _ => "",
+                };
                 if ui
-                    .add_enabled(item.enabled, egui::Button::new(&item.label))
+                    .add_enabled(item.enabled, egui::Button::new(&item.label).shortcut_text(shortcut))
                     .clicked()
                 {
                     *selected = Some((command, item.argument));
@@ -236,14 +238,7 @@ pub fn native_bar(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)>
         }
     }
     let mut selected = None;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().interact_size.y = 32.;
-        ui.spacing_mut().button_padding = egui::vec2(10., 6.);
-        ui.spacing_mut().item_spacing.x = 4.;
-        if ui.available_width() > 520. {
-            ui.strong("Binwave");
-            ui.add_space(12.);
-        }
+    egui::menu::bar(ui, |ui| {
         for menu in menus {
             ui.menu_button(&menu.label, |ui| entries(ui, &menu.children, &mut selected));
         }
@@ -272,7 +267,7 @@ pub fn decoder_controls(ui: &mut egui::Ui, enabled: bool, busy: bool) -> Option<
 mod tests {
     use super::*;
     #[test]
-    fn compact_bar_keeps_all_four_menus_on_one_row() {
+    fn desktop_menu_bar_keeps_six_menus_in_a_compact_row() {
         let ctx = egui::Context::default();
         let model = menus(&State {
             native: true,
@@ -299,17 +294,18 @@ mod tests {
         let mut positions = vec![];
         for shape in output.shapes {
             if let egui::Shape::Text(text) = shape.shape {
-                if ["Open data", "Decoder", "Edit", "View"].contains(&text.galley.text()) {
+                if ["File", "Edit", "View", "Decode", "Tools", "Help"].contains(&text.galley.text()) {
                     assert!(text.pos.x + text.galley.size().x <= 360.);
                     positions.push(text.pos.y);
                 }
             }
         }
-        assert_eq!(positions.len(), 4);
+        assert_eq!(positions.len(), 6);
+        assert!(positions.iter().all(|y| *y < 25.));
         assert!(positions.iter().all(|y| (*y - positions[0]).abs() < 1.));
     }
     #[test]
-    fn platforms_share_primary_commands_and_order() {
+    fn platforms_share_commands_with_desktop_menu_organization() {
         let web = menus(&State::default());
         let native = menus(&State {
             native: true,
@@ -319,10 +315,12 @@ mod tests {
             web.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(),
             ["Open data", "Decoder", "Edit", "View"]
         );
-        for (a, b) in web.iter().zip(&native) {
-            let a: Vec<_> = a.children.iter().filter_map(|i| i.command).collect();
-            let b: Vec<_> = b.children.iter().filter_map(|i| i.command).collect();
-            assert_eq!(a, b);
+        assert_eq!(native.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(),
+            ["File", "Edit", "View", "Decode", "Tools", "Help"]);
+        for (wi, ni) in [(0, 0), (1, 3), (2, 1), (3, 2)] {
+            for command in web[wi].children.iter().filter_map(|i| i.command) {
+                assert!(native[ni].children.iter().any(|i| i.command == Some(command)));
+            }
         }
         assert!(!web[0].children[0].enabled);
         assert!(!web[0].children[2].enabled);

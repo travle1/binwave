@@ -16,16 +16,8 @@ use std::sync::{
 
 const PAGE_SIZE: usize = 128;
 const INITIAL_PLOT_SAMPLES: usize = 1024;
-const MAX_LINES: usize = 32;
 const MAX_HIGHLIGHTS: usize = 256;
-const COLORS: [Color32; 6] = [
-    Color32::from_rgb(84, 174, 227),
-    Color32::from_rgb(133, 190, 111),
-    Color32::from_rgb(219, 165, 78),
-    Color32::from_rgb(177, 137, 217),
-    Color32::from_rgb(222, 125, 141),
-    Color32::from_rgb(88, 190, 183),
-];
+
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PageKey {
@@ -86,6 +78,9 @@ pub struct StructureViews {
     repaint_context: Option<egui::Context>,
     plot_reader: PlotReader,
     plot_target: String,
+    plot_sources: std::collections::BTreeSet<String>,
+    plot_sources_initialized: bool,
+    extra_plot_readers: std::collections::BTreeMap<String, PlotReader>,
     plot_view: Option<Range<usize>>,
     plot_axis_width: f32,
     plot_force_view: Option<Range<usize>>,
@@ -116,6 +111,7 @@ impl StructureViews {
     }
     pub fn invalidate(&mut self) {
         self.plot_reader.invalidate();
+        for reader in self.extra_plot_readers.values_mut() { reader.invalidate(); }
         self.plot_action = None;
         self.plot_range_zoom = None;
         self.plot_zoom_y = None;
@@ -934,11 +930,8 @@ impl StructureViews {
             self.plot_follow_selection = false;
             if let Some(range) = &self.last_hex_selection {
                 if let Some(collection) = containing_collection(&output.nodes, range) {
-                    if collection.path != self.plot_target {
-                        self.plot_target = collection.path.clone();
-                        self.plot_view = None;
-                        self.plot_reader.invalidate();
-                        self.plot_fit_y = true;
+                    if !self.plot_sources.contains(&collection.path) && self.plot_sources_initialized {
+                        return;
                     }
                     if let Some(samples) = sample_indices_for_bytes(collection, range) {
                         self.plot_jump = samples.start;
@@ -1011,38 +1004,41 @@ impl StructureViews {
             return None;
         }
         self.initialize_plot(output);
-        let previous_target = self.plot_target.clone();
         let mut collections = Vec::new();
         collect_collections(&output.nodes, &mut collections);
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Data");
-            egui::ComboBox::from_id_source("plot_collection")
-                .width(ui.available_width().clamp(120., 480.))
-                .selected_text(
-                    find_node(&output.nodes, &self.plot_target)
-                        .map_or_else(|| "Choose numeric samples".to_owned(), collection_label),
-                )
-                .show_ui(ui, |ui| {
-                    for node in &collections {
-                        ui.selectable_value(
-                            &mut self.plot_target,
-                            node.path.clone(),
-                            collection_label(node),
-                        )
-                        .on_hover_text(&node.path);
-                    }
-                });
-        });
-        if previous_target != self.plot_target {
-            self.plot_range_zoom = None;
-            self.plot_zoom_y = None;
-            self.plot_view = None;
-            self.plot_force_view = None;
-            self.plot_reader.invalidate();
-            self.plot_refine = false;
-            self.plot_anchor = None;
-            self.initialize_plot(output);
+        self.plot_sources.retain(|path| collections.iter().any(|node| &node.path == path));
+        if !self.plot_sources_initialized {
+            self.plot_sources_initialized = true;
+            self.plot_sources.extend(collections.iter().filter(|n| collection_score(n, output).0).map(|n| n.path.clone()));
         }
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.menu_button("Plot data", |ui| {
+                for node in &collections {
+                    let mut enabled = self.plot_sources.contains(&node.path);
+                    if ui.checkbox(&mut enabled, collection_label(node)).changed() {
+                        if enabled { self.plot_sources.insert(node.path.clone()); }
+                        else { self.plot_sources.remove(&node.path); }
+                        changed = true;
+                    }
+                }
+            });
+            ui.weak(format!("{} collections · X: sample index", self.plot_sources.len()));
+        });
+        if self.plot_sources.is_empty() {
+            self.extra_plot_readers.clear();
+            ui.label("Use Plot data to add collections. Toggle individual fields in the legend.");
+            return None;
+        }
+        let primary = collections.iter().filter(|node| self.plot_sources.contains(&node.path))
+            .max_by_key(|node| collection_count(node)).unwrap().path.clone();
+        if primary != self.plot_target {
+            self.plot_target = primary;
+            self.plot_reader.invalidate();
+            changed = true;
+        }
+        if changed { self.plot_fit_y = true; }
+        self.extra_plot_readers.retain(|path, _| self.plot_sources.contains(path) && path != &self.plot_target);
         let Some(node) = find_node(&output.nodes, &self.plot_target) else {
             ui.label("No sample collection. Repeat a numeric field or structure in the definition to plot it.");
             return None;
@@ -1055,7 +1051,7 @@ impl StructureViews {
         let selected_samples = self
             .last_hex_selection
             .as_ref()
-            .and_then(|bytes| sample_indices_for_bytes(node, bytes));
+            .and_then(|bytes| collections.iter().filter(|n| self.plot_sources.contains(&n.path)).find_map(|n| sample_indices_for_bytes(n, bytes)));
         let selected_bytes = self
             .last_hex_selection
             .clone()
@@ -1196,6 +1192,18 @@ impl StructureViews {
             self.plot_refine,
         );
         self.plot_reader.tick(ui.ctx());
+        for path in &self.plot_sources {
+            if path == &self.plot_target { continue; }
+            if let Some(extra) = find_node(&output.nodes, path) {
+                let count = collection_count(extra);
+                let reader = self.extra_plot_readers.entry(path.clone()).or_default();
+                reader.request(ui.ctx(), source.clone(), extra.clone(),
+                    requested.start.min(count)..requested.end.min(count), pixel_width, self.plot_refine);
+                reader.tick(ui.ctx());
+                if let Some(error) = reader.error() { ui.colored_label(Color32::LIGHT_RED, format!("{path}: {error}")); }
+                if reader.is_loading() { ui.spinner(); }
+            }
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label(format!(
                 "Samples {}–{} of {}",
@@ -1238,11 +1246,25 @@ impl StructureViews {
             ui.colored_label(Color32::LIGHT_RED, error);
         }
         ui.weak("Drag to pan · wheel to zoom · right-drag to zoom a range · Shift-click to extend selection");
-        let data = self.plot_reader.data();
-        if data.is_some_and(|data| data.series.len() >= MAX_LINES) {
-            ui.weak(format!("Showing up to {MAX_LINES} numeric fields."));
+        let mut combined = self.plot_reader.data().cloned();
+        {
+            if let Some(data) = &mut combined {
+                data.series = std::mem::take(&mut data.series).into_iter()
+                    .map(|(name, points)| (format!("{} / {name}", self.plot_target), points)).collect();
+                data.envelopes = std::mem::take(&mut data.envelopes).into_iter()
+                    .map(|(name, bands)| (format!("{} / {name}", self.plot_target), bands)).collect();
+                for (path, reader) in &self.extra_plot_readers {
+                    if let Some(extra) = reader.data() {
+                        for (name, points) in &extra.series { data.series.insert(format!("{path} / {name}"), points.clone()); }
+                        for (name, bands) in &extra.envelopes { data.envelopes.insert(format!("{path} / {name}"), bands.clone()); }
+                        if extra.quality == PlotQuality::SampledPreview { data.quality = PlotQuality::SampledPreview; }
+                        data.complete &= extra.complete;
+                    }
+                }
+            }
         }
-        let plot_id = egui::Id::new(("decoded_structure_plot", &self.plot_target, output.revision));
+        let data = combined.as_ref();
+        let plot_id = egui::Id::new(("decoded_structure_plot", "overlay", output.revision));
         let hidden = egui_plot::PlotMemory::load(ui.ctx(), plot_id)
             .map(|memory| memory.hidden_items)
             .unwrap_or_default();
@@ -1251,7 +1273,7 @@ impl StructureViews {
                 numeric_bounds(
                     data.series
                         .iter()
-                        .take(MAX_LINES)
+
                         .filter(|(name, _)| !hidden.contains(*name))
                         .flat_map(|(_, values)| values)
                         .map(|point| point.value),
@@ -1294,7 +1316,7 @@ impl StructureViews {
                     ));
                 }
                 if let Some(data) = data {
-                    for (name, values) in data.series.iter().take(MAX_LINES) {
+                    for (name, values) in data.series.iter() {
                         let points: Vec<[f64; 2]> = values
                             .iter()
                             .map(|point| [point.index as f64, point.value])
@@ -1543,7 +1565,7 @@ impl StructureViews {
                 for (_, values) in data
                     .series
                     .iter()
-                    .take(MAX_LINES)
+
                     .filter(|(name, _)| !hidden.contains(*name) && samples.len() == 1)
                 {
                     for point in values
@@ -1592,7 +1614,7 @@ impl StructureViews {
                 } else {
                     let nearest =
                         data.into_iter()
-                            .flat_map(|data| data.series.iter().take(MAX_LINES))
+                            .flat_map(|data| data.series.iter())
                             .filter(|(name, _)| !hidden.contains(*name))
                             .flat_map(|(_, values)| values)
                             .filter_map(|point| {
@@ -1676,10 +1698,7 @@ fn field_color(path: &str) -> Color32 {
         .rsplit_once(']')
         .map_or(path, |(_, suffix)| suffix)
         .trim_start_matches('.');
-    let hash = relative.bytes().fold(0_usize, |hash, byte| {
-        hash.wrapping_mul(31).wrapping_add(byte as usize)
-    });
-    COLORS[hash % COLORS.len()]
+    crate::plot_trace::series_color(relative)
 }
 fn find_node<'a>(nodes: &'a [Node], path: &str) -> Option<&'a Node> {
     nodes.iter().find_map(|node| {
@@ -2025,6 +2044,35 @@ fn display(node: &Node, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn advanced_demo_overlays_collections_and_keeps_them_when_selecting_bytes() {
+        let ctx = egui::Context::default();
+        let store = ByteStore::from_snapshot(Original::from_bytes(crate::demos::Demo::Advanced.bytes()).unwrap());
+        let output = Program::parse(crate::demos::Demo::Advanced.yaml()).unwrap()
+            .run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let mut views = StructureViews::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            render_plot(&ctx,&mut views,&output,&store,vec![],Default::default());
+            if views.extra_plot_readers.len()==2 && views.extra_plot_readers.values().all(|r|r.data().is_some() && !r.is_loading()) && !views.plot_reader.is_loading() {break;}
+            assert!(std::time::Instant::now()<deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(views.plot_sources.len(),3);
+        let data=views.extra_plot_readers["measurements"].data().unwrap();
+        assert_eq!(data.series["temperature"][0].index,0);
+        assert_eq!(data.series["temperature"][0].bytes,6160..6164);
+        let sources=views.plot_sources.clone();
+        views.select_bytes(&output,Some(6160..6164));
+        render_plot(&ctx,&mut views,&output,&store,vec![],Default::default());
+        assert_eq!(views.plot_sources,sources);
+        assert_eq!(views.plot_target,"waves");
+        views.plot_sources.remove("events");
+        render_plot(&ctx,&mut views,&output,&store,vec![],Default::default());
+        assert_eq!(views.plot_sources.len(),2);
+        assert!(!views.extra_plot_readers.contains_key("events"));
+    }
+
     use super::*;
     use crate::binary::Original;
     use crate::byte_store::ByteStore;
@@ -2598,7 +2646,7 @@ actions:
     ) -> Option<Range<usize>> {
         let id = egui::Id::new((
             "decoded_structure_plot",
-            &views.plot_target,
+            "overlay",
             output.revision,
         ));
         let memory = egui_plot::PlotMemory::load(ctx, id).unwrap();
@@ -2661,7 +2709,7 @@ actions:
         assert_eq!(views.desired.as_ref().unwrap().key.start, 128);
         let id = egui::Id::new((
             "decoded_structure_plot",
-            &views.plot_target,
+            "overlay",
             output.revision,
         ));
         let mut memory = egui_plot::PlotMemory::load(&ctx, id).unwrap();
@@ -2747,7 +2795,7 @@ actions:
         settle_plot(&ctx, &mut views, &output, &store);
         let id = egui::Id::new((
             "decoded_structure_plot",
-            &views.plot_target,
+            "overlay",
             output.revision,
         ));
         let mut memory = egui_plot::PlotMemory::load(&ctx, id).unwrap();
@@ -2870,7 +2918,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 assert!(values.windows(2).all(|pair| pair[0].index < pair[1].index));
                 let mut traces = Vec::new();
                 for shape in &rendered.shapes {
-                    paths(&shape.shape, field_color(name), &mut traces);
+                    paths(&shape.shape, field_color(&format!("{} / {name}", views.plot_target)), &mut traces);
                 }
                 if count <= 10_000 {
                     assert_eq!(traces.len(), 1,
@@ -2887,7 +2935,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                     assert!(rendered.shapes.iter().any(|shape| matches!(
                         &shape.shape, egui::Shape::Mesh(mesh)
                         if mesh.vertices.len() > 100
-                            && mesh.vertices.iter().any(|v| v.color == field_color(name).gamma_multiply(0.45))
+                            && mesh.vertices.iter().any(|v| v.color == field_color(&format!("{} / {name}", views.plot_target)).gamma_multiply(0.45))
                     )), "{name} must render a continuous amplitude mesh");
                 }
                 for sample in values {
@@ -3121,7 +3169,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             rendered
                 .shapes
                 .iter()
-                .any(|shape| legend_color(&shape.shape, field_color("value"))),
+                .any(|shape| legend_color(&shape.shape, field_color("samples / value"))),
             "band fill and outline must share a legend color, rather than becoming neutral gray"
         );
     }
@@ -3133,7 +3181,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
     ) -> egui_plot::PlotMemory {
         let id = egui::Id::new((
             "decoded_structure_plot",
-            &views.plot_target,
+            "overlay",
             output.revision,
         ));
         egui_plot::PlotMemory::load(ctx, id).expect("rendered plot memory")

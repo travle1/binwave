@@ -44,3 +44,12 @@ PNG: chunk boundaries, image dimensions and metadata; compressed image bytes
 remain raw. CRCs are displayed, not verified or updated.
 WAV: RIFF chunks and format metadata; audio payloads remain raw bytes.
 Neither decoder reconstructs an image or plays/plots decoded audio.
+
+Advanced demo: File > Open advanced demo (native), or
+Open data > Open advanced demo (web).
+The bundled advanced_wave.bin is 8,080 bytes. It contains three collections:
+384 waveform records, 192 measurements, and 96 events, with different field types.
+The app applies samples/advanced/decoder.yaml automatically. Each collection
+starts at sample index zero. Plot data toggles collections; the legend toggles fields.
+Regenerate with python3 samples/generators/generate_advanced_demo.py.
+The multi-gigabyte waveform stress fixtures remain local and are not bundled.

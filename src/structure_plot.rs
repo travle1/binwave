@@ -24,7 +24,6 @@ const PREVIEW_LIMIT: Address = 65_536;
 const PREVIEW_WINDOWS: Address = 128;
 const PREVIEW_WINDOW_SIZE: Address = PREVIEW_LIMIT / PREVIEW_WINDOWS;
 const MAX_BUCKETS: Address = 4096;
-const MAX_SERIES: Address = 32;
 const CACHE_ENTRIES: Address = 3;
 
 #[derive(Clone, Debug)]
@@ -348,13 +347,8 @@ impl Reduction {
     }
     fn push(&mut self, name: String, point: PlotSample) {
         if self.quality == PlotQuality::Exact {
-            if (self.exact.len() as Address) < MAX_SERIES || self.exact.contains_key(&name) {
-                self.exact.entry(name).or_default().push(point);
-            }
+            self.exact.entry(name).or_default().push(point);
         } else {
-            if self.reduced.len() as Address >= MAX_SERIES && !self.reduced.contains_key(&name) {
-                return;
-            }
             let bucket = ((point.index - self.range.start) as u128 * self.buckets as u128
                 / (self.range.end - self.range.start).max(1) as u128)
                 as Address;
@@ -828,6 +822,25 @@ pub(crate) fn read_for_viewport(
 }
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    #[test]
+    fn reductions_keep_fields_beyond_thirty_two() {
+        for quality in [PlotQuality::Exact, PlotQuality::MinMax, PlotQuality::SampledPreview] {
+            let mut reduction = Reduction::new(0..2, quality, 1);
+            for field in 0..65 {
+                for index in 0..2 {
+                    reduction.push(format!("field{field}"), PlotSample {
+                        index, value: field as f64 + index as f64,
+                        bytes: (index*130+field*2)..(index*130+field*2+2), path: format!("samples[{index}].field{field}"),
+                    });
+                }
+            }
+            let data = reduction.data(2,true);
+            assert_eq!(data.series.len(),65);
+            assert_eq!(data.series["field64"][1].value,65.);
+            assert_eq!(data.series["field64"][1].bytes,258..260);
+        }
+    }
+
     use super::*;
     use crate::binary::Original;
     use crate::byte_store::ByteStore;

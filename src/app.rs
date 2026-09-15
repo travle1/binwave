@@ -1227,6 +1227,7 @@ impl BinwaveApp {
             } else { match command {
                 OpenFile => self.choose_data_file(&ctx),
                 SimpleDemo => { self.pending_config=None; self.binary.open_simple_demo(&ctx); },
+                AdvancedDemo => { self.pending_config=None; self.binary.open_advanced_demo(&ctx); },
                 SensorDemo => { self.pending_config=None; self.binary.open_demo(&ctx); },
                 SaveCopy => self.binary.save_copy(&ctx),
                 Extract | Undo | Redo | CopyHex => self.binary.menu_action(command,&ctx),
@@ -1237,6 +1238,7 @@ impl BinwaveApp {
                 Apply => self.run_active_decoder(&ctx),
                 Example => if let Some((_,yaml))=crate::source_editor::YAML_EXAMPLES.get(argument) { self.decoder=Decoder::Layout; self.binary.load_definition_text(yaml,&ctx); self.show_view(Pane::Layout); },
                 Reset => { self.workspace=WorkspaceLayout::default(); self.show_empty_workspace=true; },
+                PlotWorkspace => { self.workspace=WorkspaceLayout::plot_and_bytes(); self.show_empty_workspace=true; },
                 Steps => { self.decoder=Decoder::Layout; self.binary.show_steps(); self.show_view(Pane::Layout); },
                 Describe => { self.binary.define_selection(&ctx); self.show_view(Pane::Layout); },
                 Python => { self.decoder=Decoder::Layout; self.binary.new_python(&ctx); self.show_view(Pane::Layout); },
@@ -2723,9 +2725,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(top, ["Binwave", "Open data", "Decoder", "Edit", "View"]);
-        workspace_click(&mut app, &ctx, "Open data");
-        workspace_click(&mut app, &ctx, "Advanced");
+        assert_eq!(top, ["File", "Edit", "View", "Decode", "Tools", "Help"]);
+        workspace_click(&mut app, &ctx, "File");
         workspace_click(&mut app, &ctx, "Open sensor demo");
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         while !app.binary.has_file() {

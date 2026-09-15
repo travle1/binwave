@@ -571,7 +571,7 @@ fn project_numeric(
     };
     let inherited = field.endian.unwrap_or(inherited);
     let consumed = if let Some(width) = primitive_width(kind) {
-        if fields.len() < 32 {
+        {
             fields.push(NumericField {
                 name: if prefix.is_empty() {
                     "value".into()
