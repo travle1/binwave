@@ -3,6 +3,12 @@ use egui::{Color32, Id, Rect, Shape, Ui};
 use egui_plot::{Line, PlotBounds, PlotGeometry, PlotItem, PlotPoint, PlotTransform};
 use std::ops::RangeInclusive;
 
+/// Stable series colors do not depend on selection order or the number of traces.
+pub fn series_color(name: &str) -> Color32 {
+    let hash = name.bytes().fold(2166136261u32, |h, b| (h ^ u32::from(b)).wrapping_mul(16777619));
+    egui::epaint::Hsva::new((hash % 65536) as f32 / 65536., 0.55 + ((hash >> 16) % 20) as f32 / 100., 0.9, 1.).into()
+}
+
 /// Render a decoded channel consistently across platform shells. Estimated
 /// bands describe observed ranges, never a continuous path across unread data.
 pub fn decoded_channel(

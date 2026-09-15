@@ -47,6 +47,7 @@ mod python_decoder;
 mod source_editor;
 mod direct_authoring;
 mod app_menu;
+mod demos;
 mod structure;
 mod structure_plot;
 mod structure_selection;

@@ -367,7 +367,16 @@ but peaks in unread regions can be missed. **Scan for all peaks** explicitly rea
 every sample in the current range and progressively builds a min/max trace.
 Navigation and cancellation stop that scan; opening or plotting a file does not
 require an initial whole-file scan. Recent results are cached in bounded memory for
-the current source and definition. Plot displays up to 32 numeric fields.
+the current source and definition. There is no fixed numeric-field count limit.
+**Plot data** adds or removes collections without replacing the others. The X axis
+is sample index, independently starting at zero for each collection; it does not
+imply shared timestamps. Series names include their collection to distinguish
+identically named fields. Toggle fields in the legend; byte selections preserve
+the plotted collections. Memory and processing scale with the fields selected.
+
+**Open advanced demo** (File on desktop, Open data on web) bundles three different
+record collections: waveforms, measurements, and events, with unequal lengths.
+Its 8 KB public fixture and YAML open together; no local data file is needed.
 
 Inside the plot, drag to pan or use the mouse wheel to zoom. Right-drag marks a
 horizontal zoom range and zooms to it on release, preserving the vertical scale;

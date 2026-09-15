@@ -168,6 +168,28 @@ impl DecoderSession {
             }).collect::<Vec<_>>()}))
         })().map_err(js_error)
     }
+    pub fn plot_many(&self, paths: &str, first: &str, last: &str, width: u32) -> Result<String, JsValue> {
+        let paths: Vec<String> = serde_json::from_str(paths).map_err(|e| js_error(e.into()))?;
+        let mut series = Vec::new();
+        let mut scanned = 0u64;
+        let mut estimated = false;
+        let mut seen = std::collections::BTreeSet::new();
+        for path in paths {
+            if !seen.insert(path.clone()) { continue; }
+            let result: Value = serde_json::from_str(&self.plot(&path, first, last, width)?).map_err(|e| js_error(e.into()))?;
+            scanned += result["scanned"].as_u64().unwrap_or(0);
+            estimated |= result["estimated"].as_bool().unwrap_or(false);
+            if let Some(channels) = result["series"].as_array() {
+                for channel in channels {
+                    let mut channel = channel.clone();
+                    channel["name"] = json!(format!("{} / {}", path, channel["name"].as_str().unwrap_or("value")));
+                    series.push(channel);
+                }
+            }
+        }
+        json_result(json!({"series":series,"scanned":scanned,"estimated":estimated,
+            "quality":if estimated {"Estimated range · zoom in for detail"} else {"Exact samples"}})).map_err(js_error)
+    }
     pub fn plot(&self, path: &str, first: &str, last: &str, width: u32) -> Result<String, JsValue> {
         (|| {
             let node = find(&self.output.as_ref().context("Apply a decoder first")?.nodes, path).context("Unknown collection")?;
@@ -184,7 +206,7 @@ impl DecoderSession {
                         band.min.value, band.max.value,
                     ]).collect()
                 } else { Vec::new() };
-                json!({"name":name,"points":points.iter().map(|point|[point.index as f64,point.value]).collect::<Vec<_>>(),"bands":bands})
+                json!({"name":name,"path":path,"bytes":points.iter().map(|p|[p.bytes.start.to_string(),p.bytes.end.to_string()]).collect::<Vec<_>>(),"points":points.iter().map(|point|[point.index as f64,point.value]).collect::<Vec<_>>(),"bands":bands})
             }).collect();
             json_result(json!({"path":path,"start":start.to_string(),"end":end.to_string(),
                 "scanned":data.scanned,"quality":data.quality.label(),"estimated":estimated,"series":series}))

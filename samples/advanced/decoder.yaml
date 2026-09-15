@@ -1,0 +1,30 @@
+# Public synthetic demo: three independent collections with different record types.
+# Each collection's X axis starts at sample index 0; these are not timestamps.
+endian: little
+structures:
+  - name: Header
+    fields:
+      - {name: signature, type: text, length: 4, expect: BWAV}
+      - {name: wave_count, type: u32}
+      - {name: measurement_count, type: u32}
+      - {name: event_count, type: u32}
+  - name: Wave
+    fields:
+      - {name: sine, type: f64}
+      - {name: triangle, type: f32}
+      - {name: ramp, type: i16}
+      - {name: pulse, type: u8}
+      - {name: bit_pattern, type: u8}
+  - name: Measurement
+    fields:
+      - {name: temperature, type: f32}
+      - {name: pressure, type: f32}
+  - name: Event
+    fields:
+      - {name: code, type: u16}
+      - {name: duration, type: u16}
+actions:
+  - read: {name: header, type: {structure: Header}}
+  - read: {name: waves, type: {structure: Wave}, repeat: {ref: header.wave_count}}
+  - read: {name: measurements, type: {structure: Measurement}, repeat: {ref: header.measurement_count}}
+  - read: {name: events, type: {structure: Event}, repeat: {ref: header.event_count}}
