@@ -1,0 +1,1130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BinWave — see inside any file</title>
+<meta name="description" content="Open binary captures, CSV logs, or any file as bytes. Describe the format in YAML or Python, then plot, inspect, and edit the data, even in multi-gigabyte files.">
+<meta name="theme-color" content="#0A0B0B">
+<link rel="canonical" href="https://binwave.pages.dev/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="BinWave">
+<meta property="og:title" content="BinWave — see inside any file">
+<meta property="og:description" content="Open binary captures, CSV logs, or any file as bytes. Describe the format in YAML or Python, then plot, inspect, and edit the data, even in multi-gigabyte files.">
+<meta property="og:url" content="https://binwave.pages.dev/">
+<meta property="og:image" content="https://binwave.pages.dev/og.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230A0B0B'/%3E%3Cpath d='M5 21h4v-10h5v10h2.5' fill='none' stroke='%23F2A93B' stroke-width='2.6' stroke-linejoin='round'/%3E%3Cpath d='M16.5 21c2.2 0 2.5-10 5-10s2.8 10 5.5 10' fill='none' stroke='%234CC9C0' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0A0B0B;
+    --bg-2: #0F1111;
+    --panel: #141717;
+    --panel-2: #1A1E1E;
+    --line: #242929;
+    --line-2: #323838;
+    --ink: #ECEEEA;
+    --ink-2: #A9AFAA;
+    --ink-3: #737A76;
+    --amber: #F2A93B;
+    --amber-2: #FFC46B;
+    --teal: #4CC9C0;
+    --pink: #E5738F;
+    --green: #8FD05A;
+    --purple: #B48CF2;
+    --blue: #3EA6F0;
+    --sel: #0E5F86;
+    --sel-2: #15405A;
+    --sans: 'Archivo', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+    --gutter: clamp(16px, 4vw, 40px);
+    --max: 1240px;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 76px; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  img { max-width: 100%; height: auto; display: block; }
+  a { color: inherit; }
+  ::selection { background: var(--sel); color: #fff; }
+  :focus-visible { outline: 2px solid var(--amber); outline-offset: 3px; border-radius: 3px; }
+
+  .wrap { max-width: var(--max); margin: 0 auto; padding-inline: var(--gutter); }
+  .mono { font-family: var(--mono); }
+  code, kbd { font-family: var(--mono); font-size: 0.86em; }
+  code { color: var(--ink); background: var(--panel-2); border: 1px solid var(--line); padding: 0.05em 0.35em; border-radius: 4px; white-space: nowrap; }
+  kbd { color: var(--ink); background: var(--panel-2); border: 1px solid var(--line-2); border-bottom-width: 2px; padding: 0.02em 0.4em; border-radius: 4px; white-space: nowrap; }
+
+  .eyebrow {
+    font-family: var(--mono); font-size: 12.5px; font-weight: 500;
+    letter-spacing: 0.12em; text-transform: uppercase; color: var(--amber);
+    display: inline-flex; align-items: center; gap: 10px;
+  }
+  .eyebrow::before { content: ""; width: 18px; height: 1px; background: currentColor; }
+
+  h1, h2, h3 { margin: 0; font-family: var(--sans); text-wrap: balance; }
+  h2 {
+    font-size: clamp(2.1rem, 4.6vw, 3.6rem);
+    font-stretch: 112%; font-weight: 760; line-height: 1.02; letter-spacing: -0.02em;
+    margin-top: 14px; max-width: 20ch;
+  }
+  h3 { font-size: 1.2rem; font-weight: 680; font-stretch: 105%; line-height: 1.25; letter-spacing: -0.005em; }
+  p { margin: 0; }
+  .lede { font-size: clamp(1.05rem, 1.6vw, 1.25rem); color: var(--ink-2); max-width: 62ch; margin-top: 20px; line-height: 1.55; }
+  .lede strong, .body strong { color: var(--ink); font-weight: 620; }
+
+  /* ---------- topbar ---------- */
+  .topbar {
+    position: sticky; top: 0; z-index: 50;
+    background: rgba(10, 11, 11, 0.82);
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--line);
+  }
+  .topbar .wrap { display: flex; align-items: center; gap: 28px; height: 64px; }
+  .brand { display: flex; align-items: center; gap: 11px; text-decoration: none; flex-shrink: 0; }
+  .brand svg { width: 34px; height: 34px; }
+  .brand span { font-size: 25px; font-weight: 660; font-stretch: 100%; letter-spacing: -0.035em; }
+  .nav { display: flex; gap: 22px; margin-left: auto; }
+  .nav a { font-family: var(--mono); font-size: 13px; color: var(--ink-2); text-decoration: none; }
+  .nav a:hover { color: var(--ink); }
+  .btn {
+    display: inline-flex; align-items: center; gap: 10px;
+    font-family: var(--sans); font-weight: 650; font-size: 16px; font-stretch: 105%;
+    padding: 13px 22px; border-radius: 6px; text-decoration: none; white-space: nowrap;
+    border: 1px solid transparent; transition: background-color .15s, border-color .15s, color .15s;
+  }
+  .btn-amber { background: var(--amber); color: #120D04; }
+  .btn-amber:hover { background: var(--amber-2); }
+  .btn-ghost { border-color: var(--line-2); color: var(--ink); }
+  .btn-ghost:hover { border-color: var(--ink-3); background: var(--panel); }
+  .topbar .btn { padding: 9px 16px; font-size: 14.5px; }
+  @media (max-width: 900px) { .nav { display: none; } .topbar .btn { margin-left: auto; } }
+
+  /* ---------- hero ---------- */
+  .hero { position: relative; padding-block: clamp(48px, 8vw, 96px) 0; overflow: hidden; }
+  .hero::before {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background-image:
+      linear-gradient(to right, rgba(255,255,255,0.035) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255,255,255,0.035) 1px, transparent 1px);
+    background-size: 56px 56px;
+    mask-image: radial-gradient(ellipse 80% 60% at 50% 20%, #000 20%, transparent 75%);
+    -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 20%, #000 20%, transparent 75%);
+  }
+  .hero .wrap { position: relative; }
+  .wordmark {
+    font-size: clamp(4.4rem, 17vw, 13.5rem);
+    font-weight: 640; font-stretch: 100%; line-height: 0.9; letter-spacing: -0.05em;
+    margin-top: 18px; margin-left: -0.05em; color: #B9BFBA;
+    padding-bottom: 0.04em;
+  }
+  @supports ((-webkit-background-clip: text) or (background-clip: text)) {
+    .wordmark {
+      background: linear-gradient(180deg, #C6CCC6 0%, #9CA39D 100%);
+      -webkit-background-clip: text; background-clip: text;
+      -webkit-text-fill-color: transparent; color: transparent;
+    }
+  }
+  .scope-strip {
+    display: block; width: 100%; height: clamp(96px, 12vw, 150px);
+    margin-top: clamp(14px, 2vw, 24px);
+    border-block: 1px solid var(--line);
+  }
+  .hero-headline {
+    font-size: clamp(2.9rem, 7.2vw, 6.2rem); font-weight: 720; font-stretch: 104%;
+    line-height: 1.04; letter-spacing: -0.035em;
+    margin-top: clamp(32px, 5vw, 56px);
+  }
+  .hero-headline em { font-style: normal; color: var(--amber); white-space: nowrap; }
+  .hero-grid {
+    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 440px);
+    gap: clamp(28px, 5vw, 80px); align-items: start; margin-top: clamp(24px, 3.5vw, 40px);
+  }
+  @media (max-width: 900px) { .hero-grid { grid-template-columns: 1fr; } }
+  .hero-sub { color: var(--ink-2); font-size: clamp(1.08rem, 1.5vw, 1.28rem); line-height: 1.55; max-width: 46ch; }
+  .hero-sub strong { color: var(--ink); font-weight: 600; }
+  .facts {
+    list-style: none; padding: 0; margin: 26px 0 0;
+    display: grid; grid-template-columns: repeat(2, minmax(0, max-content)); gap: 12px 32px;
+    font-size: 15px; color: var(--ink);
+  }
+  @media (max-width: 520px) { .facts { grid-template-columns: 1fr; } }
+  .facts li { display: flex; align-items: center; gap: 10px; }
+  .facts li::before {
+    content: ""; width: 16px; height: 16px; flex-shrink: 0; border-radius: 50%;
+    background: rgba(76,201,192,0.14) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 8.2l2.2 2.2 4.8-4.8' fill='none' stroke='%234CC9C0' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center/16px no-repeat;
+  }
+  .demo-link { display: inline-flex; align-items: center; gap: 8px; margin-top: 26px; font-family: var(--mono); font-size: 13.5px; color: var(--ink-2); text-decoration: none; border-bottom: 1px solid var(--line-2); padding-bottom: 2px; }
+  .demo-link:hover { color: var(--ink); border-color: var(--ink-3); }
+  .app-demo-cta { margin-top: 26px; font-size: 15px; }
+
+  .ea-card {
+    position: relative; background: linear-gradient(180deg, #17191A 0%, #121414 100%);
+    border: 1px solid var(--line-2); border-radius: 12px; padding: clamp(22px, 3vw, 30px);
+    box-shadow: 0 30px 80px -40px rgba(242,169,59,0.35);
+  }
+  .ea-card::before { content: ""; position: absolute; inset: -1px -1px auto -1px; height: 3px; border-radius: 12px 12px 0 0; background: var(--amber); }
+  .ea-card .eyebrow { font-size: 12px; }
+  .ea-title { font-size: clamp(1.45rem, 2.2vw, 1.8rem); font-weight: 720; font-stretch: 104%; letter-spacing: -0.02em; line-height: 1.12; margin-top: 10px; }
+  .ea-form { margin-top: 18px; display: grid; gap: 10px; }
+  .ea-form label { font-family: var(--mono); font-size: 12px; color: var(--ink-3); letter-spacing: 0.04em; }
+  .ea-form input,
+  .ea-form textarea {
+    width: 100%; min-height: 84px; resize: vertical; font: inherit; font-size: 15.5px; line-height: 1.45;
+    color: var(--ink); background: #080909; border: 1px solid var(--line-2); border-radius: 8px; padding: 12px 14px;
+  }
+  .ea-form input::placeholder,
+  .ea-form textarea::placeholder { color: #5F6662; }
+  .ea-form input:focus,
+  .ea-form textarea:focus { outline: none; border-color: var(--amber); box-shadow: 0 0 0 3px rgba(242,169,59,0.18); }
+  .ea-form .btn { justify-content: center; width: 100%; font-size: 17.5px; padding: 16px 22px; }
+  .ea-note { font-size: 13px; color: var(--ink-3); text-align: center; }
+  .ea-form [name="company"] { position: absolute; left: -9999px; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  .ea-status { min-height: 1.25em; margin: 0; font-size: 13px; color: var(--teal); text-align: center; }
+  .ea-status.is-error { color: var(--pink); }
+
+  /* ---------- annotated screenshot ---------- */
+  .shot-hero { margin-top: clamp(40px, 6vw, 72px); }
+  .window {
+    position: relative; border: 1px solid var(--line-2); border-radius: 10px; overflow: hidden;
+    background: #111; box-shadow: 0 40px 120px -40px rgba(76, 201, 192, 0.18), 0 30px 80px -30px rgba(0,0,0,0.9);
+  }
+  .window-bar {
+    display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    font-family: var(--mono); font-size: 12px; color: var(--ink-3);
+  }
+  .window-bar i { width: 10px; height: 10px; border-radius: 50%; background: var(--line-2); display: inline-block; }
+  .window-bar b { font-weight: 500; color: var(--ink-2); margin-left: 8px; }
+  .window-bar .size { margin-left: auto; }
+  @media (max-width: 560px) { .window-bar .size { display: none; } }
+  .shot { position: relative; cursor: zoom-in; }
+  .pin {
+    position: absolute; transform: translate(-50%, -50%);
+    width: 30px; height: 30px; border-radius: 50%;
+    background: var(--amber); color: #120D04; border: 2px solid #120D04;
+    font-family: var(--mono); font-weight: 700; font-size: 14px;
+    display: grid; place-items: center;
+    box-shadow: 0 0 0 5px rgba(242, 169, 59, 0.28);
+    animation: pulse 2.4s ease-in-out infinite;
+  }
+  .pin:nth-of-type(2) { animation-delay: .3s } .pin:nth-of-type(3) { animation-delay: .6s } .pin:nth-of-type(4) { animation-delay: .9s }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 10px rgba(242, 169, 59, 0.06); } }
+  @media (max-width: 640px) { .pin { width: 22px; height: 22px; font-size: 11px; border-width: 1.5px; } }
+  .legend {
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px;
+    background: var(--line); border: 1px solid var(--line); border-top: 0; border-radius: 0 0 10px 10px; overflow: hidden;
+  }
+  @media (max-width: 900px) { .legend { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 520px) { .legend { grid-template-columns: 1fr; } }
+  .legend div { background: var(--bg-2); padding: 16px 18px; font-size: 14.5px; color: var(--ink-2); line-height: 1.45; }
+  .legend b { display: flex; align-items: center; gap: 10px; color: var(--ink); font-weight: 650; margin-bottom: 4px; font-size: 15px; }
+  .legend b::before {
+    content: attr(data-n); width: 22px; height: 22px; border-radius: 50%; flex-shrink: 0;
+    background: var(--amber); color: #120D04; font-family: var(--mono); font-size: 12px; display: grid; place-items: center;
+  }
+  .legend code { font-size: 12.5px; }
+  .caption { font-family: var(--mono); font-size: 12px; color: var(--ink-3); margin-top: 14px; }
+
+  /* ---------- sections ---------- */
+  section.block { padding-block: clamp(72px, 11vw, 140px); border-top: 1px solid var(--line); }
+  section.block.tight-top { border-top: 0; }
+  .split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: clamp(28px, 5vw, 80px); align-items: start; }
+  .split.flip { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); }
+  @media (max-width: 960px) { .split, .split.flip { grid-template-columns: 1fr; } .split.flip > :first-child { order: 2; } }
+  .sticky { position: sticky; top: 100px; }
+  @media (max-width: 960px) { .sticky { position: static; } }
+  .body { color: var(--ink-2); margin-top: 18px; max-width: 60ch; }
+  .body + .body { margin-top: 14px; }
+
+  .frame { border: 1px solid var(--line-2); border-radius: 8px; overflow: hidden; background: #111; cursor: zoom-in; }
+  .frame + .frame { margin-top: 16px; }
+  .figcap { font-family: var(--mono); font-size: 12px; color: var(--ink-3); margin-top: 10px; line-height: 1.5; }
+
+  .ticks { list-style: none; padding: 0; margin: 26px 0 0; display: grid; gap: 0; }
+  .ticks li {
+    padding: 14px 0 14px 30px; border-top: 1px solid var(--line); position: relative;
+    color: var(--ink-2); font-size: 16px; line-height: 1.5;
+  }
+  .ticks li:last-child { border-bottom: 1px solid var(--line); }
+  .ticks li::before { content: ""; position: absolute; left: 2px; top: 23px; width: 12px; height: 2px; background: var(--teal); }
+  .ticks b { color: var(--ink); font-weight: 620; }
+
+  /* ---------- live cross-probe ---------- */
+  .probe {
+    margin-top: clamp(36px, 5vw, 56px);
+    border: 1px solid var(--line-2); border-radius: 10px; overflow: hidden; background: var(--bg-2);
+  }
+  .probe-top {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px;
+    padding: 12px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+    font-family: var(--mono); font-size: 12.5px; color: var(--ink-2);
+  }
+  .probe-top .status { color: var(--ink-3); }
+  .probe-top .status b { color: var(--teal); font-weight: 500; }
+  .seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: 5px; overflow: hidden; margin-left: auto; }
+  .seg button {
+    font-family: var(--mono); font-size: 12px; color: var(--ink-2); background: transparent; border: 0;
+    padding: 6px 11px; cursor: pointer;
+  }
+  .seg button + button { border-left: 1px solid var(--line-2); }
+  .seg button[aria-pressed="true"] { background: var(--sel); color: #fff; }
+  .probe-grid { display: grid; grid-template-columns: minmax(0, 1fr) 340px; }
+  @media (max-width: 980px) { .probe-grid { grid-template-columns: 1fr; } }
+  .pane { position: relative; min-width: 0; }
+  .pane + .pane { border-left: 1px solid var(--line); }
+  @media (max-width: 980px) { .pane + .pane { border-left: 0; border-top: 1px solid var(--line); } }
+  .pane-title {
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--ink-3); padding: 10px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 12px; align-items: center;
+  }
+  .pane-title .hint { text-transform: none; letter-spacing: 0; margin-left: auto; color: var(--ink-3); }
+  .plot-wrap { position: relative; height: clamp(300px, 36vw, 440px); }
+  #probe-plot { display: block; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
+  .chan-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 10px 16px; border-top: 1px solid var(--line); font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
+  .chan-legend button { all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+  .chan-legend button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+  .chan-legend i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .chan-legend button[aria-current="true"] { color: var(--ink); }
+
+  .hexview { font-family: var(--mono); font-size: 13px; line-height: 1.75; padding: 12px 16px; overflow-x: auto; white-space: pre; color: var(--ink-3); }
+  .hexview .o { color: #5B625E; margin-right: 14px; }
+  .hexview .b { color: var(--ink-2); }
+  .hexview .hl { background: var(--sel); color: #fff; }
+  .hexview .t { margin-left: 18px; color: #6A716D; }
+  .hexview .thl { background: var(--sel); color: #fff; }
+  .cursorline { font-family: var(--mono); font-size: 12.5px; padding: 10px 16px 0; color: var(--ink-2); white-space: nowrap; overflow-x: auto; }
+  .cursorline b { color: var(--teal); font-weight: 500; }
+
+  .inspector { padding: 16px; }
+  .inspector .name { font-size: 26px; font-weight: 700; font-stretch: 110%; letter-spacing: -0.01em; line-height: 1.1; }
+  .inspector .sub { font-family: var(--mono); font-size: 12px; color: var(--ink-3); margin-top: 4px; }
+  .inspector .value {
+    font-family: var(--mono); font-size: 15px; color: var(--ink); background: #070808;
+    border: 1px solid var(--line); border-radius: 5px; padding: 9px 11px; margin-top: 12px; overflow-x: auto; white-space: nowrap;
+  }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin-top: 14px; font-size: 13px; }
+  .kv dt { color: var(--ink-3); font-family: var(--mono); font-size: 12px; padding-top: 1px; }
+  .kv dd { margin: 0; font-family: var(--mono); font-size: 12.5px; color: var(--ink-2); overflow-wrap: anywhere; }
+
+  .table-scroll { overflow-x: auto; }
+  table.samples { border-collapse: collapse; width: 100%; font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+  table.samples th { text-align: left; font-weight: 500; color: var(--ink-3); padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  table.samples td { padding: 6px 12px; color: var(--ink-2); cursor: pointer; }
+  table.samples tr.sel td { background: var(--sel-2); color: var(--ink); }
+  table.samples td.cell { background: var(--sel) !important; color: #fff !important; }
+  table.samples td:nth-child(-n+3) { color: var(--ink-3); cursor: default; }
+  table.samples tr.sel td:nth-child(-n+3) { color: var(--ink-2); }
+  .probe-foot { padding: 12px 16px; border-top: 1px solid var(--line); font-size: 13.5px; color: var(--ink-3); background: var(--panel); }
+  .probe-foot a { color: var(--ink-2); }
+
+  /* ---------- decoders ---------- */
+  .lang-tabs { display: flex; gap: 0; margin-top: 36px; border-bottom: 1px solid var(--line); }
+  .lang-tabs button {
+    all: unset; cursor: pointer; font-family: var(--mono); font-size: 14px; color: var(--ink-3);
+    padding: 12px 18px; border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  .lang-tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--amber); }
+  .lang-tabs button:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
+  .lang-panel { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: clamp(24px, 4vw, 56px); padding-top: 32px; }
+  @media (max-width: 960px) { .lang-panel { grid-template-columns: 1fr; } }
+  .code {
+    margin: 0; background: #070808; border: 1px solid var(--line); border-radius: 8px;
+    font-family: var(--mono); font-size: 13.5px; line-height: 1.7; color: #C9CEC9;
+    padding: 18px 20px; overflow-x: auto; counter-reset: ln;
+  }
+  .code .c { color: #6A7470; font-style: italic; }
+  .code .k { color: #7FB8F0; }
+  .code .s { color: #B6D98B; }
+  .code .n { color: #E6A7D8; }
+  .code .f { color: #8FD8CF; }
+  .code .fn { color: var(--amber-2); }
+  .code-cap { display: flex; justify-content: space-between; gap: 12px; font-family: var(--mono); font-size: 12px; color: var(--ink-3); margin-bottom: 8px; }
+
+  .flow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-top: clamp(40px, 6vw, 64px); }
+  @media (max-width: 900px) { .flow { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 520px) { .flow { grid-template-columns: 1fr; } }
+  .flow > div { background: var(--bg-2); padding: 22px 20px 24px; }
+  .flow .num { font-family: var(--mono); font-size: 12px; color: var(--amber); }
+  .flow h3 { margin-top: 8px; font-size: 1.08rem; }
+  .flow p { margin-top: 8px; font-size: 14.5px; color: var(--ink-2); line-height: 1.5; }
+  .flow-head { margin-top: clamp(56px, 8vw, 88px); }
+  .flow-head h3 { font-size: clamp(1.4rem, 2.4vw, 1.9rem); font-stretch: 110%; font-weight: 720; letter-spacing: -0.015em; }
+  .flow-head p { color: var(--ink-2); margin-top: 10px; max-width: 62ch; }
+
+  /* ---------- self-describing diagram ---------- */
+  .chain { margin-top: 30px; display: grid; gap: 10px; }
+  .chain .node {
+    display: grid; grid-template-columns: 120px 1fr; gap: 14px; align-items: baseline;
+    padding: 14px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 7px;
+    font-size: 14.5px; color: var(--ink-2);
+  }
+  @media (max-width: 520px) { .chain .node { grid-template-columns: 1fr; gap: 4px; } }
+  .chain .node b { font-family: var(--mono); font-weight: 500; font-size: 13px; color: var(--teal); }
+  .chain .arrow { font-family: var(--mono); font-size: 12px; color: var(--ink-3); padding-left: 16px; }
+  .callout {
+    margin-top: 26px; padding: 18px 20px; border-left: 3px solid var(--amber); background: rgba(242,169,59,0.06);
+    color: var(--ink); font-size: 16px; border-radius: 0 6px 6px 0;
+  }
+
+
+  /* ---------- stats ---------- */
+  .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-top: clamp(40px, 6vw, 64px); }
+  @media (max-width: 900px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .stats > div { background: var(--bg-2); padding: 24px 22px; }
+  .stats .v { font-size: clamp(2rem, 4vw, 3rem); font-weight: 780; font-stretch: 118%; letter-spacing: -0.03em; line-height: 1; color: var(--ink); }
+  .stats .v small { font-size: 0.45em; font-weight: 600; letter-spacing: 0; color: var(--ink-2); margin-left: 4px; }
+  .stats .l { margin-top: 10px; font-size: 14px; color: var(--ink-2); line-height: 1.45; }
+  .stats-note { font-family: var(--mono); font-size: 12px; color: var(--ink-3); margin-top: 14px; max-width: 90ch; line-height: 1.6; }
+
+  .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 40px; }
+  @media (max-width: 900px) { .cards { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 22px 22px 24px; }
+  .card .tag { font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--teal); }
+  .card h3 { margin-top: 10px; }
+  .card p { margin-top: 10px; color: var(--ink-2); font-size: 15px; line-height: 1.55; }
+
+  /* ---------- notes ---------- */
+  .notes { border-top: 1px solid var(--line); padding-block: 28px; }
+  .notes h3 { font-family: var(--mono); font-size: 12px; font-weight: 500; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-3); }
+  .notes ul { list-style: none; padding: 0; margin: 10px 0 0; display: flex; flex-wrap: wrap; gap: 6px 22px; }
+  .notes li { font-size: 14px; color: var(--ink-3); }
+  .notes li::before { content: "–"; margin-right: 8px; }
+  .notes p { font-size: 13.5px; color: var(--ink-3); margin-top: 10px; }
+
+  /* ---------- final cta ---------- */
+  .final { text-align: left; position: relative; overflow: hidden; }
+  .final h2 { max-width: 16ch; font-size: clamp(2.6rem, 6.4vw, 5.2rem); }
+  .final .lede { max-width: 56ch; }
+  .who { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 44px; }
+  @media (max-width: 860px) { .who { grid-template-columns: 1fr; } }
+  .who div { border-top: 2px solid var(--line-2); padding-top: 14px; color: var(--ink-2); font-size: 15px; line-height: 1.5; }
+  .who b { display: block; color: var(--ink); font-weight: 650; margin-bottom: 4px; }
+
+  footer { border-top: 1px solid var(--line); padding-block: 36px 48px; color: var(--ink-3); font-size: 14px; }
+  footer .wrap { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px 32px; align-items: center; }
+  footer .brand span { font-size: 20px; }
+  footer .brand svg { width: 28px; height: 28px; }
+  footer a { color: var(--ink-2); }
+  footer .mono { font-size: 12.5px; }
+
+  /* ---------- lightbox ---------- */
+  dialog.lightbox { padding: 0; border: 1px solid var(--line-2); border-radius: 8px; background: #111; max-width: min(96vw, 1920px); max-height: 94vh; }
+  dialog.lightbox::backdrop { background: rgba(0,0,0,0.86); }
+  dialog.lightbox img { max-height: 90vh; width: auto; margin: 0 auto; }
+  dialog.lightbox form { position: absolute; top: 8px; right: 8px; }
+  dialog.lightbox button { font-family: var(--mono); font-size: 13px; background: var(--panel); color: var(--ink); border: 1px solid var(--line-2); border-radius: 5px; padding: 6px 10px; cursor: pointer; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="BinWave home">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#141717" stroke="#323838"/><path d="M5 21h4v-10h5v10h2.5" fill="none" stroke="#F2A93B" stroke-width="2.6" stroke-linejoin="round"/><path d="M16.5 21c2.2 0 2.5-10 5-10s2.8 10 5.5 10" fill="none" stroke="#4CC9C0" stroke-width="2.6" stroke-linecap="round"/></svg>
+      <span>BinWave</span>
+    </a>
+    <nav class="nav" aria-label="Sections">
+      <a href="#probe">Cross-probe</a>
+      <a href="#decoders">Decoders</a>
+      <a href="#plot">Plotting</a>
+      <a href="#hex">Hex &amp; edits</a>
+      <a href="#scale">Large files</a>
+    </nav>
+    <a class="btn btn-amber" href="#early-access">Early access</a>
+  </div>
+</header>
+
+<main id="top">
+
+  <!-- ================= HERO ================= -->
+  <section class="hero">
+    <div class="wrap">
+      <span class="eyebrow">Native desktop workbench for data files</span>
+      <h1 class="wordmark">BinWave</h1>
+    </div>
+    <canvas class="scope-strip" id="scope" aria-hidden="true"></canvas>
+    <div class="wrap">
+      <p class="hero-headline">See inside <em>any file.</em></p>
+      <div class="hero-grid">
+        <div>
+          <p class="hero-sub">Open binary captures, CSV logs, or any file as bytes. Describe the format in <strong>YAML</strong> or <strong>Python</strong>, then plot, inspect, and edit the data, even in multi-gigabyte files.</p>
+          <ul class="facts" aria-label="Product facts">
+            <li>Native desktop app</li>
+            <li>YAML or Python decoders</li>
+            <li>CSV, binary, or any file</li>
+            <li>Byte editing with undo / redo</li>
+          </ul>
+          <a class="btn btn-amber app-demo-cta" href="https://binwave-app.pages.dev/" target="_blank" rel="noreferrer">Try the live app →</a>
+        </div>
+        <div class="ea-card" id="early-access">
+          <span class="eyebrow">Early access</span>
+          <p class="ea-title">Get BinWave on your own data.</p>
+          <form class="ea-form" data-ea>
+            <label for="ea-hero-email">Email address</label>
+            <input id="ea-hero-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com">
+            <label for="ea-hero">What are you decoding? <span aria-hidden="true">(optional)</span></label>
+            <textarea id="ea-hero" name="context" placeholder="e.g. 16-channel sensor log from an STM32, custom struct, ~6 GB per capture"></textarea>
+            <input name="company" type="text" tabindex="-1" autocomplete="off" aria-hidden="true">
+            <div class="cf-turnstile" data-sitekey="0x4AAAAAAE0yDy9LfRE8WDOp" data-action="turnstile-spin-v1"></div>
+            <button class="btn btn-amber" type="submit">Request early access →</button>
+            <p class="ea-note">Your details are only used to follow up about BinWave.</p>
+            <p class="ea-status" aria-live="polite"></p>
+          </form>
+        </div>
+      </div>
+
+      <figure class="shot-hero" style="margin-inline:0; margin-bottom:0;">
+        <div class="window">
+          <div class="window-bar"><i></i><i></i><i></i><b>waveform_demo_2gb.bin</b><span class="size">2.0 GB · 31,249,935 samples</span></div>
+          <div class="shot" data-full="screenshots/11-cross-probing.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
+            <img src="screenshots/11-cross-probing.webp" width="1920" height="1200" alt="BinWave workspace with one selection linked across four views: the plot cursor at sample 100, the decoded samples row 100 with sine = -1.530734 at byte offset 0x2900, eight highlighted hex bytes labeled sine · f64, and the Inspector showing -1.5307337294603587" fetchpriority="high">
+            <span class="pin" style="left:55.4%; top:46.2%">1</span>
+            <span class="pin" style="left:45.3%; top:87.5%">2</span>
+            <span class="pin" style="left:32.6%; top:67.6%">3</span>
+            <span class="pin" style="left:17.5%; top:62.6%">4</span>
+          </div>
+        </div>
+        <div class="legend">
+          <div><b data-n="1">Plot</b>Cursor on <code>sample 100</code>. Twelve channels, samples 64–191 of 31,249,935.</div>
+          <div><b data-n="2">Decoded samples</b>Row 100, <code>sine</code> cell = <code>-1.530734</code>, byte offset <code>0x2900</code>.</div>
+          <div><b data-n="3">Hex</b>Exactly 8 bytes, <code>0x2900–0x2907</code>, labeled <code>sine · f64</code>.</div>
+          <div><b data-n="4">Inspector</b>Full value <code>-1.5307337294603587</code>, ready to edit or export.</div>
+        </div>
+        <figcaption class="caption">Real capture of the app, not a mockup. Bytes <span class="mono">61 A9 AE A6 E2 7D F8 BF</span> read as a little-endian f64 reproduce the Inspector value exactly.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ================= LIVE CROSS-PROBE ================= -->
+  <section class="block tight-top" id="probe">
+    <div class="wrap">
+      <span class="eyebrow">Interactive walkthrough</span>
+      <h2>One selection. Every view connected.</h2>
+      <p class="lede">Explore the first 384 samples of the demo capture: <strong>24,576 bytes loaded straight from <span class="mono">waveform_demo_2gb.bin</span></strong> and decoded in your browser with the same 64-byte layout. Hover or tap the plot, or use the arrow keys, and watch the table row, hex bytes, and value follow. This is an explanatory walkthrough; open the app to work with your own files.</p>
+      <a class="btn btn-amber app-demo-cta" href="https://binwave-app.pages.dev/" target="_blank" rel="noreferrer">Open the live web app →</a>
+
+      <div class="probe" id="probe-app">
+        <div class="probe-top">
+          <span>Data <b style="color:var(--ink);font-weight:500">samples · 31249935 samples</b></span>
+          <span class="status" id="probe-status">Loading bytes…</span>
+          <div class="seg" role="group" aria-label="Visible range">
+            <button type="button" data-range="64,191" aria-pressed="true">64–191</button>
+            <button type="button" data-range="0,383" aria-pressed="false">0–383</button>
+          </div>
+        </div>
+        <div class="probe-grid">
+          <div class="pane">
+            <div class="pane-title">Plot <span class="hint">hover · click to pin · ←→ sample · ↑↓ channel</span></div>
+            <div class="plot-wrap"><canvas id="probe-plot" tabindex="0" aria-label="Interactive plot of 12 decoded channels. Use left and right arrows to change sample, up and down to change channel."></canvas></div>
+            <div class="chan-legend" id="chan-legend"></div>
+          </div>
+          <div class="pane">
+            <div class="pane-title">Inspector</div>
+            <div class="inspector" aria-live="polite">
+              <div class="name" id="i-name">sine</div>
+              <div class="sub" id="i-sample">Sample 100</div>
+              <div class="value" id="i-value">-1.5307337294603587</div>
+              <dl class="kv">
+                <dt>Path</dt><dd id="i-path">samples[100].sine</dd>
+                <dt>Type</dt><dd id="i-type">f64 · Little endian</dd>
+                <dt>Field bytes</dt><dd id="i-range">0x2900..0x2908 (end exclusive)</dd>
+              </dl>
+            </div>
+          </div>
+        </div>
+        <div class="pane" style="border-top:1px solid var(--line)">
+          <div class="pane-title">Hex <span class="hint" id="h-hint">one 64-byte sample record</span></div>
+          <div class="cursorline" id="h-cursor">Cursor 0x2907 · 0x2900-0x2907 · 8 selected bytes <b>sine·f64</b></div>
+          <div class="hexview" id="hexview"></div>
+        </div>
+        <div class="pane" style="border-top:1px solid var(--line)">
+          <div class="pane-title">Decoded samples <span class="hint">click a value to select that field</span></div>
+          <div class="table-scroll"><table class="samples" id="samples-table"></table></div>
+        </div>
+        <div class="probe-foot">Want the raw bytes? <a href="pwav-samples-0-383.bin" download>pwav-samples-0-383.bin</a> is those 24,576 bytes, copied from offset <span class="mono">0x1000</span> of the demo file.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= DECODERS ================= -->
+  <section class="block" id="decoders">
+    <div class="wrap">
+      <span class="eyebrow">Decoders</span>
+      <h2>Describe the format. Pick the language that fits it.</h2>
+      <p class="lede">Both produce <strong>the same plot, table, and cross-probe</strong>, and neither one is a fallback for the other. Each keeps its own draft, and switching languages doesn't convert or run your code. <kbd>F5</kbd> runs whichever is active.</p>
+
+      <div class="lang-tabs" role="tablist" aria-label="Decoder language">
+        <button role="tab" id="tab-yaml" aria-controls="panel-yaml" aria-selected="true">waveform.yaml</button>
+        <button role="tab" id="tab-py" aria-controls="panel-py" aria-selected="false" tabindex="-1">waveform.py</button>
+      </div>
+
+      <div class="lang-panel" role="tabpanel" id="panel-yaml" aria-labelledby="tab-yaml">
+        <div>
+          <div class="code-cap"><span>waveform.yaml</span><span>abridged</span></div>
+<pre class="code"><span class="f">endian</span>: little
+<span class="f">structures</span>:
+  <span class="k">Descriptor</span>:
+    <span class="f">fields</span>:
+      - {<span class="f">name</span>: name, <span class="f">type</span>: text, <span class="f">length</span>: <span class="n">16</span>}
+      - {<span class="f">name</span>: format, <span class="f">type</span>: u32}
+      - {<span class="f">name</span>: byte_width, <span class="f">type</span>: u32}
+
+  <span class="k">Descriptions</span>:
+    <span class="f">fields</span>:
+      - <span class="f">name</span>: entries
+        <span class="f">type</span>: Descriptor
+        <span class="f">repeat</span>: {<span class="f">ref</span>: /header.descriptor_count}
+    <span class="f">actions</span>:
+      - <span class="fn">define</span>:              <span class="c"># build a type from the file</span>
+          <span class="f">name</span>: Sample
+          <span class="f">from</span>: entries
+          <span class="f">fields</span>:
+            <span class="f">name</span>: {<span class="f">ref</span>: name}
+            <span class="f">type</span>:
+              <span class="f">ref</span>: format
+              <span class="f">cases</span>: {<span class="s">'1'</span>: u64, <span class="s">'3'</span>: f64, <span class="s">'4'</span>: f32, <span class="s">'6'</span>: i32}
+            <span class="f">length</span>: {<span class="f">ref</span>: byte_width}
+
+  <span class="k">Section</span>:
+    <span class="f">fields</span>:
+      - {<span class="f">name</span>: id, <span class="f">type</span>: u32}
+      - {<span class="f">name</span>: payload_bytes, <span class="f">type</span>: u64}
+      - <span class="f">name</span>: payload
+        <span class="f">type</span>:
+          <span class="fn">choose</span>:
+            <span class="f">ref</span>: id
+            <span class="f">cases</span>: {<span class="s">'1'</span>: Descriptions, <span class="s">'2'</span>: Samples, <span class="s">'3'</span>: Footer}
+            <span class="f">otherwise</span>: bytes
+        <span class="f">length</span>: {<span class="f">ref</span>: payload_bytes}</pre>
+        </div>
+        <div>
+          <h3>YAML: a declarative reader</h3>
+          <ul class="ticks">
+            <li><b>Structures</b> describe fields and nested elements, and <b>actions</b> read them, skip or align bytes, calculate values, and choose interpretations.</li>
+            <li><b>References</b> like <code>/header.descriptor_count</code> use earlier decoded values for counts, lengths, and offsets.</li>
+            <li><b><code>define</code></b> builds a new record type from descriptions found in the file, and <b><code>choose</code></b> picks a type by tag.</li>
+            <li>Integers, floats, text, raw byte regions, and <b>calculated values</b> built from what you have already decoded.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="lang-panel" role="tabpanel" id="panel-py" aria-labelledby="tab-py" hidden>
+        <div>
+          <div class="code-cap"><span>waveform.py</span><span>abridged</span></div>
+<pre class="code"><span class="k">from</span> binwave <span class="k">import</span> Field, Struct
+
+FORMATS = {<span class="n">1</span>: <span class="s">"u64"</span>, <span class="n">2</span>: <span class="s">"i64"</span>, <span class="n">3</span>: <span class="s">"f64"</span>, <span class="n">4</span>: <span class="s">"f32"</span>, <span class="n">5</span>: <span class="s">"u32"</span>, <span class="n">6</span>: <span class="s">"i32"</span>}
+
+<span class="k">def</span> <span class="fn">sample_type</span>(descriptors):
+    fields = []
+    <span class="k">for</span> d <span class="k">in</span> descriptors:
+        fields.append(Field(d.name.rstrip(<span class="s">"\0"</span>), FORMATS[d.format],
+                            length=d.byte_width))
+    <span class="k">return</span> Struct(<span class="s">"Sample"</span>, fields, endian=<span class="s">"little"</span>)
+
+header = file.<span class="fn">read_struct</span>(<span class="s">"header"</span>, Header)
+<span class="k">assert</span> header.file_bytes == file.size
+
+<span class="k">for</span> index <span class="k">in</span> range(header.section_count):
+    section = file.<span class="fn">read_struct</span>(<span class="s">f"section_{index}"</span>, SectionHeader)
+    end = file.tell() + section.payload_bytes
+
+    <span class="k">if</span> section.id == <span class="n">1</span>:
+        descriptors = file.<span class="fn">records</span>(<span class="s">"descriptors"</span>, Descriptor,
+                                   count=header.descriptor_count)
+        Sample = sample_type(descriptors)
+    <span class="k">elif</span> section.id == <span class="n">2</span>:
+        <span class="c"># registers 31,249,935 records; nothing is read yet</span>
+        samples = file.<span class="fn">records</span>(<span class="s">"samples"</span>, Sample,
+                               count=header.sample_count)
+    file.seek(end)</pre>
+          <div class="code-cap" style="margin-top:14px"><span>Console</span><span></span></div>
+<pre class="code" style="color:var(--ink-2)">Discovered 12 fields, 64 bytes per sample
+Registered 31,249,935 samples at byte 4,096; values load on demand
+Ready: choose Show samples or Show plot.</pre>
+        </div>
+        <div>
+          <h3>Python: ordinary code, lazy results</h3>
+          <ul class="ticks">
+            <li><b>Real Python.</b> Imports, functions, loops, asserts, and your installed libraries, including a virtual environment of your choice.</li>
+            <li><b><code>file.read_struct()</code></b> decodes metadata you can branch on. <b><code>file.records()</code></b> registers a typed collection for Plot, Table, and Hex <em>without loading it</em>.</li>
+            <li><code>Field</code> and <code>Struct</code> cover <code>u8</code>–<code>u64</code>, <code>i8</code>–<code>i64</code>, <code>f32</code>, <code>f64</code>, <code>text</code>, <code>bytes</code>, nested structs, counts, offsets, per-field endianness, and <code>expect=</code> checks.</li>
+            <li>Scripts see the <b>working bytes, including unsaved hex edits</b>. Edit a byte and the last successful decoder reruns. <b>Stop</b> cancels a runaway loop.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="flow-head">
+        <h3>No schema yet? Start by selecting bytes.</h3>
+        <p>The YAML editor has <b style="color:var(--ink)">Source</b>, <b style="color:var(--ink)">Fields</b>, and <b style="color:var(--ink)">Steps</b> tabs, and all three edit the same draft. You can build a decoder with forms instead of writing YAML by hand.</p>
+      </div>
+      <div class="flow">
+        <div><span class="num">01 · Hex</span><h3>Select the bytes</h3><p>Drag across a header in Hex and choose <b>Describe selected bytes…</b>, or <b>New from selection</b> in Fields.</p></div>
+        <div><span class="num">02 · Fields</span><h3>Name and type them</h3><p>Each field shows its size, position, and <b>live value</b> as you pick a format. A usage meter tracks how much of the selection is described.</p></div>
+        <div><span class="num">03 · Decode</span><h3>Decode the selection</h3><p><b>Decode selection</b> opens the results right away. When the range holds whole records, <b>Decode all N records in this selection</b> appears.</p></div>
+        <div><span class="num">04 · Build on it</span><h3>Use what you decoded</h3><p><b>Use this value for…</b> turns a decoded number into a count, length, or offset. <b>Build a type from these descriptions…</b> turns a table of names into a struct.</p></div>
+      </div>
+      <p class="figcap" style="margin-top:14px">Steps forms: Read data · Skip bytes · Align position · Calculate a value · Build type from descriptions · Choose by value</p>
+    </div>
+  </section>
+
+  <!-- ================= SELF-DESCRIBING ================= -->
+  <section class="block">
+    <div class="wrap split">
+      <div class="sticky">
+        <span class="eyebrow">Self-describing files</span>
+        <h2>The decoder reads the layout out of the file.</h2>
+        <p class="body">Neither waveform decoder hardcodes a channel name or a sample offset. The file declares its own columns: twelve descriptors, each a <strong>name</strong>, a <strong>format code</strong>, and a <strong>byte width</strong>. The decoder turns them into a 64-byte <code>Sample</code> type, then walks length-prefixed sections by ID.</p>
+        <div class="chain" aria-label="How the sample type is discovered">
+          <div class="node"><b>header</b><span><code>PWAV</code> v1 · 2,000,000,000 bytes · 4 sections · 12 descriptors</span></div>
+          <div class="arrow">↓ descriptor_count = 12</div>
+          <div class="node"><b>descriptors</b><span>12 × 24 bytes: <code>sine f64</code>, <code>triangle f64</code> … <code>bit_pattern u32</code></span></div>
+          <div class="arrow">↓ define Sample from entries</div>
+          <div class="node"><b>Sample</b><span>4 × f64 · 4 × f32 · 2 × i32 · 2 × u32 = 64 bytes</span></div>
+          <div class="arrow">↓ repeat until the section ends</div>
+          <div class="node"><b>samples</b><span>31,249,935 items · 64 bytes each · starts at <code>0x1000</code></span></div>
+        </div>
+        <p class="callout">Reverse the descriptor order, widen the unknown section, and move the payload from byte 4,096 to 8,192. <strong>The same script and the same YAML still decode it</strong>.</p>
+      </div>
+      <div>
+        <div class="frame" data-full="screenshots/09-decoded-structure.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
+          <img src="screenshots/09-decoded-structure.webp" width="1100" height="800" loading="lazy" decoding="async" alt="Decoded structure tree: header (32 bytes) with signature PWAV, version 1, file_bytes 2000000000, sample_count 31249935, section_count 4, descriptor_count 12; descriptors (288 bytes) expanded to show sine and triangle, format 3, byte_width 8; unknown_section_1 of 3728 bytes; samples: 31249935 items · 64 bytes each; footer 48 bytes">
+        </div>
+        <p class="figcap">Decoded structure: an expandable tree of everything the decoder read, including the unknown section kept as raw bytes.</p>
+        <div class="frame" style="margin-top:22px" data-full="screenshots/10-yaml-decoder.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
+          <img src="screenshots/10-yaml-decoder.webp" width="1600" height="1200" loading="lazy" decoding="async" alt="The YAML decoder editor with Source, Fields, and Steps tabs showing the waveform.yaml definition">
+        </div>
+        <p class="figcap">The YAML decoder with its Source, Fields, and Steps tabs. <kbd>F5</kbd> decodes.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= PLOT ================= -->
+  <section class="block" id="plot">
+    <div class="wrap">
+      <div class="split flip">
+        <div>
+          <div class="frame" data-full="screenshots/05-waveform-plot.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
+            <img src="screenshots/05-waveform-plot.webp" width="1920" height="1080" loading="lazy" decoding="async" alt="BinWave plot with all 12 named channels over samples 0–383 of 31,249,935: bit_pattern, counter_ramp, alternating, zigzag, damped_sine, staircase, pulse, square, chirp, ramp, triangle, and sine, with a cursor at sample 100">
+          </div>
+          <p class="figcap">Plot: 12 channels, samples 0–383, cursor on sample 100. Toolbar: Overview · Zoom in · Zoom out · Lock Y · Fit Y · Fit selection · Select sample range… · Inspect / edit bytes · Export selected bytes…</p>
+        </div>
+        <div class="sticky">
+          <span class="eyebrow">Plotting</span>
+          <h2>Zoom from millions of samples to one.</h2>
+          <p class="body">Plot any numeric field across the whole collection, with <strong>many channels overlaid at once</strong>. Zoomed all the way out, peaks and dips stay visible instead of disappearing between pixels. Zoom in and every individual sample is there.</p>
+          <ul class="ticks">
+            <li><b>Every point keeps its address.</b> Click a peak at any zoom level and you get that sample's exact bytes.</li>
+            <li><b>Overview</b> shows the whole collection at a glance. <b>Scan for all peaks</b> reads every sample in the current range when you need to be sure nothing was missed.</li>
+            <li>Drag to pan, wheel to zoom, <b>right-drag</b> to zoom to a range. Wheel over an axis to zoom only that axis. <b>Lock Y</b> holds the scale and <b>Fit Y</b> refits it.</li>
+            <li>Select a sample range, then <b>Inspect / edit bytes</b> or <b>Export selected bytes…</b> to write exactly those interleaved records to a file.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= HEX ================= -->
+  <section class="block" id="hex">
+    <div class="wrap">
+      <div class="split">
+        <div class="sticky">
+          <span class="eyebrow">Hex · Inspector · Edits</span>
+          <h2>A hex editor that knows the struct.</h2>
+          <p class="body">Hex scrolls smoothly through the whole file, however large, with no paging controls. Decoded fields tint their own byte ranges, and hovering any byte names the narrowest field that covers it.</p>
+          <ul class="ticks">
+            <li><b>Jump</b> to <code>0x100</code>, <code>256</code>, or a relative <code>+256</code> / <code>-0x10</code>. <kbd>Ctrl</kbd>+<kbd>G</kbd> focuses it, and <b>Back</b> / <b>Forward</b> retrace your steps.</li>
+            <li><b>Find</b> hex pairs or text anywhere in the file, then step through matches with <b>Previous</b> and <b>Next</b>.</li>
+            <li><b>Overwrite</b> mode takes hex pairs or UTF-8 text. <b>Replace bytes…</b> swaps a same-length range.</li>
+            <li><b>Copy Python read</b> copies a line like <code>file.read_at(0x2900, 8)</code> for the selection. <b>Name / color range…</b> bookmarks bytes without any YAML.</li>
+            <li><b>Inspector</b> shows the selection as integers and floats in <em>both</em> byte orders, as text, and the first byte's bits. Fixed-width numbers can be edited in place with <b>Apply value</b>.</li>
+          </ul>
+        </div>
+        <div>
+          <div class="frame" data-full="screenshots/07-hex-editor.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
+            <img src="screenshots/07-hex-editor.webp" width="1440" height="900" loading="lazy" decoding="async" alt="Hex editor with Back, Forward, Jump, Find, Selection, View and Overwrite controls. Cursor 0x2907, 0x2900–0x2907, 8 selected bytes labeled sine · f64, highlighted in both hex and text columns">
+          </div>
+          <p class="figcap">Hex: the selection <span class="mono">0x2900–0x2907</span> is identified as <span class="mono">sine · f64</span> and highlighted in both the hex and text columns.</p>
+          <div class="frame" style="margin-top:22px" data-full="screenshots/08-value-inspector.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
+            <img src="screenshots/08-value-inspector.webp" width="960" height="400" loading="lazy" decoding="async" alt="Inspector panel: sine, Sample 100, value -1.5307337294603587, Apply value, Show field bytes, Export field…, Sample actions; technical details show the definition covers 2000000000 bytes with 6 reusable types, path samples[100].sine, type f64 little endian, field bytes 0x2900..0x2908">
+          </div>
+          <p class="figcap">Inspector: value, definition path, type, and exact field bytes, with Apply value, Show field bytes, and Export field…</p>
+
+          <div class="cards" style="grid-template-columns:1fr; margin-top:28px">
+            <div class="card">
+              <span class="tag">Editing</span>
+              <h3>Edit bytes with full undo.</h3>
+              <p>Overwrite bytes in Hex or change a value in Inspector. Changed bytes stay marked, <b style="color:var(--ink)">Undo / Redo</b> steps through your edits, and the decoded views re-run against the edited bytes. <b style="color:var(--ink)">Save edited copy…</b> streams the result to disk, and <b style="color:var(--ink)">Extract selection…</b> streams just the bytes you selected.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= SCALE ================= -->
+  <section class="block" id="scale">
+    <div class="wrap">
+      <span class="eyebrow">Large files</span>
+      <h2>Built for captures bigger than your RAM.</h2>
+      <p class="lede">Hex, tables, and plots read only the part of the file you're looking at, so a capture opens and responds like a small one.</p>
+
+      <div class="stats">
+        <div><div class="v">40<small>GB</small></div><div class="l">Synthetic waveform capture, decoded with the same YAML and Python decoders</div></div>
+        <div><div class="v">31.2<small>M</small></div><div class="l">Samples in the 2 GB demo, all reachable in the plot and table</div></div>
+        <div><div class="v">2.2<small>ms</small></div><div class="l">To the first 8,192 rows of a 20 GiB CSV</div></div>
+        <div><div class="v">~71<small>MiB</small></div><div class="l">Memory used while indexing that entire 20 GiB CSV</div></div>
+      </div>
+      <p class="stats-note">Timings vary with hardware and disk cache.</p>
+
+      <div class="cards">
+        <div class="card">
+          <span class="tag">CSV</span>
+          <h3>CSV that links back to bytes.</h3>
+          <p>Open a CSV and the first portion plots right away, with no scan to EOF. Table cells and plotted points select their exact raw bytes, quoted and multiline fields included. <b style="color:var(--ink)">Index entire file</b> when you want exact totals, and the index resumes when you reopen.</p>
+        </div>
+        <div class="card">
+          <span class="tag">Any file</span>
+          <h3>Open anything as bytes.</h3>
+          <p><span class="mono">.bin</span>, <span class="mono">.png</span>, <span class="mono">.zip</span>, or no extension at all. Hex is usable immediately, and a file opens with a <b style="color:var(--ink)">Byte preview</b> plot. Example decoders for PNG chunks and RIFF/WAVE containers are included.</p>
+        </div>
+        <div class="card">
+          <span class="tag">Workspace</span>
+          <h3>Dock it how you work.</h3>
+          <p>Drag panel titles to split, stack, or float the Decoder, Plot, Hex, Decoded samples, Decoded structure, and Inspector. Your layout persists. Closing a panel keeps its selection and history, and every open and save dialog remembers its own folder.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+  <!-- ================= CTA ================= -->
+  <section class="block final" id="access">
+    <div class="wrap">
+      <span class="eyebrow">Early access</span>
+      <h2>Send me the format you're stuck on.</h2>
+      <p class="lede">BinWave is built by a working embedded engineer who got tired of writing the same <span class="mono">struct.unpack</span> loop for every project. Email a line or two about your data: the log format, the chip, the protocol, and how big the captures get. Early testers shape what ships next.</p>
+      <div class="ea-card" style="max-width:560px; margin-top:34px">
+        <form class="ea-form" data-ea style="margin-top:0">
+          <label for="ea-final-email">Email address</label>
+          <input id="ea-final-email" name="email" type="email" autocomplete="email" required placeholder="you@example.com">
+          <label for="ea-final">What are you decoding? <span aria-hidden="true">(optional)</span></label>
+          <textarea id="ea-final" name="context" placeholder="Format or device, typical capture size, what you use today"></textarea>
+          <input name="company" type="text" tabindex="-1" autocomplete="off" aria-hidden="true">
+          <div class="cf-turnstile" data-sitekey="0x4AAAAAAE0yDy9LfRE8WDOp" data-action="turnstile-spin-v1"></div>
+          <button class="btn btn-amber" type="submit">Request early access →</button>
+          <p class="ea-note">Your details are only used to follow up about BinWave.</p>
+          <p class="ea-status" aria-live="polite"></p>
+        </form>
+      </div>
+      <div class="who">
+        <div><b>Firmware &amp; embedded</b>Your own logging format, captured during bring-up and debugged a thousand times.</div>
+        <div><b>Robotics &amp; telemetry</b>Overnight logs with dozens of channels, where the anomaly is at sample 18 million.</div>
+        <div><b>Test &amp; hardware validation</b>Instrument dumps you need to plot, trace back to raw bytes, patch, and hand off.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= NOTES ================= -->
+  <section class="notes" id="notes" aria-labelledby="notes-h">
+    <div class="wrap">
+      <h3 id="notes-h">Not available yet</h3>
+      <ul>
+        <li>Compressed or computed data as plotted collections</li>
+        <li>Bitfield and UTF-16 field types</li>
+        <li>Inserting or removing bytes</li>
+        <li>Checksum verification and repair</li>
+        <li>Browser version</li>
+      </ul>
+      <p>Python decoders run with your user permissions. YAML definitions can't run code.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="BinWave home">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#141717" stroke="#323838"/><path d="M5 21h4v-10h5v10h2.5" fill="none" stroke="#F2A93B" stroke-width="2.6" stroke-linejoin="round"/><path d="M16.5 21c2.2 0 2.5-10 5-10s2.8 10 5.5 10" fill="none" stroke="#4CC9C0" stroke-width="2.6" stroke-linecap="round"/></svg>
+      <span>BinWave</span>
+    </a>
+    <span class="mono">Native desktop app · runs on your machine</span>
+    <span>A <a href="https://buildincharge.com">Build In Charge</a> project · <a href="mailto:hello@buildincharge.com">hello@buildincharge.com</a></span>
+  </div>
+</footer>
+
+<dialog class="lightbox" id="lightbox" aria-label="Screenshot">
+  <form method="dialog"><button>Close ✕</button></form>
+  <img id="lightbox-img" alt="">
+</dialog>
+
+<script>
+(() => {
+  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* ---------- PWAV sample layout (from the file's descriptors) ---------- */
+  const FIELDS = [
+    ['sine','f64',8,'#4CC9C0'], ['triangle','f64',8,'#F2A93B'], ['ramp','f64',8,'#3EA6F0'], ['chirp','f64',8,'#5BB8F5'],
+    ['square','f32',4,'#B48CF2'], ['pulse','f32',4,'#8FD05A'], ['staircase','f32',4,'#45BFA8'], ['damped_sine','f32',4,'#57CFC6'],
+    ['zigzag','i32',4,'#E5738F'], ['alternating','i32',4,'#9CD66A'], ['counter_ramp','u32',4,'#3FC4B6'], ['bit_pattern','u32',4,'#EE7E9A'],
+  ];
+  let off = 0; for (const f of FIELDS) { f.push(off); off += f[2]; }
+  const REC = 64, BASE = 0x1000, N = 384;
+
+  const hex = (n, w = 0) => '0x' + n.toString(16).toUpperCase().padStart(w, '0');
+  const f32str = v => { if (Number.isInteger(v)) return String(v); for (let p = 1; p <= 9; p++) { const s = String(Number(v.toPrecision(p))); if (Math.fround(Number(s)) === v) return s; } return String(v); };
+  const short = (v, t) => t === 'f64' ? String(Number(v.toPrecision(7))) : t === 'f32' ? String(Number(v.toPrecision(7))) : String(v);
+  const full = (v, t) => t === 'f32' ? f32str(v) : String(v);
+
+  let view = null, values = null, bytes = null;
+  const read = (s, fi) => {
+    const [, t, , , o] = FIELDS[fi], p = s * REC + o;
+    return t === 'f64' ? view.getFloat64(p, true) : t === 'f32' ? view.getFloat32(p, true) : t === 'i32' ? view.getInt32(p, true) : view.getUint32(p, true);
+  };
+
+  /* ---------- hero strip: three real channels, each in its own lane (static) ---------- */
+  const scope = document.getElementById('scope');
+  function drawScope() {
+    if (!scope || !values) return;
+    const dpr = Math.min(devicePixelRatio || 1, 2), w = scope.clientWidth, h = scope.clientHeight;
+    scope.width = Math.round(w * dpr); scope.height = Math.round(h * dpr);
+    const c = scope.getContext('2d'); c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, w, h);
+    const lanes = [[4, '#F2A93B'], [0, '#4CC9C0'], [1, '#3EA6F0']];
+    const laneH = h / lanes.length, padY = laneH * 0.2;
+    lanes.forEach(([fi, col], li) => {
+      const vals = values[fi]; let mn = Infinity, mx = -Infinity;
+      for (const v of vals) { mn = Math.min(mn, v); mx = Math.max(mx, v); }
+      const top = li * laneH + padY, bottom = (li + 1) * laneH - padY;
+      if (li) { c.strokeStyle = 'rgba(255,255,255,0.05)'; c.lineWidth = 1; c.beginPath(); c.moveTo(0, li * laneH + 0.5); c.lineTo(w, li * laneH + 0.5); c.stroke(); }
+      c.beginPath(); c.strokeStyle = col; c.globalAlpha = 0.9; c.lineWidth = 1.6; c.lineJoin = 'round';
+      for (let s = 0; s < N; s++) {
+        const x = (s / (N - 1)) * w, y = bottom - ((vals[s] - mn) / ((mx - mn) || 1)) * (bottom - top);
+        s ? c.lineTo(x, y) : c.moveTo(x, y);
+      }
+      c.stroke(); c.globalAlpha = 1;
+    });
+  }
+
+  /* ---------- live cross-probe ---------- */
+  const canvas = document.getElementById('probe-plot');
+  const state = { s: 100, f: 0, pinned: { s: 100, f: 0 }, lo: 64, hi: 191 };
+  const Y0 = -10, Y1 = 150;
+  const pad = { l: 40, r: 12, t: 12, b: 26 };
+
+  function geom() { const w = canvas.clientWidth, h = canvas.clientHeight; return { w, h, pw: w - pad.l - pad.r, ph: h - pad.t - pad.b }; }
+  const xOf = (s, g) => pad.l + ((s - state.lo) / (state.hi - state.lo)) * g.pw;
+  const yOf = (v, g) => pad.t + (1 - (v - Y0) / (Y1 - Y0)) * g.ph;
+
+  function drawPlot() {
+    if (!values) return;
+    const dpr = Math.min(devicePixelRatio || 1, 2), g = geom();
+    canvas.width = Math.round(g.w * dpr); canvas.height = Math.round(g.h * dpr);
+    const c = canvas.getContext('2d'); c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    c.fillStyle = '#070808'; c.fillRect(0, 0, g.w, g.h);
+    c.font = '11px "JetBrains Mono", monospace'; c.textBaseline = 'middle';
+    for (let v = 0; v <= 150; v += 25) {
+      const y = yOf(v, g); c.strokeStyle = 'rgba(255,255,255,0.06)'; c.beginPath(); c.moveTo(pad.l, y); c.lineTo(g.w - pad.r, y); c.stroke();
+      c.fillStyle = '#5B625E'; c.textAlign = 'right'; c.fillText(v, pad.l - 8, y);
+    }
+    const step = state.hi - state.lo > 200 ? 50 : 20;
+    c.textAlign = 'center'; c.textBaseline = 'top';
+    for (let s = Math.ceil(state.lo / step) * step; s <= state.hi; s += step) {
+      const x = xOf(s, g); c.strokeStyle = 'rgba(255,255,255,0.05)'; c.beginPath(); c.moveTo(x, pad.t); c.lineTo(x, g.h - pad.b); c.stroke();
+      c.fillStyle = '#5B625E'; c.fillText(s, x, g.h - pad.b + 7);
+    }
+    const spacing = g.pw / (state.hi - state.lo);
+    FIELDS.forEach((f, fi) => {
+      const sel = fi === state.f;
+      c.strokeStyle = f[3]; c.globalAlpha = sel ? 1 : 0.62; c.lineWidth = sel ? 2 : 1.3; c.lineJoin = 'round';
+      c.beginPath();
+      for (let s = state.lo; s <= state.hi; s++) { const x = xOf(s, g), y = yOf(values[fi][s], g); s === state.lo ? c.moveTo(x, y) : c.lineTo(x, y); }
+      c.stroke();
+      if (spacing >= 5) { c.fillStyle = f[3]; for (let s = state.lo; s <= state.hi; s++) { c.beginPath(); c.arc(xOf(s, g), yOf(values[fi][s], g), sel ? 1.9 : 1.3, 0, 7); c.fill(); } }
+    });
+    c.globalAlpha = 1;
+    const cx = xOf(state.s, g);
+    c.strokeStyle = 'rgba(242,169,59,0.9)'; c.lineWidth = 1; c.beginPath(); c.moveTo(cx, pad.t); c.lineTo(cx, g.h - pad.b); c.stroke();
+    const cy = yOf(values[state.f][state.s], g);
+    c.strokeStyle = '#fff'; c.lineWidth = 2; c.beginPath(); c.arc(cx, cy, 6, 0, 7); c.stroke();
+    const label = `${FIELDS[state.f][0]} · ${state.s}`;
+    c.font = '12px "JetBrains Mono", monospace'; const tw = c.measureText(label).width + 14;
+    let lx = cx + 10; if (lx + tw > g.w - pad.r) lx = cx - 10 - tw;
+    const ly = Math.max(pad.t, Math.min(cy - 28, g.h - pad.b - 22));
+    c.fillStyle = 'rgba(20,23,23,0.95)'; c.fillRect(lx, ly, tw, 22); c.strokeStyle = '#323838'; c.lineWidth = 1; c.strokeRect(lx + .5, ly + .5, tw - 1, 21);
+    c.fillStyle = '#ECEEEA'; c.textAlign = 'left'; c.textBaseline = 'middle'; c.fillText(label, lx + 7, ly + 11);
+  }
+
+  function pick(ev) {
+    const r = canvas.getBoundingClientRect(), g = geom();
+    const x = ev.clientX - r.left, y = ev.clientY - r.top;
+    let s = Math.round(state.lo + ((x - pad.l) / g.pw) * (state.hi - state.lo));
+    s = Math.max(state.lo, Math.min(state.hi, s));
+    let best = 0, bd = Infinity;
+    FIELDS.forEach((_, fi) => { const d = Math.abs(yOf(values[fi][s], g) - y); if (d < bd) { bd = d; best = fi; } });
+    return { s, f: best };
+  }
+
+  const el = id => document.getElementById(id);
+  function update() {
+    if (!values) return;
+    const { s, f } = state, [name, type, width, , o] = FIELDS[f];
+    const start = BASE + s * REC + o, end = start + width, v = read(s, f);
+    el('i-name').textContent = name;
+    el('i-sample').textContent = `Sample ${s}`;
+    el('i-value').textContent = full(v, type);
+    el('i-path').textContent = `samples[${s}].${name}`;
+    el('i-type').textContent = `${type} · Little endian`;
+    el('i-range').textContent = `${hex(start)}..${hex(end)} (end exclusive)`;
+    el('probe-status').innerHTML = `Sample ${s} · <b>${width} bytes selected</b>`;
+    el('h-cursor').innerHTML = `Cursor ${hex(end - 1)} · ${hex(start)}-${hex(end - 1)} · ${width} selected bytes <b>${name}·${type}</b>`;
+    el('h-hint').textContent = `sample record ${s} · ${hex(BASE + s * REC)}–${hex(BASE + s * REC + REC - 1)}`;
+
+    let out = '';
+    for (let row = 0; row < 4; row++) {
+      const ro = s * REC + row * 16;
+      let hx = '', tx = '';
+      for (let i = 0; i < 16; i++) {
+        const p = ro + i, b = bytes[p], inSel = p >= s * REC + o && p < s * REC + o + width;
+        const h2 = b.toString(16).toUpperCase().padStart(2, '0');
+        const ch = b >= 0x20 && b < 0x7f ? String.fromCharCode(b).replace(/[<>&]/g, m => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[m])) : '·';
+        const nextSel = p + 1 >= s * REC + o && p + 1 < s * REC + o + width;
+        hx += inSel ? `<span class="hl">${h2}${nextSel && i < 15 ? ' ' : ''}</span>${nextSel && i < 15 ? '' : ' '}` : `<span class="b">${h2}</span> `;
+        tx += inSel ? `<span class="thl">${ch}</span>` : ch;
+      }
+      out += `<span class="o">${(BASE + ro).toString(16).toUpperCase().padStart(8, '0')}</span>${hx}<span class="t">${tx}</span>\n`;
+    }
+    el('hexview').innerHTML = out.trimEnd();
+
+    const table = el('samples-table');
+    let html = '<thead><tr><th>Sample</th><th>Byte offset</th><th>Bytes</th>' + FIELDS.map(x => `<th>${x[0]}</th>`).join('') + '</tr></thead><tbody>';
+    const a = Math.max(0, Math.min(N - 5, s - 2));
+    for (let r = a; r < a + 5; r++) {
+      html += `<tr class="${r === s ? 'sel' : ''}"><td>${r}</td><td>${hex(BASE + r * REC)}</td><td>64</td>` +
+        FIELDS.map((x, fi) => `<td data-s="${r}" data-f="${fi}" class="${r === s && fi === f ? 'cell' : ''}">${short(read(r, fi), x[1])}</td>`).join('') + '</tr>';
+    }
+    table.innerHTML = html + '</tbody>';
+
+    document.querySelectorAll('#chan-legend button').forEach((b, i) => b.setAttribute('aria-current', i === f ? 'true' : 'false'));
+    drawPlot();
+  }
+
+  function select(s, f, pin) { state.s = s; state.f = f; if (pin) state.pinned = { s, f }; update(); }
+
+  async function init() {
+    try {
+      const res = await fetch('pwav-samples-0-383.bin');
+      if (!res.ok) throw new Error(res.status);
+      const buf = await res.arrayBuffer();
+      if (buf.byteLength !== N * REC) throw new Error('size');
+      bytes = new Uint8Array(buf); view = new DataView(buf);
+      values = FIELDS.map((_, fi) => Float64Array.from({ length: N }, (_, s) => read(s, fi)));
+    } catch (e) {
+      el('probe-status').textContent = 'Could not load the sample bytes.';
+      return;
+    }
+    el('chan-legend').innerHTML = FIELDS.map((f, i) => `<button type="button" data-f="${i}"><i style="background:${f[3]}"></i>${f[0]}</button>`).join('');
+    el('chan-legend').addEventListener('click', e => { const b = e.target.closest('button'); if (b) select(state.s, +b.dataset.f, true); });
+    canvas.addEventListener('pointermove', e => { if (e.pointerType === 'mouse') { const p = pick(e); select(p.s, p.f, false); } });
+    canvas.addEventListener('pointerdown', e => { const p = pick(e); select(p.s, p.f, true); });
+    canvas.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') select(state.pinned.s, state.pinned.f, false); });
+    canvas.addEventListener('keydown', e => {
+      const k = e.key; let { s, f } = state;
+      if (k === 'ArrowLeft') s = Math.max(state.lo, s - 1); else if (k === 'ArrowRight') s = Math.min(state.hi, s + 1);
+      else if (k === 'ArrowUp') f = (f + FIELDS.length - 1) % FIELDS.length; else if (k === 'ArrowDown') f = (f + 1) % FIELDS.length;
+      else return;
+      e.preventDefault(); select(s, f, true);
+    });
+    el('samples-table').addEventListener('click', e => { const td = e.target.closest('td[data-f]'); if (td) select(+td.dataset.s, +td.dataset.f, true); });
+    document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => {
+      const [lo, hi] = b.dataset.range.split(',').map(Number);
+      state.lo = lo; state.hi = hi;
+      document.querySelectorAll('.seg button').forEach(x => x.setAttribute('aria-pressed', x === b ? 'true' : 'false'));
+      const s = Math.max(lo, Math.min(hi, state.s)); select(s, state.f, true);
+    }));
+    new ResizeObserver(() => drawPlot()).observe(canvas);
+    select(100, 0, true);
+    drawScope();
+    new ResizeObserver(() => drawScope()).observe(scope);
+  }
+  init();
+
+  /* ---------- decoder tabs ---------- */
+  const tabs = [...document.querySelectorAll('.lang-tabs [role=tab]')];
+  function activate(tab) {
+    tabs.forEach(t => { const on = t === tab; t.setAttribute('aria-selected', on); t.tabIndex = on ? 0 : -1; document.getElementById(t.getAttribute('aria-controls')).hidden = !on; });
+  }
+  tabs.forEach((t, i) => {
+    t.addEventListener('click', () => activate(t));
+    t.addEventListener('keydown', e => { if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') { const n = tabs[(i + (e.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length]; activate(n); n.focus(); } });
+  });
+
+  /* ---------- lightbox ---------- */
+  /* ---------- early access ---------- */
+  document.querySelectorAll('form[data-ea]').forEach(form => form.addEventListener('submit', async e => {
+    e.preventDefault();
+    if (!form.reportValidity()) return;
+    const status = form.querySelector('.ea-status');
+    const submit = form.querySelector('button[type="submit"]');
+    const token = form.querySelector('[name="cf-turnstile-response"]')?.value;
+    if (!token) {
+      status.textContent = 'Please complete the security check and try again.';
+      status.classList.add('is-error');
+      return;
+    }
+    submit.disabled = true;
+    status.textContent = 'Saving your request…';
+    status.classList.remove('is-error');
+    try {
+      const response = await fetch('/api/early-access', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: form.elements.email.value,
+          context: form.elements.context.value,
+          company: form.elements.company.value,
+          turnstileToken: token
+        })
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || 'We could not save your request. Please try again shortly.');
+      form.reset();
+      if (window.turnstile) window.turnstile.reset(form.querySelector('.cf-turnstile'));
+      status.textContent = 'You’re on the list — thanks!';
+    } catch (error) {
+      status.textContent = error.message;
+      status.classList.add('is-error');
+    } finally {
+      submit.disabled = false;
+    }
+  }));
+
+  const dlg = document.getElementById('lightbox'), dimg = document.getElementById('lightbox-img');
+  document.querySelectorAll('[data-full]').forEach(n => {
+    const open = () => { dimg.src = n.dataset.full; dimg.alt = n.querySelector('img').alt; dlg.showModal(); };
+    n.addEventListener('click', open);
+    n.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  });
+  dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });
+})();
+</script>
+</body>
+</html>

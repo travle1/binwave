@@ -1177,7 +1177,7 @@ impl PlotterApp {
             DialogFileKind::Data,
             self.dialog_template
                 .clone()
-                .set_title("Open file — Plotter Max"),
+                .set_title("Open file — BinWave"),
         );
         self.file_dialog
             .begin_open(dialog, AppDialogAction::OpenData, ctx);
@@ -1193,7 +1193,7 @@ impl PlotterApp {
             DialogFileKind::CsvConfig,
             self.dialog_template
                 .clone()
-                .set_title("Load CSV configuration — Plotter Max")
+                .set_title("Load CSV configuration — BinWave")
                 .add_filter("Markdown config", &["md", "markdown"]),
         );
         self.file_dialog
@@ -2758,7 +2758,7 @@ mod tests {
         app.open_path(path, &ctx);
         wait_csv(&mut app, &ctx);
         workspace_click(&mut app, &ctx, "Python");
-        app.binary.load_python_text("from plottermax import Struct\nByte = Struct('Byte', [('value', 'u8')])\nfile.records('bytes', Byte, count=file.size)", &ctx);
+        app.binary.load_python_text("from binwave import Struct\nByte = Struct('Byte', [('value', 'u8')])\nfile.records('bytes', Byte, count=file.size)", &ctx);
         assert!(app.displayed_decoder == Decoder::Csv);
         app.run_active_decoder(&ctx);
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
@@ -3668,7 +3668,7 @@ mod tests {
         let data = directory.path().join("capture.raw");
         let script = directory.path().join("decoder.py");
         std::fs::write(&data, [1u8, 0, 2, 0, 3, 0, 4, 0]).unwrap();
-        std::fs::write(&script, "from plottermax import Struct\nimport math\ndef sample_type():\n    return Struct('Sample', [('amplitude', 'u16')])\nfile.records('samples', sample_type())\nprint('Completed', math.sqrt(16))\n").unwrap();
+        std::fs::write(&script, "from binwave import Struct\nimport math\ndef sample_type():\n    return Struct('Sample', [('amplitude', 'u16')])\nfile.records('samples', sample_type())\nprint('Completed', math.sqrt(16))\n").unwrap();
         app.open_path(data, &ctx);
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         while !app.binary.has_file() {
@@ -3759,7 +3759,7 @@ mod tests {
         }).collect();
         let capture = serde_json::json!({"size": [1280, 850], "atlas_size": atlas.size, "atlas": pixels, "meshes": meshes});
         std::fs::write(
-            format!("/tmp/plottermax-{name}.json"),
+            format!("/tmp/binwave-{name}.json"),
             serde_json::to_vec(&capture).unwrap(),
         )
         .unwrap();

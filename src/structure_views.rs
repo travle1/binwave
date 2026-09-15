@@ -3036,7 +3036,7 @@ actions: [{read: {name: samples, type: Sample, repeat: until end}}]
             settle_plot(&ctx, &mut views, &output, &store);
             let rendered = waveform_plot_frame(&ctx, &mut views, &output, &store);
             write_waveform_capture(&ctx, rendered,
-                &format!("/tmp/plottermax-waveform-{count}.json"));
+                &format!("/tmp/binwave-waveform-{count}.json"));
         }
     }
 
@@ -3078,7 +3078,7 @@ actions: [{read: {name: samples, type: Sample, repeat: until end}}]
             assert_eq!(views.plot_reader.data().unwrap().scanned, count);
             let rendered = waveform_plot_frame(&ctx, &mut views, &output, &store);
             write_waveform_capture(&ctx, rendered,
-                &format!("/tmp/plottermax-demo-density-{count}.json"));
+                &format!("/tmp/binwave-demo-density-{count}.json"));
         }
     }
 

@@ -28,7 +28,7 @@ impl FileKind {
     }
 }
 
-const FILE_LOCATIONS_KEY: &str = "plottermax.file_locations.v1";
+const FILE_LOCATIONS_KEY: &str = "binwave.file_locations.v1";
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]

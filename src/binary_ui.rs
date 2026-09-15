@@ -3658,7 +3658,7 @@ mod tests {
         workspace.structure_ui.begin_definition(0..2);
         let yaml = workspace.yaml.clone();
         assert!(workspace.active_authoring_dirty());
-        workspace.load_python_text("from plottermax import Struct\nSample = Struct('Sample', [('value', 'u8')])\nfile.records('samples', Sample)\n", &ctx);
+        workspace.load_python_text("from binwave import Struct\nSample = Struct('Sample', [('value', 'u8')])\nfile.records('samples', Sample)\n", &ctx);
         assert!(
             workspace.pending.is_none(),
             "New Python never replaces the YAML fields"

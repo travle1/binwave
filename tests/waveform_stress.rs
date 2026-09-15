@@ -402,10 +402,10 @@ fn verify_large_file(path: &Path) {
 }
 
 #[test]
-#[ignore = "requires generated fixture; set PLOTTERMAX_WAVEFORM_FILE to choose its path"]
+#[ignore = "requires generated fixture; set BINWAVE_WAVEFORM_FILE to choose its path"]
 #[cfg(target_pointer_width = "64")]
 fn verify_generated_waveform_stress_file() {
-    let path = std::env::var_os("PLOTTERMAX_WAVEFORM_FILE")
+    let path = std::env::var_os("BINWAVE_WAVEFORM_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/data/waveform_stress_40gb.bin")
@@ -421,11 +421,11 @@ fn verify_generated_waveform_stress_file() {
 /// Exercises the same asynchronous plot reader as the UI against actual generated
 /// bytes. The default run intentionally avoids requiring a 40 GB local artifact.
 #[test]
-#[ignore = "requires generated fixture; set PLOTTERMAX_WAVEFORM_FILE to choose its path"]
+#[ignore = "requires generated fixture; set BINWAVE_WAVEFORM_FILE to choose its path"]
 #[cfg(target_pointer_width = "64")]
 fn verify_generated_waveform_plot_ranges() {
     use structure_plot::{PlotQuality, PlotReader};
-    let path = std::env::var_os("PLOTTERMAX_WAVEFORM_FILE")
+    let path = std::env::var_os("BINWAVE_WAVEFORM_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/data/waveform_stress_40gb.bin")

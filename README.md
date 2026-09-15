@@ -1,4 +1,4 @@
-# PlotterMax
+# BinWave
 
 A local Rust desktop workspace using eframe/egui and egui_plot. Inspect and edit
 bytes from any file, write Python or YAML decoders using reusable data structures,
@@ -149,7 +149,7 @@ Failed saves preserve the destination. An extraction does not mark the whole fil
 saved. Undo/Redo history remains shared across byte and legacy numeric edits;
 changing a decoder preserves that byte history. Unsaved bytes, Python/YAML source,
 and pending legacy table edits are guarded when replacing the open file or closing
-PlotterMax.
+BinWave.
 
 `.csv` files read an initial portion automatically while Hex remains available.
 Select **CSV** in Decoder and press **Apply** for delimited numeric text with another extension.
@@ -169,11 +169,11 @@ also available as **File → Load CSV configuration…**.
 ## Python decoders
 
 Python decoders use ordinary Python imports, functions, loops, and installed
-libraries. PlotterMax supplies `file` for reading the open file, including unsaved
+libraries. BinWave supplies `file` for reading the open file, including unsaved
 byte edits, and `Struct`/`Field` for describing byte-backed results:
 
 ```python
-from plottermax import Struct
+from binwave import Struct
 
 Header = Struct("Header", [("count", "u16"), ("offset", "u32")])
 Sample = Struct("Sample", [("value", "i16")])
@@ -203,7 +203,7 @@ not register arbitrary computed arrays or Python callbacks for every plotted sam
 Output and tracebacks appear in the console when execution finishes. **Stop** can
 cancel a script, including a Python loop. Loaded scripts use their own directory
 for relative imports and paths. The runtime uses `python3` (`python` on Windows);
-set `PLOTTERMAX_PYTHON` to a virtual environment's interpreter to use its libraries.
+set `BINWAVE_PYTHON` to a virtual environment's interpreter to use its libraries.
 Scripts run with your local user's permissions and are **not sandboxed**.
 
 See the [Python decoder API](python/README.md) and the
@@ -413,7 +413,7 @@ python3 samples/generators/generate_binary_demo.py
 Under **Decoder → Record layout**, the **Section** selector starts on
 `samples`. Switch to `header` to inspect its uninterpreted bytes, or `footer` to inspect and edit its ordinary `checksum` field.
 The marker is at **0x970** (2416); checksum bytes start at **0x974** (2420).
-The checksum value is illustrative: PlotterMax neither verifies nor recalculates it.
+The checksum value is illustrative: BinWave neither verifies nor recalculates it.
 Switching sections resets the plot/table selection; undo/redo follows the edited
 field back to its section. The layout summary lists each section's physical range,
 record size, payload offset, count, markers, gaps, and trailing byte count. The hex
@@ -567,7 +567,7 @@ checksums. No decompressor, recompressor, or plugin framework is included now.
 - There is **no fixed MiB/GiB cap**. The platform mapping limit is `isize::MAX`
   bytes (about 8 EiB on 64-bit, 2 GiB on 32-bit), further constrained by address
   space, filesystem limits, and free cache disk space. Without filesystem cloning,
-  a binary snapshot needs space equal to the source file. Set `PLOTTERMAX_CACHE_DIR`
+  a binary snapshot needs space equal to the source file. Set `BINWAVE_CACHE_DIR`
   to a suitable local disk if needed. During replacement the previous snapshot remains until the new one is
   ready. Snapshot/mapping failures leave the existing document intact and show
   an error. Stop external writers while taking the initial snapshot.
@@ -670,7 +670,7 @@ Examples: `samples/data/sample.csv` and `samples/configs/sample_config.md`.
 A Markdown configuration contains a fenced JSON block:
 
 ````markdown
-# Plotter Max Config
+# BinWave Config
 
 ```json
 {
@@ -696,7 +696,7 @@ python3 samples/generators/generate_large_csv.py --gb 20 --signals 8 --out sampl
 
 ## CSV storage and large-file reading
 
-**CSV values stay in the original file.** PlotterMax keeps a compact index of row
+**CSV values stay in the original file.** BinWave keeps a compact index of row
 positions and plot summaries for the portion it has read. Neither normal browsing
 nor **Index entire file** creates a full numeric copy.
 
@@ -727,7 +727,7 @@ decoded-copy settings.
 
 ### Cache location and clearing
 
-The directory is `plottermax-v1` beneath `PLOTTERMAX_CACHE_DIR`, otherwise
+The directory is `binwave-v1` beneath `BINWAVE_CACHE_DIR`, otherwise
 `$XDG_CACHE_HOME`, `$LOCALAPPDATA`, or `~/.cache` (in that order; the temporary
 directory is the final fallback). Processing and caches remain local. Keys include
 canonical source path, size, modification time, Unix identity/change time when
@@ -755,8 +755,8 @@ cargo test --release benchmark_csv_source_index -- --ignored --nocapture
 It generates one million rows and eight signals, measures first usable rows, the
 full index scan, index size, reopening, and an uncached narrow zoom. It measures
 explicit indexing, not the bounded default open. To use an existing
-**headerless** CSV, set `PLOTTERMAX_BENCH_CSV` to its path and
-`PLOTTERMAX_BENCH_CACHE_PARENT` to an existing scratch directory. The benchmark
+**headerless** CSV, set `BINWAVE_BENCH_CSV` to its path and
+`BINWAVE_BENCH_CACHE_PARENT` to an existing scratch directory. The benchmark
 creates and removes its own temporary index; it never changes the source.
 
 A local one-million-row run used a 663,067-byte index for 42,920,530 bytes of CSV.

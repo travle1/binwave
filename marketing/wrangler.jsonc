@@ -1,0 +1,15 @@
+{
+  // BinWave landing page — Cloudflare Pages (classic). Deploy from marketing/:
+  //   npx wrangler pages deploy
+  "name": "binwave",
+  "pages_build_output_dir": "./site",
+  "compatibility_date": "2026-09-11",
+  "services": [{ "binding": "TURNSTILE_VERIFY", "service": "turnstile-siteverify-buildincharge" }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "buildincharge-content",
+      "database_id": "7eb20069-0fd0-463e-b2d4-da0e7525a621"
+    }
+  ]
+}

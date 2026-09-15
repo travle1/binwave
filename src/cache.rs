@@ -77,13 +77,13 @@ impl SourceStamp {
 }
 
 pub fn root() -> PathBuf {
-    let base = std::env::var_os("PLOTTERMAX_CACHE_DIR")
+    let base = std::env::var_os("BINWAVE_CACHE_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from))
         .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".cache")))
         .unwrap_or_else(std::env::temp_dir);
-    base.join("plottermax-v1")
+    base.join("binwave-v1")
 }
 
 fn pointer_path(root: &Path, key: &str) -> PathBuf {
@@ -118,7 +118,7 @@ pub fn lookup(root: &Path, key: &str) -> Option<PathBuf> {
 pub fn staging(root: &Path) -> Result<tempfile::TempDir> {
     fs::create_dir_all(root).with_context(|| {
         format!(
-            "create cache at {} (set PLOTTERMAX_CACHE_DIR to another local disk)",
+            "create cache at {} (set BINWAVE_CACHE_DIR to another local disk)",
             root.display()
         )
     })?;
@@ -241,7 +241,7 @@ pub fn clear() -> Result<()> {
         return Ok(());
     }
     // Only this dedicated application directory is removed, never the user's
-    // PLOTTERMAX_CACHE_DIR / XDG_CACHE_HOME parent. Existing mappings remain valid.
+    // BINWAVE_CACHE_DIR / XDG_CACHE_HOME parent. Existing mappings remain valid.
     fs::remove_dir_all(&root).with_context(|| {
         format!(
             "clear cache {} (close files if your OS keeps them locked)",

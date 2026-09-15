@@ -236,7 +236,7 @@ fn inspect(path: &Path) -> Result<()> {
     let mut first = [0; 64];
     file.read_exact(&mut first)?;
     if &first[..4] != b"PWAV" {
-        return Err("This is not a PlotterMax PWAV test fixture".into());
+        return Err("This is not a BinWave PWAV test fixture".into());
     }
     let count = u64::from_le_bytes(first[16..24].try_into()?);
     if count == 0 {

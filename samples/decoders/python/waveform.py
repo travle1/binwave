@@ -4,7 +4,7 @@ PWAV is a synthetic tagged container designed to exercise reusable decoders.
 Python discovers the sections and sample structure; file.records() registers the
 large byte-backed collection without loading its values into Python or RAM.
 """
-from plottermax import Field, Struct
+from binwave import Field, Struct
 
 Header = Struct("Header", [
     Field("signature", "text", length=4, expect="PWAV"),

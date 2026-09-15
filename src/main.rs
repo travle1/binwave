@@ -31,7 +31,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Plotter Max",
+        "BinWave",
         native_options,
         Box::new(|cc| Box::new(app::PlotterApp::new(cc))),
     )?;

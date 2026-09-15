@@ -171,19 +171,19 @@ class ReaderTests(unittest.TestCase):
             # Build independent bytes in memory: this test needs no local data artifact.
             data = waveform_fixture(16_319, data_offset, reversed_fields)
             reader, calls = self.reader(data)
-            sdk = types.ModuleType("plottermax")
+            sdk = types.ModuleType("binwave")
             sdk.Field, sdk.Struct, sdk.file = runner.Field, runner.Struct, reader
-            previous = sys.modules.get("plottermax")
-            sys.modules["plottermax"] = sdk
+            previous = sys.modules.get("binwave")
+            sys.modules["binwave"] = sdk
             try:
                 scope = {"file": reader}
                 with contextlib.redirect_stdout(io.StringIO()):
                     exec(compile(script, str(script_path), "exec"), scope)
             finally:
                 if previous is None:
-                    sys.modules.pop("plottermax", None)
+                    sys.modules.pop("binwave", None)
                 else:
-                    sys.modules["plottermax"] = previous
+                    sys.modules["binwave"] = previous
             result = scope["samples"]
             decoded.append((scope["sample_offset"], dict(result[17]), reader.program()))
             self.assertLess(sum(size for _, size in calls), 200_000)
@@ -225,7 +225,7 @@ class ProtocolTests(unittest.TestCase):
         for script, expected_stdout in [
             ("test = 5", ""),
             ("import math\ndef squared(x): return x*x\nprint(squared(3), math.sqrt(16))", "9 4.0\n"),
-            ("from plottermax import file\nprint(file.read_at(0, 2).hex())", "0700\n"),
+            ("from binwave import file\nprint(file.read_at(0, 2).hex())", "0700\n"),
         ]:
             with self.subTest(script=script):
                 result = self.run_script(script)
@@ -239,7 +239,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotIn("done", result)
 
     def test_regular_python_imports_functions_and_print_are_separate_from_protocol(self):
-        result = self.run_script("from plottermax import Struct, file\nimport math\ndef squared(x): return x*x\nprint(squared(3), math.sqrt(16))\nfile.read_struct('sample', Struct('Sample', [('value','u16')]))")
+        result = self.run_script("from binwave import Struct, file\nimport math\ndef squared(x): return x*x\nprint(squared(3), math.sqrt(16))\nfile.read_struct('sample', Struct('Sample', [('value','u16')]))")
         self.assertEqual(result["done"]["stdout"], "9 4.0\n")
         self.assertEqual(result["done"]["program"]["actions"][0]["read"]["length"], 2)
 
@@ -250,7 +250,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(result["stdout"], "before error\n")
 
     def test_print_output_is_bounded(self):
-        result = self.run_script("from plottermax import Struct\nprint('x' * 100000)\nfile.records('samples',Struct('Sample',[('value','u8')]))")
+        result = self.run_script("from binwave import Struct\nprint('x' * 100000)\nfile.records('samples',Struct('Sample',[('value','u8')]))")
         output = result["done"]["stdout"]
         self.assertLessEqual(len(output.encode()), runner.OUTPUT_LIMIT)
         self.assertIn("Output truncated", output)

@@ -1,7 +1,7 @@
-"""PlotterMax's standard-library Python reader and decoder-plan bridge.
+"""BinWave's standard-library Python reader and decoder-plan bridge.
 
-Executed by PlotterMax, which supplies the open file (including byte edits).
-User scripts import Field/Struct from plottermax and use the global ``file``.
+Executed by BinWave, which supplies the open file (including byte edits).
+User scripts import Field/Struct from binwave and use the global ``file``.
 This is normal Python, not a security sandbox.
 """
 
@@ -428,13 +428,13 @@ def _main():
         send({"read": {"offset": offset, "length": length}})
         line = protocol_in.readline(4 * READ_LIMIT + 65536)
         if not line or not line.endswith("\n"):
-            raise RuntimeError("PlotterMax file reader closed or returned an oversized response")
+            raise RuntimeError("BinWave file reader closed or returned an oversized response")
         reply = json.loads(line)
         if "error" in reply:
             raise OSError(reply["error"])
         data = bytes(reply["data"])
         if len(data) != length:
-            raise OSError(f"PlotterMax returned {len(data)} bytes; requested {length}")
+            raise OSError(f"BinWave returned {len(data)} bytes; requested {length}")
         return data
 
     try:
@@ -446,10 +446,10 @@ def _main():
         if not isinstance(script, str) or len(script.encode("utf-8")) > PROGRAM_LIMIT:
             raise ValueError("Python decoder must be text of at most 256 KiB")
         reader = Reader(request["size"], request["filename"], read_bytes)
-        sdk = types.ModuleType("plottermax", "Read file bytes and describe reusable structures for PlotterMax.")
+        sdk = types.ModuleType("binwave", "Read file bytes and describe reusable structures for BinWave.")
         sdk.Field, sdk.Struct, sdk.Record, sdk.file = Field, Struct, Record, reader
         sdk.__all__ = ["Field", "Struct", "Record", "file"]
-        sys.modules["plottermax"] = sdk
+        sys.modules["binwave"] = sdk
         sys.stdout = sys.stderr = captured
         source_name = request["filename"]
         if not isinstance(source_name, str) or not source_name:

@@ -1,0 +1,4 @@
+.wrangler/
+
+# Original capture exports are local production artifacts.
+/screenshots/

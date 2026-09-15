@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate a large CSV file to stress-test Plotter Max.
+Generate a large CSV file to stress-test BinWave.
 
 Defaults create ~20 GiB at samples/data/large_test.csv with a time column plus N signals.
 Example: python samples/generators/generate_large_csv.py --gb 20 --signals 8 --out samples/data/large_test.csv
@@ -57,7 +57,7 @@ def generate(out_path: Path, target_gb: float, signals: int, chunk_rows: int) ->
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate a large CSV for Plotter Max.")
+    parser = argparse.ArgumentParser(description="Generate a large CSV for BinWave.")
     parser.add_argument(
         "--gb",
         type=float,

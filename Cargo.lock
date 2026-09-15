@@ -580,6 +580,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
 
 [[package]]
+name = "binwave"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "csv",
+ "eframe",
+ "egui",
+ "egui_dock",
+ "egui_plot",
+ "env_logger",
+ "libc",
+ "log",
+ "memmap2",
+ "num-bigint",
+ "num-rational",
+ "num-traits",
+ "rayon",
+ "rfd",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tempfile",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2637,32 +2663,6 @@ name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
-
-[[package]]
-name = "plotter_max"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "csv",
- "eframe",
- "egui",
- "egui_dock",
- "egui_plot",
- "env_logger",
- "libc",
- "log",
- "memmap2",
- "num-bigint",
- "num-rational",
- "num-traits",
- "rayon",
- "rfd",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "tempfile",
-]
 
 [[package]]
 name = "png"

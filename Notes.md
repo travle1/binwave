@@ -1,4 +1,4 @@
-# Plotter Max
+# BinWave
 
 An app that can read a file and plot it on screen. 
 
