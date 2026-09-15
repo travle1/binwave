@@ -70,6 +70,7 @@ pub struct StructureViews {
     pending_hex_selection: bool,
     reveal_selected_row: bool,
     expanded: HashSet<String>,
+    reveal_tree: Option<String>,
     table_target: String,
     table_anchor: Option<TableAnchor>,
     table_jump: usize,
@@ -390,11 +391,13 @@ impl StructureViews {
         self.pending_hex_selection = false;
     }
 
+    pub fn expand(&mut self, path: &str) { self.expanded.insert(path.into()); self.reveal_tree = Some(path.into()); }
     pub fn tree(
         &mut self,
         ui: &mut Ui,
         output: &ParseOutput,
         selection: Option<Range<usize>>,
+        names: &mut dyn FnMut(&mut Ui, &Node) -> egui::Response,
     ) -> Option<Range<usize>> {
         if self.stale(output) {
             ui.colored_label(
@@ -429,7 +432,11 @@ impl StructureViews {
         let row_height = ui.text_style_height(&egui::TextStyle::Body).max(18.) + 4.;
         let mut toggle = None;
         let mut node_click = None;
-        egui::ScrollArea::both()
+        let mut scroll = egui::ScrollArea::both();
+        if let Some(path) = self.reveal_tree.take() {
+            if let Some(index) = rows.iter().position(|(node, _)| node.path == path) { scroll = scroll.vertical_scroll_offset(index as f32 * row_height); }
+        }
+        scroll
             .id_source("decoded_structure_tree")
             .auto_shrink([false, false])
             .show_rows(ui, row_height, rows.len(), |ui, range| {
@@ -458,11 +465,8 @@ impl StructureViews {
                             } else {
                                 ui.add_space(18.);
                             }
-                            let text = format!("{}: {}", node.name, display(node, 90));
-                            let response = ui.selectable_label(
-                                self.selected.as_deref() == Some(&node.path),
-                                text,
-                            );
+                            let response = names(ui, node);
+                            let value_response = ui.selectable_label(self.selected.as_deref() == Some(&node.path), format!(": {}", display(node, 90)));
                             response.clone().on_hover_text(format!(
                                 "{}\n{} · 0x{:X}..0x{:X}\n{}",
                                 node.path,
@@ -471,7 +475,7 @@ impl StructureViews {
                                 node.range.end,
                                 node.references.join("\n")
                             ));
-                            if response.clicked() {
+                            if response.clicked() || value_response.clicked() {
                                 node_click = Some(node.clone());
                             }
                         });

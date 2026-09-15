@@ -105,17 +105,27 @@ shared with native code. See [architecture boundaries](architecture.md).
 
 ### Mobile workspace
 
-Below 900 logical pixels wide, Auto layout uses a vertically scrollable stack of
-Decoder, Plot, Samples, and Hex, with collapsible sections for each pane and
-additional structure/inspector sections. Layout offers Auto, Stacked, and Docked;
-the choice is saved. Desktop dock geometry is retained independently of the
-stacked layout. Opening a decoder focuses its section; applying it focuses Plot.
-The compact file toolbar exposes Open data and Decoder; More contains save,
-extraction, and cancellation. Explicit button styling avoids platform-default
-pill buttons. Empty panels stay hidden until data is available, and the editor
-uses the available viewport height. Secondary workspace controls and the editor
-color legend live in menus on narrow screens. Plot dragging/pinch gestures remain available; wheel scrolling over a
-stacked plot scrolls the page instead of panning the plot.
+Below 900 logical pixels wide, Auto layout stacks Hex and Decoded structure,
+with Code, Plot, Samples, and Inspector available as collapsible sections. The
+same four menus remain visible with 40-pixel touch targets. View > Arrangement
+selects Auto, Stacked, or Docked without discarding desktop dock geometry.
+Plot dragging/pinch gestures remain available; wheel scrolling over a stacked
+plot scrolls the page instead of panning the plot.
+
+Web and native share the command hierarchy in `src/app_menu.rs`:
+
+- **Open data:** files, demos, edited-copy export, extraction, cancellation.
+- **Decoder:** open, save, new, apply, Code, and examples.
+- **Edit:** byte undo/redo, copying hex, and Code editing commands.
+- **View:** Hex, Decoded structure, Plot, Samples, Code, Inspector, and reset.
+
+Native-only tools appear in advanced submenus. The browser renders this shared
+model in a single DOM toolbar so file picker clicks retain browser activation;
+native renders it with egui. Both use the same compact Apply/Stop controls in
+Code. File names and operation status have their own text lines, not button rows.
+Existing dock arrangements are preserved. **View > Reset workspace** shows Hex
+on the left and Decoded structure on the right, with Code in the supporting tab
+stack and plots/samples accessible from View.
 
 ### Memory and offset contract
 
@@ -209,30 +219,40 @@ application name and may still contain `plottermaxx`.
 
 ### Editing and developing a browser decoder
 
-The YAML editor has an **Edit** menu and a right-click menu for selection,
+**Edit > Code editing** and the YAML editor’s right-click menu provide selection,
 copy, cut, paste, undo/redo, and toggling comments. Keyboard editing remains
 available. Paste opens a native browser text box so touch paste and LAN HTTP
-work without clipboard API permission. **Save YAML** (or Ctrl/Cmd+S) downloads the current
+work without clipboard API permission. **Decoder > Save decoder** (or Ctrl/Cmd+S) downloads the current
 source as `decoder.yaml`; this is separate from exporting edited binary data.
 
-To investigate an unfamiliar file incrementally:
+Select bytes and choose **Interpret as**. Built-in types show previews; **Your
+structures** lists the names declared under `structures` in the current YAML.
+Choosing either runs the interpretation and opens its decoded result, with the
+generated name selected for typing. Press Enter or click away to finish naming;
+Escape keeps the current name. Double-click a directly created name, or use its
+right-click **Rename** menu, to rename it later. There is no Add/Update form.
 
-1. Save any decoder you want to keep, then choose **New decoder → Start empty decoder**.
-2. Drag over bytes in Hex, or click the first byte and Shift-click the last.
-   On touch devices, the Inspector's start/end range controls also allow an
-   exact selection (end is exclusive).
-3. Use **Selection → Describe selection** (also available by right-click).
-   Give the read a name and choose a type. **Add read to YAML** adds a read at
-   the selected absolute byte offset, preserving existing reads and comments.
-4. Apply and inspect **Decoded structure**. Select another range and add another
-   read as you learn the format. Numeric reads repeat when the selection holds
-   several complete values; text and bytes use the selected byte length.
-5. Refactor these independent reads into reusable structures in YAML when the
-   relationships become clear. The selection helper does not infer nesting or
-   file-format semantics.
+A structure choice adds one read referencing that structure; its declaration is
+preserved. The real decoder resolves nested fields and references to earlier
+values, then highlights the consumed range. Selecting eight bytes for a structure
+that consumes four highlights those four bytes. A short selection or missing
+reference leaves the YAML and previous decoded results unchanged. Numeric
+selections repeat complete values; text and bytes use the selected length.
+The type menu previews at most 64 cached bytes; structure decoding uses the
+normal bounded background decoder, including its existing resource limits.
+
+The untouched workspace starts with bytes and decoded structure. Saved docking
+arrangements are preserved; reset the workspace to try the new default. Mobile
+starts with these same views and keeps Code collapsed. Creating an interpretation
+reveals Decoded structure for naming; selecting existing fields still links to Hex.
+
+**Code** opens the same YAML decoder. Direct edits preserve surrounding source
+and comments. They can rename or replace the explicit reads they create; editing
+nested declarations, block-style reads, expressions, or names already referenced
+elsewhere requires Code. A structure that relies on an explicit enclosing region
+(such as `repeat: until end`) needs that region declared in YAML. Selecting bytes
+does not silently rewrite its boundaries or duplicate its definition.
 
 You do not need to decode the entire file or produce a plot. Errors leave the
-last successful results available, and edited source is marked as needing Apply.
-Hex can copy a selected range within the loaded 64 KiB page; larger ranges use
-streaming extraction where supported. This adds core authoring controls, not full
-parity with the native guided structure editor or native binary editing tools.
+last successful results available. Hex copies selections within its loaded
+64 KiB page; larger ranges use streaming extraction where supported.

@@ -5,7 +5,8 @@
     let failed = false, graphicsReady = false;
     let busy = false, dirty = false, opened = false, exportable = false;
     let runtime = null, loadingDecoder = false;
-    let decoderSource = '';
+    let decoderSource = '', rustStatus = '';
+    let ignoreDecoder = false, operation = '';
     let size = '0', selectedStart = '0', selectedEnd = '0';
     const status = document.getElementById('status');
     const open = document.getElementById('open');
@@ -21,10 +22,13 @@
         save.disabled = busy || failed || !graphicsReady || !opened || !exportable;
         extract.disabled = save.disabled || selectedStart === selectedEnd;
         cancel.disabled = !busy;
+        window.binwaveMenus?.refresh();
     }
     function submit(m) {
         if (busy || failed) return false;
         busy = true;
+        operation = m.type;
+        if (m.type === 'decode') ignoreDecoder = false;
         controls();
         if (m.type === 'decode') { m.runtime = runtime; status.textContent = 'Decoding…'; }
         worker.postMessage(m);
@@ -32,13 +36,14 @@
     }
     worker.onmessage = ({data}) => {
         if (data.type === 'ready') { busy = false; controls(); return; }
+        if (ignoreDecoder && (data.type === 'decoded' || (data.type === 'error' && ['decode','table','plot','probe','pick'].includes(operation)))) return;
         if (data.type === 'progress') { status.textContent = `Exported ${data.done} / ${data.total} bytes`; return; }
         if (['opened', 'edited', 'exported'].includes(data.type)) {
             dirty = data.dirty; size = data.size; opened = true;
             exportable = data.exportable && typeof window.showSaveFilePicker === 'function';
             if (data.type === 'opened') selectedStart = selectedEnd = '0';
         }
-        if (data.type === 'error') status.textContent = data.message;
+        if (data.type === 'error') { data.operation = operation; status.textContent = data.message; }
         if (data.type === 'decoded') {
             status.textContent = `Decoded ${data.result.consumed} of ${size} bytes`;
             if (!data.result.collections.length) status.textContent += ' · inspect Decoded structure';
@@ -160,6 +165,24 @@
         }
     });
     window.binwave = {
+        menus(model, file, message) {
+            if(message!==rustStatus){rustStatus=message;status.textContent=message;}
+            const context=document.getElementById('file-context');
+            if(context.textContent!==file)context.textContent=file;
+            const direct={open_file:open,open_decoder:openDecoder,save_copy:save,extract,cancel};
+            window.binwaveMenus.render(JSON.parse(model), (command,argument)=>{
+                if(direct[command]) { if(!direct[command].disabled)direct[command].onclick(); }
+                else if(command==='save_decoder')window.binwave.saveDecoder(decoderSource);
+                else { if(events.length>=16)events.shift();events.push({type:'menu',command,argument}); }
+            }, (command,enabled)=>direct[command] ? !direct[command].disabled : enabled && graphicsReady && !failed && (!busy || ['code','hex','structures','plot','samples','inspector','auto','stacked','docked'].includes(command)));
+        },
+        clearDecoder() {
+            ignoreDecoder = true;
+            for (let i = events.length - 1; i >= 0; i--) {
+                if (['decoded','table','plot','probe','pick'].includes(events[i].type) || (events[i].type === 'error' && ['decode','table','plot','probe','pick'].includes(events[i].operation))) events.splice(i,1);
+            }
+            status.textContent = 'No fields yet. Select bytes to begin.';
+        },
         decoderDraft(text) { decoderSource = text; },
         pasteText() { return clipboardDialog('', true); },
         copyText(text) {

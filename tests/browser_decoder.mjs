@@ -70,7 +70,8 @@ console.log(`Browser WASM: YAML, lazy 40 GiB offsets, sparse edits, tables, exac
 
 // Incremental reverse engineering: a failed count-based guess can be replaced
 // with a header-only decoder, without consuming the unknown remainder.
-const headerBytes = new Uint8Array([0x45, 0x44, 0x46, 0x4c, 0, 0, 0, 0]);
+// Entirely fictional header; unrelated to any user file format.
+const headerBytes = new Uint8Array([0x44, 0x45, 0x4d, 0x4f, 0, 0, 0, 0]);
 globalThis.binwaveDecoder = {read(start,length) { return headerBytes.slice(Number(start), Number(start)+length); }};
 const headerSession = new bindings.DecoderSession('8');
 assert.throws(() => headerSession.decode(`endian: little
@@ -87,7 +88,7 @@ const partial = JSON.parse(headerSession.decode(`actions:
 `));
 assert.equal(partial.consumed, '4');
 assert.equal(partial.collections.length, 0);
-assert.equal(partial.nodes[0].value, 'EDFL');
+assert.equal(partial.nodes[0].value, 'DEMO');
 headerSession.free();
 
 // The shipped beginner pair must produce the documented plot and byte links.
@@ -151,3 +152,26 @@ if (process.argv[2]) {
         console.log('PWAV schema: 12 channels, exact 384-sample sine, and 128 overview amplitude bands passed.');
     } finally {closeSync(fd);}
 }
+
+// Direct interpretations use the real engine and preserve the prior session on failure.
+const variableBytes = new Uint8Array([3, 65, 66, 67, 0, 0, 0, 0]);
+globalThis.binwaveDecoder = {read(start,length) { return variableBytes.slice(Number(start), Number(start)+length); }};
+const variableSession = new bindings.DecoderSession('8');
+const variableYaml = `structures:
+  - name: Header
+    fields:
+      - {name: count, type: u8}
+      - {name: payload, type: bytes, length: {ref: count}}
+actions:
+  - read: {name: field, type: {structure: Header}, at: 0}
+`;
+const interpreted = JSON.parse(variableSession.decode_interpretation(variableYaml, 'field', '0', '8'));
+assert.equal(interpreted.nodes[0].end, '4');
+assert.equal(interpreted.nodes[0].children[1].start, '1');
+assert.equal(interpreted.nodes[0].children[1].end, '4');
+const previousStructure = JSON.parse(variableSession.table('field', '0'));
+assert.throws(() => variableSession.decode_interpretation(variableYaml, 'field', '0', '2'), /Selection is too short/);
+assert.throws(() => variableSession.decode_interpretation(variableYaml.replace('ref: count', 'ref: missing'), 'field', '0', '8'));
+assert.deepEqual(JSON.parse(variableSession.table('field', '0')), previousStructure, 'Failed interpretation must retain the published structure');
+variableSession.free();
+console.log('Browser WASM: custom structures, actual variable byte ranges, short selections and missing references passed.');

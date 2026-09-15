@@ -128,11 +128,12 @@ pub(crate) struct YamlLayoutCache {
     language: DecoderLanguage,
     edit_action: Option<&'static str>,
     paste: Arc<std::sync::Mutex<Option<String>>>,
+    paste_error: Option<String>,
 }
 impl YamlLayoutCache {
+    pub fn command(&mut self, action: &'static str) { self.edit_action = Some(action); }
     fn edit_menu(&mut self, ui: &mut Ui) {
         for action in ["Undo", "Redo", "Cut", "Copy", "Paste", "Select all", "Toggle comments"] {
-            if action == "Paste" && !cfg!(target_arch = "wasm32") { continue; }
             if ui.button(action).clicked() {
                 self.edit_action = Some(action);
                 ui.close_menu();
@@ -170,9 +171,7 @@ impl YamlLayoutCache {
     }
 
     pub(crate) fn editor(&mut self, ui: &mut Ui, yaml: &mut String, language: DecoderLanguage) {
-        ui.horizontal_wrapped(|ui| {
-            ui.menu_button("Edit", |ui| { self.edit_menu(ui); });
-        });
+        if let Some(error)=&self.paste_error { ui.colored_label(ui.visuals().error_fg_color,error); }
         if language == DecoderLanguage::Yaml {
             ui.horizontal_wrapped(|ui| {
                 let dark = ui.visuals().dark_mode;
@@ -224,6 +223,11 @@ impl YamlLayoutCache {
                             }
                             if let Some(action) = self.edit_action.take() {
                                 if action == "Paste" {
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    { match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+                                        Ok(text)=>{*self.paste.lock().unwrap()=Some(text);self.paste_error=None;ui.ctx().request_repaint();},
+                                        Err(error)=>self.paste_error=Some(format!("Could not paste: {error}. You can also use Ctrl+V.")),
+                                    }}
                                     #[cfg(target_arch = "wasm32")]
                                     {
                                         let pending = self.paste.clone();
@@ -665,45 +669,6 @@ mod highlighting_tests {
     }
 }
 
-/// Add an independent read without reserializing the user's comments or structures.
-#[cfg(any(test, target_arch = "wasm32"))]
-pub(crate) fn add_selected_read(source: &str, name: &str, kind: &str, start: u64, end: u64) -> Result<String, String> {
-    if name.trim().is_empty() || end <= start { return Err("Choose a name and a nonempty byte selection.".into()); }
-    let width = match kind { "bytes" | "text" | "u8" => 1, "u16" | "i16" => 2, "u32" | "i32" | "f32" => 4, "u64" | "f64" => 8, _ => return Err("Choose a supported type.".into()) };
-    let span = end - start;
-    if span % width != 0 { return Err(format!("The selection must contain a multiple of {width} bytes for {kind}.")); }
-    let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(source).map_err(|e| format!("Fix YAML syntax before adding a read: {e}"))?;
-    if value["actions"].as_sequence().is_some_and(|a| a.iter().any(|a| a["read"]["name"].as_str() == Some(name))) {
-        return Err(format!("A read named {name} already exists. Choose another name."));
-    }
-    let extra = if matches!(kind, "bytes" | "text") { format!(", length: {span}") }
-        else if span > width { format!(", repeat: {}", span / width) } else { String::new() };
-    let action = format!("  - read: {{name: {}, type: {kind}, at: {start}{extra}}}\n", serde_json::to_string(name).unwrap());
-    let mut result = String::new();
-    let mut found = false;
-    let mut in_actions = false;
-    let mut inserted = false;
-    for line in source.split_inclusive('\n') {
-        if line.starts_with("actions:") {
-            if found { return Err("Duplicate actions blocks.".into()); }
-            let tail = line[8..].trim();
-            if !(tail.is_empty() || tail.starts_with('#') || tail == "[]") { return Err("Expand actions into a YAML list before adding a read.".into()); }
-            found = true; in_actions = true;
-            if tail == "[]" { result.push_str("actions:\n"); } else { result.push_str(line); if !line.ends_with('\n') { result.push('\n'); } }
-            continue;
-        }
-        if in_actions && !line.starts_with(char::is_whitespace) && !line.starts_with('#') && !line.trim().is_empty() {
-            result.push_str(&action); inserted = true; in_actions = false;
-        }
-        result.push_str(line);
-    }
-    if !result.ends_with('\n') { result.push('\n'); }
-    if !found { result.push_str("actions:\n"); }
-    if !inserted { result.push_str(&action); }
-    crate::structure::Program::parse(&result).map_err(|e| e.to_string())?;
-    Ok(result)
-}
-
 #[cfg(test)]
 mod selected_read_tests {
     use super::*;
@@ -726,16 +691,5 @@ mod selected_read_tests {
         assert_eq!(text, "");
         edit_source(&ctx, id, &mut text, "Undo", None);
         assert_eq!(text, "ahelloz");
-    }
-    #[test]
-    fn adds_reads_preserving_comments_and_checks_width_and_names() {
-        let source = "# my notes\nendian: little\nactions: []\n";
-        let first = add_selected_read(source, "signature", "text", 0, 4).unwrap();
-        assert!(first.starts_with("# my notes\n"));
-        let next = add_selected_read(&first, "version", "u16", 4, 6).unwrap();
-        assert!(next.contains("at: 4"));
-        assert!(next.find("signature").unwrap() < next.find("version").unwrap());
-        assert!(add_selected_read(&next, "version", "u16", 6, 8).is_err());
-        assert!(add_selected_read(&next, "bad", "u32", 6, 9).is_err());
     }
 }

@@ -45,6 +45,8 @@ mod plotting;
 #[cfg(not(target_arch = "wasm32"))]
 mod python_decoder;
 mod source_editor;
+mod direct_authoring;
+mod app_menu;
 mod structure;
 mod structure_plot;
 mod structure_selection;

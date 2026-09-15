@@ -151,6 +151,7 @@ pub struct StructureWorkspace {
     decoded_ready: bool,
     explicit_apply_pending: bool,
     pending_source: Option<RunSource>,
+    interpretation_check: Option<crate::direct_authoring::Interpretation>,
     last_run_language: Option<DecoderLanguage>,
     run_finished: Option<RunOutcome>,
     source: Option<ByteView>,
@@ -218,6 +219,17 @@ impl StructureWorkspace {
     }
     pub fn clear_file(&mut self) {
         *self = Self::default();
+    }
+    /// Direct edits refresh results without requesting a tab or viewport change.
+    pub fn keep_navigation(&mut self) {
+        self.explicit_apply_pending = false;
+        self.decoded_ready = false;
+    }
+    pub fn apply_interpretation(&mut self, yaml: &str, source: ByteView, ctx: &Context, check: crate::direct_authoring::Interpretation) -> bool {
+        self.interpretation_check = Some(check);
+        let result = self.apply(yaml, source, ctx);
+        self.interpretation_check = None;
+        result
     }
     pub fn apply(&mut self, yaml: &str, source: ByteView, ctx: &Context) -> bool {
         self.stop_worker();
@@ -296,6 +308,7 @@ impl StructureWorkspace {
         self.started = Some(Instant::now());
         self.pending_revision = Some(source.revision);
         let ctx = ctx.clone();
+        let interpretation_check = self.interpretation_check.take();
         std::thread::spawn(move || {
             let result = source
                 .validate()
@@ -315,6 +328,7 @@ impl StructureWorkspace {
                         }
                         RunSource::Yaml(program) => {
                             let output = program.run(&source, &cancel)?;
+                            if let Some(check) = &interpretation_check { check.validate(&output)?; }
                             Decoded {
                                 data: Some((program, output)),
                                 stdout: String::new(),
@@ -505,12 +519,12 @@ impl StructureWorkspace {
             }
         }
     }
-    pub fn tree(&mut self, ui: &mut Ui, selection: Option<Range<usize>>) -> Option<Range<usize>> {
+    pub fn tree(&mut self, ui: &mut Ui, selection: Option<Range<usize>>, names: &mut dyn FnMut(&mut Ui, &Node) -> egui::Response) -> Option<Range<usize>> {
         self.selection = selection.clone();
         let selected = self
             .output
             .as_ref()
-            .and_then(|output| self.views.tree(ui, output, selection));
+            .and_then(|output| self.views.tree(ui, output, selection, names));
         if let Some(range) = &selected {
             self.selection = Some(range.clone());
         }
@@ -539,6 +553,13 @@ impl StructureWorkspace {
     pub fn take_plot_action(&mut self) -> Option<PlotAction> {
         self.views.take_plot_action()
     }
+    pub fn expand_root(&mut self, name: &str) {
+        if let Some(node) = self.output.as_ref().and_then(|o| o.nodes.iter().find(|n| n.name == name)) { self.views.expand(&node.path); }
+    }
+    pub fn root_range(&self, name: &str) -> Option<Range<usize>> {
+        self.output.as_ref()?.nodes.iter().find(|n| n.name == name).map(|n| n.range.clone())
+    }
+    pub fn code_action(&mut self, action: &'static str) { self.yaml_layout.command(action); }
     pub fn selected_node(&self) -> Option<Node> {
         self.output
             .as_ref()
@@ -3770,6 +3791,25 @@ actions:
             .contains_key("Record"));
         let invalid = "structures: [broken YAML";
         assert!(update_steps(invalid, StepChange::Remove(0)).is_err());
+    }
+
+    #[test]
+    fn interpretation_failure_preserves_published_structure() {
+        let source = bytes(&[3, 65, 66, 67, 0, 0, 0, 0]);
+        let ctx = Context::default();
+        let mut workspace = StructureWorkspace::default();
+        workspace.apply("actions: [{read: {name: previous, type: u8}}]", source.view(), &ctx);
+        settle(&mut workspace, source.view(), &ctx);
+        let yaml = "structures: [{name: Header, fields: [{name: count, type: u8}, {name: data, type: bytes, length: {ref: count}}]}]\nactions:\n  - read: {name: field, type: {structure: Header}, at: 0}\n";
+        workspace.apply_interpretation(yaml, source.view(), &ctx, crate::direct_authoring::Interpretation {name: "field".into(), range: 0..2});
+        settle(&mut workspace, source.view(), &ctx);
+        assert!(matches!(workspace.take_run_finished(), Some(RunOutcome::Failed(_))));
+        assert_eq!(workspace.root_range("previous"), Some(0..1));
+        assert_eq!(workspace.root_range("field"), None);
+        workspace.apply_interpretation(yaml, source.view(), &ctx, crate::direct_authoring::Interpretation {name: "field".into(), range: 0..8});
+        settle(&mut workspace, source.view(), &ctx);
+        assert!(matches!(workspace.take_run_finished(), Some(RunOutcome::Published)));
+        assert_eq!(workspace.root_range("field"), Some(0..4));
     }
 
     #[test]

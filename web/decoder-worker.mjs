@@ -9,7 +9,7 @@ self.onmessage = async ({data: m}) => {
             const bindings = await import(m.runtime.js);
             await bindings.default({module_or_path: m.runtime.wasm});
             session = new bindings.DecoderSession(String(m.file.size));
-            self.postMessage({type:'decoded', result:JSON.parse(session.decode(m.yaml))});
+            self.postMessage({type:'decoded', result:JSON.parse(m.interpretation ? session.decode_interpretation(m.yaml, m.interpretation.name, m.interpretation.start, m.interpretation.end) : session.decode(m.yaml))});
         } else if (m.type === 'pick') {
             self.postMessage({type:'pick', request:m.request, result:JSON.parse(session.pick(m.path, m.index))});
         } else if (m.type === 'probe') {

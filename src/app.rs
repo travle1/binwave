@@ -1057,16 +1057,16 @@ impl BinwaveApp {
             if self.decoder == Decoder::Layout {
                 self.binary.show_yaml();
             }
-            self.workspace.show_decoder();
+            if self.decoder != Decoder::Layout { self.workspace.show_decoder(); }
         }
         if self.binary.take_bytes_changed() {
             self.invalidate_csv_after_edit();
         }
+        if self.binary.take_interpretation_ready() { self.workspace.reveal(Pane::Structures); }
         let initial_plot_ready = self.binary.take_initial_plot_ready();
         if self.binary.take_layout_applied() {
             if initial_plot_ready {
                 self.workspace.show_initial_plot();
-                self.workspace.show_decoder();
             } else {
                 self.workspace.show_samples();
             }
@@ -1210,307 +1210,50 @@ impl BinwaveApp {
     }
 
     fn ui_toolbar(&mut self, ui: &mut Ui) {
-        let ctx = ui.ctx().clone();
-        let available = self.commands_available();
-        egui::menu::bar(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui
-                    .add_enabled(
-                        available,
-                        egui::Button::new("Open file…").shortcut_text("Ctrl+O"),
-                    )
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.choose_data_file(&ctx);
-                }
-                if ui
-                    .add_enabled(
-                        available && self.binary.has_file(),
-                        egui::Button::new("Save edited copy…").shortcut_text("Ctrl+Shift+S"),
-                    )
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.binary.save_copy(&ctx);
-                }
-                ui.separator();
-                if ui.add_enabled(available, egui::Button::new("Open simple demo")).clicked() {
-                    ui.close_menu();
-                    self.pending_config = None;
-                    self.binary.open_simple_demo(&ctx);
-                }
-                if ui
-                    .add_enabled(available, egui::Button::new("Open sensor demo"))
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.pending_config = None;
-                    self.binary.open_demo(&ctx);
-                }
-                if ui
-                    .add_enabled(available, egui::Button::new("Load CSV configuration…"))
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.choose_csv_config(&ctx);
-                }
-            });
-            ui.menu_button("Edit", |ui| {
-                self.binary.edit_menu(ui);
-                ui.separator();
-                if ui
-                    .add_enabled(
-                        available && self.binary.has_file(),
-                        egui::Button::new("Go to byte…").shortcut_text("Ctrl+G"),
-                    )
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.show_view(Pane::Hex);
-                    self.binary.jump_to_byte();
-                }
-                if ui
-                    .add_enabled(
-                        self.binary.has_file(),
-                        egui::Button::new("Find bytes or text…"),
-                    )
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.show_view(Pane::Hex);
-                    self.binary.find_bytes();
-                }
-                if ui
-                    .add_enabled(
-                        available && self.binary.has_selection(),
-                        egui::Button::new("Replace selected bytes…"),
-                    )
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.show_view(Pane::Hex);
-                    self.binary.replace_selected_bytes();
-                }
-            });
-            ui.menu_button("View", |ui| {
-                for pane in Pane::ALL {
-                    let open = self.workspace.dock.find_tab(&pane).is_some();
-                    if ui.selectable_label(open, pane.title()).clicked() {
-                        self.show_view(pane);
-                        ui.close_menu();
-                    }
-                }
-                ui.separator();
-                if ui.button("Decoder workspace").on_hover_text("Edit Python or YAML beside the source bytes, with decoded results below.").clicked() {
-                    if self.decoder == Decoder::Layout { self.binary.show_yaml(); }
-                    self.workspace = WorkspaceLayout::default();
-                    self.show_empty_workspace = true;
-                    ui.close_menu();
-                }
-                if ui.add_enabled(self.binary.has_file(), egui::Button::new("Plot and bytes workspace"))
-                    .on_hover_text("See the plot and selected bytes together, with decoded samples one tab away.")
-                    .clicked() {
-                    self.workspace = WorkspaceLayout::plot_and_bytes();
-                    self.show_empty_workspace = true;
-                    ui.close_menu();
-                }
-            });
-            ui.menu_button("Decode", |ui| {
-                if ui.button("Edit decoder").clicked() {
-                    ui.close_menu();
-                    if self.decoder == Decoder::Layout {
-                        self.binary.show_yaml();
-                    }
-                    self.show_view(Pane::Layout);
-                }
-                if ui
-                    .add_enabled(
-                        self.decoder == Decoder::Layout && !self.binary.is_python(),
-                        egui::Button::new("Edit decoding steps…"),
-                    )
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.decoder = Decoder::Layout;
-                    self.binary.show_steps();
-                    self.show_view(Pane::Layout);
-                }
-                if ui
-                    .add_enabled(
-                        self.binary.has_selection(),
-                        egui::Button::new(if self.binary.is_python() {
-                            "Copy Python read"
-                        } else {
-                            "Describe selected bytes…"
-                        }),
-                    )
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.decoder = Decoder::Layout;
-                    self.binary.define_selection(&ctx);
-                    self.show_view(Pane::Layout);
-                }
-                if ui
-                    .add_enabled(
-                        available
-                            && if self.decoder == Decoder::Csv {
-                                self.binary.source_path().is_some() && !self.binary.has_byte_edits()
-                            } else {
-                                self.binary.can_apply_definition()
-                            },
-                        egui::Button::new(if self.decoder == Decoder::Csv {
-                            "Apply CSV settings"
-                        } else if self.binary.is_python() {
-                            "Run script"
-                        } else {
-                            "Decode file"
-                        })
-                        .shortcut_text("F5"),
-                    )
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.run_active_decoder(&ctx);
-                }
-                if ui.button("Decoded samples").clicked() {
-                    ui.close_menu();
-                    self.show_view(Pane::Table);
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(available, egui::Button::new("Open decoder…"))
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.decoder = Decoder::Layout;
-                    self.binary.choose_definition(&ctx);
-                    self.show_view(Pane::Layout);
-                }
-                if ui
-                    .add_enabled(
-                        available
-                            && self.decoder == Decoder::Layout
-                            && self.binary.can_save_definition(),
-                        egui::Button::new("Save decoder…"),
-                    )
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.binary.save_definition(&ctx);
-                }
-                if ui
-                    .add_enabled(available, egui::Button::new("New YAML decoder"))
-                    .clicked()
-                {
-                    self.decoder = Decoder::Layout;
-                    self.binary.new_yaml(&ctx);
-                    self.show_view(Pane::Layout);
-                    ui.close_menu();
-                }
-                if ui
-                    .add_enabled(available, egui::Button::new("New Python script"))
-                    .clicked()
-                {
-                    self.decoder = Decoder::Layout;
-                    self.binary.new_python(&ctx);
-                    self.show_view(Pane::Layout);
-                    ui.close_menu();
-                }
-                ui.menu_button("Examples", |ui| {
-                    for (title, yaml) in crate::source_editor::YAML_EXAMPLES {
-                        if ui
-                            .add_enabled(available, egui::Button::new(*title))
-                            .clicked()
-                        {
-                            ui.close_menu();
-                            self.decoder = Decoder::Layout;
-                            self.binary.load_definition_text(yaml, &ctx);
-                            self.show_view(Pane::Layout);
-                        }
-                    }
-                    if ui
-                        .add_enabled(available, egui::Button::new("Advanced · Python waveform container"))
-                        .clicked()
-                    {
-                        self.decoder = Decoder::Layout;
-                        self.binary.load_python_text(
-                            include_str!("../samples/decoders/python/waveform.py"),
-                            &ctx,
-                        );
-                        self.show_view(Pane::Layout);
-                        ui.close_menu();
-                    }
-                });
-            });
-            ui.menu_button("Tools", |ui| {
-                if ui.add_enabled(self.loader_rx.is_none() && available, egui::Button::new("Clear disk cache")).on_hover_text("Remove disposable indexes and cached snapshots; open documents remain available.").clicked() {
-                    self.cache_message = Some(match crate::cache::clear() {
-                        Ok(()) => "Disk cache cleared. Open files remain available.".into(), Err(error) => format!("Cache: {error:#}"),
-                    });
-                    ui.close_menu();
-                }
-            });
-            ui.menu_button("Help", |ui| {
-                if ui.button("Decoding guide").clicked() {
-                    self.show_decoding_guide = true;
-                    ui.close_menu();
-                }
-            });
-        });
-        if !self.binary.has_file() {
-            return;
+        use crate::app_menu::{self, Command::*};
+        let ctx=ui.ctx().clone();
+        let available=self.commands_available();
+        let (undo,redo)=self.binary.menu_history();
+        let menus=app_menu::menus(&app_menu::State { native:true, available,
+            file:self.binary.has_file(), selection:self.binary.has_selection(), undo,redo,
+            save_decoder:self.decoder==Decoder::Layout && self.binary.can_save_definition(), apply:available && if self.decoder==Decoder::Csv { self.binary.source_path().is_some() && !self.binary.has_byte_edits() } else { self.binary.can_apply_definition() },
+            busy:self.binary.is_decoding(), });
+        if let Some((command,argument))=app_menu::native_bar(ui,&menus) {
+            if let Some(pane)=command.pane() {
+                if pane==Pane::Layout { self.binary.show_yaml(); }
+                self.show_view(pane);
+            } else if command.editor_action().is_some() {
+                self.binary.menu_action(command,&ctx); self.show_view(Pane::Layout);
+            } else { match command {
+                OpenFile => self.choose_data_file(&ctx),
+                SimpleDemo => { self.pending_config=None; self.binary.open_simple_demo(&ctx); },
+                SensorDemo => { self.pending_config=None; self.binary.open_demo(&ctx); },
+                SaveCopy => self.binary.save_copy(&ctx),
+                Extract | Undo | Redo | CopyHex => self.binary.menu_action(command,&ctx),
+                Cancel => self.binary.stop_decoding(),
+                OpenDecoder => { self.decoder=Decoder::Layout; self.binary.choose_definition(&ctx); self.show_view(Pane::Layout); },
+                SaveDecoder => self.binary.save_definition(&ctx),
+                NewDecoder => { self.decoder=Decoder::Layout; self.binary.new_yaml(&ctx); self.show_view(Pane::Layout); },
+                Apply => self.run_active_decoder(&ctx),
+                Example => if let Some((_,yaml))=crate::source_editor::YAML_EXAMPLES.get(argument) { self.decoder=Decoder::Layout; self.binary.load_definition_text(yaml,&ctx); self.show_view(Pane::Layout); },
+                Reset => { self.workspace=WorkspaceLayout::default(); self.show_empty_workspace=true; },
+                Steps => { self.decoder=Decoder::Layout; self.binary.show_steps(); self.show_view(Pane::Layout); },
+                Describe => { self.binary.define_selection(&ctx); self.show_view(Pane::Layout); },
+                Python => { self.decoder=Decoder::Layout; self.binary.new_python(&ctx); self.show_view(Pane::Layout); },
+                PythonExample => { self.decoder=Decoder::Layout; self.binary.load_python_text(include_str!("../samples/decoders/python/waveform.py"),&ctx); self.show_view(Pane::Layout); },
+                CsvConfig => self.choose_csv_config(&ctx),
+                Find => { self.show_view(Pane::Hex); self.binary.find_bytes(); },
+                Replace => { self.show_view(Pane::Hex); self.binary.replace_selected_bytes(); },
+                Jump => { self.show_view(Pane::Hex); self.binary.jump_to_byte(); },
+                ClearCache => { self.cache_message=Some(match crate::cache::clear() { Ok(())=>"Disk cache cleared. Open files remain available.".into(),Err(e)=>format!("Cache: {e:#}") }); },
+                Help => self.show_decoding_guide=true,
+                _ => {}
+            }}
         }
-        ui.horizontal_wrapped(|ui| {
-            let source = self.binary.source_path();
-            let title = source
-                .and_then(|path| path.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Embedded demo".into());
-            ui.strong(title).on_hover_text(
-                source
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default(),
-            );
-            let size = self.binary.file_len();
-            let label = if size >= 1_000_000_000 {
-                format!("{:.1} GB", size as f64 / 1_000_000_000.)
-            } else if size >= 1_000_000 {
-                format!("{:.1} MB", size as f64 / 1_000_000.)
-            } else if size >= 1_000 {
-                format!("{:.1} KB", size as f64 / 1_000.)
-            } else {
-                format!("{size} bytes")
-            };
-            ui.weak(label).on_hover_text(format!("{size} bytes"));
-            if self.binary.is_dirty() {
-                ui.colored_label(egui::Color32::YELLOW, "Unsaved changes");
-            }
-            ui.separator();
-            if ui
-                .button("Edit decoder")
-                .on_hover_text("Open the active decoder and its settings")
-                .clicked()
-            {
-                if self.decoder == Decoder::Layout {
-                    self.binary.show_yaml();
-                }
-                self.show_view(Pane::Layout);
-            }
-            let results = match self.displayed_decoder {
-                Decoder::Layout => self.binary.decoded_ready(),
-                Decoder::Csv => self.data.is_some(),
-            };
-            ui.add_enabled_ui(results, |ui| {
-                if ui.button("Show samples").clicked() {
-                    self.show_view(Pane::Table);
-                }
-                if ui.button("Show plot").clicked() {
-                    self.show_view(Pane::Plot);
-                }
-            });
-        });
+        if self.binary.has_file() {
+            let title=self.binary.source_path().and_then(|p|p.file_name()).map(|n|n.to_string_lossy().into_owned()).unwrap_or_else(||"Embedded demo".into());
+            ui.add(egui::Label::new(format!("{title} · {} bytes{}",self.binary.file_len(),if self.binary.is_dirty(){" · unsaved changes"}else{""})).truncate(true));
+        }
     }
 
     fn ui_workspace(&mut self, ctx: &Context) {
@@ -2793,7 +2536,7 @@ mod tests {
             if text(workspace_frame(&mut app, &ctx)).contains("Replace decoder") {
                 workspace_click(&mut app, &ctx, "Replace decoder");
             }
-            workspace_click(&mut app, &ctx, "Run script");
+            workspace_click(&mut app, &ctx, "Apply decoder");
             wait_csv(&mut app, &ctx);
             let deadline = Instant::now() + std::time::Duration::from_secs(5);
             while app.binary.is_decoding() {
@@ -2885,7 +2628,7 @@ mod tests {
         workspace_click(&mut app, &ctx, "Python");
         assert!(text(workspace_frame(&mut app, &ctx)).contains("hidden decoder must not run"));
         workspace_click(&mut app, &ctx, "YAML");
-        assert!(text(workspace_frame(&mut app, &ctx)).contains("Save YAML…"));
+        assert!(text(workspace_frame(&mut app, &ctx)).contains("Apply decoder"));
         workspace_click(&mut app, &ctx, "CSV");
         assert_eq!(app.cfg.csv.time_column, "value");
         assert!(app.loader_rx.is_none());
@@ -2980,8 +2723,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(top, ["File", "Edit", "View", "Decode", "Tools", "Help"]);
-        workspace_click(&mut app, &ctx, "File");
+        assert_eq!(top, ["Binwave", "Open data", "Decoder", "Edit", "View"]);
+        workspace_click(&mut app, &ctx, "Open data");
+        workspace_click(&mut app, &ctx, "Advanced");
         workspace_click(&mut app, &ctx, "Open sensor demo");
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         while !app.binary.has_file() {
@@ -3119,7 +2863,7 @@ mod tests {
                 })
                 .collect();
             let (surface, node, _) = app.workspace.dock.find_tab(&Pane::Hex).unwrap();
-            assert!(app.workspace.dock[surface][node].rect().unwrap().width() > 700.);
+            assert!(app.workspace.dock[surface][node].rect().unwrap().width() > 400.);
             let (surface, node, _) = app.workspace.dock.find_tab(&Pane::Inspector).unwrap();
             assert!(app.workspace.dock[surface][node].rect().unwrap().width() > 400.);
             let (surface, node, _) = app.workspace.dock.find_tab(&Pane::Hex).unwrap();
@@ -3599,6 +3343,8 @@ mod tests {
                 })
                 .collect()
         };
+        // Raw data starts with bytes and meaning. Source controls are one tab away.
+        workspace_click(&mut app, &ctx, "Code");
         let opened_output = workspace_frame(&mut app, &ctx);
         let (surface, node, _) = app.workspace.dock.find_tab(&Pane::Layout).unwrap();
         let decoder_rect = app.workspace.dock[surface][node].rect().unwrap();
@@ -3610,7 +3356,7 @@ mod tests {
             "the decoder should open directly in its source editor"
         );
         let opened = labels(opened_output);
-        for label in ["Decoder", "Open decoder…", "Decode file", "YAML"] {
+        for label in ["Code", "Apply decoder", "YAML"] {
             assert!(opened.iter().any(|text| text == label), "missing {label}");
         }
         assert!(!opened.iter().any(|text| text.contains("All definitions")));
@@ -3623,7 +3369,7 @@ mod tests {
             "loading must display source, without another tab click"
         );
         assert!(app.binary.showing_byte_preview());
-        workspace_click(&mut app, &ctx, "Decode file");
+        workspace_click(&mut app, &ctx, "Apply decoder");
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         while app.binary.is_decoding() {
             workspace_frame(&mut app, &ctx);
@@ -3640,7 +3386,8 @@ mod tests {
         let (_, editor, _) = app.workspace.dock.find_tab(&Pane::Layout).unwrap();
         let (_, samples, _) = app.workspace.dock.find_tab(&Pane::Table).unwrap();
         assert_ne!(editor, samples);
-        workspace_click(&mut app, &ctx, "Show plot");
+        workspace_click(&mut app, &ctx, "View");
+        workspace_click(&mut app, &ctx, "Plot");
         assert!(app.workspace.dock.find_tab(&Pane::Plot).is_some());
         let plotted = labels(workspace_frame(&mut app, &ctx));
         assert!(plotted.iter().any(|text| text.contains("structures:")));
@@ -3673,13 +3420,13 @@ mod tests {
                 _ => None,
             })
             .collect();
-        for label in ["Python", "Run script", "Console", "decoder.py"] {
+        for label in ["Python", "Apply decoder", "Console", "decoder.py"] {
             assert!(labels.contains(&label), "missing {label}");
         }
         assert!(!labels.contains(&"Fields") && !labels.contains(&"Steps"));
         assert!(!app.binary.is_decoding());
         assert!(app.binary.showing_byte_preview());
-        workspace_click(&mut app, &ctx, "Run script");
+        workspace_click(&mut app, &ctx, "Apply decoder");
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
         while app.binary.is_decoding() {
             workspace_frame(&mut app, &ctx);
@@ -3693,7 +3440,8 @@ mod tests {
         let (_, editor, _) = app.workspace.dock.find_tab(&Pane::Layout).unwrap();
         let (_, table, _) = app.workspace.dock.find_tab(&Pane::Table).unwrap();
         assert_ne!(editor, table);
-        workspace_click(&mut app, &ctx, "Show plot");
+        workspace_click(&mut app, &ctx, "View");
+        workspace_click(&mut app, &ctx, "Plot");
         assert!(app.workspace.dock.find_tab(&Pane::Plot).is_some());
     }
 
@@ -3715,7 +3463,7 @@ mod tests {
         }
         wait_byte_preview(&mut app, &ctx);
         app.binary.load_yaml(script, &ctx);
-        workspace_click(&mut app, &ctx, "Run script");
+        workspace_click(&mut app, &ctx, "Apply decoder");
         for _ in 0..30 {
             let output = workspace_frame(&mut app, &ctx);
             assert!(!output.shapes.is_empty());
@@ -3911,7 +3659,7 @@ mod tests {
         app.workspace = WorkspaceLayout::default();
         workspace_frame(&mut app, &ctx);
         capture_workspace(&mut app, &ctx, "python-ready");
-        workspace_click(&mut app, &ctx, "Run script");
+        workspace_click(&mut app, &ctx, "Apply decoder");
         let deadline = Instant::now() + std::time::Duration::from_secs(15);
         while !app.binary.decoded_ready() {
             workspace_frame(&mut app, &ctx);

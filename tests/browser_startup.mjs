@@ -27,13 +27,15 @@ function bridge(allowReplace = true) {
             return elements.get(id);
         },
     };
+    const menuState = {};
     const listeners = {};
     const window = {addEventListener(name, callback) { listeners[name] = callback; }, location: {href: 'http://localhost:8080/'}};
+    window.binwaveMenus={refresh(){},render(model,dispatch,allow){Object.assign(menuState,{model,dispatch,allow});}};
     class Worker { constructor() { worker = this; } postMessage(message) { commands.push(message); } }
     vm.runInNewContext(readFileSync(new URL('../web/bridge.js', import.meta.url), 'utf8'), {
         document, window, Worker, URL:BrowserURL, File, Blob, setTimeout() {}, confirm: () => allowReplace,
     });
-    return {listeners, created, savedBlob: () => savedBlob, receive: data => worker.onmessage({data}), commands, app: window.binwave, get: id => document.getElementById(id)};
+    return {menuState,listeners, created, savedBlob: () => savedBlob, receive: data => worker.onmessage({data}), commands, app: window.binwave, get: id => document.getElementById(id)};
 }
 
 test('file opening waits until the graphics workspace is ready', () => {
@@ -138,11 +140,11 @@ test('graphics fallback replaces the claimed canvas and gates controls until rea
 test('successful partial decode replaces a previous range error', () => {
     const {app, get, receive} = bridge();
     app.ready();
-    receive({type:'opened', name:'unknown.bin', size:'799659845', dirty:false, exportable:false});
+    receive({type:'opened', name:'unknown.bin', size:'1024', dirty:false, exportable:false});
     receive({type:'error', message:'read samples exceeds enclosing region'});
     assert.match(get('status').textContent, /exceeds/);
     receive({type:'decoded', result:{consumed:'4', collections:[], nodes:[]}});
-    assert.equal(get('status').textContent, 'Decoded 4 of 799659845 bytes · inspect Decoded structure');
+    assert.equal(get('status').textContent, 'Decoded 4 of 1024 bytes · inspect Decoded structure');
 });
 
 test('decoder save downloads the exact YAML without a filesystem picker', async () => {
@@ -172,4 +174,41 @@ test('save shortcut downloads the current decoder and suppresses browser Save Pa
     listeners.keydown({ctrlKey:true, key:'s', preventDefault(){prevented=true;}});
     assert.equal(prevented, true);
     assert.equal(await savedBlob().text(), 'actions: []\n');
+});
+
+test('clearing the decoder discards stale results and errors without hiding file errors', () => {
+    const {app, receive, get} = bridge();
+    app.ready();
+    app.send(JSON.stringify({type:'plot'}));
+    receive({type:'decoded', result:{consumed:'4',collections:[]}});
+    receive({type:'error',message:'old decoder error'});
+    app.clearDecoder();
+    assert.equal(app.poll(), '');
+    receive({type:'decoded',result:{consumed:'4',collections:[]}});
+    receive({type:'error',message:'late decoder error'});
+    assert.equal(app.poll(), '');
+    assert.match(get('status').textContent,/No fields yet/);
+    receive({type:'ready'});
+    app.send(JSON.stringify({type:'read',offset:'0',length:4}));
+    receive({type:'error',message:'File unavailable'});
+    assert.match(get('status').textContent,/File unavailable/);
+});
+
+
+test('shared menu file pickers stay synchronous and worker busy state disables mutations',()=>{
+    const h=bridge();h.app.ready();
+    h.app.menus('[]','example.bin · 16 bytes','Ready');
+    let clicked=false;h.get('file').click=()=>{clicked=true;};
+    h.menuState.dispatch('open_file',0);
+    assert.equal(clicked,true,'Picker must open on the original menu click stack');
+    assert.equal(h.get('file-context').textContent,'example.bin · 16 bytes');
+    h.app.send(JSON.stringify({type:'page',offset:'0'}));
+    assert.equal(h.menuState.allow('open_file',true),false);
+    assert.equal(h.menuState.allow('simple_demo',true),false);
+    assert.equal(h.menuState.allow('hex',true),true);
+});
+test('shared menu application commands enter the bounded UI mailbox',()=>{
+    const h=bridge();h.app.ready();h.app.menus('[]','','Ready');
+    h.menuState.dispatch('example',2);
+    assert.deepEqual(JSON.parse(h.app.poll()),{type:'menu',command:'example',argument:2});
 });

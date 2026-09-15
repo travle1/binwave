@@ -10,6 +10,8 @@ const PAGE: usize = 64 * 1024;
 extern "C" {
     #[wasm_bindgen(js_namespace = binwave, js_name = poll)]
     fn poll_event() -> String;
+    #[wasm_bindgen(js_namespace = binwave, js_name = menus)]
+    fn publish_menus(model: &str, file: &str, status: &str);
     #[wasm_bindgen(js_namespace = binwave, js_name = pasteText)]
     pub fn paste_text() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = binwave, js_name = copyText)]
@@ -18,6 +20,8 @@ extern "C" {
     fn save_decoder(text: &str);
     #[wasm_bindgen(js_namespace = binwave, js_name = decoderDraft)]
     fn decoder_draft(text: &str);
+    #[wasm_bindgen(js_namespace = binwave, js_name = clearDecoder)]
+    fn clear_decoder_status();
     #[wasm_bindgen(js_namespace = binwave, js_name = send)]
     fn send_command(command: &str) -> bool;
     #[wasm_bindgen(js_namespace = binwave, js_name = selection)]
@@ -43,6 +47,9 @@ struct Event {
     offset: String,
     bytes: Vec<u8>,
     message: String,
+    operation: String,
+    command: Option<crate::app_menu::Command>,
+    argument: usize,
     dirty: bool,
     demo: bool,
     undo: bool,
@@ -62,8 +69,11 @@ pub struct BrowserApp {
     jump: String,
     selected: Option<u64>,
     selection_anchor: Option<u64>,
-    field_name: String,
-    field_type: String,
+    authoring: crate::direct_authoring::DirectAuthoring,
+    authoring_pane: Pane,
+    inline_decode: bool,
+    direct_pending: Option<(String, crate::direct_authoring::Interpretation)>,
+    direct_error: Option<String>,
     selected_sample: Option<u64>,
     plot_visible: Option<[f64; 2]>,
     probe_request: u64,
@@ -106,7 +116,7 @@ impl BrowserApp {
             layout: cc
                 .storage
                 .map(|s| WorkspaceLayout::load(Some(s)))
-                .unwrap_or_else(WorkspaceLayout::plot_and_bytes),
+                .unwrap_or_default(),
             name: String::new(),
             size: 0,
             offset: 0,
@@ -115,8 +125,11 @@ impl BrowserApp {
             jump: "0".into(),
             selected: None,
             selection_anchor: None,
-            field_name: "field".into(),
-            field_type: "bytes".into(),
+            authoring: Default::default(),
+            authoring_pane: Pane::Hex,
+            inline_decode: false,
+            direct_pending: None,
+            direct_error: None,
             selected_sample: None,
             plot_visible: None,
             probe_request: 0,
@@ -132,11 +145,7 @@ impl BrowserApp {
                 .storage
                 .and_then(|s| s.get_string("browser-decoder-yaml"))
                 .filter(|s| s.len() <= 256 * 1024)
-                .unwrap_or_else(|| {
-                    crate::source_editor::DecoderLanguage::Yaml
-                        .starter()
-                        .into()
-                }),
+                .unwrap_or_else(|| "endian: little\nactions: []\n".into()),
             sent_yaml: None,
             applied_yaml: String::new(),
             decoding_yaml: String::new(),
@@ -199,7 +208,7 @@ impl BrowserApp {
                         self.range_end = "0".into();
                         self.navigate(0);
                         self.status =
-                            "File opened. Choose a YAML example or write a decoder, then press F5."
+                            "Select bytes to preview interpretations and name fields."
                                 .into();
                         if event.demo {
                             self.yaml = crate::source_editor::DecoderLanguage::Yaml.starter().into();
@@ -231,6 +240,7 @@ impl BrowserApp {
                         }
                     }
                 }
+                "menu" => if let Some(command)=event.command { self.menu_action(command,event.argument); },
                 "decoder-source" => {
                     if event.source.len() <= 256 * 1024 {
                         self.yaml = event.source;
@@ -242,20 +252,37 @@ impl BrowserApp {
                     }
                 }
                 "decoded" => {
+                    if let Some((before, interpretation)) = self.direct_pending.take() {
+                        if self.yaml != before { self.decoding = false; continue; }
+                        self.yaml = self.decoding_yaml.clone();
+                        self.authoring.created(interpretation.name.clone());
+                        if let Some(node) = event.result["nodes"].as_array().and_then(|nodes| nodes.iter().find(|n| n["name"].as_str() == Some(&interpretation.name))) {
+                            if let Some((start, end)) = node["start"].as_str().and_then(parse_offset).zip(node["end"].as_str().and_then(parse_offset)) { self.select_range(start, end); }
+                        }
+                        self.authoring_pane = Pane::Structures;
+                        self.layout.reveal(Pane::Structures);
+                        self.mobile_target = Some(Pane::Structures);
+                    } else if crate::direct_authoring::empty_draft(&self.yaml) { continue; }
+                    self.direct_error = None;
                     self.applied_yaml = self.decoding_yaml.clone();
                     self.decoding = false;
                     self.decoded = event.result;
                     self.table = Default::default();
                     self.plot = Default::default();
-                    self.reveal_results = true;
+                    let inline = std::mem::take(&mut self.inline_decode);
+                    self.reveal_results |= !inline;
                     let path = self.decoded["collections"]
                         .as_array()
                         .and_then(|a| a.first())
                         .and_then(|v| v["path"].as_str())
                         .unwrap_or("")
                         .to_owned();
-                    self.select_collection(path);
-                    self.mobile_target = Some(if self.collection.is_empty() { Pane::Structures } else { Pane::Plot });
+                    if inline && !self.collection.is_empty() && self.decoded["collections"].as_array().is_some_and(|a| a.iter().any(|v| v["path"].as_str() == Some(&self.collection))) {
+                        self.table_start = self.table_start.min(self.count().saturating_sub(1));
+                        self.request_table();
+                        self.request_plot_view(1200, false);
+                    } else { self.select_collection(path); }
+                    if !inline { self.mobile_target = Some(if self.collection.is_empty() { Pane::Structures } else { Pane::Plot }); }
                     self.status = format!("Decoded {} of {} bytes. {}", self.decoded["consumed"].as_str().unwrap_or("0"), self.size,
                         if self.collection.is_empty() { "Inspect the fields in Decoded structure; unread bytes are allowed." }
                         else { "Select samples to inspect their values and bytes." });
@@ -307,6 +334,10 @@ impl BrowserApp {
                     }
                 }
                 "error" => {
+                    if self.direct_pending.is_none() && crate::direct_authoring::empty_draft(&self.yaml) && matches!(event.operation.as_str(), "decode" | "table" | "plot" | "probe" | "pick") { continue; }
+                    self.direct_pending = None;
+                    if self.inline_decode { self.direct_error = Some(event.message.clone()); }
+                    self.inline_decode = false;
                     self.decoding = false;
                     self.pending.clear();
                     self.status = event.message;
@@ -327,6 +358,14 @@ impl BrowserApp {
         }
     }
     fn hex(&mut self, ui: &mut egui::Ui) {
+        if self.name.is_empty() {
+            ui.heading("Explore your data");
+            ui.label("Open data above, then select bytes to discover their meaning.");
+            if ui.button("Try simple demo").clicked() { self.open_simple_demo(); }
+            ui.small("512 synthetic samples · 2 KB");
+            return;
+        }
+        self.direct_controls(ui, Pane::Hex);
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(self.offset > 0, egui::Button::new("Previous page"))
@@ -439,7 +478,40 @@ impl BrowserApp {
                 }
             });
     }
+    fn direct_controls(&mut self, ui: &mut egui::Ui, pane: Pane) {
+        if pane != self.authoring_pane { return; }
+        let range = parse_offset(&self.range_start).zip(parse_offset(&self.range_end)).map(|(a,b)| a..b);
+        let preview = range.as_ref().and_then(|r| r.start.checked_sub(self.offset).and_then(|n| usize::try_from(n).ok())
+            .and_then(|start| self.bytes.get(start..).map(|bytes| bytes[..bytes.len().min((r.end.saturating_sub(r.start)).min(64) as usize)].to_vec())));
+        let placeholder = self.yaml == crate::source_editor::DecoderLanguage::Yaml.starter() && self.decoded.is_null();
+        let source = if placeholder { "endian: little\nactions: []\n" } else { &self.yaml };
+        let mut edit = None;
+        ui.add_enabled_ui(!self.decoding, |ui| {
+            edit = self.authoring.ui(ui, source, range, preview.as_deref(), self.size);
+        });
+        if let Some(error) = &self.direct_error { ui.colored_label(ui.visuals().error_fg_color, error); }
+        match edit {
+            Some(crate::direct_authoring::Edit::Commit(source)) => {
+                self.yaml = source;
+                let empty = crate::direct_authoring::empty_draft(&self.yaml);
+                if empty { self.reset_decoder(); }
+                else { self.apply_decoder(); self.inline_decode = true; }
+            }
+            Some(crate::direct_authoring::Edit::Interpret(source, interpretation)) => {
+                self.direct_pending = Some((self.yaml.clone(), interpretation.clone()));
+                self.direct_error = None;
+                self.pending.clear(); self.decoding = true; self.inline_decode = true;
+                self.decoding_yaml = source.clone();
+                self.queue(serde_json::json!({"type":"decode", "yaml":source, "interpretation": {
+                    "name": interpretation.name, "start": interpretation.range.start.to_string(), "end": interpretation.range.end.to_string()
+                }}));
+            },
+            Some(crate::direct_authoring::Edit::Code) => self.reveal_decoder = true,
+            None => {}
+        }
+    }
     fn set_hex_range(&mut self, start: u64, end: u64) {
+        self.authoring_pane = Pane::Hex;
         self.selected = Some(start);
         self.range_start = start.to_string();
         self.range_end = end.to_string();
@@ -448,17 +520,11 @@ impl BrowserApp {
     }
     fn hex_menu(&mut self, ui: &mut egui::Ui) {
         if ui.button("Copy selected hex").clicked() {
-            let start = parse_offset(&self.range_start).unwrap_or(0);
-            let end = parse_offset(&self.range_end).unwrap_or(start);
-            if start >= self.offset && end <= self.offset + self.bytes.len() as u64 {
-                copy_text(&self.bytes[(start-self.offset) as usize..(end-self.offset) as usize]
-                    .iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" "));
-            } else { self.status = "Copy supports the loaded 64 KiB page; use Extract selection for larger ranges.".into(); }
+            self.copy_selected_hex();
             ui.close_menu();
         }
-        if ui.button("Describe selection…").clicked() {
-            self.reveal_inspector = true;
-            self.mobile_target = Some(Pane::Inspector);
+        if ui.button("Interpret selected bytes").clicked() {
+            self.status = "Choose a type beside the byte selection, then name the field and press Enter.".into();
             ui.close_menu();
         }
         if ui.button("Select loaded page").clicked() {
@@ -468,25 +534,6 @@ impl BrowserApp {
         }
     }
     fn inspector(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Describe selection");
-        ui.label("Add a named read at the selected byte offset. Existing reads stay in the decoder.");
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Name"); ui.text_edit_singleline(&mut self.field_name);
-            egui::ComboBox::from_id_source("selection-type").selected_text(&self.field_type).show_ui(ui, |ui| {
-                for kind in ["bytes", "text", "u8", "u16", "u32", "u64", "i16", "i32", "f32", "f64"] {
-                    ui.selectable_value(&mut self.field_type, kind.into(), kind);
-                }
-            });
-        });
-        if ui.button("Add read to YAML").clicked() {
-            let start = parse_offset(&self.range_start).unwrap_or(0);
-            let end = parse_offset(&self.range_end).unwrap_or(0);
-            match crate::source_editor::add_selected_read(&self.yaml, &self.field_name, &self.field_type, start, end) {
-                Ok(yaml) => { self.yaml = yaml; self.reveal_decoder = true; self.status = "Read added. Apply to inspect it; continue selecting and naming more bytes.".into(); }
-                Err(error) => self.status = error,
-            }
-        }
-        ui.separator();
         if let Some(at) = self.selected {
             ui.monospace(format!("Selected byte: {at} / 0x{at:X}"));
             ui.horizontal_wrapped(|ui| {
@@ -524,7 +571,20 @@ impl BrowserApp {
         }
         ui.label("Edits are sparse: up to 65,536 byte positions and 4,096 undo steps. Unsaved edits are lost on reload.");
     }
+    fn reset_decoder(&mut self) {
+        if self.decoding { self.command(serde_json::json!({"type":"cancel"})); }
+        self.direct_pending = None;
+        self.clear_results();
+        self.applied_yaml.clear();
+        self.decoding_yaml.clear();
+        self.direct_error = None;
+        self.inline_decode = false;
+        self.reveal_results = false;
+        self.status = "No fields yet. Select bytes, choose a type, and name the field.".into();
+        clear_decoder_status();
+    }
     fn clear_results(&mut self) {
+        self.direct_pending = None;
         self.selected_sample = None;
         self.probe_request = self.probe_request.wrapping_add(1);
         self.decoded = Default::default();
@@ -541,6 +601,10 @@ impl BrowserApp {
         }
     }
     fn apply_decoder(&mut self) {
+        self.direct_pending = None;
+        if crate::direct_authoring::empty_draft(&self.yaml) { self.reset_decoder(); return; }
+        self.inline_decode = false;
+        self.direct_error = None;
         if self.name.is_empty() {
             self.status = "Open a file first.".into();
             return;
@@ -614,67 +678,38 @@ impl BrowserApp {
         export_selection(&self.range_start, &self.range_end);
         self.navigate(start);
     }
+    fn menu_action(&mut self, command: crate::app_menu::Command, argument: usize) {
+        use crate::app_menu::Command::*;
+        if let Some(pane)=command.pane() { self.layout.reveal(pane); self.mobile_target=Some(pane); return; }
+        if let Some(action)=command.editor_action() { self.editor.command(action); self.layout.reveal(Pane::Layout); self.mobile_target=Some(Pane::Layout); return; }
+        match command {
+            SimpleDemo=>self.open_simple_demo(),
+            SaveDecoder=>save_decoder(&self.yaml),
+            NewDecoder=>{self.yaml="endian: little\nactions: []\n".into();self.reset_decoder();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
+            Apply=>self.apply_decoder(),
+            Example=>if let Some((_,yaml))=crate::source_editor::YAML_EXAMPLES.get(argument) {self.yaml=(*yaml).into();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
+            Undo=>{self.command(serde_json::json!({"type":"undo"}));},
+            Redo=>{self.command(serde_json::json!({"type":"redo"}));},
+            CopyHex=>self.copy_selected_hex(),
+            Cancel=>{self.pending.clear();self.command(serde_json::json!({"type":"cancel"}));self.decoding=false;self.direct_pending=None;},
+            Reset=>{self.layout=WorkspaceLayout::default();self.layout_mode="auto".into();},
+            Auto=>self.layout_mode="auto".into(), Stacked=>self.layout_mode="stacked".into(), Docked=>self.layout_mode="docked".into(),
+            _=>{}
+        }
+    }
+    fn copy_selected_hex(&mut self) {
+        let start=parse_offset(&self.range_start).unwrap_or(0);
+        let end=parse_offset(&self.range_end).unwrap_or(start);
+        if start>=self.offset && end<=self.offset+self.bytes.len() as u64 && end>=start {
+            copy_text(&self.bytes[(start-self.offset) as usize..(end-self.offset) as usize].iter().map(|b|format!("{b:02X}")).collect::<Vec<_>>().join(" "));
+        } else {self.status="Copy supports the loaded 64 KiB page; use Extract selection for larger ranges.".into();}
+    }
     fn open_simple_demo(&self) {
         open_embedded_demo(include_bytes!("../samples/quickstart/simple_wave.bin"),
             self.yaml != crate::source_editor::DecoderLanguage::Yaml.starter());
     }
     fn decoder(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.strong("YAML");
-            if ui.button("Save YAML…").clicked() { save_decoder(&self.yaml); }
-            ui.menu_button("New decoder…", |ui| {
-                ui.label("Save your current YAML first if you want to keep it.");
-                if ui.button("Start empty decoder").clicked() {
-                    self.yaml = "endian: little\nactions: []\n".into();
-                    self.status = "Select bytes in Hex, then use Describe selection to add a read.".into();
-                    ui.close_menu();
-                }
-            });
-            if ui
-                .add_enabled(!self.decoding, egui::Button::new(if self.stacked { "Apply" } else { "Apply · F5" }))
-                .clicked()
-            {
-                self.apply_decoder();
-            }
-            if self.decoding && ui.button("Stop").clicked() {
-                self.pending.clear();
-                self.command(serde_json::json!({"type":"cancel"}));
-                self.decoding = false;
-            }
-            egui::ComboBox::from_id_source("decoder-example")
-                .selected_text("Examples")
-                .show_ui(ui, |ui| {
-                    if ui.button("Open simple demo · data + decoder").clicked() {
-                        self.open_simple_demo();
-                    }
-                    ui.separator();
-                    for (title, yaml) in crate::source_editor::YAML_EXAMPLES {
-                        if ui.button(*title).clicked() {
-                            self.yaml = (*yaml).into();
-                        }
-                    }
-                    if ui.button("Unsigned byte samples").clicked() {
-                        self.yaml = crate::source_editor::DecoderLanguage::Yaml
-                            .byte_preview()
-                            .into();
-                    }
-                    if ui.button("Signed 16-bit samples").clicked() {
-                        self.yaml = crate::source_editor::DecoderLanguage::Yaml
-                            .byte_preview()
-                            .replace("type: u8", "type: i16");
-                    }
-                    if ui.button("Float32 samples").clicked() {
-                        self.yaml = crate::source_editor::DecoderLanguage::Yaml
-                            .byte_preview()
-                            .replace("type: u8", "type: f32");
-                    }
-                    if ui.button("Header and records").clicked() {
-                        self.yaml = crate::source_editor::DecoderLanguage::Yaml
-                            .header_example()
-                            .replace("# ", "");
-                    }
-                });
-        });
+        if let Some(command)=crate::app_menu::decoder_controls(ui,!self.decoding && !self.name.is_empty(),self.decoding) { self.menu_action(command,0); }
         if self.size == 0 {
             if ui.button("Open simple demo").clicked() {
                 self.open_simple_demo();
@@ -786,14 +821,24 @@ impl BrowserApp {
         }
     }
     fn structures(&mut self, ui: &mut egui::Ui) {
-        fn tree(ui: &mut egui::Ui, node: &serde_json::Value, selection: &mut Option<(u64, u64)>) {
-            let label = format!(
-                "{}: {}  {}",
-                node["name"].as_str().unwrap_or(""),
-                node["kind"].as_str().unwrap_or(""),
-                node["value"].as_str().unwrap_or("")
-            );
+        self.direct_controls(ui, Pane::Structures);
+        fn tree(ui: &mut egui::Ui, node: &serde_json::Value, selection: &mut Option<(u64, u64)>, authoring: &mut crate::direct_authoring::DirectAuthoring, source: &str, edit: &mut Option<crate::direct_authoring::Edit>) {
+            let range = node["start"].as_str().and_then(parse_offset).zip(node["end"].as_str().and_then(parse_offset));
+            ui.push_id(node["path"].as_str().unwrap_or(""), |ui| {
+                ui.horizontal(|ui| {
+                    if let Some((start, end)) = range {
+                        let name = node["name"].as_str().unwrap_or("");
+                        let (response, change) = if node["path"].as_str() == Some(name) { authoring.name_ui(ui, source, name, start..end) } else { (ui.selectable_label(false, name), None) };
+                        if response.clicked() { *selection = Some((start,end)); }
+                        if change.is_some() { *edit = change; }
+                    }
+                    if ui.selectable_label(false, format!(": {}  {}", node["kind"].as_str().unwrap_or(""), node["value"].as_str().unwrap_or(""))).clicked() { *selection = range; }
+                });
+            });
+            if node["children"].as_array().is_some_and(|c| c.is_empty()) && node["count"].is_null() { return; }
+            let label = "Fields";
             egui::CollapsingHeader::new(label)
+                .default_open(authoring.editing(node["name"].as_str().unwrap_or("")))
                 .id_source(node["path"].as_str().unwrap_or(""))
                 .show(ui, |ui| {
                     if ui
@@ -816,28 +861,34 @@ impl BrowserApp {
                     }
                     if let Some(children) = node["children"].as_array() {
                         for child in children {
-                            tree(ui, child, selection);
+                            tree(ui, child, selection, authoring, source, edit);
                         }
                     }
                 });
         }
         let mut selection = None;
+        let mut edit = None;
         egui::ScrollArea::both().show(ui, |ui| {
             if let Some(nodes) = self.decoded["nodes"].as_array() {
                 for node in nodes {
-                    tree(ui, node, &mut selection);
+                    tree(ui, node, &mut selection, &mut self.authoring, &self.yaml, &mut edit);
                 }
             } else {
-                ui.label("Apply a decoder to inspect structures.");
+                ui.label("Select bytes in Hex and name a field; its decoded value will appear here.");
             }
         });
+        if let Some(crate::direct_authoring::Edit::Commit(source)) = edit { self.yaml = source; self.apply_decoder(); self.inline_decode = true; }
         if let Some((start, end)) = selection {
             self.select_range(start, end);
+            self.authoring_pane = Pane::Structures;
         }
     }
     fn decoded_plot(&mut self, ui: &mut egui::Ui) {
+        if !self.decoded.is_null() && self.yaml != self.applied_yaml {
+            ui.weak("Previous results. Apply the edited code to refresh.");
+        }
         if self.collection.is_empty() {
-            ui.label(if self.decoded.is_null() { "Apply a decoder to inspect this file." }
+            ui.label(if self.decoded.is_null() { "Name fields in Hex to begin. Repeated numeric fields can be plotted here." }
                 else { "Fields decoded successfully. Inspect Decoded structure; add repeated numeric samples when ready to plot." });
             return;
         }
@@ -960,46 +1011,11 @@ impl eframe::App for BrowserApp {
             }
             self.reveal_results = false;
         }
-        egui::TopBottomPanel::top("browser-menu").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.strong("Binwave");
-                ui.menu_button("Workspace", |ui| {
-                egui::ComboBox::from_id_source("browser-layout-mode").selected_text(match self.layout_mode.as_str() {
-                    "stacked" => "Stacked", "docked" => "Docked", _ => "Layout: Auto",
-                }).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.layout_mode,"auto".into(),"Auto");
-                    ui.selectable_value(&mut self.layout_mode,"stacked".into(),"Stacked");
-                    ui.selectable_value(&mut self.layout_mode,"docked".into(),"Docked");
-                });
-                if ui.button("Reset workspace").clicked() {
-                    self.layout = WorkspaceLayout::plot_and_bytes();
-                }
-                if ui
-                    .add_enabled(self.undo, egui::Button::new("Undo"))
-                    .clicked()
-                {
-                    self.command(serde_json::json!({"type":"undo"}));
-                }
-                if ui
-                    .add_enabled(self.redo, egui::Button::new("Redo"))
-                    .clicked()
-                {
-                    self.command(serde_json::json!({"type":"redo"}));
-                }
-                });
-                if !self.name.is_empty() { ui.add(egui::Label::new(format!(
-                    "{} · {} bytes{}",
-                    self.name,
-                    self.size,
-                    if self.dirty { " · unsaved edits" } else { "" }
-                )).truncate(true)); }
-            });
+        let menus=crate::app_menu::menus(&crate::app_menu::State {
+            available:!self.decoding, file:!self.name.is_empty(), selection:parse_offset(&self.range_start).zip(parse_offset(&self.range_end)).is_some_and(|(a,b)| a<b),
+            undo:self.undo, redo:self.redo, save_decoder:!self.yaml.trim().is_empty(), apply:!self.decoding && !self.name.is_empty(), busy:self.decoding, ..Default::default()
         });
-        if !self.stacked || !self.name.is_empty() {
-        egui::TopBottomPanel::bottom("browser-status").show(ctx, |ui| {
-            ui.add(egui::Label::new(&self.status).truncate(true));
-        });
-        }
+        publish_menus(&serde_json::to_string(&menus).unwrap(), &if self.name.is_empty() { String::new() } else { format!("{} · {} bytes{}",self.name,self.size,if self.dirty {" · unsaved changes"}else{""}) }, &self.status);
         if self.stacked {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.spacing_mut().interact_size.y = 32.;
@@ -1009,12 +1025,12 @@ impl eframe::App for BrowserApp {
                     let width = ui.available_width();
                     let editor_height = (ui.clip_rect().height()-56.).clamp(300.,560.);
                     for (pane, height, open) in [
-                        (Pane::Layout, editor_height, true), (Pane::Plot, 430., true),
-                        (Pane::Table, 310., true), (Pane::Hex, 290., true),
-                        (Pane::Structures, 300., false), (Pane::Inspector, 300., false),
+                        (Pane::Hex, 380., true), (Pane::Structures, 380., true),
+                        (Pane::Layout, editor_height, false), (Pane::Plot, 430., true),
+                        (Pane::Table, 310., false), (Pane::Inspector, 300., false),
                     ] {
                         if pane != Pane::Layout && self.name.is_empty() { continue; }
-                        if matches!(pane, Pane::Plot | Pane::Table | Pane::Structures) && self.decoded.is_null() { continue; }
+                        if matches!(pane, Pane::Plot | Pane::Table) && self.collection.is_empty() { continue; }
                         ui.push_id(("mobile-pane", pane), |ui| {
                             let header = egui::CollapsingHeader::new(egui::RichText::new(pane.title()).strong())
                                 .default_open(open).open(if target == Some(pane) { Some(true) } else { None })
@@ -1038,6 +1054,7 @@ impl eframe::App for BrowserApp {
             self.layout = layout;
         }
         if self.sent_yaml.as_ref() != Some(&self.yaml) {
+            if crate::direct_authoring::empty_draft(&self.yaml) { self.reset_decoder(); }
             decoder_draft(&self.yaml);
             self.sent_yaml = Some(self.yaml.clone());
         }

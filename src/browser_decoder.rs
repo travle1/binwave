@@ -112,8 +112,14 @@ impl DecoderSession {
         })
     }
     pub fn decode(&mut self, yaml: &str) -> Result<String, JsValue> {
+        self.decode_interpretation(yaml, "", "0", "0")
+    }
+    pub fn decode_interpretation(&mut self, yaml: &str, name: &str, start: &str, end: &str) -> Result<String, JsValue> {
         (|| {
             let output = Program::parse(yaml)?.run(&self.source, &AtomicBool::new(false))?;
+            if !name.is_empty() {
+                crate::direct_authoring::Interpretation { name: name.into(), range: start.parse()?..end.parse()? }.validate(&output)?;
+            }
             let mut arrays = Vec::new();
             collections(&output.nodes, &mut arrays);
             let result = json_result(

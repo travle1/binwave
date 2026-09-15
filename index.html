@@ -12,24 +12,36 @@
   <style>
     html, body { margin: 0; height: 100%; overflow: hidden; background: #202020; color: #eee; font: 14px system-ui; }
     body { display: flex; flex-direction: column; height: 100dvh; }
-    header { flex-shrink: 0; height: 48px; box-sizing: border-box; display: flex; align-items: center; gap: 10px; padding: 8px; overflow-x: auto; }
-    button { padding: 5px 12px; flex-shrink: 0; white-space: nowrap; } #status { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-    #workspace { position: relative; flex: 1; min-height: 0; width: 100%; }
-    button, summary { -webkit-appearance: none; appearance: none; font: inherit; color: #e9edef; background: #303438; border: 1px solid #4a5055; border-radius: 7px; }
-    button:disabled { color: #858c91; background: #25282b; border-color: #353a3e; }
-    button:focus-visible, summary:focus-visible { outline: 2px solid #61d5c8; outline-offset: 2px; }
-    #file-more { position: relative; flex-shrink: 0; }
-    #file-more summary { list-style: none; cursor: pointer; padding: 5px 12px; }
-    #file-more summary::-webkit-details-marker { display: none; }
-    #file-more .actions { position: absolute; right: 0; top: calc(100% + 8px); z-index: 20; width: 210px; padding: 8px; display: grid; gap: 8px; background: #202427; border: 1px solid #4a5055; border-radius: 9px; box-shadow: 0 8px 24px #0008; }
-    header { overflow: visible; z-index: 10; }
+    header { flex-shrink: 0; position: relative; z-index: 10; padding: 6px 12px; border-bottom: 1px solid #3b3b3b; }
+    .menu-row { display:flex; align-items:center; min-height:32px; gap:14px; }
+    .brand { font-weight:600; font-size:16px; }
+    #app-menus { display:flex; gap:4px; }
+    button, summary { -webkit-appearance:none; appearance:none; font:inherit; color:#eee; }
+    button { background:#292929; border:1px solid #484848; border-radius:3px; padding:6px 10px; }
+    button:disabled { color:#777; }
+    button:focus-visible, summary:focus-visible { outline:2px solid #61cbd6; outline-offset:-2px; }
+    summary { cursor:pointer; list-style:none; padding:7px 10px; border-radius:3px; white-space:nowrap; }
+    summary::-webkit-details-marker { display:none; }
+    summary:hover, details[open]>summary, .menu-items button:hover:not(:disabled) { background:#383838; }
+    .app-menu { position:relative; }
+    .menu-items { display:grid; gap:2px; padding:5px; background:#242424; border:1px solid #484848; border-radius:4px; }
+    .app-menu>.menu-items { position:absolute; left:0; top:calc(100% + 4px); min-width:220px; max-height:70dvh; overflow:auto; box-shadow:0 5px 16px #0006; }
+    details:not([open])>.menu-items { display:none; }
+    .menu-items button { border:0; border-radius:2px; text-align:left; background:transparent; min-height:30px; white-space:normal; }
+    .submenu>summary:after { content:' +'; color:#999; }
+    .submenu[open]>summary:after { content:' -'; }
+    .submenu>.menu-items { border:0; border-left:1px solid #484848; margin-left:10px; }
+    #file-context { font-size:12px; color:#aaa; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+    #file-context:empty { display:none; }
+    #status { margin:0; padding:3px 12px; color:#aaa; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:12px; }
+    #workspace { position:relative; flex:1; min-height:0; width:100%; }
     @media (max-width: 899px) {
-      header { height: auto; display: flex; flex-wrap: wrap; gap: 8px; padding: 8px max(10px, env(safe-area-inset-right)) 8px max(10px, env(safe-area-inset-left)); border-bottom: 1px solid #353a3e; }
-      #open, #open-decoder { flex: 1; min-width: 0; min-height: 40px; padding: 8px 10px; }
-      #file-more summary { height: 40px; box-sizing: border-box; display: flex; align-items: center; }
-      #file-more button { min-height: 40px; text-align: left; }
-      #status { flex-basis: 100%; font-size: 12px; color: #b6bec3; }
-      #workspace { padding-bottom: env(safe-area-inset-bottom); box-sizing: border-box; }
+      header { padding:4px max(8px, env(safe-area-inset-right)) 4px max(8px, env(safe-area-inset-left)); }
+      .brand { display:none; }
+      #app-menus { width:100%; justify-content:space-between; }
+      summary, .menu-items button { min-height:40px; box-sizing:border-box; display:flex; align-items:center; }
+      .app-menu>.menu-items { position:fixed; left:8px; right:8px; top:50px; width:auto; min-width:0; }
+      #workspace { padding-bottom:env(safe-area-inset-bottom); box-sizing:border-box; }
     }
     #binwave:not([hidden]) { display: block; }
     #graphics-error { max-width: 680px; margin: 48px auto; padding: 24px; background: #292929; border-radius: 8px; }
@@ -37,19 +49,15 @@
   </style>
 </head>
 <body>
-  <header aria-label="File operations">
-    <button id="open" disabled>Open data…</button><input type="file" id="file" hidden>
-    <button id="open-decoder" disabled>Decoder…</button><input type="file" id="decoder-file" aria-label="Choose a YAML decoder" hidden>
-    <details id="file-more">
-      <summary aria-label="More file actions">More</summary>
-      <div class="actions">
-        <button id="save" disabled>Save edited copy…</button>
-        <button id="extract" disabled>Extract selection…</button>
-        <button id="cancel" disabled>Cancel operation</button>
-      </div>
-    </details>
-    <span id="status" role="status">Starting Binwave…</span>
+  <header aria-label="Application commands">
+    <div class="menu-row"><span class="brand">Binwave</span><nav id="app-menus" aria-label="Main menu"></nav></div>
+    <div id="file-context"></div>
   </header>
+  <div hidden aria-hidden="true">
+    <button id="open" disabled>Open file...</button><input type="file" id="file">
+    <button id="open-decoder" disabled>Open decoder...</button><input type="file" id="decoder-file" aria-label="Choose a YAML decoder">
+    <button id="save" disabled>Save edited copy...</button><button id="extract" disabled>Extract selection...</button><button id="cancel" disabled>Cancel operation</button>
+  </div>
   <main id="workspace">
     <canvas id="binwave" aria-label="Binwave editing workspace"></canvas>
     <section id="graphics-error" role="alert" hidden>
@@ -62,6 +70,8 @@
       <details><summary>Technical details</summary><pre id="graphics-detail"></pre></details>
     </section>
   </main>
+  <p id="status" role="status">Starting Binwave...</p>
+  <script src="web/menu.js"></script>
   <script src="web/bridge.js"></script>
 </body>
 </html>
