@@ -562,12 +562,30 @@ impl StructureWorkspace {
             ui.separator();
             ui.weak(crate::decoder_ui::RUN_LABEL);
         });
-        if self.last_run_language != Some(DecoderLanguage::Python) {
+        if self.last_run_language != Some(DecoderLanguage::Python)
+            && self.editor_page != EditorPage::Yaml
+        {
             self.status(ui);
         }
         ui.separator();
         if self.editor_page == EditorPage::Yaml {
-            self.yaml_layout.editor(ui, yaml, DecoderLanguage::Yaml);
+            let active_yaml = self.last_run_language == Some(DecoderLanguage::Yaml);
+            let error = if active_yaml { self.error.clone() } else { None };
+            let action = crate::decoder_ui::source_console(
+                ui,
+                "",
+                error.as_deref(),
+                active_yaml && self.is_parsing(),
+                |ui| self.yaml_layout.editor(ui, yaml, DecoderLanguage::Yaml),
+            );
+            if action.copy {
+                if let Some(error) = error {
+                    ui.output_mut(|output| output.copied_text = error);
+                }
+            }
+            if let Some(line) = action.line {
+                self.yaml_layout.go_to_line(line);
+            }
             return None;
         }
         if self.editor_page == EditorPage::Steps {

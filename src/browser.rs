@@ -453,13 +453,18 @@ impl BrowserApp {
                     if self.direct_pending.is_none() && self.decoder_empty() && matches!(event.operation.as_str(), "decode" | "decode_python" | "table" | "plot" | "probe" | "pick" | "inspect") { continue; }
                     self.direct_pending = None;
                     if self.inline_decode { self.direct_error = Some(event.message.clone()); }
-                    if matches!(event.operation.as_str(), "decode" | "decode_python") {
+                    let decoder_failure = matches!(event.operation.as_str(), "decode" | "decode_python");
+                    if decoder_failure {
                         self.decoder_error = Some(event.message.clone());
                     }
                     self.inline_decode = false;
                     self.decoding = false;
                     self.pending.clear();
-                    self.status = event.message;
+                    self.status = if decoder_failure {
+                        "Decoder failed. See Definition → Console for details.".into()
+                    } else {
+                        event.message
+                    };
                 }
                 _ => {}
             }
@@ -838,8 +843,8 @@ impl BrowserApp {
         self.decoding_yaml = self.yaml.clone();
         self.decoding_language = self.language;
         self.python_stdout.clear();
-        if self.language == crate::source_editor::DecoderLanguage::Python {
         self.decoder_error = None;
+        if self.language == crate::source_editor::DecoderLanguage::Python {
             self.queue(serde_json::json!({"type":"decode_python","script":self.yaml,"filename":"<browser-decoder.py>"}));
             self.status = "Loading browser Python and decoding locally…".into();
         } else {
@@ -1012,25 +1017,28 @@ impl BrowserApp {
         }
         if self.language == crate::source_editor::DecoderLanguage::Python {
             ui.weak("Python runs locally in this browser. Scripts are not sandboxed from the network.");
-            let action = crate::decoder_ui::source_console(
-                ui,
-                &self.python_stdout,
-                self.decoder_error.as_deref(),
-                self.decoding,
-                |ui| self.editor.editor(ui, &mut self.yaml, self.language),
-            );
-            if action.copy {
-                let mut text = self.python_stdout.clone();
-                if let Some(error) = &self.decoder_error {
-                    if !text.is_empty() { text.push('\n'); }
-                    text.push_str(error);
-                }
-                copy_text(&text);
-            }
-            if let Some(line) = action.line { self.editor.go_to_line(line); }
-        } else {
-            self.editor.editor(ui, &mut self.yaml, self.language);
         }
+        let stdout = if self.language == crate::source_editor::DecoderLanguage::Python {
+            self.python_stdout.as_str()
+        } else {
+            ""
+        };
+        let action = crate::decoder_ui::source_console(
+            ui,
+            stdout,
+            self.decoder_error.as_deref(),
+            self.decoding,
+            |ui| self.editor.editor(ui, &mut self.yaml, self.language),
+        );
+        if action.copy {
+            let mut text = stdout.to_owned();
+            if let Some(error) = &self.decoder_error {
+                if !text.is_empty() { text.push('\n'); }
+                text.push_str(error);
+            }
+            copy_text(&text);
+        }
+        if let Some(line) = action.line { self.editor.go_to_line(line); }
         source_editor_focus(self.editor.focused());
     }
     fn collection_picker(&mut self, ui: &mut egui::Ui) {
