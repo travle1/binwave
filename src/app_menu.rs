@@ -132,7 +132,7 @@ pub fn menus(s: &State) -> Vec<Item> {
         ),
         action("New decoder", NewDecoder, s.available),
         action(crate::decoder_ui::RUN_LABEL, Apply, s.apply),
-        action("Code", Code, true),
+        action("Show definition", Code, true),
         Item::menu(
             "Examples",
             crate::source_editor::YAML_EXAMPLES
@@ -151,7 +151,7 @@ pub fn menus(s: &State) -> Vec<Item> {
         action("Redo byte edit", Redo, s.available && s.redo),
         action("Copy selected hex", CopyHex, s.selection),
         Item::menu(
-            "Code editing",
+            "Definition editing",
             vec![
                 action("Undo", CodeUndo, true),
                 action("Redo", CodeRedo, true),
@@ -167,7 +167,7 @@ pub fn menus(s: &State) -> Vec<Item> {
         action("Decoded structure", Structures, true),
         action("Plot", Plot, true),
         action("Samples", Samples, true),
-        action("Code", Code, true),
+        action("Definition", Code, true),
         action("Inspector", Inspector, true),
         action("Reset workspace", Reset, true),
     ];
@@ -326,6 +326,8 @@ mod tests {
         }
         assert!(!web[0].children[0].enabled);
         assert!(!web[0].children[2].enabled);
+        assert!(web[1].children.iter().any(|item| item.label == "Show definition"));
+        assert!(web[3].children.iter().any(|item| item.label == "Definition"));
         let active = menus(&State {
             available: true,
             file: true,

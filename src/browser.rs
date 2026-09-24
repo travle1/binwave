@@ -1182,9 +1182,13 @@ impl BrowserApp {
             if values.is_empty() {return None;}
             Some((c["name"].as_str()?.to_owned(),values.iter().copied().fold(f64::INFINITY,f64::min),values.iter().copied().fold(f64::NEG_INFINITY,f64::max)))
         }).collect();
+        let visible_series = series.iter().filter(|channel| {
+            !self.hidden.contains(channel["name"].as_str().unwrap_or(""))
+        }).count();
         ui.horizontal_wrapped(|ui| {
-            ui.menu_button("Series", |ui| {
-                ui.menu_button("Collections", |ui| {
+            ui.menu_button(format!("Series {visible_series}/{}", series.len()), |ui| {
+                ui.strong("Collections");
+                egui::ScrollArea::vertical().max_height(180.).show(ui, |ui| {
                     for item in self.decoded["collections"].as_array().into_iter().flatten() {
                         let path=item["path"].as_str().unwrap_or("");
                         let mut enabled=self.plot_sources.contains(path);
@@ -1194,7 +1198,9 @@ impl BrowserApp {
                         }
                     }
                 });
-                ui.menu_button("Visible fields", |ui| {
+                ui.separator();
+                ui.strong("Fields shown");
+                egui::ScrollArea::vertical().max_height(220.).show(ui, |ui| {
                     for channel in &series {
                         let name=channel["name"].as_str().unwrap_or("");
                         let mut enabled=!self.hidden.contains(name);
@@ -1205,7 +1211,7 @@ impl BrowserApp {
                 });
                 if self.presentation.menu(ui,&ranges) {self.fit_plot_y=true;}
             });
-            if ui.button("Fit data").on_hover_text("Show the full sample range").clicked() { self.first="0".into();self.last=self.plot_count().to_string();self.request_plot(1200); }
+            if ui.button("Fit").on_hover_text("Show the full sample range and fit the visible fields").clicked() { self.first="0".into();self.last=self.plot_count().to_string();self.request_plot(1200); }
             ui.menu_button("Go to sample…", |ui| {
                 ui.label("Sample index (starts at 0)");
                 let last=self.plot_count().saturating_sub(1);
@@ -1229,7 +1235,9 @@ impl BrowserApp {
             if self.plot_count()>0 {self.request_plot(1200);}
         }
         if self.plot_sources.is_empty() {ui.label("Use Series to add collections.");return;}
-        ui.weak("Drag to pan · wheel or pinch to zoom · click a point to link Hex and Inspector");
+        if ui.available_height() > 260. {
+            ui.weak("Drag to pan · wheel or pinch to zoom · click a point to link Hex and Inspector");
+        }
         ui.weak(format!("{} · {} records inspected",self.plot["quality"].as_str().unwrap_or("Reading samples"),self.plot["scanned"]));
         {
             for channel in &mut series {
@@ -1245,7 +1253,7 @@ impl BrowserApp {
             });
 
             let mut plot = egui_plot::Plot::new("decoded-plot-overlay").x_axis_label("Sample index")
-                .legend(egui_plot::Legend::default()).allow_scroll(!self.stacked)
+                .allow_scroll(!self.stacked)
                 .allow_drag(!self.presentation.is_dragging())
                 .y_axis_label(if self.presentation.series.is_empty() {"Value"} else {"Display position"})
                 .label_formatter(move |name,point| {let p=placements.get(name).copied().unwrap_or_default();format!("{name}\nSample: {:.0}\nValue: {}",point.x,p.original(point.y))});

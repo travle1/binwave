@@ -27,7 +27,7 @@ impl Pane {
         match self {
             Self::Structures => "Decoded structure",
             Self::Inspector => "Inspector",
-            Self::Layout => "Code",
+            Self::Layout => "Definition",
             Self::Plot => "Plot",
             Self::Table => "Samples",
             Self::Hex => "Hex",
@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn default_shows_code_and_structure_together_beside_hex() {
+    fn default_shows_definition_and_structure_together_beside_hex() {
         let workspace = WorkspaceLayout::default();
         assert_eq!(workspace.dock.iter_all_tabs().count(), 4);
         assert!(workspace.dock.find_tab(&Pane::Plot).is_none());
@@ -288,7 +288,7 @@ mod tests {
             NodeIndex::root().right().left()
         );
         assert_eq!(workspace.dock.find_tab(&Pane::Inspector).unwrap().1, node);
-        assert_eq!(Pane::Layout.title(), "Code");
+        assert_eq!(Pane::Layout.title(), "Definition");
         assert_eq!(Pane::Structures.title(), "Decoded structure");
     }
 

@@ -12,7 +12,7 @@ use crate::workspace_layout::{Pane, WorkspaceLayout};
 use anyhow::Result;
 use egui::{Context, Ui};
 use egui_dock::{DockArea, TabViewer};
-use egui_plot::{Legend, Line, Plot, PlotBounds, PlotPoint, Points, VLine};
+use egui_plot::{Line, Plot, PlotBounds, PlotPoint, Points, VLine};
 use std::ops::Range;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{
@@ -1380,7 +1380,7 @@ impl BinwaveApp {
             ui.add_space(8.);
             ui.weak("You can also drop a file anywhere in the workspace.");
             ui.add_space(18.);
-            if ui.link("Write a decoder").clicked() {
+            if ui.link("Create a definition").clicked() {
                 if self.decoder == Decoder::Layout {
                     self.binary.show_yaml();
                 }
@@ -1444,8 +1444,13 @@ impl BinwaveApp {
         }
         let (min, max) = view.bounds(data);
         let rows = data.rows;
+        let visible_series = self.visible.iter().filter(|shown| **shown).count();
+        let total_series = data.signals.len();
         ui.horizontal_wrapped(|ui| {
-            ui.menu_button("Columns", |ui| self.ui_csv_columns(ui));
+            ui.menu_button(
+                format!("Series {visible_series}/{total_series}"),
+                |ui| self.ui_csv_columns(ui),
+            );
             ui.weak(format!(
                 "X {min:.3}–{max:.3} · {rows} rows{}",
                 if complete { "" } else { " available" }
@@ -1572,7 +1577,6 @@ impl BinwaveApp {
         let selected_samples = self.csv_selected_samples();
         let response = Plot::new("plot")
             .id(egui::Id::new(("csv_plot", self.dataset)))
-            .legend(Legend::default())
             .allow_zoom(true)
             .allow_scroll(true)
             .allow_boxed_zoom(false)
@@ -3000,7 +3004,7 @@ mod tests {
             .unwrap()
             .is_empty());
         // The actual egui signal controls and navigator are active before EOF.
-        click(&mut app, &ctx, "Columns");
+        click(&mut app, &ctx, "Series 2/2");
         click(&mut app, &ctx, "Hide all");
         assert_eq!(app.visible, [false, false]);
         app.view
@@ -3345,7 +3349,7 @@ mod tests {
                 .collect()
         };
         // Raw data starts with bytes and meaning. Source controls are one tab away.
-        workspace_click(&mut app, &ctx, "Code");
+        workspace_click(&mut app, &ctx, "Definition");
         let opened_output = workspace_frame(&mut app, &ctx);
         let (surface, node, _) = app.workspace.dock.find_tab(&Pane::Layout).unwrap();
         let decoder_rect = app.workspace.dock[surface][node].rect().unwrap();
@@ -3357,7 +3361,7 @@ mod tests {
             "the decoder should open directly in its source editor"
         );
         let opened = labels(opened_output);
-        for label in ["Code", crate::decoder_ui::RUN_LABEL, "YAML"] {
+        for label in ["Definition", crate::decoder_ui::RUN_LABEL, "YAML"] {
             assert!(opened.iter().any(|text| text == label), "missing {label}");
         }
         assert!(!opened.iter().any(|text| text.contains("All definitions")));

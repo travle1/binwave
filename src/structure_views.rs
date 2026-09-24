@@ -6,7 +6,7 @@ use crate::plot_trace::decoded_channel;
 use crate::structure::{LazyArray, Node, ParseOutput, Value};
 use crate::structure_plot::{PlotQuality, PlotReader};
 use egui::{Color32, Ui};
-use egui_plot::{Legend, Plot, PlotBounds, PlotPoint, PlotTransform, Points};
+use egui_plot::{Plot, PlotBounds, PlotPoint, PlotTransform, Points};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::{
@@ -78,6 +78,7 @@ pub struct StructureViews {
     repaint_context: Option<egui::Context>,
     plot_reader: PlotReader,
     presentation: crate::plot_presentation::Presentation,
+    plot_hidden: HashSet<String>,
     plot_target: String,
     plot_sources: std::collections::BTreeSet<String>,
     plot_sources_initialized: bool,
@@ -1063,12 +1064,39 @@ impl StructureViews {
             .flat_map(|(path,reader)| reader.data().into_iter().flat_map(move |d| d.series.iter().filter_map(move |(name,points)| {
                 numeric_bounds(points.iter().map(|p|p.value)).map(|(min,max)| (format!("{path} / {name}"),min,max))
             }))).collect();
+        let visible_series = ranges
+            .iter()
+            .filter(|(name, _, _)| !self.plot_hidden.contains(name))
+            .count();
+        let series_label = if ranges.is_empty() {
+            "Series".to_owned()
+        } else {
+            format!("Series {visible_series}/{}", ranges.len())
+        };
         ui.horizontal_wrapped(|ui| {
-            ui.menu_button("Series", |ui| {
+            ui.menu_button(series_label, |ui| {
+                ui.strong("Collections");
                 changed |= plot_collection_choices(ui,&collections,&mut self.plot_sources);
+                if !ranges.is_empty() {
+                    ui.separator();
+                    ui.strong("Fields shown");
+                    egui::ScrollArea::vertical().max_height(220.).show(ui, |ui| {
+                        for (name, _, _) in &ranges {
+                            let mut shown = !self.plot_hidden.contains(name);
+                            if ui.checkbox(&mut shown, name).changed() {
+                                if shown {
+                                    self.plot_hidden.remove(name);
+                                } else {
+                                    self.plot_hidden.insert(name.clone());
+                                }
+                                self.plot_fit_y = true;
+                            }
+                        }
+                    });
+                }
                 if self.presentation.menu(ui,&ranges) { self.plot_fit_y=true; }
             });
-            if ui.button("Fit data").on_hover_text("Show the full sample range").clicked() { force_view=Some(0..count); self.plot_fit_y=true; }
+            if ui.button("Fit").on_hover_text("Show the full sample range and fit the visible fields").clicked() { force_view=Some(0..count); self.plot_fit_y=true; }
             ui.menu_button("Go to sample…", |ui| {
                 ui.label("Sample index (starts at 0)");
                 self.plot_jump=self.plot_jump.min(count-1);
@@ -1138,7 +1166,9 @@ impl StructureViews {
             }
         });
         });
-        ui.weak("Drag to pan · wheel or pinch to zoom · click a point to link Hex and Inspector");
+        if ui.available_height() > 260. {
+            ui.weak("Drag to pan · wheel or pinch to zoom · click a point to link Hex and Inspector");
+        }
         if changed { self.plot_fit_y=true; }
         if let Some(forced) = &force_view {
             if self.plot_view.as_ref() != Some(forced) {
@@ -1237,9 +1267,7 @@ impl StructureViews {
         let placements=self.presentation.series.clone();
         let data = combined.as_ref();
         let plot_id = egui::Id::new(("decoded_structure_plot", "overlay", output.revision));
-        let hidden = egui_plot::PlotMemory::load(ui.ctx(), plot_id)
-            .map(|memory| memory.hidden_items)
-            .unwrap_or_default();
+        let hidden = self.plot_hidden.clone();
         let y_fit = if self.plot_fit_y && self.plot_range_zoom.is_none() {
             data.and_then(|data| {
                 numeric_bounds(
@@ -1265,7 +1293,6 @@ impl StructureViews {
         let mut axis_hover = None;
         let response = Plot::new(plot_id)
             .id(plot_id)
-            .legend(Legend::default())
             .auto_bounds(egui::Vec2b::new(false, false))
             .allow_double_click_reset(false)
             .allow_boxed_zoom(false)
@@ -1294,6 +1321,9 @@ impl StructureViews {
                 }
                 if let Some(data) = data {
                     for (name, values) in data.series.iter() {
+                        if hidden.contains(name) {
+                            continue;
+                        }
                         let points: Vec<[f64; 2]> = values
                             .iter()
                             .map(|point| [point.index as f64, point.value])
@@ -3160,10 +3190,12 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             "overview must paint the observed ranges, found {bands} bands"
         );
         assert_eq!(dots, 0, "overview must not render isolated sample markers");
-        fn legend_color(shape: &egui::Shape, color: Color32) -> bool {
+        fn series_color(shape: &egui::Shape, color: Color32) -> bool {
             match shape {
-                egui::Shape::Vec(shapes) => shapes.iter().any(|shape| legend_color(shape, color)),
-                egui::Shape::Circle(circle) => circle.fill == color,
+                egui::Shape::Vec(shapes) => shapes.iter().any(|shape| series_color(shape, color)),
+                egui::Shape::Path(path) => {
+                    path.stroke.color == color || path.fill == color.gamma_multiply(0.23)
+                }
                 _ => false,
             }
         }
@@ -3171,8 +3203,8 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             rendered
                 .shapes
                 .iter()
-                .any(|shape| legend_color(&shape.shape, field_color("samples / value"))),
-            "band fill and outline must share a legend color, rather than becoming neutral gray"
+                .any(|shape| series_color(&shape.shape, field_color("samples / value"))),
+            "band fill and outline must use the stable series color, rather than neutral gray"
         );
     }
 

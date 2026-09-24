@@ -123,9 +123,9 @@ plot scrolls the page instead of panning the plot.
 Web and native share the command hierarchy in `src/app_menu.rs`:
 
 - **Open data:** files, demos, edited-copy export, extraction, cancellation.
-- **Decoder:** open, save, new, apply, Code, and examples.
-- **Edit:** byte undo/redo, copying hex, and Code editing commands.
-- **View:** Hex, Decoded structure, Plot, Samples, Code, Inspector, and reset.
+- **Decoder:** open, save, new, run, Definition, and examples.
+- **Edit:** byte undo/redo, copying hex, and Definition editing commands.
+- **View:** Hex, Decoded structure, Plot, Samples, Definition, Inspector, and reset.
 
 Native uses a compact desktop menu bar: **File / Edit / View / Decode / Tools / Help**.
 CSV, search, and workspace commands remain directly accessible in native menus.
@@ -236,7 +236,7 @@ application name and may still contain `plottermaxx`.
 
 ### Editing and developing a browser decoder
 
-**Edit > Code editing** and the YAML editor’s right-click menu provide selection,
+**Edit > Definition editing** and the YAML editor’s right-click menu provide selection,
 copy, cut, paste, undo/redo, and toggling comments. Keyboard editing remains
 available. Paste opens a native browser text box so touch paste and LAN HTTP
 work without clipboard API permission. **Decoder > Save decoder** (or Ctrl/Cmd+S) downloads the current
