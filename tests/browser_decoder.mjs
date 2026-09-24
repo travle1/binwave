@@ -131,6 +131,7 @@ assert.equal(simpleTable.rows[0].cells.value.number, 1);
 assert.deepEqual(JSON.parse(simple.probe('samples', '64', '68')), {path:'samples', first:'16', end:'17'});
 assert.equal(JSON.parse(simple.probe('samples', '67', '68')).first, '16');
 assert.deepEqual(JSON.parse(simple.pick('samples', '16')), {path:'samples', index:'16', start:'64', end:'68'});
+assert.deepEqual(JSON.parse(simple.pick_range('samples', '16', '19')), {path:'samples', first:'16', last:'19', start:'64', end:'80'});
 assert.throws(() => simple.pick('samples', '512'));
 assert.equal(JSON.parse(simple.probe('samples', '2048', '2049')).first, null);
 simple.free();

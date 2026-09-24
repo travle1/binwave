@@ -164,16 +164,18 @@
         }
     });
     window.binwave = {
-        menus(model, file, message) {
+        menus(model, file, message, version) {
             if(message!==rustStatus){rustStatus=message;status.textContent=message;}
             const context=document.getElementById('file-context');
             if(context.textContent!==file)context.textContent=file;
+            const displayedVersion=document.getElementById('app-version');
+            if(displayedVersion.textContent!==version)displayedVersion.textContent=version;
             const direct={open_file:open,open_decoder:openDecoder,save_copy:save,extract,cancel};
             window.binwaveMenus.render(JSON.parse(model), (command,argument)=>{
                 if(direct[command]) { if(!direct[command].disabled)direct[command].onclick(); }
                 else if(command==='save_decoder')window.binwave.saveDecoder(decoderSource, decoderLanguage);
                 else { if(events.length>=16)events.shift();events.push({type:'menu',command,argument}); }
-            }, (command,enabled)=>direct[command] ? !direct[command].disabled : enabled && graphicsReady && !failed && (!busy || ['code','hex','structures','plot','samples','inspector','auto','stacked','docked'].includes(command)));
+            }, (command,enabled)=>direct[command] ? !direct[command].disabled : enabled && graphicsReady && !failed && (!busy || ['code','hex','structures','plot','samples','inspector','auto','stacked','docked','help'].includes(command)));
         },
         clearDecoder() {
             ignoreDecoder = true;

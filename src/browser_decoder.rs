@@ -169,6 +169,22 @@ impl DecoderSession {
         })().map_err(js_error)
     }
 
+    /// Select an inclusive range of collection records without materializing them.
+    pub fn pick_range(&self, path: &str, first: &str, last: &str) -> Result<String, JsValue> {
+        (|| -> Result<String> {
+            let node = find(&self.output.as_ref().context("Apply a decoder first")?.nodes, path)
+                .context("Unknown collection")?;
+            let first = first.parse::<u64>()?;
+            let last = last.parse::<u64>()?;
+            let start = first.min(last);
+            let end = first.max(last).checked_add(1).context("Sample index overflow")?;
+            let bytes = crate::structure_selection::sample_bytes(node, start..end)
+                .context("Sample range outside collection")?;
+            json_result(json!({"path":path,"first":first.to_string(),"last":last.to_string(),
+                "start":bytes.start.to_string(),"end":bytes.end.to_string()}))
+        })().map_err(js_error)
+    }
+
     /// Resolve the selected field on demand, paging only its containing records.
     pub fn inspect(&self, start: &str, end: &str) -> Result<String, JsValue> {
         (|| -> Result<String> {

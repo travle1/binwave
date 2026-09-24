@@ -212,18 +212,19 @@ test('clearing the decoder discards stale results and errors without hiding file
 
 test('shared menu file pickers stay synchronous and worker busy state disables mutations',()=>{
     const h=bridge();h.app.ready();
-    h.app.menus('[]','example.bin · 16 bytes','Ready');
+    h.app.menus('[]','example.bin · 16 bytes','Ready','v0.1.0');
     let clicked=false;h.get('file').click=()=>{clicked=true;};
     h.menuState.dispatch('open_file',0);
     assert.equal(clicked,true,'Picker must open on the original menu click stack');
     assert.equal(h.get('file-context').textContent,'example.bin · 16 bytes');
+    assert.equal(h.get('app-version').textContent,'v0.1.0');
     h.app.send(JSON.stringify({type:'page',offset:'0'}));
     assert.equal(h.menuState.allow('open_file',true),false);
     assert.equal(h.menuState.allow('simple_demo',true),false);
     assert.equal(h.menuState.allow('hex',true),true);
 });
 test('shared menu application commands enter the bounded UI mailbox',()=>{
-    const h=bridge();h.app.ready();h.app.menus('[]','','Ready');
+    const h=bridge();h.app.ready();h.app.menus('[]','','Ready','v0.1.0');
     h.menuState.dispatch('example',2);
     assert.deepEqual(JSON.parse(h.app.poll()),{type:'menu',command:'example',argument:2});
 });

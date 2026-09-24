@@ -1,5 +1,6 @@
 //! Shared decoder source editor and starter templates for native and browser shells.
 use egui::{Color32, Ui};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 /// One catalog for the native and browser example menus.
 pub const YAML_EXAMPLES: &[(&str, &str)] = &[
@@ -130,7 +131,17 @@ pub(crate) struct YamlLayoutCache {
     paste: Arc<std::sync::Mutex<Option<String>>>,
     paste_error: Option<String>,
     goto_line: Option<usize>,
+    diagnostic_hash: Option<u64>,
+    diagnostic: Option<SourceDiagnostic>,
 }
+
+#[derive(Clone)]
+struct SourceDiagnostic {
+    line: Option<usize>,
+    column: Option<usize>,
+    message: String,
+}
+
 impl YamlLayoutCache {
     pub fn command(&mut self, action: &'static str) { self.edit_action = Some(action); }
     pub fn go_to_line(&mut self, line: usize) { self.goto_line = Some(line.max(1)); }
@@ -191,8 +202,32 @@ impl YamlLayoutCache {
                     ui.code("structures:\n  - name: RecordType\n    fields:\n      - {name: value, type: u16}\nactions:\n  - read: {name: records, type: {structure: RecordType}, repeat: 2}");
                     ui.label("Declarations read no bytes. Actions start reads; fields consume bytes in order. A field using a structure creates nested values.");
                     ui.label("repeat counts items; length bounds each item in bytes. ref uses an earlier decoded value. Names are chosen by you.");
+                    ui.separator();
+                    ui.label("Open Help → Decoder guide for every supported type, field option, action, expression, and a complete Python API reference.");
                 });
             });
+            self.refresh_diagnostic(yaml);
+            if let Some(diagnostic) = self.diagnostic.clone() {
+                egui::Frame::none()
+                    .fill(ui.visuals().error_fg_color.gamma_multiply(0.08))
+                    .stroke(egui::Stroke::new(1_f32, ui.visuals().error_fg_color.gamma_multiply(0.55)))
+                    .inner_margin(egui::Margin::symmetric(8., 5.))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.colored_label(ui.visuals().error_fg_color, "YAML error");
+                            if let Some(line) = diagnostic.line {
+                                let location = diagnostic.column.map_or_else(
+                                    || format!("Line {line}"),
+                                    |column| format!("Line {line}:{column}"),
+                                );
+                                if ui.small_button(location).on_hover_text("Jump to this line").clicked() {
+                                    self.go_to_line(line);
+                                }
+                            }
+                            ui.label(diagnostic.message);
+                        });
+                    });
+            }
         }
         let mut font = egui::TextStyle::Monospace.resolve(ui.style());
         font.size = font.size.max(13.);
@@ -220,8 +255,27 @@ impl YamlLayoutCache {
                                 "decoder_source_text",
                                 language,
                             )));
+                            let selection_before = egui::TextEdit::load_state(ui.ctx(), editor_id)
+                                .and_then(|state| state.cursor.char_range());
                             if let Some(paste) = self.paste.lock().unwrap().take() {
                                 edit_source(ui.ctx(), editor_id, yaml, "Paste", Some(&paste));
+                            }
+                            let focused = ui.memory(|memory| memory.has_focus(editor_id));
+                            if focused {
+                                let shortcut = ui.input_mut(|input| {
+                                    if input.consume_key(egui::Modifiers::COMMAND, egui::Key::C) {
+                                        Some("Copy")
+                                    } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::X) {
+                                        Some("Cut")
+                                    } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::V) {
+                                        Some("Paste")
+                                    } else {
+                                        None
+                                    }
+                                });
+                                if shortcut.is_some() {
+                                    self.edit_action = shortcut;
+                                }
                             }
                             if let Some(action) = self.edit_action.take() {
                                 if action == "Paste" {
@@ -247,7 +301,6 @@ impl YamlLayoutCache {
                                     edit_source(ui.ctx(), editor_id, yaml, action, None);
                                 }
                             }
-                            let focused = ui.memory(|memory| memory.has_focus(editor_id));
                             if let Some(line) = self.goto_line.take() {
                                 let index = if line <= 1 {
                                     0
@@ -326,6 +379,24 @@ impl YamlLayoutCache {
                                     }
                                 })
                                 .show(ui);
+                            let secondary_pressed = ui.input(|input| {
+                                input.pointer.button_pressed(egui::PointerButton::Secondary)
+                                    && input.pointer.interact_pos().is_some_and(|position| {
+                                        output.response.rect.contains(position)
+                                    })
+                            });
+                            if (secondary_pressed || output.response.secondary_clicked())
+                                && selection_before.is_some_and(|selection| {
+                                    selection.primary.index != selection.secondary.index
+                                })
+                            {
+                                let mut state = egui::TextEdit::load_state(ui.ctx(), editor_id)
+                                    .unwrap_or_default();
+                                state.cursor.set_char_range(selection_before);
+                                state.store(ui.ctx(), editor_id);
+                                ui.memory_mut(|memory| memory.request_focus(editor_id));
+                                ui.ctx().request_repaint();
+                            }
                             output.response.context_menu(|ui| { self.edit_menu(ui); });
                             if shortcut_changed {
                                 output.response.mark_changed();
@@ -358,6 +429,100 @@ impl YamlLayoutCache {
                     });
             });
     }
+
+    fn refresh_diagnostic(&mut self, source: &str) {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut hasher);
+        let hash = hasher.finish();
+        if self.diagnostic_hash == Some(hash) {
+            return;
+        }
+        self.diagnostic_hash = Some(hash);
+        self.diagnostic = match serde_yaml_ng::from_str::<crate::structure::Program>(source) {
+            Err(error) => {
+                let location = error.location();
+                Some(SourceDiagnostic {
+                    line: location.as_ref().map(|location| location.line()),
+                    column: location.as_ref().map(|location| location.column()),
+                    message: format!("read structure YAML: {error}"),
+                })
+            }
+            Ok(program) if program.actions.is_empty() => None,
+            Ok(_) => crate::structure::Program::parse(source).err().map(|error| {
+                let location = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<serde_yaml_ng::Error>())
+                    .and_then(serde_yaml_ng::Error::location);
+                SourceDiagnostic {
+                    line: location.as_ref().map(|location| location.line()),
+                    column: location.as_ref().map(|location| location.column()),
+                    message: format!("{error:#}"),
+                }
+            }),
+        };
+    }
+}
+
+/// The decoder language reference is rendered inside the application on every platform.
+pub(crate) fn decoding_guide(ui: &mut Ui) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.heading("Decode a file with YAML or Python");
+            ui.label("Open a data file, describe its byte layout in Definition, then press ▶ Run (F5). Successful runs populate Decoded structure, Plot, Samples, Inspector, and Hex.");
+            ui.label("Click a decoded value or plot point to locate its exact bytes. Shift-click a plot sample to select every record from the anchor through that sample.");
+            ui.separator();
+
+            egui::CollapsingHeader::new("YAML quick start")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.code("endian: little\nstructures:\n  - name: Sample\n    fields:\n      - {name: time, type: u32}\n      - {name: value, type: f32}\nactions:\n  - read:\n      name: samples\n      type: {structure: Sample}\n      repeat: until end");
+                    ui.label("structures declares reusable record layouts but reads no bytes. actions performs reads from the file. Fields consume bytes in order unless an offset option changes the cursor.");
+                });
+
+            egui::CollapsingHeader::new("YAML types and field options")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.strong("Built-in types");
+                    ui.code("u8  i8  u16  i16  u32  i32  u64  i64  f32  f64\nbytes  text  cstring  varuint");
+                    ui.label("Use type: {structure: Name} for a declared structure. A structure or the whole file can set endian: little or endian: big.");
+                    ui.strong("Field options");
+                    ui.code("repeat: 12\nrepeat: {ref: header.count}\nrepeat: until end\nlength: 16\nat: 128\nrelative: 4\nalign: 8\nendian: big\nexpect: 42");
+                    ui.label("length bounds one value in bytes. at is an absolute offset; relative moves from the current cursor; align advances to a boundary. expect validates the decoded value.");
+                    ui.strong("Choose a type from an earlier value");
+                    ui.code("type:\n  choose:\n    ref: stream_id\n    cases:\n      '1': {structure: Imu}\n      '2': {structure: Motors}\n    otherwise: {structure: Raw}");
+                });
+
+            egui::CollapsingHeader::new("YAML actions and expressions")
+                .show(ui, |ui| {
+                    ui.label("Every action contains exactly one of read, define, skip, align, calculate, or choose.");
+                    ui.code("actions:\n  - read: {name: header, type: {structure: Header}}\n  - calculate: {name: payload_bytes, value: {multiply: [{ref: header.count}, 4]}}\n  - align: 8\n  - skip: 16");
+                    ui.label("Expressions can be an integer, {ref: path}, or add, subtract, multiply, and divide pairs. References must point to values decoded earlier.");
+                    ui.strong("Choose different actions");
+                    ui.code("- choose:\n    ref: id\n    cases:\n      '1':\n        - read: {name: header, type: {structure: Header}}\n    otherwise:\n      - skip: {ref: length}");
+                    ui.strong("Create a structure from decoded metadata");
+                    ui.code("- define:\n    name: Discovered\n    from: metadata.entries\n    fields:\n      name: {ref: name}\n      type: {ref: format, cases: {'1': u16, '2': i16}}\n      repeat: {ref: count}");
+                    ui.label("define maps an earlier description collection into reusable fields. Optional mappings also include length, at, and relative.");
+                });
+
+            egui::CollapsingHeader::new("Python quick start and API")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.code("from binwave import Field, Struct\n\nHeader = Struct('Header', [('count', 'u32')], endian='little')\nSample = Struct('Sample', [\n    ('time', 'u32'),\n    Field('value', 'f32'),\n])\nheader = file.read_struct('header', Header)\nsamples = file.records('samples', Sample, count=header.count)\nprint(f'{len(samples)} samples')");
+                    ui.label("Field(name, type, length=None, count=None, offset=None, endian=None, expect=None) accepts a fixed-size numeric type, text, bytes, or another Struct. (name, type) is shorthand.");
+                    ui.label("Struct(name, fields, endian=None) creates a fixed layout and exposes size and fields.");
+                    ui.label("file.size is the byte length. file.tell() and file.seek(offset, whence=0) control the cursor. file.read(length) advances it; file.read_at(offset, length) does not. file.unpack(format, offset=None) uses Python struct formats.");
+                    ui.label("file.read_struct(name, struct, offset=None) decodes metadata now. file.records(name, struct, count=None, offset=None) registers a lazy collection for Plot and Samples. Without count, records consumes complete records to the end of the file.");
+                    ui.label("Python supports ordinary imports, functions, loops, conditions, assertions, and print(). In the web app it runs locally in the browser; on desktop it runs with the selected Python interpreter.");
+                });
+
+            egui::CollapsingHeader::new("Editing and troubleshooting")
+                .show(ui, |ui| {
+                    ui.label("YAML syntax and indentation are checked while you type. Select a reported line to jump there. Run-time errors remain in the Console because they depend on the open data.");
+                    ui.label("Copy, cut, paste, undo, redo, select all, and toggle comments are available from Edit → Definition editing and from the editor context menu. Ctrl/Cmd+C, X, and V use the same selection.");
+                    ui.label("Start with Decoder → Examples, then adapt one field at a time. Keep the last successful result visible while correcting a definition.");
+                });
+        });
 }
 
 // Menu actions use the same cursor and undo history as keyboard editing.
@@ -710,5 +875,90 @@ mod selected_read_tests {
         assert_eq!(text, "");
         edit_source(&ctx, id, &mut text, "Undo", None);
         assert_eq!(text, "ahelloz");
+    }
+
+    #[test]
+    fn yaml_diagnostics_are_live_and_include_parser_locations() {
+        let mut editor = YamlLayoutCache::default();
+        editor.refresh_diagnostic(
+            "actions:\n  - read:\n      name: value\n       type: u8\n",
+        );
+        let diagnostic = editor.diagnostic.as_ref().expect("invalid indentation");
+        assert!(diagnostic.line.is_some());
+        assert!(diagnostic.column.is_some());
+        assert!(diagnostic.message.contains("read structure YAML"));
+
+        editor.refresh_diagnostic("actions: [{read: {name: value, type: u8}}]\n");
+        assert!(editor.diagnostic.is_none());
+        editor.refresh_diagnostic("endian: little\nactions: []\n");
+        assert!(editor.diagnostic.is_none(), "The new-decoder placeholder is not an error");
+    }
+
+    #[test]
+    fn right_click_preserves_source_selection_and_copy_shortcut_uses_it() {
+        let ctx = egui::Context::default();
+        let mut editor = YamlLayoutCache::default();
+        let mut source = "actions: [{read: {name: value, type: u8}}]\n".to_owned();
+        let frame = |editor: &mut YamlLayoutCache, source: &mut String, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(700., 400.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        editor.editor(ui, source, DecoderLanguage::Yaml);
+                    });
+                },
+            )
+        };
+        let first = frame(&mut editor, &mut source, vec![]);
+        let position = first
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == source => {
+                    Some(text.pos + egui::vec2(12., 6.))
+                }
+                _ => None,
+            })
+            .expect("source position");
+        frame(&mut editor, &mut source, vec![egui::Event::PointerMoved(position)]);
+        for pressed in [true, false] {
+            frame(&mut editor, &mut source, vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        let id = ctx.memory(|memory| memory.focused()).expect("editor focus");
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        frame(&mut editor, &mut source, vec![key(egui::Key::A)]);
+        frame(&mut editor, &mut source, vec![egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let selection = egui::TextEdit::load_state(&ctx, id)
+            .unwrap()
+            .cursor
+            .char_range()
+            .unwrap();
+        assert_eq!(selection.sorted()[0].index, 0);
+        assert_eq!(selection.sorted()[1].index, source.chars().count());
+        let copied = frame(&mut editor, &mut source, vec![key(egui::Key::C)]);
+        assert_eq!(copied.platform_output.copied_text, source);
     }
 }

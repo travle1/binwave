@@ -17,6 +17,7 @@
     .menu-row { display:flex; align-items:center; min-height:32px; gap:14px; }
     .brand { font-weight:600; font-size:16px; }
     #app-menus { display:flex; gap:4px; }
+    #app-version { margin-left:auto; color:#999; font-size:12px; white-space:nowrap; }
     button, summary { -webkit-appearance:none; appearance:none; font:inherit; color:#eee; }
     button { background:#292929; border:1px solid #484848; border-radius:3px; padding:6px 10px; }
     button:disabled { color:#777; }
@@ -39,7 +40,8 @@
     @media (max-width: 899px) {
       header { padding:4px max(8px, env(safe-area-inset-right)) 4px max(8px, env(safe-area-inset-left)); }
       .brand { display:none; }
-      #app-menus { width:100%; justify-content:space-between; }
+      #app-menus { flex:1; justify-content:space-between; }
+      #app-version { margin-left:0; }
       summary, .menu-items button { min-height:40px; box-sizing:border-box; display:flex; align-items:center; }
       .app-menu>.menu-items { position:fixed; left:8px; right:8px; top:50px; width:auto; min-width:0; }
       #workspace { padding-bottom:env(safe-area-inset-bottom); box-sizing:border-box; }
@@ -51,7 +53,7 @@
 </head>
 <body>
   <header aria-label="Application commands">
-    <div class="menu-row"><span class="brand">Binwave</span><nav id="app-menus" aria-label="Main menu"></nav></div>
+    <div class="menu-row"><span class="brand">Binwave</span><nav id="app-menus" aria-label="Main menu"></nav><span id="app-version" aria-label="Application version"></span></div>
     <div id="file-context"></div>
   </header>
   <div hidden aria-hidden="true">

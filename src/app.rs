@@ -1295,19 +1295,7 @@ impl BinwaveApp {
         egui::TopBottomPanel::top("workspace_toolbar").show(ctx, |ui| self.ui_toolbar(ui));
         if self.show_decoding_guide {
             egui::Window::new("Decoding guide").open(&mut self.show_decoding_guide).default_width(540.).resizable(true).show(ctx, |ui| {
-                ui.heading("Write a decoder, inspect its results");
-                ui.label("Open a data file. Decoder shows your Python or YAML source beside Hex.");
-                ui.label("Open decoder… loads Python or YAML. ▶ Run (F5) reads the open data file.");
-                ui.label("Decoded samples opens after a successful decode. Show plot opens the same data as a plot; select a value to find its bytes.");
-                ui.separator();
-                ui.strong("Build a decoder from bytes");
-                ui.label("Python supports imports, functions, loops and conditions. Copy Python read in Hex copies a read for the selected range. Register structures and records to populate the decoded views.");
-                ui.label("For YAML, select bytes in Hex and use Fields to name fields and choose their formats. Decode selection previews those fields.");
-                ui.label("Steps edits reading order, conditions and calculations. YAML and the guided tools edit the same decoder.");
-                ui.label("Decoded structure is the result tree. It shows what the decoder read; select an element to locate it in Hex.");
-                ui.label("Save Python… or Save YAML… keeps the decoder for reuse. Decode → Examples provides starting points.");
-                ui.separator();
-                ui.small("Hex edits preserve file length. Compressed data and automatic checksum/offset rebuilding need additional support. CSV reads requested rows and can index the entire file on demand.");
+                crate::source_editor::decoding_guide(ui);
             });
         }
         egui::TopBottomPanel::bottom("workspace_status").show(ctx, |ui| {
@@ -2729,7 +2717,18 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(top, ["File", "Edit", "View", "Decode", "Tools", "Help"]);
+        assert_eq!(
+            top,
+            [
+                "File",
+                "Edit",
+                "View",
+                "Decode",
+                "Tools",
+                "Help",
+                crate::APP_VERSION,
+            ]
+        );
         workspace_click(&mut app, &ctx, "File");
         workspace_click(&mut app, &ctx, "Open sensor demo");
         let deadline = Instant::now() + std::time::Duration::from_secs(5);

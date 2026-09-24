@@ -11,7 +11,7 @@ extern "C" {
     #[wasm_bindgen(js_namespace = binwave, js_name = poll)]
     fn poll_event() -> String;
     #[wasm_bindgen(js_namespace = binwave, js_name = menus)]
-    fn publish_menus(model: &str, file: &str, status: &str);
+    fn publish_menus(model: &str, file: &str, status: &str, version: &str);
     #[wasm_bindgen(js_namespace = binwave, js_name = pasteText)]
     pub fn paste_text() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = binwave, js_name = copyText)]
@@ -75,6 +75,8 @@ pub struct BrowserApp {
     direct_pending: Option<(String, crate::direct_authoring::Interpretation)>,
     direct_error: Option<String>,
     selected_sample: Option<u64>,
+    selected_samples: Option<(u64, u64)>,
+    plot_anchor: Option<u64>,
     inspected: Option<crate::workspace_inspector::FieldInfo>,
     inspector_definition: Option<(u64, usize)>,
     value_text: String,
@@ -119,6 +121,7 @@ pub struct BrowserApp {
     reveal_results: bool,
     reveal_decoder: bool,
     reveal_inspector: bool,
+    show_decoding_guide: bool,
     plot_request: u64,
     reset_plot: bool,
     layout_mode: String,
@@ -160,6 +163,8 @@ impl BrowserApp {
             direct_pending: None,
             direct_error: None,
             selected_sample: None,
+            selected_samples: None,
+            plot_anchor: None,
             inspected: None,
             inspector_definition: None,
             value_text: String::new(),
@@ -205,6 +210,7 @@ impl BrowserApp {
             reveal_results: false,
             reveal_decoder: false,
             reveal_inspector: false,
+            show_decoding_guide: false,
             plot_request: 0,
             reset_plot: false,
             layout_mode: cc.storage.and_then(|s|s.get_string("browser-layout-mode")).filter(|s|matches!(s.as_str(),"auto"|"stacked"|"docked")).unwrap_or_else(||"auto".into()),
@@ -362,7 +368,13 @@ impl BrowserApp {
                             export_selection(&self.range_start, &self.range_end);
                             self.request_inspect(start, end);
                             self.navigate(start);
-                            self.table_start = self.selected_sample.unwrap_or(0) / 128 * 128;
+                            let first = event.result["first"].as_str().and_then(parse_offset)
+                                .or_else(|| event.result["index"].as_str().and_then(parse_offset));
+                            let last = event.result["last"].as_str().and_then(parse_offset)
+                                .or(first);
+                            self.selected_sample = first;
+                            self.selected_samples = first.zip(last).map(|(first, last)| (first.min(last), first.max(last).saturating_add(1)));
+                            self.table_start = first.unwrap_or(0) / 128 * 128;
                             self.request_table();
                         }
                     }
@@ -371,6 +383,9 @@ impl BrowserApp {
                     if event.request == self.probe_request.to_string()
                         && event.result["path"].as_str() == Some(&self.collection) {
                         self.selected_sample = event.result["first"].as_str().and_then(parse_offset);
+                        self.selected_samples = self.selected_sample.zip(
+                            event.result["end"].as_str().and_then(parse_offset)
+                        );
                         if let Some(index) = self.selected_sample {
                             self.table_start = index / 128 * 128;
                             self.request_table();
@@ -759,6 +774,8 @@ impl BrowserApp {
     fn clear_results(&mut self) {
         self.direct_pending = None;
         self.selected_sample = None;
+        self.selected_samples = None;
+        self.plot_anchor = None;
         self.inspected = None;
         self.inspector_definition = None;
         self.value_text.clear();
@@ -839,6 +856,8 @@ impl BrowserApp {
     }
     fn select_collection(&mut self, path: String) {
         self.selected_sample = None;
+        self.selected_samples = None;
+        self.plot_anchor = None;
         self.probe_request = self.probe_request.wrapping_add(1);
         self.collection = path;
         self.table_start = 0;
@@ -883,6 +902,7 @@ impl BrowserApp {
     }
     fn probe_selection(&mut self, start: u64, end: u64) {
         self.selected_sample = None;
+        self.selected_samples = None;
         self.probe_request = self.probe_request.wrapping_add(1);
         if !self.collection.is_empty() {
             self.queue(serde_json::json!({"type":"probe","path":self.collection,
@@ -917,6 +937,7 @@ impl BrowserApp {
             Cancel=>{self.pending.clear();self.command(serde_json::json!({"type":"cancel"}));self.decoding=false;self.direct_pending=None;},
             Reset=>{self.layout=WorkspaceLayout::default();self.layout_mode="auto".into();},
             Auto=>self.layout_mode="auto".into(), Stacked=>self.layout_mode="stacked".into(), Docked=>self.layout_mode="docked".into(),
+            Help=>self.show_decoding_guide=true,
             _=>{}
         }
     }
@@ -1236,7 +1257,7 @@ impl BrowserApp {
         }
         if self.plot_sources.is_empty() {ui.label("Use Series to add collections.");return;}
         if ui.available_height() > 260. {
-            ui.weak("Drag to pan · wheel or pinch to zoom · click a point to link Hex and Inspector");
+            ui.weak("Drag to pan · wheel or pinch to zoom · click a point to link bytes · Shift-click to select a range");
         }
         ui.weak(format!("{} · {} records inspected",self.plot["quality"].as_str().unwrap_or("Reading samples"),self.plot["scanned"]));
         {
@@ -1264,9 +1285,6 @@ impl BrowserApp {
                     let old=plot.plot_bounds();let pad=((max-min)*0.05).max(0.1);
                     plot.set_plot_bounds(egui_plot::PlotBounds::from_min_max([old.min()[0],min-pad],[old.max()[0],max+pad]));
                 }
-                if let Some(index) = self.selected_sample {
-                    plot.vline(egui_plot::VLine::new(index as f64).color(egui::Color32::WHITE).name(format!("Selected sample {index}")));
-                }
                 for channel in &series {
                     let name = channel["name"].as_str().unwrap_or("");
                     if self.hidden.contains(name) {
@@ -1279,6 +1297,28 @@ impl BrowserApp {
                         self.plot["estimated"].as_bool().unwrap_or(false).then_some(bands.as_slice()));
                 }
             });
+            if let Some((first, end)) = self.selected_samples.filter(|(first, end)| first < end) {
+                let frame = *response.transform.frame();
+                let left = response.transform.position_from_point(
+                    &egui_plot::PlotPoint::new(first as f64 - 0.5, 0.),
+                ).x;
+                let right = response.transform.position_from_point(
+                    &egui_plot::PlotPoint::new(end as f64 - 0.5, 0.),
+                ).x;
+                let painter = ui.painter().with_clip_rect(frame.intersect(ui.clip_rect()));
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(left, frame.top()),
+                        egui::pos2(right.max(left + 2.), frame.bottom()),
+                    ),
+                    0.,
+                    ui.visuals().selection.bg_fill.gamma_multiply(0.18),
+                );
+                painter.line_segment(
+                    [egui::pos2(left, frame.top()), egui::pos2(left, frame.bottom())],
+                    egui::Stroke::new(1_f32, ui.visuals().selection.stroke.color),
+                );
+            }
             self.presentation.drag(ui,&response.transform,series.iter().filter(|c|!self.hidden.contains(c["name"].as_str().unwrap_or("")))
                 .flat_map(|c|c["points"].as_array().into_iter().flatten().filter_map(move |p|Some((c["name"].as_str()?.to_owned(),[p[0].as_f64()?,p[1].as_f64()?])))));
             self.plot_visible = Some([response.transform.bounds().min()[0], response.transform.bounds().max()[0]]);
@@ -1296,6 +1336,18 @@ impl BrowserApp {
             if response.response.clicked() && !response.response.double_clicked() && self.plot_count() > 0 {
                 if let Some(pointer) = response.response.interact_pointer_pos() {
                     let transform = &response.transform;
+                    let x = transform.value_from_position(pointer).x;
+                    let shift = ui.input(|input| input.modifiers.shift);
+                    if shift {
+                        if let Some(index) = crate::browser_viewport::clicked_sample(x, self.count()) {
+                            let anchor = self.plot_anchor.or(self.selected_sample).unwrap_or(index);
+                            self.probe_request = self.probe_request.wrapping_add(1);
+                            self.queue(serde_json::json!({"type":"pick","path":self.collection,
+                                "anchor":anchor.to_string(),"index":index.to_string(),
+                                "request":self.probe_request.to_string()}));
+                        }
+                        return;
+                    }
                     let nearest = series.iter().filter(|c| !self.hidden.contains(c["name"].as_str().unwrap_or("")))
                         .flat_map(|c| c["points"].as_array().into_iter().flatten().enumerate().filter_map(move |(i,p)| {
                             let x=p[0].as_f64()?; let y=p[1].as_f64()?;
@@ -1306,15 +1358,17 @@ impl BrowserApp {
                         if let (Some(start), Some(end)) = (channel["bytes"][i][0].as_str().and_then(parse_offset), channel["bytes"][i][1].as_str().and_then(parse_offset)) {
                             let path=channel["path"].as_str().unwrap_or("").to_owned();
                             self.collection=path;
-                            self.selected_sample=Some(x as u64);
-                            self.table_start=x as u64 / 128 * 128;
-                            self.request_table();
                             self.select_range(start,end);
+                            let index = x.round().max(0.) as u64;
+                            self.plot_anchor=Some(index);
+                            self.selected_sample=Some(index);
+                            self.selected_samples=Some((index,index.saturating_add(1)));
+                            self.table_start=index / 128 * 128;
+                            self.request_table();
                         }
                     } else {
-                    let x = response.transform.value_from_position(pointer).x;
                     if let Some(index) = crate::browser_viewport::clicked_sample(x, self.count()) {
-                        self.selected_sample = Some(index);
+                        self.plot_anchor = Some(index);
                         self.probe_request = self.probe_request.wrapping_add(1);
                         self.queue(serde_json::json!({"type":"pick","path":self.collection,
                             "index":index.to_string(),"request":self.probe_request.to_string()}));
@@ -1349,6 +1403,14 @@ impl eframe::App for BrowserApp {
             self.layout.reveal(Pane::Inspector);
             self.reveal_inspector = false;
         }
+        if self.show_decoding_guide {
+            egui::Window::new("Decoder guide")
+                .open(&mut self.show_decoding_guide)
+                .default_width(560.)
+                .default_height(640.)
+                .resizable(true)
+                .show(ctx, |ui| crate::source_editor::decoding_guide(ui));
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
             self.apply_decoder();
         }
@@ -1366,7 +1428,7 @@ impl eframe::App for BrowserApp {
             available:!self.decoding, file:!self.name.is_empty(), selection:parse_offset(&self.range_start).zip(parse_offset(&self.range_end)).is_some_and(|(a,b)| a<b),
             undo:self.undo, redo:self.redo, save_decoder:!self.yaml.trim().is_empty(), apply:!self.decoding && !self.name.is_empty() && !self.decoder_empty(), busy:self.decoding, ..Default::default()
         });
-        publish_menus(&serde_json::to_string(&menus).unwrap(), &if self.name.is_empty() { String::new() } else { format!("{} · {} bytes{}",self.name,self.size,if self.dirty {" · unsaved changes"}else{""}) }, &self.status);
+        publish_menus(&serde_json::to_string(&menus).unwrap(), &if self.name.is_empty() { String::new() } else { format!("{} · {} bytes{}",self.name,self.size,if self.dirty {" · unsaved changes"}else{""}) }, &self.status, crate::APP_VERSION);
         if self.stacked {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.spacing_mut().interact_size.y = 32.;

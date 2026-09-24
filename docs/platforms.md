@@ -241,6 +241,10 @@ copy, cut, paste, undo/redo, and toggling comments. Keyboard editing remains
 available. Paste opens a native browser text box so touch paste and LAN HTTP
 work without clipboard API permission. **Decoder > Save decoder** (or Ctrl/Cmd+S) downloads the current
 source as `decoder.yaml`; this is separate from exporting edited binary data.
+Right-click preserves the current source selection. YAML syntax and indentation
+diagnostics update while typing and link back to their source line. **Help >
+Decoder guide** contains the YAML type/action reference and Python API inside the
+application; using the editor does not depend on opening repository Markdown files.
 
 Select bytes and choose **Interpret as**. Built-in types show previews; **Your
 structures** lists the names declared under `structures` in the current YAML.
@@ -260,16 +264,18 @@ normal bounded background decoder, including its existing resource limits.
 
 The untouched workspace starts with bytes and decoded structure. Saved docking
 arrangements are preserved; reset the workspace to try the new default. Mobile
-starts with these same views and keeps Code collapsed. Creating an interpretation
+starts with these same views and keeps Definition collapsed. Creating an interpretation
 reveals Decoded structure for naming; selecting existing fields still links to Hex.
 
-**Code** opens the same YAML decoder. Direct edits preserve surrounding source
+**Definition** opens the same YAML decoder. Direct edits preserve surrounding source
 and comments. They can rename or replace the explicit reads they create; editing
 nested declarations, block-style reads, expressions, or names already referenced
-elsewhere requires Code. A structure that relies on an explicit enclosing region
+elsewhere requires Definition. A structure that relies on an explicit enclosing region
 (such as `repeat: until end`) needs that region declared in YAML. Selecting bytes
 does not silently rewrite its boundaries or duplicate its definition.
 
 You do not need to decode the entire file or produce a plot. Errors leave the
 last successful results available. Hex copies selections within its loaded
 64 KiB page; larger ranges use streaming extraction where supported.
+Plot clicks select one record and link its exact bytes; Shift-click extends from
+the previous plot anchor and paints the selected record range on web and desktop.

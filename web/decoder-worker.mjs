@@ -23,7 +23,10 @@ self.onmessage = async ({data: m}) => {
                 self.postMessage({type:'decoded', result:JSON.parse(m.interpretation ? session.decode_interpretation(m.yaml, m.interpretation.name, m.interpretation.start, m.interpretation.end) : session.decode(m.yaml))});
             }
         } else if (m.type === 'pick') {
-            self.postMessage({type:'pick', request:m.request, result:JSON.parse(session.pick(m.path, m.index))});
+            const result = m.anchor === undefined
+                ? session.pick(m.path, m.index)
+                : session.pick_range(m.path, m.anchor, m.index);
+            self.postMessage({type:'pick', request:m.request, result:JSON.parse(result)});
         } else if (m.type === 'probe') {
             self.postMessage({type:'probe', request:m.request, result:JSON.parse(session.probe(m.path, m.start, m.end))});
         } else if (m.type === 'inspect') {

@@ -1,5 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+pub(crate) const APP_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+
 #[cfg(not(target_arch = "wasm32"))]
 mod app;
 #[cfg(not(target_arch = "wasm32"))]

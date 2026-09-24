@@ -215,6 +215,7 @@ pub fn menus(s: &State) -> Vec<Item> {
         Item::menu("Decoder", decoder),
         Item::menu("Edit", edit),
         Item::menu("View", view),
+        Item::menu("Help", vec![action("Decoder guide", Help, true)]),
     ]
 }
 pub fn native_bar(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)> {
@@ -245,6 +246,14 @@ pub fn native_bar(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)>
         for menu in menus {
             ui.menu_button(&menu.label, |ui| entries(ui, &menu.children, &mut selected));
         }
+        let row = ui.min_rect();
+        ui.painter().text(
+            egui::pos2(ui.clip_rect().right() - 8., row.top() + row.height() / 2.),
+            egui::Align2::RIGHT_CENTER,
+            crate::APP_VERSION,
+            egui::TextStyle::Small.resolve(ui.style()),
+            ui.visuals().weak_text_color(),
+        );
     });
     selected
 }
@@ -294,8 +303,8 @@ mod tests {
         let _ = frame();
         let output = frame();
         let mut positions = vec![];
-        for shape in output.shapes {
-            if let egui::Shape::Text(text) = shape.shape {
+        for shape in &output.shapes {
+            if let egui::Shape::Text(text) = &shape.shape {
                 if ["File", "Edit", "View", "Decode", "Tools", "Help"].contains(&text.galley.text()) {
                     assert!(text.pos.x + text.galley.size().x <= 360.);
                     positions.push(text.pos.y);
@@ -305,6 +314,23 @@ mod tests {
         assert_eq!(positions.len(), 6);
         assert!(positions.iter().all(|y| *y < 25.));
         assert!(positions.iter().all(|y| (*y - positions[0]).abs() < 1.));
+        let texts: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.text().to_owned(),
+                    text.pos,
+                    text.galley.size(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|(label, pos, size)|
+                label == crate::APP_VERSION && pos.x + size.x <= 360. && pos.y < 25.),
+            "version is not in the top-right menu row: {texts:?}"
+        );
     }
     #[test]
     fn platforms_share_commands_with_desktop_menu_organization() {
@@ -315,11 +341,11 @@ mod tests {
         });
         assert_eq!(
             web.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(),
-            ["Open data", "Decoder", "Edit", "View"]
+            ["Open data", "Decoder", "Edit", "View", "Help"]
         );
         assert_eq!(native.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(),
             ["File", "Edit", "View", "Decode", "Tools", "Help"]);
-        for (wi, ni) in [(0, 0), (1, 3), (2, 1), (3, 2)] {
+        for (wi, ni) in [(0, 0), (1, 3), (2, 1), (3, 2), (4, 5)] {
             for command in web[wi].children.iter().filter_map(|i| i.command) {
                 assert!(native[ni].children.iter().any(|i| i.command == Some(command)));
             }
