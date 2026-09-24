@@ -2023,6 +2023,14 @@ impl BinaryWorkspace {
                 }
             }
         });
+        if let Some(byte) = self.structure_ui.take_console_byte_jump() {
+            let file_len = self.file_len();
+            if file_len > 0 {
+                let start = usize::try_from(byte).unwrap_or(usize::MAX).min(file_len - 1);
+                self.hex_editor.select_range(start..start + 1, true);
+                self.reveal_hex = true;
+            }
+        }
     }
 
     fn select(&mut self, record: usize, field: usize) {

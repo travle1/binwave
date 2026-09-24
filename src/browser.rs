@@ -71,6 +71,8 @@ pub struct BrowserApp {
     jump: String,
     selected: Option<u64>,
     selection_anchor: Option<u64>,
+    hex_visible: Option<std::ops::Range<u64>>,
+    hex_reveal: Option<u64>,
     authoring: crate::direct_authoring::DirectAuthoring,
     authoring_pane: Pane,
     inline_decode: bool,
@@ -159,6 +161,8 @@ impl BrowserApp {
             jump: "0".into(),
             selected: None,
             selection_anchor: None,
+            hex_visible: None,
+            hex_reveal: None,
             authoring: Default::default(),
             authoring_pane: Pane::Hex,
             inline_decode: false,
@@ -229,6 +233,22 @@ impl BrowserApp {
         self.bytes.clear();
         self.jump = self.offset.to_string();
         self.needs_read = true;
+        self.hex_visible = None;
+        self.hex_reveal = None;
+    }
+    fn reveal_hex_selection(&mut self, start: u64) {
+        let loaded_end = self.offset.saturating_add(self.bytes.len() as u64);
+        let loaded = start >= self.offset && start < loaded_end;
+        if !loaded {
+            self.navigate(start / PAGE as u64 * PAGE as u64);
+            self.hex_reveal = Some(start);
+        } else if !self
+            .hex_visible
+            .as_ref()
+            .is_some_and(|visible| visible.contains(&start))
+        {
+            self.hex_reveal = Some(start);
+        }
     }
     fn events(&mut self) {
         // At most one file operation is outstanding. Bound work in each UI frame.
@@ -546,16 +566,81 @@ impl BrowserApp {
         let rows = self.bytes.len().div_ceil(columns);
         let selected_start = parse_offset(&self.range_start);
         let selected_end = parse_offset(&self.range_end);
-        egui::ScrollArea::both()
-            .id_source(("browser-hex", columns))
-            .show_rows(ui, row_height, rows, |ui, range| {
-                for row in range {
+        let width = address_width + columns as f32 * cell_width
+            + if show_ascii { ascii_width } else { 0. };
+        let (header, _) = ui.allocate_exact_size(
+            egui::vec2(width.max(ui.available_width()), row_height),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter_at(header);
+        painter.text(
+            header.left_center(),
+            egui::Align2::LEFT_CENTER,
+            "Offset",
+            font.clone(),
+            ui.visuals().weak_text_color(),
+        );
+        for column in 0..columns {
+            let cell = egui::Rect::from_min_size(
+                egui::pos2(
+                    header.left() + address_width + column as f32 * cell_width,
+                    header.top(),
+                ),
+                egui::vec2(cell_width, row_height),
+            );
+            painter.text(
+                cell.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("+{column:02X}"),
+                font.clone(),
+                ui.visuals().weak_text_color(),
+            );
+        }
+        if show_ascii {
+            painter.text(
+                egui::pos2(
+                    header.left() + address_width + columns as f32 * cell_width + 12.,
+                    header.center().y,
+                ),
+                egui::Align2::LEFT_CENTER,
+                "Text",
+                font.clone(),
+                ui.visuals().weak_text_color(),
+            );
+        }
+        painter.line_segment(
+            [header.left_bottom(), header.right_bottom()],
+            egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        );
+
+        let reveal = self.hex_reveal.filter(|at| {
+            *at >= self.offset && *at < self.offset.saturating_add(self.bytes.len() as u64)
+        });
+        let desired_scroll = reveal.map(|at| {
+            let row = (at - self.offset) / columns as u64;
+            (row as f32 * row_height - ui.available_height() * 0.35).max(0.0)
+        });
+        if reveal.is_some() {
+            self.hex_reveal = None;
+        }
+        let mut scroll = egui::ScrollArea::both().id_source(("browser-hex", columns));
+        if let Some(offset) = desired_scroll {
+            scroll = scroll.vertical_scroll_offset(offset);
+        }
+        let mut visible_bytes = None;
+        scroll.show_rows(ui, row_height, rows, |ui, range| {
+            if !range.is_empty() {
+                visible_bytes = Some(
+                    self.offset + (range.start * columns) as u64
+                        ..(self.offset + (range.end * columns) as u64)
+                            .min(self.offset.saturating_add(self.bytes.len() as u64)),
+                );
+            }
+            for row in range {
                     let start = row * columns;
                     let end = (start + columns).min(self.bytes.len());
                     // A row always occupies exactly one line. Painting fixed cells
                     // also gives each mobile byte a predictable touch target.
-                    let width = address_width + columns as f32 * cell_width
-                        + if show_ascii { ascii_width } else { 0. };
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::hover());
                     ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER,
                         format!("{:0digits$X}", self.offset + start as u64), font.clone(), ui.visuals().weak_text_color());
@@ -599,8 +684,9 @@ impl BrowserApp {
                             self.bytes[start..end].iter().map(|&b| crate::byte_display::ascii(b)).collect::<String>(),
                             font.clone(), ui.visuals().weak_text_color());
                     }
-                }
-            });
+            }
+        });
+        self.hex_visible = visible_bytes;
     }
     fn direct_controls(&mut self, ui: &mut egui::Ui, pane: Pane) {
         if pane != self.authoring_pane || self.language == crate::source_editor::DecoderLanguage::Python { return; }
@@ -930,7 +1016,7 @@ impl BrowserApp {
         self.range_start = start.to_string();
         self.range_end = end.to_string();
         export_selection(&self.range_start, &self.range_end);
-        self.navigate(start);
+        self.reveal_hex_selection(start);
     }
     fn menu_action(&mut self, command: crate::app_menu::Command, argument: usize) {
         use crate::app_menu::Command::*;
@@ -1039,6 +1125,14 @@ impl BrowserApp {
             copy_text(&text);
         }
         if let Some(line) = action.line { self.editor.go_to_line(line); }
+        if let Some(byte) = action.byte {
+            if self.size > 0 {
+                let start = byte.min(self.size - 1);
+                self.select_range(start, (start + 1).min(self.size));
+                self.layout.reveal(Pane::Hex);
+                self.mobile_target = Some(Pane::Hex);
+            }
+        }
         source_editor_focus(self.editor.focused());
     }
     fn collection_picker(&mut self, ui: &mut egui::Ui) {

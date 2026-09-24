@@ -90,6 +90,7 @@ pub struct StructureWorkspace {
     run_finished: Option<RunOutcome>,
     source: Option<ByteView>,
     run_requested: bool,
+    console_byte_jump: Option<u64>,
 }
 impl Drop for StructureWorkspace {
     fn drop(&mut self) {
@@ -389,6 +390,9 @@ impl StructureWorkspace {
     pub fn take_run_requested(&mut self) -> bool {
         std::mem::take(&mut self.run_requested)
     }
+    pub fn take_console_byte_jump(&mut self) -> Option<u64> {
+        self.console_byte_jump.take()
+    }
     pub fn show_steps(&mut self) {
         self.editor_page = EditorPage::Steps;
     }
@@ -586,6 +590,9 @@ impl StructureWorkspace {
             if let Some(line) = action.line {
                 self.yaml_layout.go_to_line(line);
             }
+            if let Some(byte) = action.byte {
+                self.console_byte_jump = Some(byte);
+            }
             return None;
         }
         if self.editor_page == EditorPage::Steps {
@@ -617,6 +624,9 @@ impl StructureWorkspace {
         }
         if let Some(line) = action.line {
             self.yaml_layout.go_to_line(line);
+        }
+        if let Some(byte) = action.byte {
+            self.console_byte_jump = Some(byte);
         }
     }
 

@@ -58,6 +58,7 @@ pub struct HexEditor {
     auto_width: bool,
     window_start: usize,
     pending_scroll: Option<f32>,
+    visible_range: Option<Range<usize>>,
     jump: String,
     focus_jump: bool,
     history: Vec<usize>,
@@ -107,6 +108,7 @@ impl Default for HexEditor {
             auto_width: true,
             window_start: 0,
             pending_scroll: None,
+            visible_range: None,
             jump: String::new(),
             focus_jump: false,
             history: vec![0],
@@ -192,18 +194,22 @@ impl HexEditor {
     }
 
     pub fn select_range(&mut self, range: Range<usize>, reveal: bool) {
+        let already_visible = self
+            .visible_range
+            .as_ref()
+            .is_some_and(|visible| visible.contains(&range.start));
         if range.is_empty() {
             self.anchor = None;
             if reveal {
                 self.caret = range.start;
-                self.reveal = true;
+                self.reveal |= !already_visible;
                 self.high_nibble = None;
             }
             return;
         }
         self.anchor = Some(range.start);
         self.caret = range.end - 1;
-        self.reveal |= reveal;
+        self.reveal |= reveal && !already_visible;
         self.high_nibble = None;
     }
 
@@ -853,6 +859,48 @@ A gold underline marks search hits; an orange top edge marks edits.");
         let hex_end = offset_width + self.bytes_per_row as f32 * cell_width;
         let ascii_start = hex_end + ascii_gutter;
         let content_width = row_width(self.bytes_per_row);
+        let (header, _) = ui.allocate_exact_size(
+            egui::vec2(content_width.max(ui.available_width()), row_height),
+            Sense::hover(),
+        );
+        let header_painter = ui.painter_at(header);
+        header_painter.text(
+            header.left_center(),
+            egui::Align2::LEFT_CENTER,
+            "Offset",
+            font.clone(),
+            ui.visuals().weak_text_color(),
+        );
+        for column in 0..self.bytes_per_row {
+            let cell = egui::Rect::from_min_size(
+                egui::pos2(
+                    header.left() + offset_width + column as f32 * cell_width,
+                    header.top(),
+                ),
+                egui::vec2(cell_width, row_height),
+            );
+            header_painter.text(
+                cell.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("+{column:02X}"),
+                font.clone(),
+                ui.visuals().weak_text_color(),
+            );
+        }
+        header_painter.text(
+            egui::pos2(header.left() + ascii_start, header.center().y),
+            egui::Align2::LEFT_CENTER,
+            "Text",
+            font.clone(),
+            ui.visuals().weak_text_color(),
+        );
+        header_painter.line_segment(
+            [header.left_bottom(), header.right_bottom()],
+            egui::Stroke::new(
+                1.0_f32,
+                ui.visuals().widgets.noninteractive.bg_stroke.color,
+            ),
+        );
         let id = ui.make_persistent_id("hex_byte_surface");
         let mut clicked_offset = None;
         let mut drag_offset = None;
@@ -867,7 +915,14 @@ A gold underline marks search hits; an orange top edge marks edits.");
         }
         let old_spacing = ui.spacing().item_spacing.y;
         ui.spacing_mut().item_spacing.y = 0.0;
+        let mut visible_range = None;
         let output = scroll.show_rows(ui, row_height, rows, |ui, visible| {
+            if !visible.is_empty() {
+                visible_range = Some(
+                    (self.window_start + visible.start) * self.bytes_per_row
+                        ..((self.window_start + visible.end) * self.bytes_per_row).min(source.len()),
+                );
+            }
             ui.set_min_width(content_width);
             if let Some(row) = visible.clone().next() {
                 requested_page = Some((self.window_start + row) * self.bytes_per_row);
@@ -1048,6 +1103,7 @@ A gold underline marks search hits; an orange top edge marks edits.");
                 }
             }
         });
+        self.visible_range = visible_range;
         // Menus can cover a different row from the one that opened them. Wait until
         // every row has handled its menu, then let egui check hover layers and delay.
         if !wants_context && !ui.input(|i| i.pointer.any_down()) {
@@ -1878,6 +1934,17 @@ mod tests {
                 _ => None,
             })
             .collect();
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"Offset"));
+        assert!(labels.contains(&"+00"));
+        assert!(labels.contains(&"+0F"));
         assert!(
             offsets.iter().copied().max().unwrap() > 256,
             "the panel must show more than a fixed 256-byte page"
@@ -1895,6 +1962,19 @@ mod tests {
         let (bytes, original) = page.result.unwrap();
         assert_eq!(bytes.len(), PAGE * 2);
         assert_eq!(bytes, original);
+    }
+
+    #[test]
+    fn decoded_selection_only_scrolls_when_the_target_is_offscreen() {
+        let mut editor = HexEditor::default();
+        editor.visible_range = Some(64..192);
+        editor.select_range(96..100, true);
+        assert_eq!(editor.selection(), Some(96..100));
+        assert!(!editor.reveal, "a visible selection must not move the viewport");
+
+        editor.select_range(512..516, true);
+        assert_eq!(editor.selection(), Some(512..516));
+        assert!(editor.reveal, "an offscreen selection must be revealed");
     }
 
     #[test]
