@@ -1262,13 +1262,7 @@ A gold underline marks search hits; an orange top edge marks edits.");
             ui.weak("Select a byte or range in Hex.");
             return actions;
         };
-        ui.label(RichText::new("Byte selection").strong());
-        ui.monospace(format!("0x{:X}–0x{:X}", range.start, range.end - 1));
-        ui.label(format!(
-            "{} bytes · absolute offset {}",
-            range.len(),
-            range.start
-        ));
+        // The byte display is shared with the browser Inspector.
         let preview_range = range.start..range.end.min(range.start.saturating_add(64));
         if self.selection_rx.is_none()
             && !self
@@ -1291,53 +1285,12 @@ A gold underline marks search hits; an orange top edge marks edits.");
                 ctx.request_repaint();
             });
         }
-        if let Some((cached, revision, bytes)) = &self.selection_bytes {
-            if *cached == preview_range && *revision == source.revision {
-                egui::Grid::new("hex_numeric_inspector")
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.strong("Type");
-                        ui.strong("Little endian");
-                        ui.strong("Big endian");
-                        ui.end_row();
-                        if let Some(&b) = bytes.first() {
-                            ui.label("u8 / i8");
-                            ui.monospace(format!("{b} / {}", b as i8));
-                            ui.weak("—");
-                            ui.end_row();
-                        }
-                        macro_rules! numeric {
-                            ($ty:ty, $count:expr, $name:expr) => {
-                                if bytes.len() >= $count {
-                                    let b: [u8; $count] = bytes[..$count].try_into().unwrap();
-                                    ui.label($name);
-                                    ui.monospace(format!("{}", <$ty>::from_le_bytes(b)));
-                                    ui.monospace(format!("{}", <$ty>::from_be_bytes(b)));
-                                    ui.end_row();
-                                }
-                            };
-                        }
-                        numeric!(u16, 2, "u16");
-                        numeric!(i16, 2, "i16");
-                        numeric!(u32, 4, "u32");
-                        numeric!(i32, 4, "i32");
-                        numeric!(f32, 4, "f32");
-                        numeric!(u64, 8, "u64");
-                        numeric!(i64, 8, "i64");
-                        numeric!(f64, 8, "f64");
-                    });
-                if let Some(b) = bytes.first() {
-                    ui.monospace(format!("Bits  {b:08b}"));
-                }
-                ui.label(format!(
-                    "Text  {}",
-                    String::from_utf8_lossy(bytes)
-                        .chars()
-                        .map(|c| if c.is_control() { '·' } else { c })
-                        .collect::<String>()
-                ));
-            }
-        }
+        let preview = self.selection_bytes.as_ref()
+            .filter(|(cached, revision, _)| *cached == preview_range && *revision == source.revision)
+            .map(|(_, _, bytes)| bytes.as_slice());
+        crate::workspace_inspector::byte_selection(
+            ui, range.start as u64..range.end as u64, preview,
+        );
         ui.horizontal_wrapped(|ui| {
             if ui
                 .button(if self.python_mode {

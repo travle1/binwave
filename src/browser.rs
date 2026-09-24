@@ -17,9 +17,9 @@ extern "C" {
     #[wasm_bindgen(js_namespace = binwave, js_name = copyText)]
     pub fn copy_text(text: &str);
     #[wasm_bindgen(js_namespace = binwave, js_name = saveDecoder)]
-    fn save_decoder(text: &str);
+    fn save_decoder(text: &str, language: &str);
     #[wasm_bindgen(js_namespace = binwave, js_name = decoderDraft)]
-    fn decoder_draft(text: &str);
+    fn decoder_draft(text: &str, language: &str);
     #[wasm_bindgen(js_namespace = binwave, js_name = clearDecoder)]
     fn clear_decoder_status();
     #[wasm_bindgen(js_namespace = binwave, js_name = send)]
@@ -75,6 +75,12 @@ pub struct BrowserApp {
     direct_pending: Option<(String, crate::direct_authoring::Interpretation)>,
     direct_error: Option<String>,
     selected_sample: Option<u64>,
+    inspected: Option<crate::workspace_inspector::FieldInfo>,
+    inspector_definition: Option<(u64, usize)>,
+    value_text: String,
+    value_original: String,
+    value_error: Option<String>,
+    value_request: u64,
     plot_visible: Option<[f64; 2]>,
     probe_request: u64,
     range_start: String,
@@ -84,10 +90,16 @@ pub struct BrowserApp {
     dirty: bool,
     undo: bool,
     redo: bool,
+    language: crate::source_editor::DecoderLanguage,
+    other_draft: String,
+    applied_language: crate::source_editor::DecoderLanguage,
     yaml: String,
     sent_yaml: Option<String>,
     applied_yaml: String,
     decoding_yaml: String,
+    decoding_language: crate::source_editor::DecoderLanguage,
+    python_stdout: String,
+    decoder_error: Option<String>,
     editor: crate::source_editor::YamlLayoutCache,
     decoded: serde_json::Value,
     table: serde_json::Value,
@@ -117,6 +129,18 @@ pub struct BrowserApp {
 impl BrowserApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         browser_ready();
+        let saved_yaml = cc.storage.and_then(|s| s.get_string("browser-decoder-yaml"))
+            .filter(|s| s.len() <= 256 * 1024)
+            .unwrap_or_else(|| "endian: little\nactions: []\n".into());
+        let saved_python = cc.storage.and_then(|s| s.get_string("browser-decoder-python"))
+            .filter(|s| s.len() <= 256 * 1024)
+            .unwrap_or_else(|| crate::source_editor::DecoderLanguage::Python.byte_preview().into());
+        let language = if cc.storage.and_then(|s| s.get_string("browser-decoder-language")).as_deref() == Some("python") {
+            crate::source_editor::DecoderLanguage::Python
+        } else { crate::source_editor::DecoderLanguage::Yaml };
+        let (active_draft, other_draft) = if language == crate::source_editor::DecoderLanguage::Python {
+            (saved_python, saved_yaml)
+        } else { (saved_yaml, saved_python) };
         Self {
             layout: cc
                 .storage
@@ -136,6 +160,12 @@ impl BrowserApp {
             direct_pending: None,
             direct_error: None,
             selected_sample: None,
+            inspected: None,
+            inspector_definition: None,
+            value_text: String::new(),
+            value_original: String::new(),
+            value_error: None,
+            value_request: 0,
             plot_visible: None,
             probe_request: 0,
             range_start: "0".into(),
@@ -146,14 +176,16 @@ impl BrowserApp {
             dirty: false,
             undo: false,
             redo: false,
-            yaml: cc
-                .storage
-                .and_then(|s| s.get_string("browser-decoder-yaml"))
-                .filter(|s| s.len() <= 256 * 1024)
-                .unwrap_or_else(|| "endian: little\nactions: []\n".into()),
+            language,
+            other_draft,
+            applied_language: crate::source_editor::DecoderLanguage::Yaml,
+            yaml: active_draft,
             sent_yaml: None,
             applied_yaml: String::new(),
             decoding_yaml: String::new(),
+            decoding_language: language,
+            python_stdout: String::new(),
+            decoder_error: None,
             editor: Default::default(),
             decoded: Default::default(),
             table: Default::default(),
@@ -221,6 +253,7 @@ impl BrowserApp {
                             "Select bytes to preview interpretations and name fields."
                                 .into();
                         if event.demo {
+                            self.switch_language(crate::source_editor::DecoderLanguage::Yaml);
                             self.yaml = if self.name == crate::demos::Demo::Advanced.name() {
                                 crate::demos::Demo::Advanced.yaml()
                             } else { crate::demos::Demo::Simple.yaml() }.into();
@@ -255,10 +288,13 @@ impl BrowserApp {
                 "menu" => if let Some(command)=event.command { self.menu_action(command,event.argument); },
                 "decoder-source" => {
                     if event.source.len() <= 256 * 1024 {
+                        self.switch_language(if event.name.to_ascii_lowercase().ends_with(".py") {
+                            crate::source_editor::DecoderLanguage::Python
+                        } else { crate::source_editor::DecoderLanguage::Yaml });
                         self.yaml = event.source;
                         self.reveal_decoder = true;
                         self.mobile_target = Some(Pane::Layout);
-                        self.status = format!("Loaded {}. Tap Apply to decode the open data file.", event.name);
+                        self.status = format!("Loaded {}. Press ▶ Run (F5) to decode the open data file.", event.name);
                     } else {
                         self.status = "Decoder source is limited to 256 KiB.".into();
                     }
@@ -274,11 +310,22 @@ impl BrowserApp {
                         self.authoring_pane = Pane::Structures;
                         self.layout.reveal(Pane::Structures);
                         self.mobile_target = Some(Pane::Structures);
-                    } else if crate::direct_authoring::empty_draft(&self.yaml) { continue; }
+                    } else if self.decoder_empty() { continue; }
                     self.direct_error = None;
                     self.applied_yaml = self.decoding_yaml.clone();
+                    self.applied_language = self.decoding_language;
+                    self.python_stdout = event.result["stdout"].as_str().unwrap_or("").to_owned();
+                    self.decoder_error = None;
                     self.decoding = false;
                     self.decoded = event.result;
+                    if self.decoded["noData"].as_bool() == Some(true) {
+                        self.table = Default::default();
+                        self.plot = Default::default();
+                        self.collection.clear();
+                        self.plot_sources.clear();
+                        self.status = "Python script ran, but registered no decoded fields.".into();
+                        continue;
+                    }
                     self.plot_sources.retain(|p| self.decoded["collections"].as_array().into_iter().flatten().any(|c| c["path"].as_str()==Some(p)));
 
                     self.table = Default::default();
@@ -300,6 +347,9 @@ impl BrowserApp {
                     self.status = format!("Decoded {} of {} bytes. {}", self.decoded["consumed"].as_str().unwrap_or("0"), self.size,
                         if self.collection.is_empty() { "Inspect the fields in Decoded structure; unread bytes are allowed." }
                         else { "Select samples to inspect their values and bytes." });
+                    if let Some((start, end)) = parse_offset(&self.range_start).zip(parse_offset(&self.range_end)) {
+                        self.request_inspect(start, end);
+                    }
                 }
                 "pick" => {
                     if event.request == self.probe_request.to_string()
@@ -310,6 +360,7 @@ impl BrowserApp {
                             self.range_start = start.to_string();
                             self.range_end = end.to_string();
                             export_selection(&self.range_start, &self.range_end);
+                            self.request_inspect(start, end);
                             self.navigate(start);
                             self.table_start = self.selected_sample.unwrap_or(0) / 128 * 128;
                             self.request_table();
@@ -335,6 +386,30 @@ impl BrowserApp {
                         }
                     }
                 }
+                "inspect" => {
+                    if event.request == self.probe_request.to_string() {
+                        self.inspected = serde_json::from_value(event.result["field"].clone()).ok();
+                        self.inspector_definition = event.result["consumed"].as_str()
+                            .and_then(parse_offset).zip(event.result["types"].as_u64())
+                            .map(|(consumed, types)| (consumed, types as usize));
+                        self.value_original = self.inspected.as_ref().map(|field| field.value.clone()).unwrap_or_default();
+                        self.value_text = self.value_original.clone();
+                        self.value_error = None;
+                    }
+                }
+                "encoded" => {
+                    if event.request == format!("{}:{}", self.probe_request, self.value_request) {
+                        if let Some(field) = self.inspected.clone() {
+                            if event.result["start"].as_str() == Some(&field.start.to_string())
+                                && event.result["end"].as_str() == Some(&field.end.to_string()) {
+                                self.queue(serde_json::json!({"type":"replace_range",
+                                    "offset":field.start.to_string(),"bytes":event.result["bytes"]}));
+                                self.status = format!("Applying {} to {}…",
+                                    event.result["displayed"].as_str().unwrap_or("value"), field.name);
+                            }
+                        }
+                    }
+                }
                 "table" => {
                     if event.result["path"].as_str() == Some(&self.collection) {
                         self.table = event.result;
@@ -347,9 +422,16 @@ impl BrowserApp {
                     }
                 }
                 "error" => {
-                    if self.direct_pending.is_none() && crate::direct_authoring::empty_draft(&self.yaml) && matches!(event.operation.as_str(), "decode" | "table" | "plot" | "probe" | "pick") { continue; }
+                    if event.operation == "encode" {
+                        self.value_error = Some(event.message);
+                        continue;
+                    }
+                    if self.direct_pending.is_none() && self.decoder_empty() && matches!(event.operation.as_str(), "decode" | "decode_python" | "table" | "plot" | "probe" | "pick" | "inspect") { continue; }
                     self.direct_pending = None;
                     if self.inline_decode { self.direct_error = Some(event.message.clone()); }
+                    if matches!(event.operation.as_str(), "decode" | "decode_python") {
+                        self.decoder_error = Some(event.message.clone());
+                    }
                     self.inline_decode = false;
                     self.decoding = false;
                     self.pending.clear();
@@ -492,7 +574,7 @@ impl BrowserApp {
             });
     }
     fn direct_controls(&mut self, ui: &mut egui::Ui, pane: Pane) {
-        if pane != self.authoring_pane { return; }
+        if pane != self.authoring_pane || self.language == crate::source_editor::DecoderLanguage::Python { return; }
         let range = parse_offset(&self.range_start).zip(parse_offset(&self.range_end)).map(|(a,b)| a..b);
         let preview = range.as_ref().and_then(|r| r.start.checked_sub(self.offset).and_then(|n| usize::try_from(n).ok())
             .and_then(|start| self.bytes.get(start..).map(|bytes| bytes[..bytes.len().min((r.end.saturating_sub(r.start)).min(64) as usize)].to_vec())));
@@ -541,16 +623,83 @@ impl BrowserApp {
             ui.close_menu();
         }
         if ui.button("Select loaded page").clicked() {
+        if self.inspected.is_none() && self.selected.is_none() {
+            crate::workspace_inspector::empty_selection(
+                ui,
+                !self.name.is_empty(),
+                !self.decoded.is_null(),
+            );
+        }
             self.selection_anchor = Some(self.offset);
             self.set_hex_range(self.offset, self.offset + self.bytes.len() as u64);
             ui.close_menu();
         }
     }
     fn inspector(&mut self, ui: &mut egui::Ui) {
-        if let Some(at) = self.selected {
-            ui.monospace(format!("Selected byte: {at} / 0x{at:X}"));
+        let mut reveal = None;
+        if let Some(field) = self.inspected.clone() {
+            crate::workspace_inspector::field_heading(ui, &field);
+            ui.label("Value");
+            if field.editable {
+                let apply = crate::workspace_inspector::value_editor(
+                    ui, &mut self.value_text, &self.value_original, &mut self.value_error, !self.decoding);
+                if apply {
+                    self.value_request = self.value_request.wrapping_add(1);
+                    self.value_error = None;
+                    self.queue(serde_json::json!({"type":"encode",
+                        "start":field.start.to_string(),"end":field.end.to_string(),
+                        "value":self.value_text,
+                        "request":format!("{}:{}",self.probe_request,self.value_request)}));
+                }
+            } else {
+                ui.label(&field.value);
+                ui.weak("Edit this field in Hex.");
+            }
             ui.horizontal_wrapped(|ui| {
-                ui.label("Replace with hex byte:");
+                if ui.button("Reveal in Hex").clicked() {
+                    reveal = Some((field.start, field.end));
+                }
+                if let Some(range) = field.sample_range() {
+                    ui.menu_button("Sample actions", |ui| {
+                        if ui.button("Select all bytes of sample").clicked() {
+                            reveal = Some((range.start, range.end));
+                            ui.close_menu();
+                        }
+                    });
+                }
+            });
+            egui::CollapsingHeader::new("Technical details").show(ui, |ui| {
+                crate::workspace_inspector::field_details(ui, &field, self.inspector_definition);
+            });
+            ui.separator();
+        } else if !self.decoded.is_null() && self.selected.is_some() {
+            ui.weak("No decoded field covers this selection.");
+        }
+        let selection = parse_offset(&self.range_start).zip(parse_offset(&self.range_end))
+            .filter(|(start, end)| start < end && *end <= self.size);
+        let preview = selection.and_then(|(start, end)| {
+            let index = usize::try_from(start.checked_sub(self.offset)?).ok()?;
+            let bytes = self.bytes.get(index..)?;
+            Some(bytes[..bytes.len().min(64).min((end - start).min(64) as usize)].to_vec())
+        });
+        let raw = |ui: &mut egui::Ui| {
+            if let Some((start, end)) = selection {
+                crate::workspace_inspector::byte_selection(ui, start..end, preview.as_deref());
+            } else {
+                ui.weak("Select a byte or range in Hex.");
+            }
+        };
+        if self.inspected.is_some() {
+            egui::CollapsingHeader::new("Raw bytes").show(ui, raw);
+        } else {
+            raw(ui);
+        }
+        if let Some((start, end)) = reveal {
+            self.select_range(start, end);
+        }
+        if let Some(at) = self.selected {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Replace selected byte with hex:");
                 ui.add(egui::TextEdit::singleline(&mut self.replacement).desired_width(40.0).char_limit(2));
                 if ui.button("Apply").clicked() {
                     if let Ok(value) = u8::from_str_radix(self.replacement.trim(), 16) {
@@ -560,29 +709,36 @@ impl BrowserApp {
                     } else { self.status = "Enter a hexadecimal byte, 00 through FF.".into(); }
                 }
             });
-        } else {
-            ui.label("Select a byte in Hex to edit it.");
         }
         ui.separator();
         ui.label("Extraction range (start inclusive, end exclusive):");
         ui.text_edit_singleline(&mut self.range_start);
         ui.text_edit_singleline(&mut self.range_end);
         if ui.button("Set extraction range").clicked() {
-            match (
-                parse_offset(&self.range_start),
-                parse_offset(&self.range_end),
-            ) {
+            match (parse_offset(&self.range_start), parse_offset(&self.range_end)) {
                 (Some(start), Some(end)) if start <= end && end <= self.size => {
                     self.selection_anchor = Some(start);
                     self.set_hex_range(start, end);
-                    self.status = format!(
-                        "Extraction range {start}..{end} set. Use Extract selection above."
-                    );
+                    self.status = format!("Extraction range {start}..{end} set. Use Extract selection above.");
                 }
                 _ => self.status = "Extraction range must be inside the file.".into(),
             }
         }
         ui.label("Edits are sparse: up to 65,536 byte positions and 4,096 undo steps. Unsaved edits are lost on reload.");
+    }
+    fn decoder_empty(&self) -> bool {
+        match self.language {
+            crate::source_editor::DecoderLanguage::Yaml => crate::direct_authoring::empty_draft(&self.yaml),
+            crate::source_editor::DecoderLanguage::Python => self.yaml.trim().is_empty(),
+        }
+    }
+    fn switch_language(&mut self, language: crate::source_editor::DecoderLanguage) {
+        if self.language == language { return; }
+        std::mem::swap(&mut self.yaml, &mut self.other_draft);
+        self.language = language;
+        self.editor = Default::default();
+        self.sent_yaml = None;
+        self.reset_decoder();
     }
     fn reset_decoder(&mut self) {
         if self.decoding { self.command(serde_json::json!({"type":"cancel"})); }
@@ -593,13 +749,23 @@ impl BrowserApp {
         self.direct_error = None;
         self.inline_decode = false;
         self.reveal_results = false;
-        self.status = "No fields yet. Select bytes, choose a type, and name the field.".into();
+        self.python_stdout.clear();
+        self.decoder_error = None;
+        self.status = if self.language == crate::source_editor::DecoderLanguage::Python {
+            "Open a data file, then press ▶ Run (F5). Python runs locally in this browser."
+        } else { "No fields yet. Select bytes, choose a type, and name the field." }.into();
         clear_decoder_status();
     }
     fn clear_results(&mut self) {
         self.direct_pending = None;
         self.selected_sample = None;
+        self.inspected = None;
+        self.inspector_definition = None;
+        self.value_text.clear();
+        self.value_original.clear();
+        self.value_error = None;
         self.probe_request = self.probe_request.wrapping_add(1);
+        self.decoder_error = None;
         self.decoded = Default::default();
         self.table = Default::default();
         self.plot = Default::default();
@@ -611,14 +777,26 @@ impl BrowserApp {
         self.decoding = false;
     }
     fn queue(&mut self, value: serde_json::Value) {
+        let important = matches!(value["type"].as_str(), Some("decode" | "decode_python" | "encode" | "replace_range" | "pick"));
         self.pending.retain(|m| m["type"] != value["type"]);
-        if self.pending.len() < 4 {
+        if self.pending.len() >= 8 {
+            if !important { return; }
+            if let Some(index) = self.pending.iter().rposition(|m|
+                matches!(m["type"].as_str(), Some("plot" | "table" | "probe" | "inspect"))) {
+                self.pending.remove(index);
+            } else {
+                self.pending.pop_back();
+            }
+        }
+        if important {
+            self.pending.push_front(value);
+        } else {
             self.pending.push_back(value);
         }
     }
     fn apply_decoder(&mut self) {
         self.direct_pending = None;
-        if crate::direct_authoring::empty_draft(&self.yaml) { self.reset_decoder(); return; }
+        if self.decoder_empty() { self.reset_decoder(); return; }
         self.inline_decode = false;
         self.direct_error = None;
         if self.name.is_empty() {
@@ -632,8 +810,16 @@ impl BrowserApp {
         self.pending.clear();
         self.decoding = true;
         self.decoding_yaml = self.yaml.clone();
-        self.queue(serde_json::json!({"type":"decode","yaml":self.yaml}));
-        self.status = "Decoding in worker…".into();
+        self.decoding_language = self.language;
+        self.python_stdout.clear();
+        if self.language == crate::source_editor::DecoderLanguage::Python {
+        self.decoder_error = None;
+            self.queue(serde_json::json!({"type":"decode_python","script":self.yaml,"filename":"<browser-decoder.py>"}));
+            self.status = "Loading browser Python and decoding locally…".into();
+        } else {
+            self.queue(serde_json::json!({"type":"decode","yaml":self.yaml}));
+            self.status = "Decoding in worker…".into();
+        }
     }
     fn count(&self) -> u64 {
         self.decoded["collections"]
@@ -685,6 +871,16 @@ impl BrowserApp {
             _ => self.status = "Choose a nonempty sample range within the collection.".into(),
         }
     }
+    fn request_inspect(&mut self, start: u64, end: u64) {
+        self.inspected = None;
+        self.inspector_definition = None;
+        self.value_error = None;
+        if !self.decoded.is_null() && self.decoded["noData"].as_bool() != Some(true) && start < end {
+            self.queue(serde_json::json!({"type":"inspect",
+                "start":start.to_string(),"end":end.to_string(),
+                "request":self.probe_request.to_string()}));
+        }
+    }
     fn probe_selection(&mut self, start: u64, end: u64) {
         self.selected_sample = None;
         self.probe_request = self.probe_request.wrapping_add(1);
@@ -692,6 +888,7 @@ impl BrowserApp {
             self.queue(serde_json::json!({"type":"probe","path":self.collection,
                 "start":start.to_string(),"end":end.to_string(),"request":self.probe_request.to_string()}));
         }
+        self.request_inspect(start, end);
     }
     fn select_range(&mut self, start: u64, end: u64) {
         self.probe_selection(start, end);
@@ -708,10 +905,12 @@ impl BrowserApp {
         match command {
             SimpleDemo=>self.open_simple_demo(),
             AdvancedDemo=>self.open_demo(crate::demos::Demo::Advanced),
-            SaveDecoder=>save_decoder(&self.yaml),
-            NewDecoder=>{self.yaml="endian: little\nactions: []\n".into();self.reset_decoder();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
+            SaveDecoder=>save_decoder(&self.yaml, if self.language == crate::source_editor::DecoderLanguage::Python { "python" } else { "yaml" }),
+            NewDecoder=>{self.switch_language(crate::source_editor::DecoderLanguage::Yaml);self.yaml="endian: little\nactions: []\n".into();self.reset_decoder();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
+            Python=>{self.switch_language(crate::source_editor::DecoderLanguage::Python);self.yaml=crate::source_editor::DecoderLanguage::Python.starter().into();self.reset_decoder();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
+            PythonExample=>{self.switch_language(crate::source_editor::DecoderLanguage::Python);self.yaml=crate::source_editor::DecoderLanguage::Python.byte_preview().into();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
             Apply=>self.apply_decoder(),
-            Example=>if let Some((_,yaml))=crate::source_editor::YAML_EXAMPLES.get(argument) {self.yaml=(*yaml).into();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
+            Example=>if let Some((_,yaml))=crate::source_editor::YAML_EXAMPLES.get(argument) {self.switch_language(crate::source_editor::DecoderLanguage::Yaml);self.yaml=(*yaml).into();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
             Undo=>{self.command(serde_json::json!({"type":"undo"}));},
             Redo=>{self.command(serde_json::json!({"type":"redo"}));},
             CopyHex=>self.copy_selected_hex(),
@@ -732,31 +931,85 @@ impl BrowserApp {
         self.open_demo(crate::demos::Demo::Simple);
     }
     fn open_demo(&self, demo: crate::demos::Demo) {
-        open_embedded_demo(demo.bytes(), self.yaml != demo.yaml(), demo.name());
+        open_embedded_demo(demo.bytes(), self.language != crate::source_editor::DecoderLanguage::Yaml || self.yaml != demo.yaml(), demo.name());
     }
     fn decoder(&mut self, ui: &mut egui::Ui) {
-        if let Some(command)=crate::app_menu::decoder_controls(ui,!self.decoding && !self.name.is_empty(),self.decoding) { self.menu_action(command,0); }
+        ui.horizontal(|ui| {
+            let mut language = self.language;
+            ui.selectable_value(&mut language, crate::source_editor::DecoderLanguage::Yaml, "YAML");
+            ui.selectable_value(&mut language, crate::source_editor::DecoderLanguage::Python, "Python");
+            self.switch_language(language);
+        });
+        let disabled_reason = if self.decoding {
+            Some("A decoder is already running. Stop it before starting another run.")
+        } else if self.name.is_empty() {
+            Some("Open a data file first. The decoder runs against the open file.")
+        } else if self.decoder_empty() {
+            Some("Enter decoder source or open a decoder file first.")
+        } else {
+            None
+        };
+        let can_run = disabled_reason.is_none();
+        if let Some(command)=crate::app_menu::decoder_controls(
+            ui, can_run, self.decoding, disabled_reason) {
+            self.menu_action(command,0);
+        }
         if self.size == 0 {
             if ui.button("Open simple demo").clicked() {
                 self.open_simple_demo();
             }
             ui.label("512 samples · 2 KB · opens and plots automatically");
         }
-        ui.label(&self.status);
-        if !self.decoded.is_null() && self.yaml != self.applied_yaml {
-            ui.colored_label(ui.visuals().warn_fg_color, "Results show the last successful decode. Apply to test these edits.");
+        let current = !self.decoded.is_null()
+            && self.yaml == self.applied_yaml
+            && self.language == self.applied_language;
+        let (headline, detail, tone) = if self.decoder_error.is_some() {
+            ("Run failed", "Use the Console below to inspect the error and jump to its source line.", crate::decoder_ui::StatusTone::Error)
+        } else if self.decoding {
+            ("Running decoder…", "The last successful results remain visible while this run completes.", crate::decoder_ui::StatusTone::Ready)
+        } else if self.name.is_empty() {
+            ("Open a data file", "Step 1: open a local file. Step 2: edit the decoder. Step 3: press ▶ Run (F5).", crate::decoder_ui::StatusTone::Neutral)
+        } else if self.decoder_empty() {
+            ("Add decoder source", "Start from the runnable example or open a decoder, then press ▶ Run (F5).", crate::decoder_ui::StatusTone::Neutral)
+        } else if current {
+            ("Results are current", "Decoded structure, Plot, Samples, Inspector, and Hex now use this run.", crate::decoder_ui::StatusTone::Success)
+        } else {
+            ("Ready to run", "Press ▶ Run (F5) to update Decoded structure, Plot, Samples, Inspector, and Hex.", crate::decoder_ui::StatusTone::Ready)
+        };
+        crate::decoder_ui::status_banner(ui, headline, detail, tone, self.decoding);
+        if !self.decoded.is_null() && (self.yaml != self.applied_yaml || self.language != self.applied_language) {
+            ui.colored_label(ui.visuals().warn_fg_color, "Previous results remain visible. Press ▶ Run (F5) to test these edits.");
         }
-        self.editor.editor(
-            ui,
-            &mut self.yaml,
-            crate::source_editor::DecoderLanguage::Yaml,
-        );
+        if self.language == crate::source_editor::DecoderLanguage::Python {
+            ui.weak("Python runs locally in this browser. Scripts are not sandboxed from the network.");
+            let height = ui.available_height();
+            let console_height: f32 = if self.decoder_error.is_some() { 190.0 } else { 125.0 };
+            let console_height = console_height.min(height * 0.42).max(64.0);
+            ui.allocate_ui(
+                egui::vec2(ui.available_width(), (height - console_height - 8.0).max(80.0)),
+                |ui| self.editor.editor(ui, &mut self.yaml, self.language),
+            );
+            ui.add_space(6.0);
+            let action = crate::decoder_ui::console(
+                ui, &self.python_stdout, self.decoder_error.as_deref(), self.decoding);
+            if action.copy {
+                let mut text = self.python_stdout.clone();
+                if let Some(error) = &self.decoder_error {
+                    if !text.is_empty() { text.push('\n'); }
+                    text.push_str(error);
+                }
+                copy_text(&text);
+            }
+            if let Some(line) = action.line { self.editor.go_to_line(line); }
+        } else {
+            self.editor.editor(ui, &mut self.yaml, self.language);
+        }
     }
     fn collection_picker(&mut self, ui: &mut egui::Ui) {
         let mut selected = self.collection.clone();
         egui::ComboBox::from_id_source("collection")
             .selected_text(if selected.is_empty() {
-                "Apply a decoder"
+                "Run a decoder"
             } else {
                 &selected
             })
@@ -839,7 +1092,7 @@ impl BrowserApp {
                         }
                     });
             } else {
-                ui.label(if self.decoded.is_null() { "Apply a decoder to populate samples." } else { "No repeated samples yet. Your decoded fields are in Decoded structure." });
+                ui.label(if self.decoded.is_null() { "Press ▶ Run (F5) to populate samples." } else { "No repeated samples yet. Your decoded fields are in Decoded structure." });
             }
         });
         if let Some((start, end)) = selection {
@@ -848,13 +1101,13 @@ impl BrowserApp {
     }
     fn structures(&mut self, ui: &mut egui::Ui) {
         self.direct_controls(ui, Pane::Structures);
-        fn tree(ui: &mut egui::Ui, node: &serde_json::Value, selection: &mut Option<(u64, u64)>, authoring: &mut crate::direct_authoring::DirectAuthoring, source: &str, edit: &mut Option<crate::direct_authoring::Edit>) {
+        fn tree(ui: &mut egui::Ui, node: &serde_json::Value, selection: &mut Option<(u64, u64)>, authoring: &mut crate::direct_authoring::DirectAuthoring, source: &str, editable: bool, edit: &mut Option<crate::direct_authoring::Edit>) {
             let range = node["start"].as_str().and_then(parse_offset).zip(node["end"].as_str().and_then(parse_offset));
             ui.push_id(node["path"].as_str().unwrap_or(""), |ui| {
                 ui.horizontal(|ui| {
                     if let Some((start, end)) = range {
                         let name = node["name"].as_str().unwrap_or("");
-                        let (response, change) = if node["path"].as_str() == Some(name) { authoring.name_ui(ui, source, name, start..end) } else { (ui.selectable_label(false, name), None) };
+                        let (response, change) = if editable && node["path"].as_str() == Some(name) { authoring.name_ui(ui, source, name, start..end) } else { (ui.selectable_label(false, name), None) };
                         if response.clicked() { *selection = Some((start,end)); }
                         if change.is_some() { *edit = change; }
                     }
@@ -887,7 +1140,7 @@ impl BrowserApp {
                     }
                     if let Some(children) = node["children"].as_array() {
                         for child in children {
-                            tree(ui, child, selection, authoring, source, edit);
+                            tree(ui, child, selection, authoring, source, editable, edit);
                         }
                     }
                 });
@@ -897,7 +1150,7 @@ impl BrowserApp {
         egui::ScrollArea::both().show(ui, |ui| {
             if let Some(nodes) = self.decoded["nodes"].as_array() {
                 for node in nodes {
-                    tree(ui, node, &mut selection, &mut self.authoring, &self.yaml, &mut edit);
+                    tree(ui, node, &mut selection, &mut self.authoring, &self.yaml, self.language == crate::source_editor::DecoderLanguage::Yaml, &mut edit);
                 }
             } else {
                 ui.label("Select bytes in Hex and name a field; its decoded value will appear here.");
@@ -910,12 +1163,16 @@ impl BrowserApp {
         }
     }
     fn decoded_plot(&mut self, ui: &mut egui::Ui) {
-        if !self.decoded.is_null() && self.yaml != self.applied_yaml {
-            ui.weak("Previous results. Apply the edited code to refresh.");
+        if !self.decoded.is_null() && (self.yaml != self.applied_yaml || self.language != self.applied_language) {
+            ui.weak("Previous results. Press ▶ Run (F5) to refresh.");
         }
         if self.collection.is_empty() {
-            ui.label(if self.decoded.is_null() { "Name fields in Hex to begin. Repeated numeric fields can be plotted here." }
-                else { "Fields decoded successfully. Inspect Decoded structure; add repeated numeric samples when ready to plot." });
+            let (title, detail) = if self.decoded.is_null() {
+                ("Nothing to plot yet", "Press ▶ Run (F5). Repeated numeric fields become plot series.")
+            } else {
+                ("No sample series yet", "The decoder ran successfully. Add a repeated numeric field, then run again.")
+            };
+            crate::decoder_ui::empty_state(ui, title, detail);
             return;
         }
         let mut changed = false;
@@ -948,8 +1205,8 @@ impl BrowserApp {
                 });
                 if self.presentation.menu(ui,&ranges) {self.fit_plot_y=true;}
             });
-            if ui.button("Fit all").clicked() { self.first="0".into();self.last=self.plot_count().to_string();self.request_plot(1200); }
-            ui.menu_button("Go to…", |ui| {
+            if ui.button("Fit data").on_hover_text("Show the full sample range").clicked() { self.first="0".into();self.last=self.plot_count().to_string();self.request_plot(1200); }
+            ui.menu_button("Go to sample…", |ui| {
                 ui.label("Sample index (starts at 0)");
                 let last=self.plot_count().saturating_sub(1);
                 ui.add(egui::DragValue::new(&mut self.plot_jump).clamp_range(0..=last));
@@ -959,7 +1216,7 @@ impl BrowserApp {
                     self.request_plot(1200);ui.close_menu();
                 }
             });
-            ui.menu_button("More", |ui| {
+            ui.menu_button("Plot options", |ui| {
                 ui.label("Drag a trace vertically to position it.");
                 ui.label("Drag empty space to pan; scroll or pinch to zoom.");
                 if ui.button("Inspect selected bytes").clicked() {self.layout.reveal(Pane::Inspector);self.mobile_target=Some(Pane::Inspector);ui.close_menu();}
@@ -972,6 +1229,7 @@ impl BrowserApp {
             if self.plot_count()>0 {self.request_plot(1200);}
         }
         if self.plot_sources.is_empty() {ui.label("Use Series to add collections.");return;}
+        ui.weak("Drag to pan · wheel or pinch to zoom · click a point to link Hex and Inspector");
         ui.weak(format!("{} · {} records inspected",self.plot["quality"].as_str().unwrap_or("Reading samples"),self.plot["scanned"]));
         {
             for channel in &mut series {
@@ -1098,7 +1356,7 @@ impl eframe::App for BrowserApp {
         }
         let menus=crate::app_menu::menus(&crate::app_menu::State {
             available:!self.decoding, file:!self.name.is_empty(), selection:parse_offset(&self.range_start).zip(parse_offset(&self.range_end)).is_some_and(|(a,b)| a<b),
-            undo:self.undo, redo:self.redo, save_decoder:!self.yaml.trim().is_empty(), apply:!self.decoding && !self.name.is_empty(), busy:self.decoding, ..Default::default()
+            undo:self.undo, redo:self.redo, save_decoder:!self.yaml.trim().is_empty(), apply:!self.decoding && !self.name.is_empty() && !self.decoder_empty(), busy:self.decoding, ..Default::default()
         });
         publish_menus(&serde_json::to_string(&menus).unwrap(), &if self.name.is_empty() { String::new() } else { format!("{} · {} bytes{}",self.name,self.size,if self.dirty {" · unsaved changes"}else{""}) }, &self.status);
         if self.stacked {
@@ -1139,8 +1397,8 @@ impl eframe::App for BrowserApp {
             self.layout = layout;
         }
         if self.sent_yaml.as_ref() != Some(&self.yaml) {
-            if crate::direct_authoring::empty_draft(&self.yaml) { self.reset_decoder(); }
-            decoder_draft(&self.yaml);
+            if self.decoder_empty() { self.reset_decoder(); }
+            decoder_draft(&self.yaml, if self.language == crate::source_editor::DecoderLanguage::Python { "python" } else { "yaml" });
             self.sent_yaml = Some(self.yaml.clone());
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -1148,9 +1406,12 @@ impl eframe::App for BrowserApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.layout.save(storage);
         storage.set_string("browser-layout-mode", self.layout_mode.clone());
-        if self.yaml.len() <= 256 * 1024 {
-            storage.set_string("browser-decoder-yaml", self.yaml.clone());
-        }
+        let (yaml, python) = if self.language == crate::source_editor::DecoderLanguage::Yaml {
+            (&self.yaml, &self.other_draft)
+        } else { (&self.other_draft, &self.yaml) };
+        if yaml.len() <= 256 * 1024 { storage.set_string("browser-decoder-yaml", yaml.clone()); }
+        if python.len() <= 256 * 1024 { storage.set_string("browser-decoder-python", python.clone()); }
+        storage.set_string("browser-decoder-language", if self.language == crate::source_editor::DecoderLanguage::Python { "python" } else { "yaml" }.into());
     }
 }
 impl TabViewer for BrowserApp {

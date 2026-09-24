@@ -5,7 +5,7 @@
     let failed = false, graphicsReady = false;
     let busy = false, dirty = false, opened = false, exportable = false;
     let runtime = null, loadingDecoder = false;
-    let decoderSource = '', rustStatus = '';
+    let decoderSource = '', decoderLanguage = 'yaml', rustStatus = '';
     let ignoreDecoder = false, operation = '';
     let size = '0', selectedStart = '0', selectedEnd = '0';
     const status = document.getElementById('status');
@@ -28,15 +28,15 @@
         if (busy || failed) return false;
         busy = true;
         operation = m.type;
-        if (m.type === 'decode') ignoreDecoder = false;
+        if (['decode', 'decode_python'].includes(m.type)) ignoreDecoder = false;
         controls();
-        if (m.type === 'decode') { m.runtime = runtime; status.textContent = 'Decoding…'; }
+        if (['decode', 'decode_python'].includes(m.type)) { m.runtime = runtime; status.textContent = 'Decoding…'; }
         worker.postMessage(m);
         return true;
     }
     worker.onmessage = ({data}) => {
         if (data.type === 'ready') { busy = false; controls(); return; }
-        if (ignoreDecoder && (data.type === 'decoded' || (data.type === 'error' && ['decode','table','plot','probe','pick'].includes(operation)))) return;
+        if (ignoreDecoder && (data.type === 'decoded' || (data.type === 'error' && ['decode','decode_python','table','plot','probe','pick','inspect','encode'].includes(operation)))) return;
         if (data.type === 'progress') { status.textContent = `Exported ${data.done} / ${data.total} bytes`; return; }
         if (['opened', 'edited', 'exported'].includes(data.type)) {
             dirty = data.dirty; size = data.size; opened = true;
@@ -93,10 +93,9 @@
         if (!file) return;
         loadingDecoder = true; controls();
         try {
-            if (/\.py$/i.test(file.name)) throw Error('Python decoders require the native app. Choose a YAML decoder.');
-            if (file.size > 256 * 1024) throw Error('Decoder source is limited to 256 KiB. Choose a YAML decoder, not the data file.');
+            if (file.size > 256 * 1024) throw Error('Decoder source is limited to 256 KiB. Choose a YAML or Python decoder, not the data file.');
             const source = await file.text();
-            if (source.includes('\0')) throw Error('This looks like binary data. Choose a YAML decoder.');
+            if (source.includes('\0')) throw Error('This looks like binary data. Choose a YAML or Python decoder.');
             const old = events.findIndex(e => e.type === 'decoder-source');
             if (old >= 0) events.splice(old, 1);
             if (events.length >= 16) events.shift();
@@ -161,7 +160,7 @@
     window.addEventListener('keydown', event => {
         if (graphicsReady && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
             event.preventDefault();
-            window.binwave.saveDecoder(decoderSource);
+            window.binwave.saveDecoder(decoderSource, decoderLanguage);
         }
     });
     window.binwave = {
@@ -172,18 +171,18 @@
             const direct={open_file:open,open_decoder:openDecoder,save_copy:save,extract,cancel};
             window.binwaveMenus.render(JSON.parse(model), (command,argument)=>{
                 if(direct[command]) { if(!direct[command].disabled)direct[command].onclick(); }
-                else if(command==='save_decoder')window.binwave.saveDecoder(decoderSource);
+                else if(command==='save_decoder')window.binwave.saveDecoder(decoderSource, decoderLanguage);
                 else { if(events.length>=16)events.shift();events.push({type:'menu',command,argument}); }
             }, (command,enabled)=>direct[command] ? !direct[command].disabled : enabled && graphicsReady && !failed && (!busy || ['code','hex','structures','plot','samples','inspector','auto','stacked','docked'].includes(command)));
         },
         clearDecoder() {
             ignoreDecoder = true;
             for (let i = events.length - 1; i >= 0; i--) {
-                if (['decoded','table','plot','probe','pick'].includes(events[i].type) || (events[i].type === 'error' && ['decode','table','plot','probe','pick'].includes(events[i].operation))) events.splice(i,1);
+                if (['decoded','table','plot','probe','pick'].includes(events[i].type) || (events[i].type === 'error' && ['decode','decode_python','table','plot','probe','pick'].includes(events[i].operation))) events.splice(i,1);
             }
             status.textContent = 'No fields yet. Select bytes to begin.';
         },
-        decoderDraft(text) { decoderSource = text; },
+        decoderDraft(text, language) { decoderSource = text; decoderLanguage = language; },
         pasteText() { return clipboardDialog('', true); },
         copyText(text) {
             if (!text) return;
@@ -191,13 +190,15 @@
                 navigator.clipboard.writeText(text).catch(() => clipboardDialog(text, false));
             } else clipboardDialog(text, false);
         },
-        saveDecoder(text) {
-            const blob = new Blob([text], {type:'text/yaml;charset=utf-8'});
+        saveDecoder(text, language = decoderLanguage) {
+            const python = language === 'python';
+            const name = python ? 'decoder.py' : 'decoder.yaml';
+            const blob = new Blob([text], {type:python ? 'text/x-python;charset=utf-8' : 'text/yaml;charset=utf-8'});
             const url = URL.createObjectURL(blob);
             const link = document.createElement('a');
-            link.href = url; link.download = 'decoder.yaml'; document.body.append(link); link.click(); link.remove();
+            link.href = url; link.download = name; document.body.append(link); link.click(); link.remove();
             setTimeout(() => URL.revokeObjectURL(url), 60000);
-            status.textContent = 'Decoder downloaded as decoder.yaml';
+            status.textContent = `Decoder downloaded as ${name}`;
         },
         openDemo(bytes, replaceDecoder = false, name = 'simple_wave.bin') {
             if (busy || loadingDecoder || failed || !graphicsReady) return false;
@@ -216,7 +217,7 @@
         send(json) {
             const command = JSON.parse(json);
             if (command.type === 'cancel') { worker.postMessage(command); return true; }
-            if (command.type === 'decode' && !runtime) return false;
+            if (['decode', 'decode_python'].includes(command.type) && !runtime) return false;
             return submit(command);
         },
         selection(start, end) { selectedStart = start; selectedEnd = end; controls(); },

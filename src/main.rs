@@ -28,6 +28,7 @@ mod csv_table;
 mod data;
 #[cfg(not(target_arch = "wasm32"))]
 mod field_preview;
+mod field_edit;
 #[cfg(not(target_arch = "wasm32"))]
 mod file_dialog;
 mod file_range;
@@ -48,6 +49,7 @@ mod python_decoder;
 mod source_editor;
 mod direct_authoring;
 mod app_menu;
+mod decoder_ui;
 mod demos;
 mod structure;
 mod structure_plot;
@@ -56,6 +58,9 @@ mod structure_selection;
 mod structure_ui;
 #[cfg(not(target_arch = "wasm32"))]
 mod structure_views;
+mod workspace_inspector;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod inspector_parity_tests;
 mod workspace_layout;
 
 #[cfg(not(target_arch = "wasm32"))]

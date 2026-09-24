@@ -75,16 +75,23 @@ test('decoder picker loads YAML independently of the data file', async () => {
     assert.equal(get('save').disabled, true, 'Opening a decoder must not open a data file');
 });
 
-test('oversized and Python decoder files are rejected before reading', async () => {
+test('oversized decoder files are rejected before reading', async () => {
     const {app, get} = bridge();
     app.ready();
-    for (const file of [{name:'data.bin',size:40*1024**3},{name:'decoder.py',size:100}]) {
-        get('decoder-file').files = [{...file,text:()=>{throw Error('Must not read');}}];
-        await get('decoder-file').onchange();
-        assert.equal(app.poll(), '');
-        assert.match(get('status').textContent, /256 KiB|Python decoders require/);
-        assert.equal(get('open-decoder').disabled, false);
-    }
+    get('decoder-file').files = [{name:'data.bin',size:40*1024**3,text:()=>{throw Error('Must not read');}}];
+    await get('decoder-file').onchange();
+    assert.equal(app.poll(), '');
+    assert.match(get('status').textContent, /256 KiB/);
+    assert.equal(get('open-decoder').disabled, false);
+});
+
+test('Python decoder source opens through the same picker', async () => {
+    const {app, get} = bridge();
+    app.ready();
+    get('decoder-file').files = [{name:'decoder.py',size:13,text:async()=> 'print("hi")\\n'}];
+    await get('decoder-file').onchange();
+    assert.deepEqual(JSON.parse(app.poll()), {type:'decoder-source',name:'decoder.py',source:'print("hi")\\n'});
+    assert.match(get('status').textContent, /decoder.py/);
 });
 
 test('cancelled and failed decoder reads leave the current draft alone', async () => {
@@ -156,6 +163,14 @@ test('decoder save downloads the exact YAML without a filesystem picker', async 
     assert.equal(link.download, 'decoder.yaml');
     assert.equal(link.clicked, true);
 });
+test('Python decoder save uses a .py file and preserves source', async () => {
+    const {app, created, savedBlob} = bridge();
+    const source = 'print("hello")\\n';
+    app.saveDecoder(source, 'python');
+    assert.equal(await savedBlob().text(), source);
+    assert.equal(created.find(e => e.tag === 'a').download, 'decoder.py');
+});
+
 test('paste dialog supports native browser paste and cancellation', async () => {
     const {app, created} = bridge();
     const pending = app.pasteText();

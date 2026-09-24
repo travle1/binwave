@@ -19,6 +19,7 @@ __pycache__/
 
 # Local platform build artifacts
 /dist/
+/node_modules/
 
 # Local Cloudflare deployment state
 /.wrangler/

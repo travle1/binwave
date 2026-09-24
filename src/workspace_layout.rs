@@ -2,7 +2,7 @@
 use egui_dock::{DockState, Node, NodeIndex, Split, SurfaceIndex};
 use serde::{Deserialize, Serialize};
 
-const STORAGE_KEY: &str = "workspace-layout-v2";
+const STORAGE_KEY: &str = "workspace-layout-v3";
 const DECODER_WIDTH: f32 = 0.40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -41,10 +41,16 @@ pub struct WorkspaceLayout {
 }
 impl Default for WorkspaceLayout {
     fn default() -> Self {
-        // Start with bytes and their meaning; source remains one tab away.
+        // Keep source and its result visible together. Inspector stays beside the
+        // result as a supporting tab, while Hex keeps the full left column.
         let mut dock = DockState::new(vec![Pane::Hex]);
-        dock.main_surface_mut()
-            .split_right(NodeIndex::root(), 0.48, vec![Pane::Structures, Pane::Layout, Pane::Inspector]);
+        let [_, source] = dock.main_surface_mut()
+            .split_right(NodeIndex::root(), 0.48, vec![Pane::Layout]);
+        dock.main_surface_mut().split_below(
+            source,
+            0.58,
+            vec![Pane::Structures, Pane::Inspector],
+        );
         Self { dock }
     }
 }
@@ -255,29 +261,17 @@ mod tests {
         fn flush(&mut self) {}
     }
 
-    fn assert_decoder_stack(workspace: &WorkspaceLayout) {
-        let (surface, decoder, tab) = workspace.dock.find_tab(&Pane::Layout).unwrap();
-        let expected = match workspace.dock[surface][NodeIndex::root()] {
-            Node::Horizontal { fraction, .. } if (fraction - 0.48).abs() < 0.001 => NodeIndex::root().right(),
-            _ => NodeIndex::root().left(),
-        };
-        assert_eq!(decoder, expected);
-        assert_eq!(
-            workspace.dock.find_tab(&Pane::Inspector).unwrap().1,
-            decoder
-        );
-        assert_eq!(
-            workspace.dock.find_tab(&Pane::Structures).unwrap().1,
-            decoder
-        );
-        assert!(matches!(&workspace.dock[surface][decoder],
-            Node::Leaf { active, .. } if *active == tab));
+    fn assert_decoder_visible(workspace: &WorkspaceLayout) {
+        assert!(workspace.dock.find_tab(&Pane::Layout).is_some());
+        assert!(workspace.dock.find_tab(&Pane::Inspector).is_some());
+        assert!(workspace.dock.find_tab(&Pane::Structures).is_some());
+        let surface = workspace.dock.find_tab(&Pane::Layout).unwrap().0;
         assert!(matches!(workspace.dock[surface][NodeIndex::root()],
             Node::Horizontal { fraction, .. } if (fraction - 0.48).abs() < 0.001 || (fraction - 0.40).abs() < 0.001));
     }
 
     #[test]
-    fn default_shows_structure_beside_full_height_hex_with_code_available() {
+    fn default_shows_code_and_structure_together_beside_hex() {
         let workspace = WorkspaceLayout::default();
         assert_eq!(workspace.dock.iter_all_tabs().count(), 4);
         assert!(workspace.dock.find_tab(&Pane::Plot).is_none());
@@ -288,7 +282,12 @@ mod tests {
         );
         let (surface, node, tab) = workspace.dock.find_tab(&Pane::Structures).unwrap();
         assert!(matches!(&workspace.dock[surface][node], Node::Leaf { active, .. } if *active == tab));
-        assert_eq!(node, NodeIndex::root().right());
+        assert_eq!(node, NodeIndex::root().right().right());
+        assert_eq!(
+            workspace.dock.find_tab(&Pane::Layout).unwrap().1,
+            NodeIndex::root().right().left()
+        );
+        assert_eq!(workspace.dock.find_tab(&Pane::Inspector).unwrap().1, node);
         assert_eq!(Pane::Layout.title(), "Code");
         assert_eq!(Pane::Structures.title(), "Decoded structure");
     }
@@ -298,7 +297,7 @@ mod tests {
         let mut workspace = WorkspaceLayout::default();
         workspace.show_initial_plot();
         workspace.show_decoder();
-        assert_decoder_stack(&workspace);
+        assert_decoder_visible(&workspace);
         let plot = workspace.dock.find_tab(&Pane::Plot).unwrap();
         let hex = workspace.dock.find_tab(&Pane::Hex).unwrap();
         assert_eq!(plot.1, NodeIndex::root().left().left());
@@ -349,7 +348,7 @@ mod tests {
         workspace.dock.remove_tab(original);
         workspace.show_decoder();
         workspace.show_decoder();
-        assert_decoder_stack(&workspace);
+        assert_decoder_visible(&workspace);
         workspace.reveal(Pane::Plot);
         workspace.reveal(Pane::Table);
         let hex = workspace.dock.find_tab(&Pane::Hex).unwrap().1;
@@ -378,7 +377,7 @@ mod tests {
     #[test]
     fn comparison_layout_adds_samples_below_both_plot_and_hex() {
         let mut workspace = WorkspaceLayout::plot_and_bytes();
-        assert_decoder_stack(&workspace);
+        assert_decoder_visible(&workspace);
         let plot = workspace.dock.find_tab(&Pane::Plot).unwrap();
         let hex = workspace.dock.find_tab(&Pane::Hex).unwrap();
         assert_eq!(plot.1.parent(), Some(NodeIndex::root().right()));
@@ -394,7 +393,7 @@ mod tests {
         assert_eq!(plot.1.parent(), hex.1.parent());
         assert_eq!(plot.1.parent(), Some(NodeIndex::root().right().left()));
         assert_eq!(table.1, NodeIndex::root().right().right());
-        assert_decoder_stack(&workspace);
+        assert_decoder_visible(&workspace);
         workspace.show_samples();
         assert_eq!(workspace.dock.find_tab(&Pane::Plot), Some(plot));
         assert_eq!(workspace.dock.find_tab(&Pane::Hex), Some(hex));

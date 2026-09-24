@@ -1,5 +1,5 @@
 //! Shared selection and bounded, asynchronous pages for decoded structure views.
-use crate::structure_selection::{sample_indices_for_bytes, sample_bytes};
+use crate::structure_selection::{covering, sample_indices_for_bytes, sample_bytes};
 use crate::byte_store::ByteView;
 use crate::hex_editor::HexHighlight;
 use crate::plot_trace::decoded_channel;
@@ -339,8 +339,7 @@ impl StructureViews {
         };
         let mut best = covering(&output.nodes, &range);
         if let Some(node) = best.filter(|node| node.lazy.is_some()) {
-            let array = node.lazy.as_ref().unwrap();
-            let index = range.start.saturating_sub(node.range.start) / array.stride.max(1);
+            let index = sample_indices_for_bytes(node, &range).map_or(0, |indices| indices.start);
             self.table_target = node.path.clone();
             self.table_jump = index;
             self.target_initialized = true;
@@ -399,7 +398,7 @@ impl StructureViews {
         if self.stale(output) {
             ui.colored_label(
                 Color32::YELLOW,
-                "Bytes changed. Apply the definition again to refresh these elements.",
+                "Bytes changed. Press ▶ Run (F5) to refresh these elements.",
             );
             return None;
         }
@@ -716,7 +715,7 @@ impl StructureViews {
     ) -> Option<Range<usize>> {
         self.tick(ui.ctx(), source);
         if self.stale(output) {
-            ui.label("Bytes changed. Apply the definition again to refresh the table.");
+            ui.label("Bytes changed. Press ▶ Run (F5) to refresh the table.");
             return None;
         }
         self.target_controls(ui, output);
@@ -1001,7 +1000,7 @@ impl StructureViews {
     ) -> Option<Range<usize>> {
         self.tick(ui.ctx(), source.clone());
         if self.stale(output) {
-            ui.label("Bytes changed. Apply the definition again to refresh the plot.");
+            ui.label("Bytes changed. Press ▶ Run (F5) to refresh the plot.");
             return None;
         }
         self.initialize_plot(output);
@@ -1014,9 +1013,17 @@ impl StructureViews {
         }
         let mut changed = false;
         if self.plot_sources.is_empty() {
+            if collections.is_empty() {
+                crate::decoder_ui::empty_state(
+                    ui,
+                    "No sample series yet",
+                    "Define a repeated structure or numeric field, then press ▶ Run (F5).",
+                );
+                return None;
+            }
             self.extra_plot_readers.clear();
             ui.menu_button("Series", |ui| {plot_collection_choices(ui,&collections,&mut self.plot_sources);});
-            ui.label("Use Series to add collections. Toggle individual fields in the legend.");
+            ui.label("Choose a collection in Series. Toggle individual fields in the legend.");
             return None;
         }
         let primary = collections.iter().filter(|node| self.plot_sources.contains(&node.path))
@@ -1061,8 +1068,8 @@ impl StructureViews {
                 changed |= plot_collection_choices(ui,&collections,&mut self.plot_sources);
                 if self.presentation.menu(ui,&ranges) { self.plot_fit_y=true; }
             });
-            if ui.button("Fit all").clicked() { force_view=Some(0..count); self.plot_fit_y=true; }
-            ui.menu_button("Go to…", |ui| {
+            if ui.button("Fit data").on_hover_text("Show the full sample range").clicked() { force_view=Some(0..count); self.plot_fit_y=true; }
+            ui.menu_button("Go to sample…", |ui| {
                 ui.label("Sample index (starts at 0)");
                 self.plot_jump=self.plot_jump.min(count-1);
                 ui.add(egui::DragValue::new(&mut self.plot_jump).clamp_range(0..=count-1));
@@ -1072,7 +1079,7 @@ impl StructureViews {
                     ui.close_menu();
                 }
             });
-            ui.menu_button("More", |ui| {
+            ui.menu_button("Plot options", |ui| {
             let mut lock_y=!self.plot_free_y;
             if ui.checkbox(&mut lock_y,"Lock vertical zoom").changed() {self.plot_free_y=!lock_y;}
             if ui.button("Fit Y").clicked() {self.plot_fit_y=true;ui.close_menu();}
@@ -1113,7 +1120,7 @@ impl StructureViews {
                     ui.close_menu();
                 }
             });
-            if ui.add_enabled(selected_bytes.is_some(), egui::Button::new("Inspect / edit bytes")).clicked() {
+            if ui.add_enabled(selected_bytes.is_some(), egui::Button::new("Open in Inspector")).clicked() {
                 self.plot_action = selected_bytes.clone().map(PlotAction::InspectBytes);
             }
             if ui.add_enabled(selected_bytes.is_some(), egui::Button::new("Export selected bytes…")).clicked() {
@@ -1131,6 +1138,7 @@ impl StructureViews {
             }
         });
         });
+        ui.weak("Drag to pan · wheel or pinch to zoom · click a point to link Hex and Inspector");
         if changed { self.plot_fit_y=true; }
         if let Some(forced) = &force_view {
             if self.plot_view.as_ref() != Some(forced) {
@@ -1695,15 +1703,6 @@ fn find_node<'a>(nodes: &'a [Node], path: &str) -> Option<&'a Node> {
             find_node(&node.children, path)
         }
     })
-}
-fn covering<'a>(nodes: &'a [Node], range: &Range<usize>) -> Option<&'a Node> {
-    nodes
-        .iter()
-        .filter(|node| {
-            node.range.start <= range.start && node.range.end >= range.end && !node.range.is_empty()
-        })
-        .filter_map(|node| covering(&node.children, range).or(Some(node)))
-        .min_by_key(|node| node.range.len())
 }
 fn expand_ancestors(path: &str, expanded: &mut HashSet<String>) {
     for (index, ch) in path.char_indices() {

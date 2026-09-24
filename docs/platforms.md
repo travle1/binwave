@@ -56,6 +56,7 @@ Install the WASM target and Trunk (the workflow pins Trunk 0.21.14):
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install --locked trunk --version 0.21.14
+npm ci
 trunk serve
 # Open http://127.0.0.1:8080
 ```
@@ -72,6 +73,9 @@ choice; opening `index.html` via `file://` is unsupported. Relative asset paths
 support subdirectory hosting. The server must serve `.wasm` as
 `application/wasm` and `.mjs` as JavaScript. No application backend, accounts,
 telemetry, Python service, cross-origin isolation, or shared WASM memory is used.
+The pinned Pyodide interpreter is copied into the static build and loaded only
+when Python is applied. Python executes locally in the decoder worker and uses
+the same embedded runner as native. Build with `npm ci` before running Trunk.
 Do not omit the `web/` worker files when copying the output.
 
 The browser version uses eframe/egui, egui_plot, the existing shared pane model
@@ -86,10 +90,14 @@ shared with native code. See [architecture boundaries](architecture.md).
 - Open a user-selected local file without reading it in full.
 - Inspect a 64 KiB page of hex/text, jump to decimal or hexadecimal absolute
   offsets, and move between pages. Scrolling is virtualized within the page.
-- Use Open decoder to select a local YAML file (up to 256 KiB), or edit YAML
-  directly; tap Apply or press F5. The decoder picker works independently of the
-  data-file picker and uses a standard file input on LAN HTTP.
-- Inspect decoded structures and 128-record sample pages. Selecting a decoded field selects its byte range in Hex.
+- Use Open decoder to select a local YAML or Python file (up to 256 KiB), or
+  edit source directly; tap Apply or press F5. YAML and Python keep independent
+  drafts. The decoder picker works independently of the data-file picker and
+  uses a standard file input on LAN HTTP.
+- Inspect decoded structures and 128-record sample pages. Selecting a decoded
+  field selects its byte range in Hex. Inspector uses the same field details,
+  raw-byte interpretations, and numeric value encoder as native; applying a
+  value is one atomic byte edit and undo step.
 - Plot numeric channels from a decoded collection with the native min/max and
   sampled overview algorithm. Collections initially display 512 samples. Zoom/pan reloads
   the visible sample range after gestures settle. Fit all (or double-click) fits
@@ -120,9 +128,10 @@ Web and native share the command hierarchy in `src/app_menu.rs`:
 - **View:** Hex, Decoded structure, Plot, Samples, Code, Inspector, and reset.
 
 Native uses a compact desktop menu bar: **File / Edit / View / Decode / Tools / Help**.
-CSV, Python, search, and workspace commands remain directly accessible in their
-menus. Web uses a touch-sized DOM toolbar so file picker clicks retain browser
-activation. Both presentations dispatch the same shared commands. Both use the same compact Apply/Stop controls in
+CSV, search, and workspace commands remain directly accessible in native menus.
+Python decoder commands are available in both. Web uses a touch-sized DOM toolbar
+so file picker clicks retain browser activation. Both presentations dispatch
+the same shared commands. Both use the same compact Apply/Stop controls in
 Code. File names and operation status have their own text lines, not button rows.
 Existing dock arrangements are preserved. **View > Reset workspace** shows Hex
 on the left and Decoded structure on the right, with Code in the supporting tab
@@ -176,10 +185,12 @@ Source size and modification time are checked before reads and before/after
 export; browsers can also invalidate reads when a source changes. Keep source
 files unchanged while working.
 
-CSV, native Python, full-file Hex searching, multi-byte replacement,
-and continuous whole-file hex scrolling are not implemented
-in the browser yet. Python cannot run as a native subprocess in a browser. Byte
-edits invalidate decoded results; apply YAML again to decode the new revision.
+CSV, full-file Hex searching, and continuous whole-file hex scrolling are not
+implemented in the browser yet. Browser Python uses Pyodide, so native-only
+Python modules and local OS files are unavailable. Browser Python scripts are
+ordinary code and can access the network; only run scripts you trust. The runtime
+is bundled; optional imported packages may require network access. Byte edits
+invalidate decoded results; apply the decoder again for the new revision.
 Failed YAML applies retain the previous successful worker session and results.
 Source drafts are persisted up to 256 KiB; file contents and edits are not.
 
@@ -189,6 +200,8 @@ See the [recorded local validation results](platform-validation.md) for the chec
 actually run and the outstanding Windows/browser smoke tests.
 
 ```sh
+npm ci
+node tests/browser_python.mjs
 node tests/browser_backend.mjs
 cargo check --locked --target wasm32-unknown-unknown
 cargo test --locked
@@ -198,7 +211,10 @@ The Node tests use a synthetic 40 GiB file whose whole-file reader throws. They
 verify bounded tail reads, >4 GiB edits, exact offset limits, streaming with
 backpressure, undo/redo caps, source protection, cancellation, and aborts on
 source changes/write failures. They do not substitute for a browser picker and
-filesystem permission smoke test or a real Windows launch.
+filesystem permission smoke test or a real Windows launch. The optional
+`tests/browser_chrome_smoke.mjs` exercises the built app's demo and Python
+Apply path via a locally served page and headless Chrome; it does not exercise
+native picker permissions or export.
 
 Before distributing a build, smoke-test Windows launch/open/decoder/save and
 browser open/jump/edit/undo/export/reopen, including a multi-gigabyte source,

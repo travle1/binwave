@@ -25,7 +25,7 @@ cargo run --release
 Linux needs working X11 or Wayland and graphics drivers; native file pickers use
 the desktop file portal. Open and save pickers keep the workspace responding while
 you browse. Compilation may download crates; file processing is local.
-Python decoders require an installed Python 3 interpreter; YAML and Hex do not.
+Desktop Python decoders require an installed Python 3 interpreter; YAML and Hex do not.
 
 Sample files are grouped by purpose: `samples/data/`,
 `samples/decoders/python/`, `samples/decoders/yaml/`, `samples/configs/`, and
@@ -51,8 +51,11 @@ never require loading a whole data file into WebAssembly or JavaScript memory.
 File offsets remain 64-bit independently of the memory address size, with bounded
 caches and background work to keep the interface responsive. The preview uses
 64 KiB pages and 1 MiB export chunks and rejects browser offsets above `2^53 - 1`
-rather than rounding them. Native Python and CSV decoding are unavailable
-in this browser preview.
+rather than rounding them. Python decoder scripts run browser-locally with the
+same SDK/runner and Rust plan engine as native, using a pinned Pyodide runtime
+loaded on first use. CSV remains native-only in this preview. Browser Python
+cannot use native-only modules or arbitrary OS files, and user scripts are not
+network-sandboxed.
 
 See [platform builds and limitations](docs/platforms.md) for Windows packaging,
 `trunk serve`, static browser builds, browser compatibility, and validation.

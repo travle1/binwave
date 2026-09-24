@@ -17,7 +17,7 @@ function harness() {
         postMessage(m) {
             this.commands.push(m);
             if(m.yaml==='slow')return;
-            queueMicrotask(()=>this.onmessage({data:m.yaml==='invalid' ? {type:'error',message:'Invalid YAML'} : {type:m.type==='decode'?'decoded':m.type,result:{path:m.path}}}));
+            queueMicrotask(()=>this.onmessage({data:m.yaml==='invalid' ? {type:'error',message:'Invalid YAML'} : {type:['decode','decode_python'].includes(m.type)?'decoded':m.type,result:{path:m.path}}}));
         }
     }
     const self={postMessage:m=>messages.push(m)};
@@ -48,6 +48,16 @@ test('failed candidate preserves the previous decoder; edits invalidate it',asyn
     assert.match(h.messages.at(-2).message,/Apply the decoder again/);
     await h.send({type:'decode',yaml:'valid'});
     assert.equal(h.workers.at(-1).commands[0].patches[0][0],4294967297n);
+});
+test('browser Python applies as a candidate and shares subsequent result requests',async()=>{
+    const h=harness();
+    await h.send({type:'open',file:{name:'test.bin',size:4}});
+    await h.send({type:'decode_python',script:'from binwave import Struct'});
+    assert.equal(h.workers.length,1);
+    assert.equal(h.workers[0].commands[0].type,'decode_python');
+    assert.equal(h.messages.at(-2).type,'decoded');
+    await h.send({type:'inspect',start:'0',end:'1',request:'1'});
+    assert.equal(h.workers[0].commands.at(-1).type,'inspect');
 });
 test('cancelling a candidate terminates work and retains the prior session',async()=>{
     const h=harness();

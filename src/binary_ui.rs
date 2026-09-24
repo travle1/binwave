@@ -311,11 +311,15 @@ impl BinaryWorkspace {
         self.decode_error = next.error;
         self.language = language;
         self.error = false;
-        self.message = match language {
-            DecoderLanguage::Python => "Python draft selected.",
-            DecoderLanguage::Yaml => "YAML draft selected.",
-        }
-        .into();
+        self.message = if self.has_file() {
+            format!("Editing {}. Press {} to update every result view.",
+                if language == DecoderLanguage::Python { "Python" } else { "YAML" },
+                crate::decoder_ui::RUN_LABEL)
+        } else {
+            format!("Editing {}. Open a data file, then press {}.",
+                if language == DecoderLanguage::Python { "Python" } else { "YAML" },
+                crate::decoder_ui::RUN_LABEL)
+        };
         self.reveal_definition = true;
     }
     fn active_authoring_dirty(&self) -> bool {
@@ -811,7 +815,7 @@ impl BinaryWorkspace {
                 self.decode_error = None;
                 self.reveal_definition = true;
                 self.report(Ok(
-                    "Decoder updated. Click Decode file to view the results.".into(),
+                    "Decoder updated. Press ▶ Run (F5) to view the results.".into(),
                 ));
             }
             Action::ExampleYaml(yaml) => {
@@ -1680,7 +1684,7 @@ impl BinaryWorkspace {
             }
         } else if !self.has_definition() {
             if self.is_python() {
-                "New or open a Python decoder"
+                "Add Python decoder source"
             } else {
                 "Load or write YAML, then decode the file"
             }
@@ -1716,6 +1720,61 @@ impl BinaryWorkspace {
             }
         }
     }
+    fn run_disabled_reason(&self) -> Option<&'static str> {
+        if self.is_decoding() {
+            Some("A decoder is already running. Stop it before starting another run.")
+        } else if !self.commands_available() {
+            Some("Finish or cancel the current file operation first.")
+        } else if !self.has_file() {
+            Some("Open a data file first. The decoder runs against the open file.")
+        } else if !self.has_definition() {
+            Some("Enter decoder source or open a decoder file first.")
+        } else if self.active_authoring_dirty() {
+            Some("Finish or cancel the field editor changes first.")
+        } else {
+            None
+        }
+    }
+
+    fn decoder_status_detail(&self) -> &'static str {
+        if self.decode_error.is_some() {
+            if self.is_python() {
+                "Open the Console below for the traceback and source-line shortcut."
+            } else {
+                "Fix the decoder problem, then run again."
+            }
+        } else if !self.has_file() {
+            "Step 1: open a data file. Step 2: edit the decoder. Step 3: press ▶ Run (F5)."
+        } else if !self.has_definition() {
+            "Start from the runnable example or open a decoder, then press ▶ Run (F5)."
+        } else if self.active_authoring_dirty() {
+            "Review the pending field changes before running."
+        } else if self.is_decoding() {
+            "The last successful results remain visible while this run completes."
+        } else if matches!(self.decoder_status(), "Decoded" | "Script finished") {
+            "Decoded structure, Plot, Samples, Inspector, and Hex now use these results."
+        } else {
+            "Press ▶ Run (F5) to update Decoded structure, Plot, Samples, Inspector, and Hex."
+        }
+    }
+
+    fn decoder_status_tone(&self) -> crate::decoder_ui::StatusTone {
+        use crate::decoder_ui::StatusTone;
+        if self.decode_error.is_some() {
+            StatusTone::Error
+        } else if matches!(self.decoder_status(), "Decoded" | "Script finished") {
+            StatusTone::Success
+        } else if self.active_authoring_dirty()
+            || self.applied_yaml.as_ref().is_some_and(|source| source != &self.yaml)
+        {
+            StatusTone::Warning
+        } else if self.can_apply_definition() {
+            StatusTone::Ready
+        } else {
+            StatusTone::Neutral
+        }
+    }
+
     pub fn define_selection(&mut self, ctx: &Context) {
         if let Some(range) = self.hex_editor.selection() {
             self.hex_actions(vec![HexAction::Define(range)], ctx);
@@ -1874,22 +1933,8 @@ impl BinaryWorkspace {
                 {
                     self.choose_save(&ctx, true);
                 }
-                if ui
-                    .add_enabled(
-                        self.can_apply_definition(),
-                        egui::Button::new(
-                            RichText::new(if self.is_python() {
-                                "Run script"
-                            } else {
-                                "Decode file"
-                            })
-                            .strong(),
-                        )
-                        .fill(ui.visuals().selection.bg_fill),
-                    )
-                    .on_hover_text("Run this decoder against the open file (F5)")
-                    .clicked()
-                {
+                if crate::decoder_ui::run_button(
+                    ui, self.can_apply_definition(), self.run_disabled_reason()).clicked() {
                     self.apply_definition(&ctx);
                 }
                 if self.is_decoding() && ui.button("Stop").clicked() {
@@ -1897,25 +1942,24 @@ impl BinaryWorkspace {
                 }
             });
         });
-        } else if let Some(command)=crate::app_menu::decoder_controls(ui,self.can_apply_definition() && enabled,self.is_decoding()) {
+        } else if let Some(command)=crate::app_menu::decoder_controls(
+            ui,
+            self.can_apply_definition() && enabled,
+            self.is_decoding(),
+            self.run_disabled_reason(),
+        ) {
             match command { crate::app_menu::Command::Apply=>self.apply_definition(&ctx),crate::app_menu::Command::Cancel=>self.stop_decoding(),_=>{} }
         }
-        ui.horizontal_wrapped(|ui| {
-            if self.structure_ui.is_parsing() || self.decoding_layout {
-                ui.spinner();
-            }
-            let color = if self.decode_error.is_some() {
-                Color32::LIGHT_RED
-            } else if matches!(self.decoder_status(), "Decoded" | "Script finished") {
-                Color32::LIGHT_GREEN
-            } else {
-                ui.visuals().weak_text_color()
-            };
-            ui.colored_label(color, self.decoder_status());
-            if self.active_authoring_dirty() && ui.button("Review changes").clicked() {
-                self.structure_ui.show_authoring_draft();
-            }
-        });
+        crate::decoder_ui::status_banner(
+            ui,
+            self.decoder_status(),
+            self.decoder_status_detail(),
+            self.decoder_status_tone(),
+            self.structure_ui.is_parsing() || self.decoding_layout,
+        );
+        if self.active_authoring_dirty() && ui.button("Review field changes").clicked() {
+            self.structure_ui.show_authoring_draft();
+        }
         if let Some(progress) = &self.load_progress {
             let done = progress.done.load(Ordering::Relaxed);
             let total = progress.total.load(Ordering::Relaxed);
@@ -2195,7 +2239,7 @@ impl BinaryWorkspace {
     pub fn content(&mut self, ui: &mut Ui) {
         if self.document.is_none() {
             if self.has_file() {
-                ui.label("File open. Inspect the bytes below; load or write YAML and click Decode file to plot and edit records.");
+                ui.label("File open. Inspect the bytes below; load or write YAML and press ▶ Run (F5) to plot and edit records.");
                 self.hex(ui);
             } else {
                 ui.centered_and_justified(|ui| {
@@ -2246,12 +2290,18 @@ impl BinaryWorkspace {
             return;
         }
         if self.document.is_none() {
-            ui.label("Run a decoder to plot its values.");
+            crate::decoder_ui::empty_state(
+                ui,
+                "Nothing to plot yet",
+                if self.has_file() { "Press ▶ Run (F5). Repeated numeric fields become plot series." }
+                else { "Open a data file, then press ▶ Run (F5) with a decoder." },
+            );
             return;
         }
         if self.document.as_ref().unwrap().layout.fields.is_empty() {
-            ui.label(
-                "This section has no numeric fields. Inspect it in Hex or select another section.",
+            crate::decoder_ui::empty_state(
+                ui, "No numeric series in this section",
+                "Choose another decoded collection or inspect this section in Hex.",
             );
             return;
         }
@@ -2947,45 +2997,19 @@ impl BinaryWorkspace {
         self.hex_editor.set_python_mode(self.is_python());
         let node = self.structure_ui.selected_node();
         if let Some(node) = node {
-            ui.heading(&node.name);
             let sample = self.structure_ui.selected_sample();
-            if let Some((index, _)) = &sample {
-                ui.weak(format!("Sample {index}"));
-            }
+            let field = crate::workspace_inspector::FieldInfo::from_node(
+                &node,
+                sample.as_ref().map(|(index, range)| (*index as u64, range.start as u64..range.end as u64)),
+            );
+            crate::workspace_inspector::field_heading(ui, &field);
             if editable_value(&node) {
                 self.prepare_value_edit(&node);
                 let enabled = self.commands_available() && !self.cell_dirty();
-                let mut apply = false;
                 ui.label("Value");
-                if let Some(edit) = &mut self.generic_value_edit {
-                    ui.add_enabled_ui(enabled, |ui| {
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut edit.text).desired_width(f32::INFINITY),
-                        );
-                        let changed = edit.text != edit.original;
-                        ui.horizontal_wrapped(|ui| {
-                            apply = ui
-                                .add_enabled(changed, egui::Button::new("Apply value"))
-                                .clicked()
-                                || (changed
-                                    && response.lost_focus()
-                                    && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-                            if changed && ui.button("Cancel").clicked() {
-                                edit.text.clone_from(&edit.original);
-                                edit.error = None;
-                            }
-                        });
-                        if response.has_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Escape))
-                        {
-                            edit.text.clone_from(&edit.original);
-                            edit.error = None;
-                        }
-                    });
-                    if let Some(error) = &edit.error {
-                        ui.colored_label(Color32::LIGHT_RED, error);
-                    }
-                }
+                let apply = self.generic_value_edit.as_mut().is_some_and(|edit|
+                    crate::workspace_inspector::value_editor(
+                        ui, &mut edit.text, &edit.original, &mut edit.error, enabled));
                 if self
                     .hex_editor
                     .selection()
@@ -3009,10 +3033,10 @@ impl BinaryWorkspace {
             let enabled = self.commands_available();
             ui.add_enabled_ui(enabled, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("Show field bytes").clicked() {
+                    if ui.button("Reveal in Hex").clicked() {
                         self.plot_action(PlotAction::InspectBytes(node.range.clone()), ui.ctx());
                     }
-                    if ui.button("Export field…").clicked() {
+                    if ui.button("Export bytes…").clicked() {
                         self.choose_export(ui.ctx(), node.range.clone());
                     }
                 });
@@ -3053,6 +3077,13 @@ impl BinaryWorkspace {
                 self.hex_actions(actions, ui.ctx());
             });
         } else {
+            if self.hex_editor.selection().is_none() {
+                crate::workspace_inspector::empty_selection(
+                    ui,
+                    self.has_file(),
+                    self.structure_ui.has_published_program(),
+                );
+            }
             self.generic_value_edit = None;
             if self.structure_ui.is_parsing() {
                 ui.weak("Refreshing the selected value…");
@@ -3685,7 +3716,7 @@ mod tests {
         workspace.yaml_path = Some(PathBuf::from("decoder.py"));
         let python = workspace.yaml.clone();
         let controls = visible_control_text(&mut workspace, &ctx);
-        assert!(controls.contains("Run script"));
+        assert!(controls.contains(crate::decoder_ui::RUN_LABEL));
         assert!(controls.contains("Save Python…"));
         click(&mut workspace, &ctx, "YAML");
         assert_eq!(workspace.yaml, yaml);
@@ -3696,7 +3727,7 @@ mod tests {
         );
         assert!(workspace.draft_dirty(DecoderLanguage::Yaml));
         let controls = visible_control_text(&mut workspace, &ctx);
-        assert!(controls.contains("Decode file"));
+        assert!(controls.contains(crate::decoder_ui::RUN_LABEL));
         assert!(controls.contains("Save YAML…"));
         click(&mut workspace, &ctx, "Python");
         assert_eq!(workspace.yaml, python);
@@ -4002,7 +4033,7 @@ mod tests {
         click(&mut workspace, &ctx, "New");
         assert!(workspace.is_python());
         assert_eq!(workspace.yaml, DecoderLanguage::Python.starter());
-        assert!(!workspace.has_definition());
+        assert!(workspace.has_definition(), "The Python starter is ready to run");
         assert!(!workspace.draft_dirty(DecoderLanguage::Python));
         assert!(workspace.pending.is_none());
         let python = workspace.yaml.clone();
@@ -4012,7 +4043,7 @@ mod tests {
         assert!(visible_control_text(&mut workspace, &ctx).contains("Replace the YAML draft"));
         click(&mut workspace, &ctx, "Replace decoder");
         assert_eq!(workspace.yaml, DecoderLanguage::Yaml.starter());
-        assert!(workspace.has_definition(), "The simple YAML starter is ready to apply");
+        assert!(workspace.has_definition(), "The simple YAML starter is ready to run");
         assert!(!workspace.is_dirty());
         workspace.switch_language(DecoderLanguage::Python);
         assert_eq!(workspace.yaml, python);
@@ -4046,13 +4077,13 @@ mod tests {
             "sample-decoder.yml",
             "Open decoder…",
             "Save YAML…",
-            "Decode file",
+            crate::decoder_ui::RUN_LABEL,
             "Ready to decode",
             "actions:",
         ] {
             assert!(text.contains(label), "missing {label:?} from {text}");
         }
-        click(&mut workspace, &ctx, "Decode file");
+        click(&mut workspace, &ctx, crate::decoder_ui::RUN_LABEL);
         settle(&mut workspace, &ctx);
         assert!(workspace.decoded_ready(), "{}", workspace.message);
         assert_eq!(workspace.decoder_status(), "Decoded");
@@ -4145,8 +4176,8 @@ mod tests {
         assert!(!workspace.has_layout());
         let text = visible_control_text(&mut workspace, &ctx);
         assert!(text.contains("Modified"));
-        assert!(text.contains("Review changes"));
-        click(&mut workspace, &ctx, "Review changes");
+        assert!(text.contains("Review field changes"));
+        click(&mut workspace, &ctx, "Review field changes");
         assert!(workspace.structure_ui.is_describing());
         assert_eq!(workspace.yaml, original_yaml);
     }
@@ -4171,7 +4202,7 @@ mod tests {
             assert!(!workspace.decoded_ready());
         }
         workspace.yaml = binary::DEMO_YAML.into();
-        click(&mut workspace, &ctx, "Decode file");
+        click(&mut workspace, &ctx, crate::decoder_ui::RUN_LABEL);
         settle(&mut workspace, &ctx);
         assert!(workspace.decode_error.is_none(), "{}", workspace.message);
         assert!(workspace.decoded_ready());
@@ -5037,7 +5068,7 @@ mod tests {
         settle(&mut workspace, &ctx);
         assert!(workspace.original.is_some());
         assert!(workspace.document.is_none(), "layout must require Apply");
-        click(&mut workspace, &ctx, "Decode file");
+        click(&mut workspace, &ctx, crate::decoder_ui::RUN_LABEL);
         settle(&mut workspace, &ctx);
         assert_eq!(workspace.document.as_ref().unwrap().records, 200);
         let spike = workspace
@@ -5166,7 +5197,7 @@ mod tests {
         let mut workspace = BinaryWorkspace::default();
         click(&mut workspace, &ctx, "Open demo");
         settle(&mut workspace, &ctx);
-        click(&mut workspace, &ctx, "Decode file");
+        click(&mut workspace, &ctx, crate::decoder_ui::RUN_LABEL);
         settle(&mut workspace, &ctx);
         assert_eq!(workspace.document.as_ref().unwrap().section, 1);
         workspace.select(73, 1);
@@ -5216,7 +5247,7 @@ mod tests {
         let selected = workspace.selected;
         let active = workspace.document.as_ref().unwrap().structure.clone();
         workspace.yaml = binary::DEMO_YAML.replace("DE AD BE EF", "00 00 00 00");
-        click(&mut workspace, &ctx, "Decode file");
+        click(&mut workspace, &ctx, crate::decoder_ui::RUN_LABEL);
         settle(&mut workspace, &ctx);
         assert!(workspace.error);
         assert!(workspace.message.contains("marker"));
@@ -5232,7 +5263,7 @@ mod tests {
         assert!(workspace.bytes.as_ref().unwrap().can_undo());
         workspace.yaml =
             "endian: little\nsections: [{name: broken, bytes: 1, compression: gzip}]".into();
-        click(&mut workspace, &ctx, "Decode file");
+        click(&mut workspace, &ctx, crate::decoder_ui::RUN_LABEL);
         assert!(workspace
             .message
             .contains("compressed sections are not supported yet"));

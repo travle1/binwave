@@ -416,9 +416,35 @@ class _CapturedOutput(io.TextIOBase):
         return self.data.decode("utf-8", errors="replace")
 
 
+def run_decoder(script, filename, size, read_bytes):
+    """Run the same decoder program with any bounded byte-source adapter."""
+    captured = _CapturedOutput()
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    try:
+        if not isinstance(script, str) or len(script.encode("utf-8")) > PROGRAM_LIMIT:
+            raise ValueError("Python decoder must be text of at most 256 KiB")
+        if not isinstance(filename, str) or not filename:
+            raise ValueError("decoder filename must be a nonempty string")
+        reader = Reader(size, filename, read_bytes)
+        sdk = types.ModuleType("binwave", "Read file bytes and describe reusable structures for Binwave.")
+        sdk.Field, sdk.Struct, sdk.Record, sdk.file = Field, Struct, Record, reader
+        sdk.__all__ = ["Field", "Struct", "Record", "file"]
+        sys.modules["binwave"] = sdk
+        sys.modules["plottermax"] = sdk  # Compatibility with saved decoder scripts.
+        linecache.cache[filename] = (len(script), None, script.splitlines(keepends=True), filename)
+        sys.stdout = sys.stderr = captured
+        exec(compile(script, filename, "exec"), {"__name__": "__main__", "__file__": filename, "file": reader})
+        return {"done": {"program": reader.program(), "stdout": captured.getvalue()}}
+    except BaseException:
+        error = _CapturedOutput()
+        error.write(traceback.format_exc(limit=20))
+        return {"error": error.getvalue(), "stdout": captured.getvalue()}
+    finally:
+        sys.stdout, sys.stderr = original_stdout, original_stderr
+
+
 def _main():
     protocol_in, protocol_out = sys.stdin, sys.stdout
-    captured = _CapturedOutput()
 
     def send(value):
         protocol_out.write(json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n")
@@ -442,28 +468,11 @@ def _main():
         if not line or not line.endswith("\n"):
             raise ValueError("missing or oversized decoder request")
         request = json.loads(line)
-        script = request["script"]
-        if not isinstance(script, str) or len(script.encode("utf-8")) > PROGRAM_LIMIT:
-            raise ValueError("Python decoder must be text of at most 256 KiB")
-        reader = Reader(request["size"], request["filename"], read_bytes)
-        sdk = types.ModuleType("binwave", "Read file bytes and describe reusable structures for Binwave.")
-        sdk.Field, sdk.Struct, sdk.Record, sdk.file = Field, Struct, Record, reader
-        sdk.__all__ = ["Field", "Struct", "Record", "file"]
-        sys.modules["binwave"] = sdk
-        sys.modules["plottermax"] = sdk  # Compatibility with saved decoder scripts.
-        sys.stdout = sys.stderr = captured
-        source_name = request["filename"]
-        if not isinstance(source_name, str) or not source_name:
-            raise ValueError("decoder filename must be a nonempty string")
-        linecache.cache[source_name] = (len(script), None, script.splitlines(keepends=True), source_name)
-        exec(compile(script, source_name, "exec"), {"__name__": "__main__", "__file__": source_name, "file": reader})
-        result = {"done": {"program": reader.program(), "stdout": captured.getvalue()}}
+        result = run_decoder(request["script"], request["filename"], request["size"], read_bytes)
     except BaseException:
         error = _CapturedOutput()
         error.write(traceback.format_exc(limit=20))
-        result = {"error": error.getvalue(), "stdout": captured.getvalue()}
-    finally:
-        sys.stdout, sys.stderr = protocol_out, sys.__stderr__
+        result = {"error": error.getvalue(), "stdout": ""}
     send(result)
 
 

@@ -7,6 +7,7 @@
   <base data-trunk-public-url>
   <link data-trunk rel="rust" data-bin="binwave">
   <link data-trunk rel="copy-dir" href="web">
+  <link data-trunk rel="copy-dir" href="node_modules/pyodide" data-target-path="pyodide">
   <link data-trunk rel="copy-dir" href="samples/decoders/yaml" data-target-path="decoders">
   <link data-trunk rel="copy-dir" href="samples/quickstart" data-target-path="examples">
   <style>
@@ -55,7 +56,7 @@
   </header>
   <div hidden aria-hidden="true">
     <button id="open" disabled>Open file...</button><input type="file" id="file">
-    <button id="open-decoder" disabled>Open decoder...</button><input type="file" id="decoder-file" aria-label="Choose a YAML decoder">
+    <button id="open-decoder" disabled>Open decoder...</button><input type="file" id="decoder-file" aria-label="Choose a YAML or Python decoder">
     <button id="save" disabled>Save edited copy...</button><button id="extract" disabled>Extract selection...</button><button id="cancel" disabled>Cancel operation</button>
   </div>
   <main id="workspace">

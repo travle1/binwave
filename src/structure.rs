@@ -10,7 +10,7 @@ pub(crate) type Address = usize;
 pub(crate) type Address = u64;
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::ops::Range;
 use std::sync::{
@@ -448,7 +448,11 @@ impl Node {
     }
     pub fn display(&self) -> String {
         if let Some(array) = &self.lazy {
-            format!("{} items · {} bytes each", array.count, array.stride)
+            if array.offsets.is_some() {
+                format!("{} items · variable size", array.count)
+            } else {
+                format!("{} items · {} bytes each", array.count, array.stride)
+            }
         } else if let Some(value) = &self.value {
             value.to_string()
         } else {
@@ -482,6 +486,9 @@ pub struct ResolvedField {
 pub struct LazyArray {
     pub count: Address,
     pub stride: Address,
+    /// Boundaries for variable-size records, including the final end offset.
+    /// Fixed-size arrays calculate boundaries from their stride instead.
+    offsets: Option<Arc<Vec<Address>>>,
     plan: Arc<LazyPlan>,
 }
 #[derive(Debug, Clone)]
@@ -625,6 +632,28 @@ fn project_numeric(
     Some(length.unwrap_or(consumed))
 }
 impl LazyArray {
+    pub(crate) fn indices_for_bytes(&self, bytes: &Range<Address>) -> Option<Range<Address>> {
+        if self.count == 0 || bytes.is_empty() { return None; }
+        if let Some(offsets) = &self.offsets {
+            let first = offsets.partition_point(|offset| *offset <= bytes.start).saturating_sub(1);
+            let end = offsets.partition_point(|offset| *offset < bytes.end).min(offsets.len() - 1);
+            return (first < end).then_some(first as Address..end as Address);
+        }
+        if self.stride == 0 { return None; }
+        let first = (bytes.start - self.plan.start) / self.stride;
+        let end = (bytes.end - self.plan.start).div_ceil(self.stride).min(self.count);
+        (first < end).then_some(first..end)
+    }
+    pub(crate) fn bounds(&self, index: Address) -> Option<Range<Address>> {
+        if index >= self.count { return None; }
+        if let Some(offsets) = &self.offsets {
+            let index = usize::try_from(index).ok()?;
+            return Some(*offsets.get(index)?..*offsets.get(index + 1)?);
+        }
+        let start = self.plan.start.checked_add(index.checked_mul(self.stride)?)?;
+        Some(start..start.checked_add(self.stride)?)
+    }
+
     pub(crate) fn numeric_plan(&self) -> Option<NumericPlan> {
         let mut fields = Vec::new();
         let mut budget = MAX_NODES;
@@ -674,10 +703,11 @@ impl LazyArray {
         );
         ensure!(start <= self.count, "collection index is out of bounds");
         ensure!(!cancel.load(Ordering::Relaxed), "parsing cancelled");
-        let length = count.min(self.count - start).checked_mul(self.stride);
-        let offset = start
-            .checked_mul(self.stride)
-            .and_then(|offset| self.plan.start.checked_add(offset));
+        let page_end = start.saturating_add(count).min(self.count);
+        let offset = if start < page_end { self.bounds(start).map(|r| r.start) } else { None };
+        let length = if start < page_end {
+            self.bounds(page_end - 1).and_then(|r| offset.map(|start| r.end - start))
+        } else { None };
         // A page normally occupies a small contiguous region. Decode its fields
         // from one bounded read rather than reopening the file for every scalar.
         // Explicit field references outside that region still use the source.
@@ -718,24 +748,23 @@ impl LazyArray {
         let mut nodes =
             Vec::with_capacity(usize::try_from(end - start).context("page exceeds memory range")?);
         for index in start..end {
-            let mut cursor = self
-                .plan
-                .start
-                .checked_add(
-                    index
-                        .checked_mul(self.stride)
-                        .context("array offset overflow")?,
-                )
-                .context("array offset overflow")?;
+            let bounds = self.bounds(index).context("array offset overflow")?;
+            let mut cursor = bounds.start;
+            if self.offsets.is_some() {
+                engine.values = self.plan.values.clone();
+                engine.collections.clear();
+                engine.nodes = 0;
+            }
             let path = format!("{}[{index}]", self.plan.path);
             let mut node = engine.single(
                 &self.plan.field,
                 &path,
                 &mut cursor,
-                self.plan.end,
+                if self.offsets.is_some() { bounds.end } else { self.plan.end },
                 self.plan.endian,
                 0,
             )?;
+            ensure!(self.offsets.is_none() || cursor == bounds.end, "{path}: record size changed since indexing");
             node.name = format!("[{index}]");
             nodes.push(node);
         }
@@ -762,6 +791,40 @@ impl Source for PageSource<'_> {
             }
         }
         self.source.read(offset, length)
+    }
+}
+
+/// Sequential scans reuse one bounded read for many scalar fields.
+struct ScanSource<'a> {
+    source: &'a dyn Source,
+    cache: std::cell::RefCell<(Address, Vec<u8>)>,
+}
+impl<'a> ScanSource<'a> {
+    fn new(source: &'a dyn Source) -> Self {
+        Self { source, cache: std::cell::RefCell::new((0, Vec::new())) }
+    }
+}
+impl Source for ScanSource<'_> {
+    fn len(&self) -> Address { self.source.len() }
+    fn read(&self, offset: Address, length: Address) -> Result<Vec<u8>> {
+        const WINDOW: Address = 64 * 1024;
+        if length > WINDOW { return self.source.read(offset, length); }
+        {
+            let cache = self.cache.borrow();
+            if let Some(start) = offset.checked_sub(cache.0) {
+                if let Some(bytes) = start.checked_add(length).and_then(|end| {
+                    cache.1.get(usize::try_from(start).ok()?..usize::try_from(end).ok()?)
+                }) {
+                    return Ok(bytes.to_vec());
+                }
+            }
+        }
+        ensure!(offset <= self.source.len(), "scan offset is outside the file");
+        let bytes = self.source.read(offset, WINDOW.min(self.source.len() - offset))?;
+        let result = bytes.get(..usize::try_from(length).context("scan length exceeds memory range")?)
+            .context("truncated source during record scan")?.to_vec();
+        *self.cache.borrow_mut() = (offset, bytes);
+        Ok(result)
     }
 }
 
@@ -1157,6 +1220,163 @@ impl<'a> Engine<'a> {
         }
         Ok(start)
     }
+    fn scan_field(
+        &mut self,
+        field: &Field,
+        path: &str,
+        cursor: &mut Address,
+        end: Address,
+        endian: Endian,
+        depth: Address,
+        needed: &HashSet<String>,
+    ) -> Result<()> {
+        if field.repeat.is_some() {
+            self.field(field, path, cursor, end, endian, depth)?;
+            return Ok(());
+        }
+        *cursor = self.position(field, path, *cursor, end)?;
+        self.scan_single(field, path, cursor, end, endian, depth, needed)
+    }
+
+    /// Find a record boundary without building a tree for fields that a later
+    /// offset, length, or choice does not reference.
+    fn scan_single(
+        &mut self,
+        field: &Field,
+        path: &str,
+        cursor: &mut Address,
+        outer_end: Address,
+        inherited: Endian,
+        depth: Address,
+        needed: &HashSet<String>,
+    ) -> Result<()> {
+        self.check(depth)?;
+        let start = *cursor;
+        let kind = self.selected_type(&field.kind, path)?;
+        let length = field.length.as_ref().map(|value| self.size(value, path)).transpose()?;
+        let end = if let Some(length) = length {
+            checked_end(start, length, outer_end)?
+        } else {
+            outer_end
+        };
+        let endian = field.endian.unwrap_or(inherited);
+        let keep_value = needed.contains(&field.name) || field.expect.is_some();
+        let mut value = None;
+        if let Some(width) = primitive_width(&kind) {
+            let value_end = checked_end(start, width, end)?;
+            if keep_value {
+                value = Some(decode_primitive(&kind, &self.exact(start, width)?, endian)?);
+            }
+            *cursor = value_end;
+        } else if kind == "bytes" {
+            ensure!(length.is_some(), "{path}: bytes requires a length");
+            if keep_value {
+                value = Some(Value::Bytes(self.exact(start, (end - start).min(64))?));
+            }
+            *cursor = end;
+        } else if kind == "text" {
+            ensure!(length.is_some(), "{path}: text requires a byte length");
+            ensure!(end - start <= MAX_TEXT, "{path}: text exceeds 1 MiB; inspect it as bytes instead");
+            if keep_value {
+                value = Some(Value::Text(String::from_utf8(self.exact(start, end - start)?)
+                    .with_context(|| format!("{path}: invalid UTF-8 text"))?));
+            }
+            *cursor = end;
+        } else if kind == "cstring" {
+            let max = (end - start).min(MAX_TEXT);
+            let mut text = Vec::new();
+            let mut found = false;
+            while *cursor - start < max {
+                let size = (max - (*cursor - start)).min(4096);
+                let chunk = self.exact(*cursor, size)?;
+                if let Some(index) = chunk.iter().position(|byte| *byte == 0) {
+                    if keep_value { text.extend_from_slice(&chunk[..index]); }
+                    *cursor += index as Address + 1;
+                    found = true;
+                    break;
+                }
+                if keep_value { text.extend_from_slice(&chunk); }
+                *cursor += size;
+            }
+            ensure!(found, "{path}: missing zero terminator within the bounded region (maximum 1 MiB)");
+            if keep_value {
+                value = Some(Value::Text(String::from_utf8(text).context("invalid UTF-8 text")?));
+            }
+        } else if kind == "varuint" {
+            let mut number = 0u64;
+            let mut terminated = false;
+            for i in 0..10 {
+                checked_end(*cursor, 1, end)?;
+                let byte = self.exact(*cursor, 1)?[0];
+                *cursor += 1;
+                ensure!(i != 9 || byte <= 1, "{path}: unsigned LEB128 exceeds u64");
+                number |= u64::from(byte & 0x7f) << (7 * i);
+                if byte & 0x80 == 0 { terminated = true; break; }
+            }
+            ensure!(terminated, "{path}: unterminated unsigned LEB128");
+            if keep_value { value = Some(Value::Unsigned(number)); }
+        } else {
+            let structure = self.structures.get(&kind)
+                .with_context(|| format!("{path}: unknown structure or primitive type {kind:?}"))?
+                .clone();
+            ensure!(structure.actions.is_empty(), "{path}: indexed records cannot define structures");
+            let child_endian = field.endian.or(structure.endian).unwrap_or(inherited);
+            if length.is_some() { self.regions.push(start..end); }
+            for child in &structure.fields {
+                let child_path = child_path(path, &child.name);
+                self.scan_field(child, &child_path, cursor, end, child_endian, depth + 1, needed)
+                    .with_context(|| format!("read {child_path} at byte {cursor}"))?;
+            }
+            if length.is_some() { self.regions.pop(); }
+        }
+        if let Some(expect) = &field.expect {
+            let actual = value.as_ref().context("expect requires a scalar value")?;
+            ensure!(matches_expected(actual, expect), "{path}: expected {expect:?}, found {actual}");
+        }
+        if length.is_some() && *cursor < end { *cursor = end; }
+        if let Some(value) = value { self.values.insert(path.into(), value); }
+        Ok(())
+    }
+
+    fn index_variable(
+        &self,
+        element: &Field,
+        path: &str,
+        start: Address,
+        end: Address,
+        count: Option<Address>,
+        endian: Endian,
+        depth: Address,
+    ) -> Result<Option<Vec<Address>>> {
+        // Definitions inside a record can change how later records decode.
+        // Keep those collections on the ordinary execution path.
+        let Ok(kind) = self.selected_type(&element.kind, path) else { return Ok(None); };
+        if self.has_actions(&kind, 0) { return Ok(None); }
+        let source = ScanSource::new(self.source);
+        let mut scanner = Engine::new(&source, self.cancel, endian, self.structures.clone(), self.revision);
+        scanner.regions = self.regions.clone();
+        let needed: HashSet<String> = self.structures.values()
+            .flat_map(|structure| structure.fields.iter())
+            .flat_map(field_references)
+            .map(|reference| reference.rsplit(|c| c == '.' || c == '/').next().unwrap_or("").to_owned())
+            .collect();
+        let mut offsets = vec![start];
+        let mut cursor = start;
+        while count.map_or(cursor < end, |count| ((offsets.len() - 1) as Address) < count) {
+            ensure!(!self.cancel.load(Ordering::Relaxed), "parsing cancelled");
+            let index = offsets.len() - 1;
+            let before = cursor;
+            scanner.values = self.values.clone();
+            scanner.collections.clear();
+            scanner.nodes = 0;
+            let item_path = format!("{path}[{index}]");
+            scanner.scan_single(element, &item_path, &mut cursor, end, endian, depth + 1, &needed)
+                .with_context(|| format!("item {index} at byte {before}"))?;
+            ensure!(cursor > before, "{path}: repeated item consumed no bytes");
+            offsets.push(cursor);
+        }
+        Ok(Some(offsets))
+    }
     fn field(
         &mut self,
         field: &Field,
@@ -1211,6 +1431,7 @@ impl<'a> Engine<'a> {
                     lazy: Some(LazyArray {
                         count,
                         stride,
+                        offsets: None,
                         plan: Arc::new(LazyPlan {
                             field: element,
                             start,
@@ -1227,6 +1448,44 @@ impl<'a> Engine<'a> {
                 };
                 self.collections.insert(path.into(), node.clone());
                 return Ok(node);
+            }
+        }
+        if stride.is_none() && count.is_none_or(|count| count > LAZY_THRESHOLD) {
+            if let Some(offsets) = self.index_variable(
+                &element, path, start, end, count, field.endian.unwrap_or(endian), depth,
+            )? {
+                let indexed_count = (offsets.len() - 1) as Address;
+                if indexed_count > LAZY_THRESHOLD {
+                    let array_end = *offsets.last().unwrap();
+                    *cursor = array_end;
+                    let node = Node {
+                        name: field.name.clone(),
+                        path: path.into(),
+                        range: start..array_end,
+                        kind: format!("{}[]", self.selected_type(&field.kind, path)?),
+                        value: None,
+                        children: vec![],
+                        lazy: Some(LazyArray {
+                            count: indexed_count,
+                            stride: 0,
+                            offsets: Some(Arc::new(offsets)),
+                            plan: Arc::new(LazyPlan {
+                                field: element,
+                                start,
+                                end: array_end,
+                                path: path.into(),
+                                endian: field.endian.unwrap_or(endian),
+                                values: self.values.clone(),
+                                structures: self.structures.clone(),
+                                revision: self.revision,
+                            }),
+                        }),
+                        endian: field.endian.unwrap_or(endian),
+                        references: field_references(field),
+                    };
+                    self.collections.insert(path.into(), node.clone());
+                    return Ok(node);
+                }
             }
         }
         if let Some(count) = count {
@@ -1934,6 +2193,80 @@ actions:
             .is_err());
     }
     #[test]
+    fn interleaved_choose_records_page_and_map_bytes_beyond_node_cap() {
+        let yaml = r#"
+structures:
+  - name: Short
+    fields:
+      - {name: a, type: u16}
+  - name: Long
+    fields:
+      - {name: b, type: u32}
+  - name: Record
+    fields:
+      - {name: tag, type: u8}
+      - name: payload
+        type: {choose: {ref: tag, cases: {'1': {structure: Short}, '2': {structure: Long}}}}
+actions:
+  - read: {name: records, type: {structure: Record}, repeat: until end}
+"#;
+        let mut bytes = Vec::new();
+        for index in 0..30_000u32 {
+            if index % 2 == 0 {
+                bytes.push(1);
+                bytes.extend_from_slice(&(index as u16).to_le_bytes());
+            } else {
+                bytes.push(2);
+                bytes.extend_from_slice(&index.to_le_bytes());
+            }
+        }
+        let source = Bytes(bytes.clone());
+        let output = Program::parse(yaml).unwrap()
+            .run_from(&source, &AtomicBool::new(false), 1).unwrap();
+        assert_eq!(output.consumed, bytes.len());
+        let node = &output.nodes[0];
+        let array = node.lazy.as_ref().expect("variable records should be indexed");
+        assert_eq!(array.count, 30_000);
+        assert_eq!(node.children.len(), 0);
+        let page = array.page_from(&source, &AtomicBool::new(false), 1_455, 3).unwrap();
+        assert_eq!(page[0].children[1].kind, "Long");
+        assert_eq!(page[1].children[1].kind, "Short");
+        assert_eq!(page[0].children[1].children[0].value, Some(Value::Unsigned(1_455)));
+        let bytes = array.bounds(1_455).unwrap();
+        assert_eq!(array.indices_for_bytes(&bytes),
+            Some(1_455..1_456));
+        assert_eq!(bytes.start..array.bounds(1_456).unwrap().end,
+            page[0].range.start..page[1].range.end);
+        assert_eq!(array.bounds(29_999).unwrap().end, source.len());
+    }
+
+    #[test]
+    fn indexed_lengths_from_prior_fields_keep_record_boundaries() {
+        let yaml = r#"
+structures:
+  - name: Item
+    fields:
+      - {name: length, type: u8}
+      - {name: payload, type: bytes, length: {ref: length}}
+actions:
+  - read: {name: items, type: {structure: Item}, repeat: until end}
+"#;
+        let mut data = Vec::new();
+        for index in 0..2_000 {
+            let length = (index % 4 + 1) as u8;
+            data.push(length);
+            data.extend(std::iter::repeat_n(0xA5, length as usize));
+        }
+        let source = Bytes(data);
+        let output = Program::parse(yaml).unwrap()
+            .run_from(&source, &AtomicBool::new(false), 1).unwrap();
+        let array = output.nodes[0].lazy.as_ref().unwrap();
+        assert_eq!(array.count, 2_000);
+        let page = array.page_from(&source, &AtomicBool::new(false), 1_999, 1).unwrap();
+        assert_eq!(page[0].children[0].value, Some(Value::Unsigned(4)));
+        assert_eq!(page[0].range.end, source.len());
+    }
+    #[test]
     fn regions_choices_alignment_and_prior_lengths_decode_chunks() {
         let yaml = r#"
 structures:
@@ -2096,9 +2429,13 @@ actions:
         let yaml = "structures: [{name: Record, fields: [{name: count, type: u8}, {name: data, type: bytes, length: {ref: count}}]}]\nactions: [{read: {name: count, type: u8}}, {read: {name: records, type: {structure: Record}, repeat: 129}}]";
         let mut bytes = vec![255];
         bytes.extend(std::iter::repeat_n(0, 129));
-        let out = run(yaml, bytes).unwrap();
-        assert!(out.nodes[1].lazy.is_none());
-        assert_eq!(out.nodes[1].children.len(), 129);
+        let source = Bytes(bytes);
+        let out = Program::parse(yaml).unwrap()
+            .run_from(&source, &AtomicBool::new(false), 1).unwrap();
+        let array = out.nodes[1].lazy.as_ref().unwrap();
+        assert_eq!(array.count, 129);
+        assert_eq!(array.bounds(128), Some(129..130));
+        assert_eq!(array.page_from(&source, &AtomicBool::new(false), 128, 1).unwrap()[0].range, 129..130);
         assert_eq!(out.nodes[1].range, 1..130);
     }
 }

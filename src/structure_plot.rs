@@ -846,6 +846,45 @@ mod tests {
     use crate::byte_store::ByteStore;
     use crate::structure::Program;
 
+    #[test]
+    fn interleaved_lazy_plot_keeps_each_stream_and_exact_byte_ranges() {
+        let yaml = r#"
+structures:
+  - name: A
+    fields:
+      - {name: value_a, type: u16}
+  - name: B
+    fields:
+      - {name: value_b, type: u32}
+  - name: Record
+    fields:
+      - {name: tag, type: u8}
+      - name: payload
+        type: {choose: {ref: tag, cases: {'1': {structure: A}, '2': {structure: B}}}}
+actions:
+  - read: {name: records, type: {structure: Record}, repeat: until end}
+"#;
+        let mut bytes = Vec::new();
+        for index in 0..2_000u32 {
+            if index % 2 == 0 {
+                bytes.push(1);
+                bytes.extend_from_slice(&(index as u16).to_le_bytes());
+            } else {
+                bytes.push(2);
+                bytes.extend_from_slice(&index.to_le_bytes());
+            }
+        }
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let node = parse(&store.view(), yaml);
+        assert!(node.lazy.is_some());
+        let data = read_for_viewport(store.view(), node, 0..2_000, 1_000).unwrap();
+        assert_eq!(data.quality, PlotQuality::Exact);
+        assert_eq!(data.series["payload.value_a"].len(), 1_000);
+        assert_eq!(data.series["payload.value_b"].len(), 1_000);
+        assert_eq!(data.series["payload.value_a"][0].bytes, 1..3);
+        assert_eq!(data.series["payload.value_b"][0].bytes, 4..8);
+    }
+
     fn fixture(count: usize, spike: usize) -> (ByteStore, Node) {
         let bytes: Vec<_> = (0..count)
             .flat_map(|index| {

@@ -15,6 +15,10 @@ use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+#[wasm_bindgen]
+pub fn python_runner() -> String {
+    include_str!("../python/runner.py").into()
+}
 fn json_result(value: Value) -> Result<String> {
     let text = serde_json::to_string(&value)?;
     ensure!(
@@ -114,6 +118,15 @@ impl DecoderSession {
     pub fn decode(&mut self, yaml: &str) -> Result<String, JsValue> {
         self.decode_interpretation(yaml, "", "0", "0")
     }
+    /// Python's shared runner emits the same plan object used by native.
+    pub fn decode_plan_json(&mut self, plan_json: &str) -> Result<String, JsValue> {
+        let yaml = (|| -> Result<String> {
+            let plan: serde_json::Value = serde_json::from_str(plan_json)?;
+            ensure!(!plan.is_null(), "Python decoder did not define a read plan");
+            Ok(serde_yaml_ng::to_string(&plan)?)
+        })().map_err(js_error)?;
+        self.decode(&yaml)
+    }
     pub fn decode_interpretation(&mut self, yaml: &str, name: &str, start: &str, end: &str) -> Result<String, JsValue> {
         (|| {
             let output = Program::parse(yaml)?.run(&self.source, &AtomicBool::new(false))?;
@@ -153,6 +166,36 @@ impl DecoderSession {
                 .context("Sample outside collection")?;
             json_result(json!({"path":path,"index":index.to_string(),
                 "start":bytes.start.to_string(),"end":bytes.end.to_string()}))
+        })().map_err(js_error)
+    }
+
+    /// Resolve the selected field on demand, paging only its containing records.
+    pub fn inspect(&self, start: &str, end: &str) -> Result<String, JsValue> {
+        (|| -> Result<String> {
+            let output = self.output.as_ref().context("Apply a decoder first")?;
+            let range = start.parse::<u64>()?..end.parse::<u64>()?;
+            ensure!(range.start < range.end && range.end <= self.source.len(), "Invalid byte selection");
+            let field = crate::structure_selection::resolved_field(&output.nodes, &self.source, &range)?;
+            let field = field.as_ref().map(|node| {
+                let sample = crate::structure_selection::sample_for_node(&output.nodes, node);
+                crate::workspace_inspector::FieldInfo::from_node(node, sample)
+            });
+            json_result(json!({"field":field,"consumed":output.consumed.to_string(),
+                "types":output.definitions.len()}))
+        })().map_err(js_error)
+    }
+
+    /// Encode a whole numeric field with the same rules as the native editor.
+    pub fn encode(&self, start: &str, end: &str, value: &str) -> Result<String, JsValue> {
+        (|| -> Result<String> {
+            let output = self.output.as_ref().context("Apply a decoder first")?;
+            let range = start.parse::<u64>()?..end.parse::<u64>()?;
+            ensure!(range.start < range.end && range.end <= self.source.len(), "Invalid field range");
+            let node = crate::structure_selection::resolved_field(&output.nodes, &self.source, &range)?
+                .context("No decoded field covers these bytes")?;
+            ensure!(node.range == range, "Select the full decoded field");
+            let (bytes, displayed) = crate::field_edit::encode_value(&node, value)?;
+            json_result(json!({"start":start,"end":end,"bytes":bytes,"displayed":displayed}))
         })().map_err(js_error)
     }
 

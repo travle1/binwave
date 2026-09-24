@@ -143,3 +143,22 @@ old-form rejection, reserved/duplicate names, nested byte ranges, dynamic format
 and large-file reads. The Windows test cross-check, Trunk release, browser worker tests, and actual
 WASM tests with the 40 GiB synthetic source and generated waveform fixture all
 passed. These are not real Windows or iPhone launch tests.
+
+## September 23 browser Inspector and Python parity slice
+
+Native and browser Inspectors now share field lookup, display, raw-byte
+interpretation, value-edit controls, and numeric encoding. Browser selection
+pages lazy variable-size records on demand, and whole-field edits are atomic
+worker-owned undo steps. YAML and Python use independent persistent browser
+drafts; browser Python executes the same embedded runner with a bundled,
+pinned Pyodide runtime and hands its plan to the shared Rust decoder.
+
+Validation on Linux: 351 native unit and 48 integration tests passed (12
+existing ignored), 13 Python runner tests passed, browser backend/startup/worker
+tests passed, and the actual bundled Pyodide runner test passed. The Trunk
+release build succeeded; the WASM API test decoded 30,000 interleaved
+variable-size records beyond the former node cap, including Inspector lookup and
+editing. A local headless Chrome smoke loaded the app, opened the simple demo,
+loaded a Python decoder, and applied it through both workers to decode 512
+samples. The bundle contains local Python WASM and standard-library assets.
+CSV and full-file Hex search remain browser gaps. No deployment or push occurred.

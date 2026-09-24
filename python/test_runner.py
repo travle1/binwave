@@ -197,6 +197,22 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(first_fields, list(reversed(reversed_fields)))
 
 
+class SharedRunnerTests(unittest.TestCase):
+    def test_browser_adapter_uses_same_runner_and_bounded_reads(self):
+        data = b"\x07\x00\x08\x00"
+        reads = []
+        def read_bytes(offset, length):
+            reads.append((offset, length))
+            return data[offset:offset + length]
+        script = ("from binwave import Struct\n"
+                  "print(file.read_at(0, 2).hex())\n"
+                  "file.records('samples', Struct('Sample', [('value', 'u16')]))")
+        result = runner.run_decoder(script, "decoder.py", len(data), read_bytes)
+        self.assertEqual(result["done"]["stdout"], "0700\n")
+        self.assertEqual(result["done"]["program"]["actions"][0]["read"]["repeat"], 2)
+        self.assertEqual(reads, [(0, 4)])
+
+
 class ProtocolTests(unittest.TestCase):
     def run_script(self, script, data=b"\x07\x00"):
         process = subprocess.Popen([sys.executable, str(ROOT / "python/runner.py")],

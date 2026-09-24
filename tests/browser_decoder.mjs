@@ -38,6 +38,13 @@ actions:
       at: 0
       repeat: until end
 `;
+const embeddedRunner = bindings.python_runner();
+assert.equal(embeddedRunner, await readFile('python/runner.py','utf8'),
+    'Browser and native Python adapters must use the same runner source');
+const plan={endian:'little',structures:[{name:'Sample',fields:[{name:'value',type:'u16'}]}],
+    actions:[{read:{name:'samples',type:{structure:'Sample'},at:0,length:2,repeat:size/2}}]};
+const pythonDecoded=JSON.parse(session.decode_plan_json(JSON.stringify(plan)));
+assert.equal(pythonDecoded.collections[0].count,String(size/2));
 const decoded=JSON.parse(session.decode(yaml));
 assert.equal(decoded.collections[0].count,String(size/2));
 assert.equal(decoded.nodes[0].end,String(size));
@@ -65,6 +72,16 @@ assert.ok(source.cache.size<=4);
 assert.throws(()=>source.read('0',1024**2+1));
 assert.equal(JSON.parse(session.probe(path, String(size-1), String(size))).first, String(size/2-1));
 assert.equal(JSON.parse(session.pick(path, String(size/2-1))).start, String(size-2));
+const inspected=JSON.parse(session.inspect(String(size-2),String(size)));
+assert.equal(inspected.field.name,'value');
+assert.equal(inspected.field.value,'65535');
+assert.equal(inspected.field.sample,size/2-1);
+assert.equal(inspected.field.sample_start,size-2);
+assert.equal(inspected.field.sample_end,size);
+assert.equal(inspected.field.editable,true);
+assert.deepEqual(JSON.parse(session.encode(String(size-2),String(size),'1234')).bytes,[210,4]);
+assert.throws(()=>session.encode(String(size-2),String(size),'65536'));
+assert.throws(()=>session.encode(String(size-1),String(size),'3'));
 session.free();
 console.log(`Browser WASM: YAML, lazy 40 GiB offsets, sparse edits, tables, exact plots, bounded overview, and failed-apply retention passed (${reads.length} bounded slices).`);
 
@@ -175,6 +192,43 @@ assert.throws(() => variableSession.decode_interpretation(variableYaml.replace('
 assert.deepEqual(JSON.parse(variableSession.table('field', '0')), previousStructure, 'Failed interpretation must retain the published structure');
 variableSession.free();
 console.log('Browser WASM: custom structures, actual variable byte ranges, short selections and missing references passed.');
+
+// Variable-size choose records stay lazy well past the old 20,000-node cap.
+const interleavedBytes = new Uint8Array(30_000 * 4);
+const interleavedView = new DataView(interleavedBytes.buffer);
+for (let i = 0, at = 0; i < 30_000; i++) {
+    interleavedBytes[at++] = i % 2 ? 2 : 1;
+    if (i % 2) { interleavedView.setUint32(at, i, true); at += 4; }
+    else { interleavedView.setUint16(at, i, true); at += 2; }
+}
+globalThis.binwaveDecoder = {read(start,length) {
+    return interleavedBytes.slice(Number(start), Number(start) + length);
+}};
+const interleaved = new bindings.DecoderSession(String(interleavedBytes.length));
+const chooseYaml = [
+    'structures:',
+    '  - name: Short',
+    '    fields: [{name: value, type: u16}]',
+    '  - name: Long',
+    '    fields: [{name: value, type: u32}]',
+    '  - name: Record',
+    '    fields:',
+    '      - {name: tag, type: u8}',
+    "      - name: payload",
+    "        type: {choose: {ref: tag, cases: {'1': {structure: Short}, '2': {structure: Long}}}}",
+    'actions:',
+    '  - read: {name: records, type: {structure: Record}, repeat: until end}',
+].join('\n');
+const chooseDecoded = JSON.parse(interleaved.decode(chooseYaml));
+assert.equal(chooseDecoded.collections[0].count, '30000');
+const oddRecord = JSON.parse(interleaved.pick('records', '1457'));
+assert.equal(oddRecord.start, '5827');
+const oddField = JSON.parse(interleaved.inspect('5828', '5832'));
+assert.equal(oddField.field.value, '1457');
+assert.equal(oddField.field.sample, 1457);
+assert.deepEqual(JSON.parse(interleaved.encode('5828','5832','12345')).bytes,[57,48,0,0]);
+interleaved.free();
+console.log('Browser WASM: 30,000 interleaved choose records, on-demand Inspector and editing passed.');
 
 
 const advancedBytes = await readFile('samples/quickstart/advanced_wave.bin');

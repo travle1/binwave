@@ -8,7 +8,9 @@ must not introduce another decoder or a second plot-reduction algorithm.
 | YAML syntax, execution, lazy arrays, numeric plans | `structure.rs` | Native `ByteView`; browser bounded worker reader |
 | Viewport sampling, exact reads, min/max reduction | `structure_plot.rs` | Native thread scheduler; browser decoder worker |
 | Dense trace rendering | `plot_trace.rs` | Both shells use `decoded_channel`; sampled bands never connect unread gaps |
-| Source editor, highlighting, shortcuts, templates | `source_editor.rs` | Native language controls; browser YAML controls |
+| Source editor, highlighting, shortcuts, templates | `source_editor.rs` | Native and browser language/draft controls |
+| Inspector field lookup, display, and numeric encoding | `structure_selection.rs`, `workspace_inspector.rs`, `field_edit.rs` | Native selection and browser on-demand worker requests |
+| Python SDK and plan generation | `python/runner.py` | Native subprocess; browser-local Pyodide worker |
 | Dock arrangement and persistence | `workspace_layout.rs` | Native and browser application state |
 | File identity, dialogs, patches, streaming export | Shared range validation; platform-specific I/O | Native OS files versus browser handles/workers |
 
@@ -30,8 +32,12 @@ native interfaces to u64 is still a separate migration.
 The browser shell still duplicates some view composition and Hex interactions.
 It is not full native UI parity. Future work should extract platform-independent
 controllers/views where useful, rather than copy native decoders into the browser.
-CSV, Python execution, native file dialogs, and OS caching are not abstracted by
-pretending browser APIs have the same capabilities.
+CSV, native file dialogs, and OS caching remain platform-specific gaps.
+Python uses the same runner and decoder plan on both platforms, but the browser
+loads a pinned Pyodide runtime into a worker on first use; it does not start a
+native subprocess. Browser scripts can make network requests and are not a
+security sandbox. The browser needs a separate file/worker adapter, not another
+decoder implementation.
 
 Validation combines native engine tests with the actual built WASM API against
 a synthetic 40 GiB file (`tests/browser_decoder.mjs`). The synthetic file forbids

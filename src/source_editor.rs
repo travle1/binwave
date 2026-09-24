@@ -43,7 +43,7 @@ actions:
             Self::Python => {
                 r#"# Byte preview: edit this to match your data.
 # Field types: u8, i16, u16, i32, f32, f64.
-# F5 runs this script; print() uses Console.
+# Press ▶ Run (F5); print() uses Console.
 from binwave import Struct
 
 Sample = Struct("Sample", [
@@ -62,7 +62,7 @@ print(f"Registered {len(samples):,} samples")
     pub fn starter(self) -> &'static str {
         match self {
             Self::Yaml => include_str!("../samples/quickstart/simple_wave.yaml"),
-            Self::Python => self.header_example(),
+            Self::Python => self.byte_preview(),
         }
     }
 
@@ -72,7 +72,7 @@ print(f"Registered {len(samples):,} samples")
                 r#"## Adapt this example to your binary file.
 ## Header: u32 count. Samples: u32 time, f32 value.
 ## Select all, then Ctrl+/ to uncomment.
-## On Mac use Cmd+/. F5 decodes.
+## On Mac use Cmd+/. Press ▶ Run (F5).
 #
 # endian: little
 # structures:
@@ -95,7 +95,7 @@ print(f"Registered {len(samples):,} samples")
                 r#"## Adapt this example to your binary file.
 ## `file` is the open file. print() uses Console.
 ## Select all, then Ctrl+/ to uncomment.
-## On Mac use Cmd+/. F5 runs.
+## On Mac use Cmd+/. Press ▶ Run (F5).
 #
 # from binwave import Struct
 #
@@ -129,9 +129,11 @@ pub(crate) struct YamlLayoutCache {
     edit_action: Option<&'static str>,
     paste: Arc<std::sync::Mutex<Option<String>>>,
     paste_error: Option<String>,
+    goto_line: Option<usize>,
 }
 impl YamlLayoutCache {
     pub fn command(&mut self, action: &'static str) { self.edit_action = Some(action); }
+    pub fn go_to_line(&mut self, line: usize) { self.goto_line = Some(line.max(1)); }
     fn edit_menu(&mut self, ui: &mut Ui) {
         for action in ["Undo", "Redo", "Cut", "Copy", "Paste", "Select all", "Toggle comments"] {
             if ui.button(action).clicked() {
@@ -246,6 +248,23 @@ impl YamlLayoutCache {
                                 }
                             }
                             let focused = ui.memory(|memory| memory.has_focus(editor_id));
+                            if let Some(line) = self.goto_line.take() {
+                                let index = if line <= 1 {
+                                    0
+                                } else {
+                                    yaml.char_indices()
+                                        .filter(|(_, ch)| *ch == '\n')
+                                        .nth(line - 2)
+                                        .map_or_else(|| yaml.chars().count(), |(index, _)| yaml[..=index].chars().count())
+                                };
+                                let mut state = egui::TextEdit::load_state(ui.ctx(), editor_id)
+                                    .unwrap_or_default();
+                                state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                                    egui::text::CCursor::new(index),
+                                )));
+                                state.store(ui.ctx(), editor_id);
+                                ui.memory_mut(|memory| memory.request_focus(editor_id));
+                            }
                             let toggle = focused
                                 && ui.input_mut(|input| {
                                     input.consume_key(egui::Modifiers::COMMAND, egui::Key::Slash)

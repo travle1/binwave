@@ -1,0 +1,13 @@
+{
+  "private": true,
+  "name": "binwave-web-assets",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Pinned browser-local Python runtime for BinWave web builds",
+  "dependencies": {
+    "pyodide": "0.28.3"
+  },
+  "devDependencies": {
+    "wrangler": "^4.137.0"
+  }
+}

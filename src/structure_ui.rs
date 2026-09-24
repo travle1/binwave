@@ -23,74 +23,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-/// Only a complete, fixed-width numeric field can be edited as one value.
-pub fn editable_value(node: &Node) -> bool {
-    let Some(width) = primitive_size(&node.kind) else {
-        return false;
-    };
-    node.value
-        .as_ref()
-        .is_some_and(|value| value.numeric().is_some())
-        && node.range.len() == width
-}
-
-/// Integer parsing never passes through f64, including the full u64/i64 ranges.
-/// Floats use the target primitive's normal rounding and reject non-finite values.
-pub fn encode_value(node: &Node, text: &str) -> Result<(Vec<u8>, String)> {
-    anyhow::ensure!(
-        editable_value(node),
-        "Edit this field's bytes in Hex; it is not a fixed-width numeric value."
-    );
-    let text = text.trim();
-    anyhow::ensure!(
-        !text.is_empty() && text.len() <= 1024,
-        "Enter a numeric value of at most 1024 characters."
-    );
-    macro_rules! integer {
-        ($kind:ty) => {{
-            let value = text.parse::<$kind>().with_context(|| {
-                format!(
-                    "Enter a whole number from {} to {}.",
-                    <$kind>::MIN,
-                    <$kind>::MAX
-                )
-            })?;
-            let bytes = match node.endian {
-                Endian::Little => value.to_le_bytes(),
-                Endian::Big => value.to_be_bytes(),
-            };
-            (bytes.to_vec(), value.to_string())
-        }};
-    }
-    macro_rules! float {
-        ($kind:ty) => {{
-            let value = text.parse::<$kind>().context("Enter a decimal number.")?;
-            anyhow::ensure!(
-                value.is_finite(),
-                "Enter a finite value within the {} range.",
-                node.kind
-            );
-            let bytes = match node.endian {
-                Endian::Little => value.to_le_bytes(),
-                Endian::Big => value.to_be_bytes(),
-            };
-            (bytes.to_vec(), value.to_string())
-        }};
-    }
-    Ok(match node.kind.as_str() {
-        "u8" => integer!(u8),
-        "i8" => integer!(i8),
-        "u16" => integer!(u16),
-        "i16" => integer!(i16),
-        "u32" => integer!(u32),
-        "i32" => integer!(i32),
-        "u64" => integer!(u64),
-        "i64" => integer!(i64),
-        "f32" => float!(f32),
-        "f64" => float!(f64),
-        _ => unreachable!("editable_value checked the primitive"),
-    })
-}
+pub use crate::field_edit::{editable_value, encode_value};
+use crate::field_edit::primitive_size;
 
 pub fn has_decoder_code(source: &str) -> bool {
     source.lines().any(|line| {
@@ -568,40 +502,7 @@ impl StructureWorkspace {
 
     pub fn selected_sample(&self) -> Option<(usize, Range<usize>)> {
         let field = self.selected_node()?;
-        let bracket = field.path.rfind('[')?;
-        let suffix = &field.path[bracket + 1..];
-        let end = suffix.find(']')?;
-        let index = suffix[..end].parse::<usize>().ok()?;
-        let collection = &field.path[..bracket];
-        let item_path = &field.path[..bracket + end + 2];
-        fn find(
-            nodes: &[Node],
-            collection: &str,
-            item_path: &str,
-            index: usize,
-        ) -> Option<Range<usize>> {
-            for node in nodes {
-                if node.path == item_path {
-                    return Some(node.range.clone());
-                }
-                if node.path == collection {
-                    if let Some(array) = &node.lazy {
-                        if index < array.count {
-                            let start = node
-                                .range
-                                .start
-                                .checked_add(index.checked_mul(array.stride)?)?;
-                            return Some(start..start.checked_add(array.stride)?);
-                        }
-                    }
-                }
-                if let Some(range) = find(&node.children, collection, item_path, index) {
-                    return Some(range);
-                }
-            }
-            None
-        }
-        find(&self.output.as_ref()?.nodes, collection, item_path, index).map(|range| (index, range))
+        crate::structure_selection::sample_for_node(&self.output.as_ref()?.nodes, &field)
     }
 
     /// Detailed parser information stays behind the inspector's disclosure control.
@@ -609,23 +510,10 @@ impl StructureWorkspace {
         let Some(node) = self.selected_node() else {
             return;
         };
-        if let Some(output) = &self.output {
-            ui.label(format!(
-                "Definition covers {} bytes · {} reusable types",
-                output.consumed,
-                output.definitions.len()
-            ));
-        }
-        ui.label("Definition path");
-        ui.monospace(&node.path);
-        ui.label(format!("Type: {} · {:?} endian", node.kind, node.endian));
-        ui.label(format!(
-            "Field bytes: 0x{:X}..0x{:X} (end exclusive)",
-            node.range.start, node.range.end
-        ));
-        if !node.references.is_empty() {
-            ui.label(format!("Uses: {}", node.references.join(", ")));
-        }
+        let definition = self.output.as_ref().map(|output|
+            (output.consumed as u64, output.definitions.len()));
+        let field = crate::workspace_inspector::FieldInfo::from_node(&node, None);
+        crate::workspace_inspector::field_details(ui, &field, definition);
         if language == DecoderLanguage::Python {
             return;
         }
@@ -672,7 +560,7 @@ impl StructureWorkspace {
             ui.selectable_value(&mut self.editor_page, EditorPage::Structures, "Fields");
             ui.selectable_value(&mut self.editor_page, EditorPage::Steps, "Steps");
             ui.separator();
-            ui.weak("F5 Decode");
+            ui.weak(crate::decoder_ui::RUN_LABEL);
         });
         if self.last_run_language != Some(DecoderLanguage::Python) {
             self.status(ui);
@@ -708,52 +596,24 @@ impl StructureWorkspace {
             ),
             |ui| self.yaml_layout.editor(ui, code, DecoderLanguage::Python),
         );
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.strong("Console");
-            if active_python && self.is_parsing() {
-                ui.spinner();
-                ui.weak("Running…");
+        ui.add_space(6.0);
+        let action = crate::decoder_ui::console(
+            ui,
+            if active_python { &self.python_stdout } else { "" },
+            if active_python { self.error.as_deref() } else { None },
+            active_python && self.is_parsing(),
+        );
+        if action.copy {
+            let mut text = self.python_stdout.clone();
+            if let Some(error) = &self.error {
+                if !text.is_empty() { text.push('\n'); }
+                text.push_str(error);
             }
-            if ui
-                .add_enabled(
-                    active_python && (!self.python_stdout.is_empty() || self.error.is_some()),
-                    egui::Button::new("Copy output").small(),
-                )
-                .clicked()
-            {
-                let mut text = self.python_stdout.clone();
-                if let Some(error) = &self.error {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(error);
-                }
-                ui.output_mut(|output| output.copied_text = text);
-            }
-        });
-        egui::ScrollArea::both()
-            .id_source("python_decoder_console")
-            .auto_shrink([false, false])
-            .max_height(ui.available_height())
-            .show(ui, |ui| {
-                if !active_python {
-                    return;
-                }
-                if !self.python_stdout.is_empty() {
-                    ui.monospace(&self.python_stdout);
-                }
-                if let Some(error) = &self.error {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(error)
-                                .monospace()
-                                .color(Color32::LIGHT_RED),
-                        )
-                        .wrap(false),
-                    );
-                }
-            });
+            ui.output_mut(|output| output.copied_text = text);
+        }
+        if let Some(line) = action.line {
+            self.yaml_layout.go_to_line(line);
+        }
     }
 
     fn fields_editor(
@@ -3023,15 +2883,6 @@ impl DraftField {
             String::new()
         };
     }
-}
-fn primitive_size(kind: &str) -> Option<usize> {
-    Some(match kind {
-        "u8" | "i8" => 1,
-        "u16" | "i16" => 2,
-        "u32" | "i32" | "f32" => 4,
-        "u64" | "i64" | "f64" => 8,
-        _ => return None,
-    })
 }
 fn format_label(kind: &str) -> String {
     match kind {

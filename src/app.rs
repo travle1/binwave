@@ -1297,7 +1297,7 @@ impl BinwaveApp {
             egui::Window::new("Decoding guide").open(&mut self.show_decoding_guide).default_width(540.).resizable(true).show(ctx, |ui| {
                 ui.heading("Write a decoder, inspect its results");
                 ui.label("Open a data file. Decoder shows your Python or YAML source beside Hex.");
-                ui.label("Open decoder… loads Python or YAML. Run script or Decode file (F5) reads the open data file.");
+                ui.label("Open decoder… loads Python or YAML. ▶ Run (F5) reads the open data file.");
                 ui.label("Decoded samples opens after a successful decode. Show plot opens the same data as a plot; select a value to find its bytes.");
                 ui.separator();
                 ui.strong("Build a decoder from bytes");
@@ -2538,7 +2538,7 @@ mod tests {
             if text(workspace_frame(&mut app, &ctx)).contains("Replace decoder") {
                 workspace_click(&mut app, &ctx, "Replace decoder");
             }
-            workspace_click(&mut app, &ctx, "Apply decoder");
+            workspace_click(&mut app, &ctx, crate::decoder_ui::RUN_LABEL);
             wait_csv(&mut app, &ctx);
             let deadline = Instant::now() + std::time::Duration::from_secs(5);
             while app.binary.is_decoding() {
@@ -2630,7 +2630,7 @@ mod tests {
         workspace_click(&mut app, &ctx, "Python");
         assert!(text(workspace_frame(&mut app, &ctx)).contains("hidden decoder must not run"));
         workspace_click(&mut app, &ctx, "YAML");
-        assert!(text(workspace_frame(&mut app, &ctx)).contains("Apply decoder"));
+        assert!(text(workspace_frame(&mut app, &ctx)).contains(crate::decoder_ui::RUN_LABEL));
         workspace_click(&mut app, &ctx, "CSV");
         assert_eq!(app.cfg.csv.time_column, "value");
         assert!(app.loader_rx.is_none());
@@ -3357,7 +3357,7 @@ mod tests {
             "the decoder should open directly in its source editor"
         );
         let opened = labels(opened_output);
-        for label in ["Code", "Apply decoder", "YAML"] {
+        for label in ["Code", crate::decoder_ui::RUN_LABEL, "YAML"] {
             assert!(opened.iter().any(|text| text == label), "missing {label}");
         }
         assert!(!opened.iter().any(|text| text.contains("All definitions")));
@@ -3370,7 +3370,7 @@ mod tests {
             "loading must display source, without another tab click"
         );
         assert!(app.binary.showing_byte_preview());
-        workspace_click(&mut app, &ctx, "Apply decoder");
+        workspace_click(&mut app, &ctx, crate::decoder_ui::RUN_LABEL);
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         while app.binary.is_decoding() {
             workspace_frame(&mut app, &ctx);
@@ -3421,13 +3421,13 @@ mod tests {
                 _ => None,
             })
             .collect();
-        for label in ["Python", "Apply decoder", "Console", "decoder.py"] {
+        for label in ["Python", crate::decoder_ui::RUN_LABEL, "Console", "decoder.py"] {
             assert!(labels.contains(&label), "missing {label}");
         }
         assert!(!labels.contains(&"Fields") && !labels.contains(&"Steps"));
         assert!(!app.binary.is_decoding());
         assert!(app.binary.showing_byte_preview());
-        workspace_click(&mut app, &ctx, "Apply decoder");
+        workspace_click(&mut app, &ctx, crate::decoder_ui::RUN_LABEL);
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
         while app.binary.is_decoding() {
             workspace_frame(&mut app, &ctx);
@@ -3464,7 +3464,7 @@ mod tests {
         }
         wait_byte_preview(&mut app, &ctx);
         app.binary.load_yaml(script, &ctx);
-        workspace_click(&mut app, &ctx, "Apply decoder");
+        workspace_click(&mut app, &ctx, crate::decoder_ui::RUN_LABEL);
         for _ in 0..30 {
             let output = workspace_frame(&mut app, &ctx);
             assert!(!output.shapes.is_empty());
@@ -3660,7 +3660,7 @@ mod tests {
         app.workspace = WorkspaceLayout::default();
         workspace_frame(&mut app, &ctx);
         capture_workspace(&mut app, &ctx, "python-ready");
-        workspace_click(&mut app, &ctx, "Apply decoder");
+        workspace_click(&mut app, &ctx, crate::decoder_ui::RUN_LABEL);
         let deadline = Instant::now() + std::time::Duration::from_secs(15);
         while !app.binary.decoded_ready() {
             workspace_frame(&mut app, &ctx);

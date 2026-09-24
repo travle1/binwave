@@ -10,7 +10,7 @@ function resetDecoder() {
 }
 async function decoding(m) {
     await source.validate();
-    const candidate = m.type === 'decode';
+    const candidate = m.type === 'decode' || m.type === 'decode_python';
     const worker = candidate ? new Worker(new URL('./decoder-worker.mjs', import.meta.url), {type:'module'}) : decoder;
     if (!worker) throw Error('Apply the decoder again before requesting results');
     pendingDecoder = worker;
@@ -55,15 +55,16 @@ self.onmessage = async ({data: m}) => {
             self.postMessage({type: 'opened', ...metadata(), demo:m.demo === true});
         } else {
             if (!source) throw Error('Open a file first');
-            if (['decode', 'table', 'plot', 'probe', 'pick'].includes(m.type)) {
+            if (['decode', 'decode_python', 'table', 'plot', 'probe', 'pick', 'inspect', 'encode'].includes(m.type)) {
                 await decoding(m);
             } else if (m.type === 'read') {
                 if (m.length > PAGE_SIZE) throw Error('Preview exceeds 64 KiB');
                 await source.validate();
                 const bytes = await source.read(m.offset, m.length);
                 self.postMessage({type: 'page', offset: m.offset, bytes: bytes.buffer}, [bytes.buffer]);
-            } else if (m.type === 'replace' || m.type === 'undo' || m.type === 'redo') {
+            } else if (['replace', 'replace_range', 'undo', 'redo'].includes(m.type)) {
                 if (m.type === 'replace') await source.replace(m.offset, m.value);
+                else if (m.type === 'replace_range') await source.replaceRange(m.offset, m.bytes);
                 else { await source.validate(); source.history(m.type === 'redo'); }
                 resetDecoder();
                 self.postMessage({type: 'edited', ...metadata()});

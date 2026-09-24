@@ -67,6 +67,29 @@ test('high-offset edits, undo and redo read no whole file', async () => {
     assert.ok(reads.every(([start, end]) => end - start === 1));
     assert.equal(source.dirty, true);
 });
+test('whole-field edits are atomic, bounded, and one undo step', async () => {
+    const {source} = fixture(16);
+    await source.replaceRange('4', [9, 8, 7]);
+    assert.deepEqual(await source.read('4', 3), new Uint8Array([9, 8, 7]));
+    assert.equal(source.undo.length, 1);
+    source.history();
+    assert.deepEqual(await source.read('4', 3), new Uint8Array([4, 5, 6]));
+    source.history(true);
+    assert.deepEqual(await source.read('4', 3), new Uint8Array([9, 8, 7]));
+    const count = source.patches.size;
+    const steps = source.undo.length;
+    await assert.rejects(source.replaceRange('15', [1, 2]), /Invalid byte replacement/);
+    await assert.rejects(source.replaceRange('4', [1, 256]), /Invalid byte replacement/);
+    assert.equal(source.patches.size, count);
+    assert.equal(source.undo.length, steps);
+});
+test('multi-byte limit failure does not partially change the source', async () => {
+    const {source} = fixture(MAX_EDITS + 2);
+    for (let i = 0; i < MAX_EDITS - 1; i++) source.patches.set(BigInt(i), 0);
+    await assert.rejects(source.replaceRange(String(MAX_EDITS), [1, 2]), /edit limit/);
+    assert.equal(source.patches.size, MAX_EDITS - 1);
+    assert.equal(source.undo.length, 0);
+});
 test('streams an edited high-offset selection in bounded chunks with backpressure', async () => {
     const {source} = fixture();
     const first = source.size - BigInt(READ_LIMIT * 2 + 3);

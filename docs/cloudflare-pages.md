@@ -11,6 +11,8 @@ data files remain on their device.
 Build and validate before deploying:
 
 ```sh
+npm ci
+node tests/browser_python.mjs
 trunk build --release --locked
 node --experimental-default-type=module tests/browser_decoder.mjs
 ```

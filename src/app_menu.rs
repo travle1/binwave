@@ -131,7 +131,7 @@ pub fn menus(s: &State) -> Vec<Item> {
             s.available && s.save_decoder,
         ),
         action("New decoder", NewDecoder, s.available),
-        action("Apply decoder", Apply, s.apply),
+        action(crate::decoder_ui::RUN_LABEL, Apply, s.apply),
         action("Code", Code, true),
         Item::menu(
             "Examples",
@@ -197,6 +197,10 @@ pub fn menus(s: &State) -> Vec<Item> {
             Item::menu("Help", vec![action("Decoding guide", Help, true)]),
         ];
     } else {
+        decoder.extend([
+            action("New Python script", Python, s.available),
+            action("Python byte preview example", PythonExample, s.available),
+        ]);
         view.push(Item::menu(
             "Arrangement",
             vec![
@@ -221,7 +225,6 @@ pub fn native_bar(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)>
                 let shortcut = match command {
                     Command::OpenFile => "Ctrl+O",
                     Command::SaveCopy => "Ctrl+Shift+S",
-                    Command::Apply => "F5",
                     Command::Jump => "Ctrl+G",
                     _ => "",
                 };
@@ -245,16 +248,15 @@ pub fn native_bar(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)>
     });
     selected
 }
-pub fn decoder_controls(ui: &mut egui::Ui, enabled: bool, busy: bool) -> Option<Command> {
+pub fn decoder_controls(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    busy: bool,
+    disabled_reason: Option<&str>,
+) -> Option<Command> {
     let mut result = None;
     ui.horizontal(|ui| {
-        if ui
-            .add_enabled(
-                enabled,
-                egui::Button::new("Apply decoder").shortcut_text("F5"),
-            )
-            .clicked()
-        {
+        if crate::decoder_ui::run_button(ui, enabled, disabled_reason).clicked() {
             result = Some(Command::Apply);
         }
         if busy && ui.button("Stop").clicked() {

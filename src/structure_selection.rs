@@ -8,14 +8,7 @@ pub(crate) fn sample_indices_for_bytes(node: &Node, bytes: &Range<Address>) -> O
         return None;
     }
     if let Some(array) = &node.lazy {
-        if array.stride == 0 || array.count == 0 {
-            return None;
-        }
-        let first = (bytes.start - node.range.start) / array.stride;
-        let end = (bytes.end - node.range.start)
-            .div_ceil(array.stride)
-            .min(array.count);
-        return (first < end).then_some(first..end);
+        return array.indices_for_bytes(bytes);
     }
     let first = node
         .children
@@ -34,18 +27,58 @@ pub(crate) fn sample_bytes(node: &Node, samples: Range<Address>) -> Option<Range
         return None;
     }
     if let Some(array) = &node.lazy {
-        let start = node
-            .range
-            .start
-            .checked_add(samples.start.checked_mul(array.stride)?)?;
-        let end = node
-            .range
-            .start
-            .checked_add(samples.end.checked_mul(array.stride)?)?;
+        let start = array.bounds(samples.start)?.start;
+        let end = array.bounds(samples.end - 1)?.end;
         return (start < end && end <= node.range.end).then_some(start..end);
     }
     Some(
         node.children.get(usize::try_from(samples.start).ok()?)?.range.start
             ..node.children.get(usize::try_from(samples.end - 1).ok()?)?.range.end,
     )
+}
+
+/// Find the most specific decoded field containing a selected byte range.
+pub(crate) fn covering<'a>(nodes: &'a [Node], range: &Range<Address>) -> Option<&'a Node> {
+    nodes
+        .iter()
+        .filter(|node| {
+            node.range.start <= range.start && node.range.end >= range.end && !node.range.is_empty()
+        })
+        .filter_map(|node| covering(&node.children, range).or(Some(node)))
+        .min_by_key(|node| node.range.end - node.range.start)
+}
+
+pub(crate) fn sample_for_node(nodes: &[Node], field: &Node) -> Option<(Address, Range<Address>)> {
+    let bracket = field.path.rfind('[')?;
+    let suffix = &field.path[bracket + 1..];
+    let end = suffix.find(']')?;
+    let index = suffix[..end].parse::<Address>().ok()?;
+    let collection_path = &field.path[..bracket];
+    fn find<'a>(nodes: &'a [Node], path: &str) -> Option<&'a Node> {
+        nodes.iter().find_map(|node| {
+            if node.path == path { Some(node) } else { find(&node.children, path) }
+        })
+    }
+    let collection = find(nodes, collection_path)?;
+    let range = sample_bytes(collection, index..index.checked_add(1)?)?;
+    Some((index, range))
+}
+
+/// Resolve one selected field, paging only its containing lazy records.
+pub(crate) fn resolved_field(
+    nodes: &[Node],
+    source: &crate::byte_store::ByteView,
+    range: &Range<Address>,
+) -> anyhow::Result<Option<Node>> {
+    let mut field = covering(nodes, range).cloned();
+    for _ in 0..64 {
+        let Some(current) = field.as_ref() else { break; };
+        let Some(array) = current.lazy.as_ref() else { break; };
+        let Some(indices) = sample_indices_for_bytes(current, range) else { break; };
+        if indices.end - indices.start != 1 { break; }
+        let rows = array.page(source, &std::sync::atomic::AtomicBool::new(false), indices.start, 1)?;
+        let Some(next) = covering(&rows, range) else { break; };
+        field = Some(next.clone());
+    }
+    Ok(field)
 }

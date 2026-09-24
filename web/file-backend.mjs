@@ -47,25 +47,38 @@ export class FileBackend {
         return bytes;
     }
     async replace(start, value) {
+        return this.replaceRange(start, [value]);
+    }
+    // One multi-byte field edit is one undo step. Validate before mutating patches.
+    async replaceRange(start, values) {
         const at = offset(start);
-        if (at >= this.size || !Number.isInteger(value) || value < 0 || value > 255) throw Error('Invalid byte replacement');
-        if (!this.patches.has(at) && this.patches.size >= MAX_EDITS) throw Error('Browser edit limit reached (65,536 bytes)');
+        if (!Array.isArray(values) && !(values instanceof Uint8Array)) throw Error('Invalid byte replacement');
+        if (values.length < 1 || values.length > PAGE_SIZE || at + BigInt(values.length) > this.size
+            || Array.from(values).some(value => !Number.isInteger(value) || value < 0 || value > 255)) {
+            throw Error('Invalid byte replacement');
+        }
         await this.validate();
-        const before = (await this.read(start, 1))[0];
-        if (before === value) return;
-        this.undo.push({at, before, after: value});
+        const before = await this.read(start, values.length);
+        const changes = [];
+        for (let i = 0; i < values.length; i++) {
+            if (before[i] !== values[i]) changes.push({at:at + BigInt(i), before:before[i], after:values[i]});
+        }
+        const added = changes.filter(change => !this.patches.has(change.at)).length;
+        if (this.patches.size + added > MAX_EDITS) throw Error('Browser edit limit reached (65,536 bytes)');
+        if (!changes.length) return;
+        this.undo.push(changes);
         if (this.undo.length > MAX_HISTORY) this.undo.shift();
         this.redo = [];
-        this.patches.set(at, value);
+        for (const change of changes) this.patches.set(change.at, change.after);
         this.dirty = true;
     }
     history(redo = false) {
         const from = redo ? this.redo : this.undo;
         const to = redo ? this.undo : this.redo;
-        const edit = from.pop();
-        if (!edit) return;
-        this.patches.set(edit.at, redo ? edit.after : edit.before);
-        to.push(edit);
+        const changes = from.pop();
+        if (!changes) return;
+        for (const change of changes) this.patches.set(change.at, redo ? change.after : change.before);
+        to.push(changes);
         this.dirty = true;
     }
     async export(handle, start, end, cancelled = () => false, progress = () => {}) {
