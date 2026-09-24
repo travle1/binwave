@@ -4,7 +4,7 @@ import vm from 'node:vm';
 import {File, Blob} from 'node:buffer';
 import {readFileSync} from 'node:fs';
 
-function bridge(allowReplace = true) {
+function bridge(allowReplace = true, clipboardRead = async () => 'name: café') {
     const commands = [];
     let worker;
     const elements = new Map();
@@ -32,8 +32,9 @@ function bridge(allowReplace = true) {
     const window = {addEventListener(name, callback) { listeners[name] = callback; }, location: {href: 'http://localhost:8080/'}};
     window.binwaveMenus={refresh(){},render(model,dispatch,allow){Object.assign(menuState,{model,dispatch,allow});}};
     class Worker { constructor() { worker = this; } postMessage(message) { commands.push(message); } }
+    const navigator = {clipboard: {readText: clipboardRead, writeText: async () => {}}};
     vm.runInNewContext(readFileSync(new URL('../web/bridge.js', import.meta.url), 'utf8'), {
-        document, window, Worker, URL:BrowserURL, File, Blob, setTimeout() {}, confirm: () => allowReplace,
+        document, window, navigator, Worker, URL:BrowserURL, File, Blob, setTimeout() {}, confirm: () => allowReplace,
     });
     return {menuState,listeners, created, savedBlob: () => savedBlob, receive: data => worker.onmessage({data}), commands, app: window.binwave, get: id => document.getElementById(id)};
 }
@@ -171,13 +172,35 @@ test('Python decoder save uses a .py file and preserves source', async () => {
     assert.equal(created.find(e => e.tag === 'a').download, 'decoder.py');
 });
 
-test('paste dialog supports native browser paste and cancellation', async () => {
+test('paste reads the browser clipboard directly without opening a dialog', async () => {
     const {app, created} = bridge();
+    assert.equal(await app.pasteText(), 'name: café');
+    assert.equal(created.some(e => e.tag === 'textarea'), false);
+});
+
+test('focused decoder paste preserves multiline source without a popup', () => {
+    const {app, listeners, created} = bridge();
+    app.sourceEditorFocus(true);
+    let prevented = false;
+    const source = "actions:\n  - read: {name: sample, type: u8}\n";
+    listeners.paste({
+        clipboardData: {getData(type) { assert.equal(type, 'text/plain'); return source; }},
+        preventDefault() { prevented = true; },
+    });
+    assert.equal(prevented, true);
+    assert.deepEqual(JSON.parse(app.poll()), {type:'decoder-paste', source});
+    assert.equal(created.some(e => e.tag === 'textarea'), false);
+});
+
+test('paste dialog appears only when browser clipboard access fails', async () => {
+    const {app, created} = bridge(true, async () => { throw Error('NotAllowedError'); });
     const pending = app.pasteText();
+    await new Promise(resolve => setImmediate(resolve));
     created.find(e => e.tag === 'textarea').value = 'name: café';
     await created.find(e => e.textContent === 'Insert into decoder').onclick();
     assert.equal(await pending, 'name: café');
     const cancelled = app.pasteText();
+    await new Promise(resolve => setImmediate(resolve));
     created.filter(e => e.textContent === 'Close').at(-1).onclick();
     assert.equal(await cancelled, null);
 });

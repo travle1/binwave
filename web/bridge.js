@@ -4,7 +4,7 @@
     const events = [];
     let failed = false, graphicsReady = false;
     let busy = false, dirty = false, opened = false, exportable = false;
-    let runtime = null, loadingDecoder = false;
+    let runtime = null, loadingDecoder = false, sourceEditorFocused = false;
     let decoderSource = '', decoderLanguage = 'yaml', rustStatus = '';
     let ignoreDecoder = false, operation = '';
     let size = '0', selectedStart = '0', selectedEnd = '0';
@@ -121,13 +121,28 @@
     window.addEventListener('beforeunload', event => {
         if (dirty || busy) { event.preventDefault(); event.returnValue = ''; }
     });
+    window.addEventListener('paste', event => {
+        if (!sourceEditorFocused) return;
+        const text = event.clipboardData?.getData('text/plain');
+        if (typeof text !== 'string') return;
+        event.preventDefault();
+        if (text.length > 256 * 1024) {
+            status.textContent = 'Paste is limited to 256 KiB.';
+            return;
+        }
+        const old = events.findIndex(item => item.type === 'decoder-paste');
+        if (old >= 0) events.splice(old, 1);
+        if (events.length >= 16) events.shift();
+        events.push({type:'decoder-paste', source:text});
+    });
     window.addEventListener('TrunkApplicationStarted', () => {
         const js = document.querySelector('link[rel="modulepreload"]');
         const wasm = document.querySelector('link[type="application/wasm"]');
         if (js && wasm) runtime = {js:js.href, wasm:wasm.href};
     });
-    // A DOM dialog keeps native clipboard menus and touch paste available even
-    // on LAN HTTP, where navigator.clipboard is unavailable.
+    // Keep a manual fallback for browsers that deny clipboard access. The
+    // production HTTPS app reads the clipboard directly and does not interrupt
+    // ordinary paste with a dialog.
     function clipboardDialog(text, paste) {
         return new Promise(resolve => {
             const dialog = document.createElement('dialog');
@@ -185,7 +200,17 @@
             status.textContent = 'No fields yet. Select bytes to begin.';
         },
         decoderDraft(text, language) { decoderSource = text; decoderLanguage = language; },
-        pasteText() { return clipboardDialog('', true); },
+        sourceEditorFocus(focused) { sourceEditorFocused = Boolean(focused); },
+        async pasteText() {
+            try {
+                if (typeof navigator === 'undefined' || !navigator.clipboard?.readText) throw Error('Clipboard read is unavailable');
+                const text = await navigator.clipboard.readText();
+                if (text.length > 256 * 1024) throw Error('Paste is limited to 256 KiB.');
+                return text;
+            } catch {
+                return clipboardDialog('', true);
+            }
+        },
         copyText(text) {
             if (!text) return;
             if (typeof navigator !== 'undefined' && navigator.clipboard) {

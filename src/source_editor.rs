@@ -130,7 +130,9 @@ pub(crate) struct YamlLayoutCache {
     edit_action: Option<&'static str>,
     paste: Arc<std::sync::Mutex<Option<String>>>,
     paste_error: Option<String>,
+    focused: bool,
     goto_line: Option<usize>,
+    goto_column: Option<usize>,
     diagnostic_hash: Option<u64>,
     diagnostic: Option<SourceDiagnostic>,
 }
@@ -140,11 +142,30 @@ struct SourceDiagnostic {
     line: Option<usize>,
     column: Option<usize>,
     message: String,
+    hint: Option<String>,
 }
 
 impl YamlLayoutCache {
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn focused(&self) -> bool { self.focused }
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn queue_paste(&mut self, text: String) {
+        if text.len() <= 256 * 1024 {
+            *self.paste.lock().unwrap() = Some(text);
+            self.paste_error = None;
+        } else {
+            self.paste_error = Some("Paste is limited to 256 KiB.".into());
+        }
+    }
     pub fn command(&mut self, action: &'static str) { self.edit_action = Some(action); }
-    pub fn go_to_line(&mut self, line: usize) { self.goto_line = Some(line.max(1)); }
+    pub fn go_to_line(&mut self, line: usize) {
+        self.goto_line = Some(line.max(1));
+        self.goto_column = Some(1);
+    }
+    fn go_to_location(&mut self, line: usize, column: usize) {
+        self.goto_line = Some(line.max(1));
+        self.goto_column = Some(column.max(1));
+    }
     fn edit_menu(&mut self, ui: &mut Ui) {
         for action in ["Undo", "Redo", "Cut", "Copy", "Paste", "Select all", "Toggle comments"] {
             if ui.button(action).clicked() {
@@ -220,12 +241,30 @@ impl YamlLayoutCache {
                                     || format!("Line {line}"),
                                     |column| format!("Line {line}:{column}"),
                                 );
-                                if ui.small_button(location).on_hover_text("Jump to this line").clicked() {
-                                    self.go_to_line(line);
+                                let column = diagnostic.column.unwrap_or(1);
+                                if ui.small_button(location)
+                                    .on_hover_text(format!("Jump to line {line}, column {column}"))
+                                    .clicked()
+                                {
+                                    self.go_to_location(line, column);
                                 }
                             }
                             ui.label(diagnostic.message);
                         });
+                        if let Some(line) = diagnostic.line {
+                            if let Some(source_line) = yaml.lines().nth(line.saturating_sub(1)) {
+                                ui.monospace(format!("{line:>4} | {source_line}"));
+                                if let Some(column) = diagnostic.column {
+                                    ui.colored_label(
+                                        ui.visuals().error_fg_color,
+                                        format!("     | {}^", " ".repeat(column.saturating_sub(1))),
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(hint) = diagnostic.hint {
+                            ui.label(format!("Fix: {hint}"));
+                        }
                     });
             }
         }
@@ -239,7 +278,14 @@ impl YamlLayoutCache {
             .fill(ui.visuals().extreme_bg_color)
             .inner_margin(egui::Margin::same(6.))
             .show(ui, |ui| {
+                let ruler_height = (font.size * 1.45).max(18.);
+                let (ruler, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), ruler_height),
+                    egui::Sense::hover(),
+                );
                 let size = ui.available_size();
+                let mut column_origin = ruler.left() + gutter_width;
+                let mut caret = None;
                 egui::ScrollArea::both()
                     .id_source(("decoder_source", language))
                     .auto_shrink([false, false])
@@ -261,6 +307,7 @@ impl YamlLayoutCache {
                                 edit_source(ui.ctx(), editor_id, yaml, "Paste", Some(&paste));
                             }
                             let focused = ui.memory(|memory| memory.has_focus(editor_id));
+                            self.focused = focused;
                             if focused {
                                 let shortcut = ui.input_mut(|input| {
                                     if input.consume_key(egui::Modifiers::COMMAND, egui::Key::C) {
@@ -302,14 +349,8 @@ impl YamlLayoutCache {
                                 }
                             }
                             if let Some(line) = self.goto_line.take() {
-                                let index = if line <= 1 {
-                                    0
-                                } else {
-                                    yaml.char_indices()
-                                        .filter(|(_, ch)| *ch == '\n')
-                                        .nth(line - 2)
-                                        .map_or_else(|| yaml.chars().count(), |(index, _)| yaml[..=index].chars().count())
-                                };
+                                let column = self.goto_column.take().unwrap_or(1);
+                                let index = source_char_index(yaml, line, column);
                                 let mut state = egui::TextEdit::load_state(ui.ctx(), editor_id)
                                     .unwrap_or_default();
                                 state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
@@ -379,6 +420,13 @@ impl YamlLayoutCache {
                                     }
                                 })
                                 .show(ui);
+                            column_origin = output.galley_pos.x;
+                            caret = output.cursor_range.map(|range| {
+                                (
+                                    range.primary.rcursor.row + 1,
+                                    range.primary.rcursor.column + 1,
+                                )
+                            });
                             let secondary_pressed = ui.input(|input| {
                                 input.pointer.button_pressed(egui::PointerButton::Secondary)
                                     && input.pointer.interact_pos().is_some_and(|position| {
@@ -396,6 +444,11 @@ impl YamlLayoutCache {
                                 state.store(ui.ctx(), editor_id);
                                 ui.memory_mut(|memory| memory.request_focus(editor_id));
                                 ui.ctx().request_repaint();
+                            }
+                            if language == DecoderLanguage::Yaml {
+                                if let Some(diagnostic) = &self.diagnostic {
+                                    paint_source_diagnostic(ui, &output, diagnostic);
+                                }
                             }
                             output.response.context_menu(|ui| { self.edit_menu(ui); });
                             if shortcut_changed {
@@ -427,6 +480,7 @@ impl YamlLayoutCache {
                             }
                         });
                     });
+                paint_column_ruler(ui, ruler, &font, column_origin, gutter_width, caret);
             });
     }
 
@@ -441,10 +495,13 @@ impl YamlLayoutCache {
         self.diagnostic = match serde_yaml_ng::from_str::<crate::structure::Program>(source) {
             Err(error) => {
                 let location = error.location();
+                let line = location.as_ref().map(|location| location.line());
+                let message = format!("read structure YAML: {error}");
                 Some(SourceDiagnostic {
-                    line: location.as_ref().map(|location| location.line()),
+                    line,
                     column: location.as_ref().map(|location| location.column()),
-                    message: format!("read structure YAML: {error}"),
+                    hint: diagnostic_hint(source, line, &message),
+                    message,
                 })
             }
             Ok(program) if program.actions.is_empty() => None,
@@ -453,14 +510,195 @@ impl YamlLayoutCache {
                     .chain()
                     .find_map(|cause| cause.downcast_ref::<serde_yaml_ng::Error>())
                     .and_then(serde_yaml_ng::Error::location);
+                let line = location.as_ref().map(|location| location.line());
+                let message = format!("{error:#}");
                 SourceDiagnostic {
-                    line: location.as_ref().map(|location| location.line()),
+                    line,
                     column: location.as_ref().map(|location| location.column()),
-                    message: format!("{error:#}"),
+                    hint: diagnostic_hint(source, line, &message),
+                    message,
                 }
             }),
         };
     }
+}
+
+fn paint_column_ruler(
+    ui: &Ui,
+    rect: egui::Rect,
+    font: &egui::FontId,
+    origin: f32,
+    gutter_width: f32,
+    caret: Option<(usize, usize)>,
+) {
+    let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.hline(rect.x_range(), rect.bottom(), stroke);
+    painter.vline(rect.left() + gutter_width, rect.y_range(), stroke);
+    let digit = ui.fonts(|fonts| fonts.glyph_width(font, '0')).max(1.);
+    let caret_label = caret.map(|(line, column)| format!("Ln {line}, Col {column}"));
+    let badge_width = caret_label
+        .as_ref()
+        .map_or(0., |label| digit * label.chars().count() as f32 + 12.);
+    let label_limit = rect.right() - badge_width - 6.;
+    let first = (((rect.left() - origin) / digit).floor().max(0.) as usize + 1).max(1);
+    let last = (((label_limit - origin) / digit).ceil().max(0.) as usize + 1).max(first);
+    for column in first..=last {
+        if column != 1 && column % 5 != 0 {
+            continue;
+        }
+        let x = origin + (column.saturating_sub(1)) as f32 * digit;
+        if x < rect.left() || x > label_limit {
+            continue;
+        }
+        painter.vline(
+            x,
+            (rect.bottom() - 3.)..=rect.bottom(),
+            egui::Stroke::new(1_f32, ui.visuals().weak_text_color()),
+        );
+        painter.text(
+            egui::pos2(x, rect.top() + 1.),
+            egui::Align2::CENTER_TOP,
+            column.to_string(),
+            font.clone(),
+            ui.visuals().weak_text_color(),
+        );
+    }
+    if let Some(label) = caret_label {
+        let badge = egui::Rect::from_min_max(
+            egui::pos2(rect.right() - badge_width, rect.top()),
+            rect.right_bottom(),
+        );
+        painter.rect_filled(badge, 2., ui.visuals().extreme_bg_color);
+        painter.text(
+            badge.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            font.clone(),
+            ui.visuals().text_color(),
+        );
+    }
+}
+
+fn paint_source_diagnostic(
+    ui: &Ui,
+    output: &egui::text_edit::TextEditOutput,
+    diagnostic: &SourceDiagnostic,
+) {
+    let Some(row_index) = diagnostic.line.and_then(|line| line.checked_sub(1)) else {
+        return;
+    };
+    let Some(row) = output.galley.rows.get(row_index) else {
+        return;
+    };
+    let row_rect = row.rect.translate(output.galley_pos.to_vec2());
+    let line_rect = egui::Rect::from_min_max(
+        egui::pos2(output.text_clip_rect.left(), row_rect.top()),
+        egui::pos2(output.text_clip_rect.right(), row_rect.bottom()),
+    )
+    .intersect(output.text_clip_rect);
+    if !line_rect.is_positive() {
+        return;
+    }
+    let color = ui.visuals().error_fg_color;
+    let painter = ui.painter().with_clip_rect(output.text_clip_rect);
+    painter.rect_filled(line_rect, 0., color.gamma_multiply(0.10));
+    painter.vline(
+        line_rect.left() + 1.,
+        line_rect.y_range(),
+        egui::Stroke::new(2_f32, color),
+    );
+    if let Some(column) = diagnostic.column {
+        let caret = output
+            .galley
+            .pos_from_rcursor(egui::epaint::text::cursor::RCursor {
+            row: row_index,
+            column: column.saturating_sub(1),
+        });
+        let x = output.galley_pos.x + caret.left();
+        let width = ui
+            .fonts(|fonts| fonts.glyph_width(&egui::TextStyle::Monospace.resolve(ui.style()), '0'))
+            .max(3.);
+        let column_rect = egui::Rect::from_min_max(
+            egui::pos2(x, row_rect.top()),
+            egui::pos2(x + width, row_rect.bottom()),
+        )
+        .intersect(output.text_clip_rect);
+        painter.rect_stroke(column_rect, 1., egui::Stroke::new(1.5_f32, color));
+        painter.hline(
+            column_rect.x_range(),
+            column_rect.bottom() - 1.,
+            egui::Stroke::new(2_f32, color),
+        );
+    }
+}
+
+fn source_char_index(source: &str, line: usize, column: usize) -> usize {
+    let target_line = line.max(1);
+    let mut line_number = 1;
+    let mut line_start = 0;
+    let chars: Vec<char> = source.chars().collect();
+    for (index, ch) in chars.iter().enumerate() {
+        if line_number == target_line {
+            line_start = index;
+            break;
+        }
+        if *ch == '\n' {
+            line_number += 1;
+            line_start = index + 1;
+        }
+    }
+    if line_number < target_line {
+        return chars.len();
+    }
+    let line_length = chars[line_start..]
+        .iter()
+        .position(|ch| *ch == '\n')
+        .unwrap_or(chars.len() - line_start);
+    line_start + column.saturating_sub(1).min(line_length)
+}
+
+fn diagnostic_hint(source: &str, line: Option<usize>, message: &str) -> Option<String> {
+    let line = line?;
+    let lines: Vec<&str> = source.lines().collect();
+    let current = *lines.get(line.saturating_sub(1))?;
+    if current.chars().take_while(|ch| ch.is_whitespace()).any(|ch| ch == '\t') {
+        return Some("YAML indentation cannot contain tabs. Replace the leading tab with spaces.".into());
+    }
+    if current.chars().any(|ch| matches!(ch, '‘' | '’' | '“' | '”')) {
+        return Some("Replace typographic quotes with plain ASCII ' or \" characters.".into());
+    }
+    if message.contains("mapping values are not allowed") {
+        let current_indent = current.len() - current.trim_start_matches(' ').len();
+        let current_key = current.trim_start().split_once(':').map(|(key, _)| key.trim());
+        let previous = lines[..line.saturating_sub(1)]
+            .iter()
+            .rev()
+            .copied()
+            .find(|candidate| {
+                let candidate = candidate.trim();
+                !candidate.is_empty() && !candidate.starts_with('#')
+            });
+        if let (Some(current_key), Some(previous)) = (current_key, previous) {
+            let previous_indent = previous.len() - previous.trim_start_matches(' ').len();
+            if current_indent > previous_indent {
+                if let Some((previous_key, value)) = previous.trim_start().split_once(':') {
+                    if !value.trim().is_empty() {
+                        return Some(format!(
+                            "`{current_key}` is indented under `{}`, but `{}` already has the value `{}`. Remove {} leading spaces so `{current_key}` aligns with `{}`.",
+                            previous_key.trim(),
+                            previous_key.trim(),
+                            value.trim(),
+                            current_indent - previous_indent,
+                            previous_key.trim(),
+                        ));
+                    }
+                }
+            }
+        }
+        return Some("Check this line's indentation and align it with the sibling key above it.".into());
+    }
+    None
 }
 
 /// The decoder language reference is rendered inside the application on every platform.
@@ -892,6 +1130,67 @@ mod selected_read_tests {
         assert!(editor.diagnostic.is_none());
         editor.refresh_diagnostic("endian: little\nactions: []\n");
         assert!(editor.diagnostic.is_none(), "The new-decoder placeholder is not an error");
+    }
+
+    #[test]
+    fn overindented_cases_reports_the_actual_alignment_fix() {
+        let mut editor = YamlLayoutCache::default();
+        let source = "structures:\n  - name: Metadata\n    fields:\n      - name: payload\n        type:\n          choose:\n            ref: metadata_type\n              cases: {'1': u8}\nactions: []\n";
+        editor.refresh_diagnostic(source);
+        let diagnostic = editor.diagnostic.as_ref().expect("invalid cases indentation");
+        assert_eq!(diagnostic.line, Some(8));
+        assert_eq!(diagnostic.column, Some(20));
+        let hint = diagnostic.hint.as_deref().expect("actionable indentation hint");
+        assert!(hint.contains("`cases` is indented under `ref`"), "{hint}");
+        assert!(hint.contains("Remove 2 leading spaces"), "{hint}");
+
+        editor.refresh_diagnostic(&source.replace("              cases", "            cases"));
+        assert!(editor.diagnostic.is_none());
+    }
+
+    #[test]
+    fn source_locations_use_one_based_unicode_columns() {
+        let source = "first\nαβ猫 value\nlast";
+        assert_eq!(source_char_index(source, 1, 1), 0);
+        assert_eq!(source_char_index(source, 2, 4), 9);
+        assert_eq!(source_char_index(source, 2, 200), 15);
+        assert_eq!(source_char_index(source, 20, 1), source.chars().count());
+    }
+
+    #[test]
+    fn column_ruler_shows_columns_and_current_caret_position() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(700., 100.),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(650., 20.),
+                        egui::Sense::hover(),
+                    );
+                    paint_column_ruler(
+                        ui,
+                        rect,
+                        &egui::FontId::monospace(13.),
+                        rect.left() + 48.,
+                        40.,
+                        Some((27, 20)),
+                    );
+                });
+            },
+        );
+        let labels: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+            _ => None,
+        }).collect();
+        assert!(labels.contains(&"20".to_owned()), "{labels:?}");
+        assert!(labels.contains(&"Ln 27, Col 20".to_owned()), "{labels:?}");
     }
 
     #[test]

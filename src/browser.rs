@@ -20,6 +20,8 @@ extern "C" {
     fn save_decoder(text: &str, language: &str);
     #[wasm_bindgen(js_namespace = binwave, js_name = decoderDraft)]
     fn decoder_draft(text: &str, language: &str);
+    #[wasm_bindgen(js_namespace = binwave, js_name = sourceEditorFocus)]
+    fn source_editor_focus(focused: bool);
     #[wasm_bindgen(js_namespace = binwave, js_name = clearDecoder)]
     fn clear_decoder_status();
     #[wasm_bindgen(js_namespace = binwave, js_name = send)]
@@ -303,6 +305,13 @@ impl BrowserApp {
                         self.status = format!("Loaded {}. Press ▶ Run (F5) to decode the open data file.", event.name);
                     } else {
                         self.status = "Decoder source is limited to 256 KiB.".into();
+                    }
+                }
+                "decoder-paste" => {
+                    if event.source.len() <= 256 * 1024 {
+                        self.editor.queue_paste(event.source);
+                    } else {
+                        self.status = "Paste is limited to 256 KiB.".into();
                     }
                 }
                 "decoded" => {
@@ -1003,16 +1012,13 @@ impl BrowserApp {
         }
         if self.language == crate::source_editor::DecoderLanguage::Python {
             ui.weak("Python runs locally in this browser. Scripts are not sandboxed from the network.");
-            let height = ui.available_height();
-            let console_height: f32 = if self.decoder_error.is_some() { 190.0 } else { 125.0 };
-            let console_height = console_height.min(height * 0.42).max(64.0);
-            ui.allocate_ui(
-                egui::vec2(ui.available_width(), (height - console_height - 8.0).max(80.0)),
+            let action = crate::decoder_ui::source_console(
+                ui,
+                &self.python_stdout,
+                self.decoder_error.as_deref(),
+                self.decoding,
                 |ui| self.editor.editor(ui, &mut self.yaml, self.language),
             );
-            ui.add_space(6.0);
-            let action = crate::decoder_ui::console(
-                ui, &self.python_stdout, self.decoder_error.as_deref(), self.decoding);
             if action.copy {
                 let mut text = self.python_stdout.clone();
                 if let Some(error) = &self.decoder_error {
@@ -1025,6 +1031,7 @@ impl BrowserApp {
         } else {
             self.editor.editor(ui, &mut self.yaml, self.language);
         }
+        source_editor_focus(self.editor.focused());
     }
     fn collection_picker(&mut self, ui: &mut egui::Ui) {
         let mut selected = self.collection.clone();
@@ -1392,6 +1399,7 @@ fn parse_offset(text: &str) -> Option<u64> {
 }
 impl eframe::App for BrowserApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        source_editor_focus(false);
         self.stacked = self.layout_mode == "stacked" || (self.layout_mode == "auto" && ctx.screen_rect().width() < 900.);
         self.events();
         if self.reveal_decoder {

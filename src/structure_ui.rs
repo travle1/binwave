@@ -582,26 +582,12 @@ impl StructureWorkspace {
 
     fn python_editor(&mut self, ui: &mut Ui, code: &mut String) {
         let active_python = self.last_run_language == Some(DecoderLanguage::Python);
-        let height = ui.available_height();
-        let console_height: f32 = if active_python && self.error.is_some() {
-            180.
-        } else {
-            110.
-        };
-        let console_height = console_height.min(height * 0.4).max(48.);
-        ui.allocate_ui(
-            egui::vec2(
-                ui.available_width(),
-                (height - console_height - 10.).max(60.),
-            ),
-            |ui| self.yaml_layout.editor(ui, code, DecoderLanguage::Python),
-        );
-        ui.add_space(6.0);
-        let action = crate::decoder_ui::console(
+        let action = crate::decoder_ui::source_console(
             ui,
             if active_python { &self.python_stdout } else { "" },
             if active_python { self.error.as_deref() } else { None },
             active_python && self.is_parsing(),
+            |ui| self.yaml_layout.editor(ui, code, DecoderLanguage::Python),
         );
         if action.copy {
             let mut text = self.python_stdout.clone();

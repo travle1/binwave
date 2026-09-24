@@ -65,6 +65,48 @@ pub struct ConsoleAction {
     pub line: Option<usize>,
 }
 
+/// Keep the source editor and its console in one bounded vertical split.
+///
+/// Both application shells use this layout so a short Definition pane cannot
+/// push Python errors below the visible tab. The child UIs are clipped to their
+/// assigned regions; each contains its own scrolling surface.
+pub fn source_console(
+    ui: &mut Ui,
+    stdout: &str,
+    error: Option<&str>,
+    running: bool,
+    source: impl FnOnce(&mut Ui),
+) -> ConsoleAction {
+    let spacing = 6.0;
+    let (source_height, console_height) = source_console_heights(ui.available_height(), error.is_some());
+    let width = ui.available_width();
+    ui.allocate_ui(egui::vec2(width, source_height), |ui| {
+        ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+        source(ui);
+    });
+    ui.add_space(spacing);
+    ui.allocate_ui(egui::vec2(width, console_height), |ui| {
+        ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+        console(ui, stdout, error, running)
+    })
+    .inner
+}
+
+fn source_console_heights(available: f32, has_error: bool) -> (f32, f32) {
+    let spacing = 6.0;
+    let body = (available - spacing).max(0.0);
+    let desired_console: f32 = if has_error { 190.0 } else { 125.0 };
+    let minimum_console: f32 = if has_error { 96.0 } else { 64.0 };
+    let minimum_source = 72.0_f32.min(body * 0.5);
+    let maximum_console = (body - minimum_source).max(0.0);
+    let effective_minimum = minimum_console.min(maximum_console);
+    let console = (body * 0.55)
+        .max(effective_minimum)
+        .min(desired_console)
+        .min(maximum_console);
+    (body - console, console)
+}
+
 pub fn console(ui: &mut Ui, stdout: &str, error: Option<&str>, running: bool) -> ConsoleAction {
     let mut action = ConsoleAction::default();
     let error_count = usize::from(error.is_some());
@@ -166,5 +208,18 @@ mod tests {
         );
         assert_eq!(error_line("invalid value at line 4 column 9"), Some(4));
         assert_eq!(error_line("decoder failed"), None);
+    }
+
+    #[test]
+    fn source_console_keeps_errors_visible_in_short_panes() {
+        let (source, console) = source_console_heights(260.0, true);
+        assert!(source >= 72.0);
+        assert!(console >= 96.0);
+        assert!(source + console + 6.0 <= 260.0);
+
+        let (source, console) = source_console_heights(150.0, true);
+        assert!(source >= 72.0);
+        assert!(console >= 72.0);
+        assert!(source + console + 6.0 <= 150.0);
     }
 }
