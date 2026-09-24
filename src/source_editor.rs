@@ -758,6 +758,12 @@ fn diagnostic_hint(source: &str, line: Option<usize>, message: &str) -> Option<S
         }
         return Some("Check this line's indentation and align it with the sibling key above it.".into());
     }
+    if message.contains("untagged enum Expr") {
+        return Some(
+            "BinWave could not read this size or offset expression. Use a number, {ref: earlier_field}, or a supported expression such as {subtract: [{ref: total_bytes}, 4]}. A length may also use remaining."
+                .into(),
+        );
+    }
     None
 }
 
@@ -1569,6 +1575,31 @@ mod selected_read_tests {
         assert!(editor.diagnostic.is_none());
         editor.refresh_diagnostic("endian: little\nactions: []\n");
         assert!(editor.diagnostic.is_none(), "The new-decoder placeholder is not an error");
+    }
+
+    #[test]
+    fn nested_expression_errors_point_to_the_field_instead_of_the_file_header() {
+        let source = "endian: little\nstructures:\n  - name: Packet\n    fields:\n      - {name: payload, type: bytes, length: {unknown: 4}}\nactions:\n  - read: {name: packet, type: {structure: Packet}}\n";
+        let mut editor = YamlLayoutCache::default();
+        editor.refresh_diagnostic(source);
+        let diagnostic = editor.diagnostic.as_ref().expect("invalid length expression");
+
+        assert_eq!(diagnostic.line, Some(5));
+        assert_ne!(diagnostic.line, Some(1));
+        assert_ne!(diagnostic.line, Some(4));
+        assert!(diagnostic.message.contains("untagged enum Expr"));
+        assert!(diagnostic
+            .hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("size or offset expression")));
+
+        let run_error = crate::structure::Program::parse(source).unwrap_err();
+        let run_location = run_error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<serde_yaml_ng::Error>())
+            .and_then(serde_yaml_ng::Error::location)
+            .expect("run error location");
+        assert_eq!(run_location.line(), 5);
     }
 
     #[test]

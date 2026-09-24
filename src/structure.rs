@@ -58,11 +58,28 @@ mod named_structures {
         endian: Option<Endian>,
     }
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, Structure>, D::Error> {
-        let value = serde_yaml_ng::Value::deserialize(d)?;
-        if !value.is_sequence() {
-            return Err(serde::de::Error::custom("structures must be a list of declarations beginning with '- name: RecordType'; mapping-style declarations are no longer supported"));
+        struct StructureList;
+        impl<'de> serde::de::Visitor<'de> for StructureList {
+            type Value = Vec<Named>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(
+                    "a list of declarations beginning with '- name: RecordType'; mapping-style declarations are no longer supported",
+                )
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut entries = Vec::new();
+                while let Some(entry) = sequence.next_element()? {
+                    entries.push(entry);
+                }
+                Ok(entries)
+            }
         }
-        let entries: Vec<Named> = serde_yaml_ng::from_value(value).map_err(serde::de::Error::custom)?;
+        let entries = d.deserialize_seq(StructureList)?;
         let mut map = BTreeMap::new();
         for entry in entries {
             let name = entry.name;
@@ -861,10 +878,7 @@ impl Program {
             yaml.len() as Address <= MAX_YAML,
             "definition exceeds 256 KiB"
         );
-        let value: serde_yaml_ng::Value =
-            serde_yaml_ng::from_str(yaml).context("read structure YAML")?;
-        let program: Self =
-            serde_yaml_ng::from_value(value).context("invalid structure definition")?;
+        let program: Self = serde_yaml_ng::from_str(yaml).context("read structure YAML")?;
         ensure!(!program.actions.is_empty(), "define at least one action");
         ensure!(
             program.structures.len() <= 256,
