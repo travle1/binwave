@@ -278,15 +278,9 @@ impl YamlLayoutCache {
             .fill(ui.visuals().extreme_bg_color)
             .inner_margin(egui::Margin::same(6.))
             .show(ui, |ui| {
-                let ruler_height = (font.size * 1.45).max(18.);
-                let (ruler, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), ruler_height),
-                    egui::Sense::hover(),
-                );
                 let size = ui.available_size();
-                let mut column_origin = ruler.left() + gutter_width;
                 let mut caret = None;
-                egui::ScrollArea::both()
+                let scroll = egui::ScrollArea::both()
                     .id_source(("decoder_source", language))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -420,7 +414,6 @@ impl YamlLayoutCache {
                                     }
                                 })
                                 .show(ui);
-                            column_origin = output.galley_pos.x;
                             caret = output.cursor_range.map(|range| {
                                 (
                                     range.primary.rcursor.row + 1,
@@ -480,7 +473,7 @@ impl YamlLayoutCache {
                             }
                         });
                     });
-                paint_column_ruler(ui, ruler, &font, column_origin, gutter_width, caret);
+                paint_caret_status(ui, scroll.inner_rect, &font, caret);
             });
     }
 
@@ -523,61 +516,34 @@ impl YamlLayoutCache {
     }
 }
 
-fn paint_column_ruler(
+fn paint_caret_status(
     ui: &Ui,
     rect: egui::Rect,
     font: &egui::FontId,
-    origin: f32,
-    gutter_width: f32,
     caret: Option<(usize, usize)>,
 ) {
-    let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
-    let painter = ui.painter().with_clip_rect(rect);
-    painter.hline(rect.x_range(), rect.bottom(), stroke);
-    painter.vline(rect.left() + gutter_width, rect.y_range(), stroke);
+    let Some((line, column)) = caret else { return; };
+    let label = format!("Ln {line}, Col {column}");
     let digit = ui.fonts(|fonts| fonts.glyph_width(font, '0')).max(1.);
-    let caret_label = caret.map(|(line, column)| format!("Ln {line}, Col {column}"));
-    let badge_width = caret_label
-        .as_ref()
-        .map_or(0., |label| digit * label.chars().count() as f32 + 12.);
-    let label_limit = rect.right() - badge_width - 6.;
-    let first = (((rect.left() - origin) / digit).floor().max(0.) as usize + 1).max(1);
-    let last = (((label_limit - origin) / digit).ceil().max(0.) as usize + 1).max(first);
-    for column in first..=last {
-        if column != 1 && column % 5 != 0 {
-            continue;
-        }
-        let x = origin + (column.saturating_sub(1)) as f32 * digit;
-        if x < rect.left() || x > label_limit {
-            continue;
-        }
-        painter.vline(
-            x,
-            (rect.bottom() - 3.)..=rect.bottom(),
-            egui::Stroke::new(1_f32, ui.visuals().weak_text_color()),
-        );
-        painter.text(
-            egui::pos2(x, rect.top() + 1.),
-            egui::Align2::CENTER_TOP,
-            column.to_string(),
-            font.clone(),
-            ui.visuals().weak_text_color(),
-        );
-    }
-    if let Some(label) = caret_label {
-        let badge = egui::Rect::from_min_max(
-            egui::pos2(rect.right() - badge_width, rect.top()),
-            rect.right_bottom(),
-        );
-        painter.rect_filled(badge, 2., ui.visuals().extreme_bg_color);
-        painter.text(
-            badge.center(),
-            egui::Align2::CENTER_CENTER,
-            label,
-            font.clone(),
-            ui.visuals().text_color(),
-        );
-    }
+    let size = egui::vec2(digit * label.chars().count() as f32 + 14., font.size + 8.);
+    let badge = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - size.x - 4., rect.bottom() - size.y - 4.),
+        size,
+    );
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(badge, 3., ui.visuals().extreme_bg_color);
+    painter.rect_stroke(
+        badge,
+        3.,
+        egui::Stroke::new(1_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
+    painter.text(
+        badge.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        font.clone(),
+        ui.visuals().weak_text_color(),
+    );
 }
 
 fn paint_source_diagnostic(
@@ -706,59 +672,162 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.heading("Decode a file with YAML or Python");
-            ui.label("Open a data file, describe its byte layout in Definition, then press ▶ Run (F5). Successful runs populate Decoded structure, Plot, Samples, Inspector, and Hex.");
-            ui.label("Click a decoded value or plot point to locate its exact bytes. Shift-click a plot sample to select every record from the anchor through that sample.");
+            ui.heading("Binwave decoder guide");
+            ui.label("A decoder describes how bytes become named values. Open a data file, edit the Definition, then press ▶ Run (F5). A successful run publishes the same decoded structure to Plot, Samples, Inspector, and Hex.");
+            ui.label("This guide documents Binwave's decoder types and cursor rules. YAML is the declarative format; Python is available when the layout needs loops, validation, or other program logic.");
             ui.separator();
 
-            egui::CollapsingHeader::new("YAML quick start")
+            egui::CollapsingHeader::new("How parsing works")
                 .default_open(true)
                 .show(ui, |ui| {
-                    ui.code("endian: little\nstructures:\n  - name: Sample\n    fields:\n      - {name: time, type: u32}\n      - {name: value, type: f32}\nactions:\n  - read:\n      name: samples\n      type: {structure: Sample}\n      repeat: until end");
-                    ui.label("structures declares reusable record layouts but reads no bytes. actions performs reads from the file. Fields consume bytes in order unless an offset option changes the cursor.");
+                    ui.label("1. Binwave loads every static declaration under structures into a type catalog. Declaring a structure consumes no bytes, and static declaration order does not matter.");
+                    ui.label("2. The byte cursor starts at offset 0. Top-level actions execute in order. A structure's fields then execute in their listed order, followed by that structure's actions.");
+                    ui.label("3. A field reads at the current cursor unless at, relative, or align moves it. The decoded value is stored under the field name and the cursor advances by the bytes consumed.");
+                    ui.label("4. ref retrieves an earlier decoded value. It does not reread, forward, or consume that value's bytes.");
+                    ui.label("5. choose uses an earlier value to select one type for the current field. The chosen type begins at the current cursor.");
+                    ui.label("6. length creates a bounded byte region. The chosen or nested type cannot escape it; unused bytes are consumed as padding so the next field starts at the region's end.");
+                    ui.label("7. repeat reads multiple items. It belongs on the field or read action that actually repeats; choose by itself never repeats.");
+                    ui.separator();
+                    ui.strong("Small fixed-record example");
+                    ui.code("endian: little\nstructures:\n  - name: Record\n    fields:\n      - {name: timestamp, type: u32}\n      - {name: measurement, type: f32}\nactions:\n  - read:\n      name: records\n      type: {structure: Record}\n      repeat: until end");
+                    ui.label("Each Record consumes eight bytes. The read action repeats complete records until the file boundary.");
                 });
 
-            egui::CollapsingHeader::new("YAML types and field options")
+            egui::CollapsingHeader::new("Built-in decoder types")
                 .default_open(true)
                 .show(ui, |ui| {
-                    ui.strong("Built-in types");
-                    ui.code("u8  i8  u16  i16  u32  i32  u64  i64  f32  f64\nbytes  text  cstring  varuint");
-                    ui.label("Use type: {structure: Name} for a declared structure. A structure or the whole file can set endian: little or endian: big.");
-                    ui.strong("Field options");
-                    ui.code("repeat: 12\nrepeat: {ref: header.count}\nrepeat: until end\nlength: 16\nat: 128\nrelative: 4\nalign: 8\nendian: big\nexpect: 42");
-                    ui.label("length bounds one value in bytes. at is an absolute offset; relative moves from the current cursor; align advances to a boundary. expect validates the decoded value.");
-                    ui.strong("Choose a type from an earlier value");
-                    ui.code("type:\n  choose:\n    ref: stream_id\n    cases:\n      '1': {structure: Imu}\n      '2': {structure: Motors}\n    otherwise: {structure: Raw}");
+                    ui.label("These are Binwave schema types implemented by the decoder engine. Their names resemble Rust types, but they are not arbitrary Rust or Python types.");
+                    egui::Grid::new("decoder-guide-types")
+                        .striped(true)
+                        .num_columns(3)
+                        .show(ui, |ui| {
+                            ui.strong("Type"); ui.strong("Bytes"); ui.strong("Meaning"); ui.end_row();
+                            ui.code("u8 / i8"); ui.label("1"); ui.label("Unsigned / signed integer"); ui.end_row();
+                            ui.code("u16 / i16"); ui.label("2"); ui.label("Unsigned / signed integer"); ui.end_row();
+                            ui.code("u32 / i32"); ui.label("4"); ui.label("Unsigned / signed integer"); ui.end_row();
+                            ui.code("u64 / i64"); ui.label("8"); ui.label("Unsigned / signed integer"); ui.end_row();
+                            ui.code("f32"); ui.label("4"); ui.label("IEEE-754 floating point"); ui.end_row();
+                            ui.code("f64"); ui.label("8"); ui.label("IEEE-754 floating point"); ui.end_row();
+                            ui.code("bytes"); ui.label("length"); ui.label("Raw bytes; normally requires length"); ui.end_row();
+                            ui.code("text"); ui.label("length"); ui.label("Fixed-length UTF-8 text"); ui.end_row();
+                            ui.code("cstring"); ui.label("variable"); ui.label("Zero-terminated UTF-8 text"); ui.end_row();
+                            ui.code("varuint"); ui.label("variable"); ui.label("Unsigned LEB128 integer"); ui.end_row();
+                        });
+                    ui.label("Integers remain exact in decoded data; plotting alone converts numeric values to floating point. Multi-byte numeric types inherit endian: little or endian: big from the file or structure, and a field can override it.");
+                    ui.code("endian: little\n# ...\n- {name: network_value, type: u32, endian: big}");
+                    ui.label("A declared structure is referenced explicitly: type: {structure: Record}. Bare user-defined type names are rejected so they cannot be confused with built-ins.");
                 });
 
-            egui::CollapsingHeader::new("YAML actions and expressions")
+            egui::CollapsingHeader::new("Structures, nesting, and declaration order")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.label("structures is a reusable type catalog, not the file's top-level byte order. Static structures may reference declarations written earlier or later in that list because the complete catalog is loaded before parsing begins.");
+                    ui.code("structures:\n  - name: Envelope\n    fields:\n      - {name: body, type: {structure: Body}}\n  - name: Body\n    fields:\n      - {name: value, type: u16}");
+                    ui.label("Nesting does not automatically imply a count, size, pointer, tag, or terminator. Declare those fields only when the file actually stores them, and use them explicitly with ref, length, repeat, or choose.");
+                    ui.label("Execution order still matters: fields and actions read bytes in order, references can only use values already decoded, and a runtime structure produced by define must be created before a later read uses it.");
+                });
+
+            egui::CollapsingHeader::new("Cursor movement, bounds, and field options")
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::Grid::new("decoder-guide-field-options")
+                        .striped(true)
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.code("length: 16"); ui.label("Bound one item to 16 bytes; unused bytes become padding"); ui.end_row();
+                            ui.code("repeat: 12"); ui.label("Read 12 consecutive items"); ui.end_row();
+                            ui.code("repeat: {ref: count}"); ui.label("Use an earlier decoded item count"); ui.end_row();
+                            ui.code("repeat: until end"); ui.label("Read complete items to the enclosing region's end"); ui.end_row();
+                            ui.code("at: 128"); ui.label("Move to absolute file offset 128 before reading"); ui.end_row();
+                            ui.code("relative: 4"); ui.label("Move four bytes from the current cursor"); ui.end_row();
+                            ui.code("align: 8"); ui.label("Advance to the next absolute eight-byte boundary"); ui.end_row();
+                            ui.code("endian: big"); ui.label("Override inherited byte order for this field"); ui.end_row();
+                            ui.code("expect: 42"); ui.label("Fail unless the decoded numeric or text value matches"); ui.end_row();
+                        });
+                    ui.label("A field's length applies to each repeated item, not the array as a whole. To bound a whole repeated payload, put the repeated field inside a containing structure and apply length to that containing structure.");
+                    ui.label("at and relative change where subsequent reading continues; they are not temporary peeks. No read may escape an explicitly bounded parent region. A partial final item is an error rather than silently ignored data.");
+                });
+
+            egui::CollapsingHeader::new("Tagged and length-delimited data with choose")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.label("choose selects the type for one field at the current cursor. The tag has already been consumed; ref only looks up its decoded value. The selected structure receives the bytes that follow the tag and length fields.");
+                    ui.code("structures:\n  - name: VariantA\n    fields:\n      - {name: value, type: u32}\n\n  - name: Section\n    fields:\n      - {name: kind, type: u8}\n      - {name: payload_bytes, type: u16}\n      - name: payload\n        type:\n          choose:\n            ref: kind\n            cases:\n              '1': {structure: VariantA}\n            otherwise: bytes\n        length: {ref: payload_bytes}\n\nactions:\n  - read:\n      name: sections\n      type: {structure: Section}\n      repeat: until end");
+                    ui.label("Here each outer Section repeats. Every section reads its own tag and length, chooses one payload type, and advances to the end of that payload's bounded region before the next section begins.");
+                    ui.label("If one tag selects a homogeneous array instead, put repeat on the payload field. If a chosen region contains its own mixed records, reference a container structure whose inner record field uses repeat: until end.");
+                    ui.label("otherwise is recommended for forward-compatible formats. Using otherwise: bytes preserves unknown payloads and their exact byte ranges instead of failing on an unfamiliar tag.");
+                });
+
+            egui::CollapsingHeader::new("References and integer expressions")
+                .show(ui, |ui| {
+                    ui.label("An unqualified reference searches the current decoded element and then its enclosing scopes. A leading slash anchors the path at file level. References name decoded values, not structure declarations.");
+                    ui.code("{ref: count}\n{ref: header.count}\n{ref: /header.entries[0].size}");
+                    ui.label("Expressions use checked integer arithmetic. add, subtract, multiply, and divide accept two operands, and either operand may be another expression or reference. Division must be exact.");
+                    ui.code("length: {subtract: [{ref: total_bytes}, 4]}\nrepeat: {divide: [{ref: payload_bytes}, 8]}\nrelative: {add: [{ref: gap}, 2]}");
+                    ui.label("Missing or forward references, negative sizes, overflow, division remainders, and out-of-region reads are reported as decoder errors.");
+                });
+
+            egui::CollapsingHeader::new("YAML actions")
                 .show(ui, |ui| {
                     ui.label("Every action contains exactly one of read, define, skip, align, calculate, or choose.");
-                    ui.code("actions:\n  - read: {name: header, type: {structure: Header}}\n  - calculate: {name: payload_bytes, value: {multiply: [{ref: header.count}, 4]}}\n  - align: 8\n  - skip: 16");
-                    ui.label("Expressions can be an integer, {ref: path}, or add, subtract, multiply, and divide pairs. References must point to values decoded earlier.");
-                    ui.strong("Choose different actions");
-                    ui.code("- choose:\n    ref: id\n    cases:\n      '1':\n        - read: {name: header, type: {structure: Header}}\n    otherwise:\n      - skip: {ref: length}");
-                    ui.strong("Create a structure from decoded metadata");
-                    ui.code("- define:\n    name: Discovered\n    from: metadata.entries\n    fields:\n      name: {ref: name}\n      type: {ref: format, cases: {'1': u16, '2': i16}}\n      repeat: {ref: count}");
-                    ui.label("define maps an earlier description collection into reusable fields. Optional mappings also include length, at, and relative.");
+                    egui::Grid::new("decoder-guide-actions")
+                        .striped(true)
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.code("read"); ui.label("Decode a named field using the normal field options"); ui.end_row();
+                            ui.code("skip"); ui.label("Advance the cursor by a byte count"); ui.end_row();
+                            ui.code("align"); ui.label("Advance to an absolute alignment boundary"); ui.end_row();
+                            ui.code("calculate"); ui.label("Publish a named checked-integer expression without reading bytes"); ui.end_row();
+                            ui.code("choose"); ui.label("Run one action list selected by an earlier value"); ui.end_row();
+                            ui.code("define"); ui.label("Create a new structure from previously decoded descriptions"); ui.end_row();
+                        });
+                    ui.code("actions:\n  - read: {name: header, type: {structure: Header}}\n  - calculate: {name: data_bytes, value: {multiply: [{ref: header.count}, 4]}}\n  - align: 8\n  - choose:\n      ref: header.kind\n      cases:\n        '1':\n          - read: {name: body, type: {structure: Body}}\n      otherwise:\n        - skip: {ref: data_bytes}");
+                });
+
+            egui::CollapsingHeader::new("Structures generated from file metadata")
+                .show(ui, |ui| {
+                    ui.label("define is different from choose. choose selects an existing type; define creates a new type from an earlier description collection. Creating the type consumes no payload bytes—the later read does that.");
+                    ui.code("- define:\n    name: GeneratedRecord\n    from: description.fields\n    fields:\n      name: {ref: label}\n      type: {ref: format, cases: {'1': u16, '2': i16, '3': f32}}\n      repeat: {ref: count}");
+                    ui.label("Optional mappings also include length, at, and relative. Generated names and formats come from decoded data, but the mapping from numeric format codes to Binwave types belongs to the decoder definition.");
+                    ui.label("Because define executes during parsing, the description bytes and define action must occur before any read that references GeneratedRecord.");
+                });
+
+            egui::CollapsingHeader::new("Checksums, trailers, and validation")
+                .show(ui, |ui| {
+                    ui.label("Place a stored checksum after the bounded data it follows. It is a separate field; choose decodes only the payload region before it.");
+                    ui.code("- name: Block\n  fields:\n    - {name: payload_bytes, type: u16}\n    - {name: payload, type: bytes, length: {ref: payload_bytes}}\n    - {name: stored_checksum, type: u32, endian: big}");
+                    ui.label("If the stored length includes the checksum itself, subtract the checksum width when bounding the payload. The checksum field's byte order is a format rule separate from the checksum algorithm's byte range.");
+                    ui.label("YAML currently displays stored checksum values but does not calculate, verify, or rebuild checksums. Use Python for calculated validation, and remember that some formats cover only payload bytes while others also cover tag or header bytes.");
                 });
 
             egui::CollapsingHeader::new("Python quick start and API")
-                .default_open(true)
                 .show(ui, |ui| {
-                    ui.code("from binwave import Field, Struct\n\nHeader = Struct('Header', [('count', 'u32')], endian='little')\nSample = Struct('Sample', [\n    ('time', 'u32'),\n    Field('value', 'f32'),\n])\nheader = file.read_struct('header', Header)\nsamples = file.records('samples', Sample, count=header.count)\nprint(f'{len(samples)} samples')");
-                    ui.label("Field(name, type, length=None, count=None, offset=None, endian=None, expect=None) accepts a fixed-size numeric type, text, bytes, or another Struct. (name, type) is shorthand.");
+                    ui.label("Python field strings such as 'u32' use the same Binwave schema names; they are not Python type annotations. Python is useful when a format needs loops, conditions, calculated validation, or structure discovery that is awkward in declarative YAML.");
+                    ui.code("from binwave import Field, Struct\n\nHeader = Struct('Header', [('count', 'u32')], endian='little')\nRecord = Struct('Record', [\n    ('timestamp', 'u32'),\n    Field('measurement', 'f32'),\n])\nheader = file.read_struct('header', Header)\nrecords = file.records('records', Record, count=header.count)\nprint(f'{len(records)} records')");
+                    ui.label("Field(name, type, length=None, count=None, offset=None, endian=None, expect=None) accepts a fixed numeric type, text, bytes, or another Struct. (name, type) is shorthand.");
                     ui.label("Struct(name, fields, endian=None) creates a fixed layout and exposes size and fields.");
                     ui.label("file.size is the byte length. file.tell() and file.seek(offset, whence=0) control the cursor. file.read(length) advances it; file.read_at(offset, length) does not. file.unpack(format, offset=None) uses Python struct formats.");
                     ui.label("file.read_struct(name, struct, offset=None) decodes metadata now. file.records(name, struct, count=None, offset=None) registers a lazy collection for Plot and Samples. Without count, records consumes complete records to the end of the file.");
+                    ui.strong("Calculated checksum example");
+                    ui.code("import zlib\n\ndef crc32_range(start, length):\n    crc = 0\n    while length:\n        size = min(length, 1024 * 1024)\n        crc = zlib.crc32(file.read_at(start, size), crc)\n        start += size\n        length -= size\n    return crc & 0xFFFFFFFF\n\nif crc32_range(payload_start, payload_bytes) != stored_checksum:\n    raise ValueError('checksum mismatch')");
+                    ui.label("A single read/read_at call is limited to 1 MiB, so calculated validation over larger ranges must use bounded chunks as shown above.");
                     ui.label("Python supports ordinary imports, functions, loops, conditions, assertions, and print(). In the web app it runs locally in the browser; on desktop it runs with the selected Python interpreter.");
+                });
+
+            egui::CollapsingHeader::new("Large files and lazy decoding")
+                .show(ui, |ui| {
+                    ui.label("Fixed-size collections are kept lazy: Binwave stores the collection plan and decodes only the pages requested by Plot, Samples, Inspector, or Hex. This is the preferred representation for very large recordings.");
+                    ui.label("Variable-size records must be scanned to discover their boundaries. A tagged record containing choose is variable-size unless every selected layout has a known common stride. Keep each record length-delimited when the format provides a length.");
+                    ui.label("Use file.records in Python or a fixed-size repeated structure in YAML for large homogeneous arrays. Avoid turning a large raw payload into one decoded node per byte.");
                 });
 
             egui::CollapsingHeader::new("Editing and troubleshooting")
                 .show(ui, |ui| {
                     ui.label("YAML syntax and indentation are checked while you type. Select a reported line to jump there. Run-time errors remain in the Console because they depend on the open data.");
                     ui.label("Copy, cut, paste, undo, redo, select all, and toggle comments are available from Edit → Definition editing and from the editor context menu. Ctrl/Cmd+C, X, and V use the same selection.");
-                    ui.label("Start with Decoder → Examples, then adapt one field at a time. Keep the last successful result visible while correcting a definition.");
+                    ui.label("Use the line numbers and the bottom-right Ln/Col indicator to locate errors. The highlighted source line and exact reported column show where YAML stopped understanding the definition.");
+                    ui.label("Start with Decoder → Examples, run after each small change, and compare the decoded byte ranges with the format specification. Keep an otherwise: bytes branch while investigating unknown variants.");
+                    ui.label("Click a decoded value or plot point to reveal its exact bytes. Shift-click a plot sample to select the complete range from the anchor through that sample.");
                 });
         });
 }
@@ -1158,7 +1227,7 @@ mod selected_read_tests {
     }
 
     #[test]
-    fn column_ruler_shows_columns_and_current_caret_position() {
+    fn caret_position_is_the_only_editor_column_label() {
         let ctx = egui::Context::default();
         let output = ctx.run(
             egui::RawInput {
@@ -1171,15 +1240,13 @@ mod selected_read_tests {
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(650., 20.),
+                        egui::vec2(650., 80.),
                         egui::Sense::hover(),
                     );
-                    paint_column_ruler(
+                    paint_caret_status(
                         ui,
                         rect,
                         &egui::FontId::monospace(13.),
-                        rect.left() + 48.,
-                        40.,
                         Some((27, 20)),
                     );
                 });
@@ -1189,8 +1256,8 @@ mod selected_read_tests {
             egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
             _ => None,
         }).collect();
-        assert!(labels.contains(&"20".to_owned()), "{labels:?}");
         assert!(labels.contains(&"Ln 27, Col 20".to_owned()), "{labels:?}");
+        assert!(!labels.contains(&"20".to_owned()), "{labels:?}");
     }
 
     #[test]
