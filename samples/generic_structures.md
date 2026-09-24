@@ -129,6 +129,7 @@ restore the cursor to where that nested read began.
 | `repeat: {ref: count}` | Read the number of items given by an earlier decoded value |
 | `repeat: until end` | Read complete items until the enclosing byte region ends; at top level this is the file end |
 | `length: 12` | Bound this item to 12 bytes; for a structure, unused bytes are consumed as padding |
+| `length: remaining` | Consume from this field through the enclosing region's end |
 | `at: 100` | Start at absolute file byte 100, even inside a nested structure |
 | `relative: 4` | Start four bytes after the current cursor |
 | `align: 4` | Advance to the next absolute offset divisible by four |
@@ -145,6 +146,32 @@ containing structure and put the repeated field inside it. A trailing partial
 item is an error, not an instruction to silently discard bytes. Likewise,
 `until end` cannot identify a following footer unless the payload has its own
 boundary that excludes that footer.
+
+Lengths can select between expressions without switching to action syntax. This
+is useful when a terminal tag owns the remainder of its enclosing region while
+ordinary tags use a stored byte count:
+
+```yaml
+- name: payload
+  type:
+    choose:
+      ref: kind
+      cases:
+        '0': bytes
+        '1': {structure: KnownPayload}
+      otherwise: bytes
+  length:
+    choose:
+      ref: kind
+      cases:
+        '0': remaining
+      otherwise: {ref: payload_bytes}
+```
+
+`remaining` is contextual: at the file level it reaches EOF, while inside an
+explicitly length-bounded structure it reaches only that structure's end. The
+selected length still bounds the chosen type and preserves unknown payloads as
+raw bytes.
 
 Nesting does not imply a stored count, byte length, pointer, tag, or terminator.
 Declare and use those only if the file format actually contains them. The

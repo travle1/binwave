@@ -120,7 +120,6 @@ print(f"Registered {len(samples):,} samples")
     }
 }
 
-#[derive(Default)]
 pub(crate) struct YamlLayoutCache {
     job: Option<egui::text::LayoutJob>,
     font: egui::FontId,
@@ -135,6 +134,28 @@ pub(crate) struct YamlLayoutCache {
     goto_column: Option<usize>,
     diagnostic_hash: Option<u64>,
     diagnostic: Option<SourceDiagnostic>,
+    tab_width: usize,
+}
+
+impl Default for YamlLayoutCache {
+    fn default() -> Self {
+        Self {
+            job: None,
+            font: egui::FontId::default(),
+            dark: false,
+            foreground: Color32::default(),
+            language: DecoderLanguage::default(),
+            edit_action: None,
+            paste: Default::default(),
+            paste_error: None,
+            focused: false,
+            goto_line: None,
+            goto_column: None,
+            diagnostic_hash: None,
+            diagnostic: None,
+            tab_width: 2,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -146,6 +167,10 @@ struct SourceDiagnostic {
 }
 
 impl YamlLayoutCache {
+    pub(crate) fn tab_width(&self) -> usize { self.tab_width }
+    pub(crate) fn set_tab_width(&mut self, width: usize) {
+        self.tab_width = width.clamp(1, 8);
+    }
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn focused(&self) -> bool { self.focused }
     #[cfg(target_arch = "wasm32")]
@@ -166,12 +191,32 @@ impl YamlLayoutCache {
         self.goto_line = Some(line.max(1));
         self.goto_column = Some(column.max(1));
     }
+    fn tab_width_menu(&mut self, ui: &mut Ui) {
+        ui.menu_button(format!("Tab: {} spaces", self.tab_width), |ui| {
+            ui.set_min_width(180.);
+            ui.horizontal(|ui| {
+                ui.label("Spaces");
+                ui.add(
+                    egui::DragValue::new(&mut self.tab_width)
+                        .clamp_range(1..=8)
+                        .speed(1),
+                );
+            });
+            ui.weak("Tab indents; Shift+Tab dedents; Enter continues indentation.");
+        });
+    }
     fn edit_menu(&mut self, ui: &mut Ui) {
         for action in ["Undo", "Redo", "Cut", "Copy", "Paste", "Select all", "Toggle comments"] {
             if ui.button(action).clicked() {
                 self.edit_action = Some(action);
                 ui.close_menu();
             }
+        }
+        ui.separator();
+        self.tab_width_menu(ui);
+        if ui.button("Convert leading tabs to spaces").clicked() {
+            self.edit_action = Some("Convert indentation");
+            ui.close_menu();
         }
     }
     pub(crate) fn layout(
@@ -226,6 +271,7 @@ impl YamlLayoutCache {
                     ui.separator();
                     ui.label("Open Help → Decoder guide for every supported type, field option, action, expression, and a complete Python API reference.");
                 });
+                self.tab_width_menu(ui);
             });
             self.refresh_diagnostic(yaml);
             if let Some(diagnostic) = self.diagnostic.clone() {
@@ -267,6 +313,8 @@ impl YamlLayoutCache {
                         }
                     });
             }
+        } else {
+            ui.horizontal(|ui| self.tab_width_menu(ui));
         }
         let mut font = egui::TextStyle::Monospace.resolve(ui.style());
         font.size = font.size.max(13.);
@@ -338,6 +386,13 @@ impl YamlLayoutCache {
                                     }
 
                                     ui.memory_mut(|m| m.request_focus(editor_id));
+                                } else if action == "Convert indentation" {
+                                    convert_source_indentation(
+                                        ui.ctx(),
+                                        editor_id,
+                                        yaml,
+                                        self.tab_width,
+                                    );
                                 } else {
                                     edit_source(ui.ctx(), editor_id, yaml, action, None);
                                 }
@@ -366,8 +421,47 @@ impl YamlLayoutCache {
                                         egui::Key::Z,
                                     )
                                 });
+                            let indent = focused.then(|| {
+                                ui.input_mut(|input| {
+                                    if input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab) {
+                                        Some(true)
+                                    } else if input.consume_key(
+                                        egui::Modifiers::NONE,
+                                        egui::Key::Tab,
+                                    ) {
+                                        Some(false)
+                                    } else {
+                                        None
+                                    }
+                                })
+                            }).flatten();
+                            let newline = focused
+                                && ui.input_mut(|input| {
+                                    input.consume_key(
+                                        egui::Modifiers::NONE,
+                                        egui::Key::Enter,
+                                    )
+                                });
                             let mut shortcut_changed = false;
-                            if toggle || redo {
+                            if newline {
+                                insert_auto_indented_newline(
+                                    ui.ctx(),
+                                    editor_id,
+                                    yaml,
+                                    self.tab_width,
+                                    language,
+                                );
+                                shortcut_changed = true;
+                            } else if let Some(dedent) = indent {
+                                indent_source(
+                                    ui.ctx(),
+                                    editor_id,
+                                    yaml,
+                                    self.tab_width,
+                                    dedent,
+                                );
+                                shortcut_changed = true;
+                            } else if toggle || redo {
                                 if let Some(mut state) =
                                     egui::TextEdit::load_state(ui.ctx(), editor_id)
                                 {
@@ -629,7 +723,7 @@ fn diagnostic_hint(source: &str, line: Option<usize>, message: &str) -> Option<S
     let lines: Vec<&str> = source.lines().collect();
     let current = *lines.get(line.saturating_sub(1))?;
     if current.chars().take_while(|ch| ch.is_whitespace()).any(|ch| ch == '\t') {
-        return Some("YAML indentation cannot contain tabs. Replace the leading tab with spaces.".into());
+        return Some("YAML indentation cannot contain tabs. Right-click the editor and choose Convert leading tabs to spaces.".into());
     }
     if current.chars().any(|ch| matches!(ch, '‘' | '’' | '“' | '”')) {
         return Some("Replace typographic quotes with plain ASCII ' or \" characters.".into());
@@ -735,6 +829,7 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
                         .num_columns(2)
                         .show(ui, |ui| {
                             ui.code("length: 16"); ui.label("Bound one item to 16 bytes; unused bytes become padding"); ui.end_row();
+                            ui.code("length: remaining"); ui.label("Consume through the enclosing region's end"); ui.end_row();
                             ui.code("repeat: 12"); ui.label("Read 12 consecutive items"); ui.end_row();
                             ui.code("repeat: {ref: count}"); ui.label("Use an earlier decoded item count"); ui.end_row();
                             ui.code("repeat: until end"); ui.label("Read complete items to the enclosing region's end"); ui.end_row();
@@ -754,6 +849,9 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
                     ui.label("choose selects the type for one field at the current cursor. The tag has already been consumed; ref only looks up its decoded value. The selected structure receives the bytes that follow the tag and length fields.");
                     ui.code("structures:\n  - name: VariantA\n    fields:\n      - {name: value, type: u32}\n\n  - name: Section\n    fields:\n      - {name: kind, type: u8}\n      - {name: payload_bytes, type: u16}\n      - name: payload\n        type:\n          choose:\n            ref: kind\n            cases:\n              '1': {structure: VariantA}\n            otherwise: bytes\n        length: {ref: payload_bytes}\n\nactions:\n  - read:\n      name: sections\n      type: {structure: Section}\n      repeat: until end");
                     ui.label("Here each outer Section repeats. Every section reads its own tag and length, chooses one payload type, and advances to the end of that payload's bounded region before the next section begins.");
+                    ui.label("A tagged terminal payload can choose its length too. Use remaining for the terminal case and the stored byte count otherwise; this stays a field and does not require a choose action.");
+                    ui.code("length:\n  choose:\n    ref: kind\n    cases:\n      '0': remaining\n    otherwise: {ref: payload_bytes}");
+                    ui.label("remaining means the bytes from the payload's current cursor through its enclosing boundary. At top level that boundary is the file end; inside a length-bounded parent it is that parent's end.");
                     ui.label("If one tag selects a homogeneous array instead, put repeat on the payload field. If a chosen region contains its own mixed records, reference a container structure whose inner record field uses repeat: until end.");
                     ui.label("otherwise is recommended for forward-compatible formats. Using otherwise: bytes preserves unknown payloads and their exact byte ranges instead of failing on an unfamiliar tag.");
                 });
@@ -825,11 +923,276 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
                 .show(ui, |ui| {
                     ui.label("YAML syntax and indentation are checked while you type. Select a reported line to jump there. Run-time errors remain in the Console because they depend on the open data.");
                     ui.label("Copy, cut, paste, undo, redo, select all, and toggle comments are available from Edit → Definition editing and from the editor context menu. Ctrl/Cmd+C, X, and V use the same selection.");
+                    ui.label("Tab inserts spaces to the next indentation stop; Shift+Tab dedents selected lines. Enter preserves indentation and adds one level after YAML or Python block openers. Right-click the editor to choose a tab width from 1–8 spaces or convert existing leading tabs.");
                     ui.label("Use the line numbers and the bottom-right Ln/Col indicator to locate errors. The highlighted source line and exact reported column show where YAML stopped understanding the definition.");
                     ui.label("Start with Decoder → Examples, run after each small change, and compare the decoded byte ranges with the format specification. Keep an otherwise: bytes branch while investigating unknown variants.");
                     ui.label("Click a decoded value or plot point to reveal its exact bytes. Shift-click a plot sample to select the complete range from the anchor through that sample.");
                 });
         });
+}
+
+#[derive(Clone)]
+struct SourceEdit {
+    start: usize,
+    remove: usize,
+    insert: String,
+}
+
+fn apply_source_edits(
+    text: &mut String,
+    selection: egui::text::CCursorRange,
+    edits: &[SourceEdit],
+) -> egui::text::CCursorRange {
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
+    let mut copied = 0;
+    for edit in edits {
+        let start = edit.start.min(chars.len());
+        result.extend(chars[copied..start].iter());
+        result.push_str(&edit.insert);
+        copied = (start + edit.remove).min(chars.len());
+    }
+    result.extend(chars[copied..].iter());
+    *text = result;
+
+    let transform = |index: usize| {
+        let mut shift = 0_isize;
+        for edit in edits {
+            let end = edit.start + edit.remove;
+            let inserted = edit.insert.chars().count();
+            if index < edit.start {
+                break;
+            }
+            if index < end {
+                return edit.start
+                    .checked_add_signed(shift)
+                    .unwrap_or_default()
+                    + inserted;
+            }
+            shift += inserted as isize - edit.remove as isize;
+        }
+        index.checked_add_signed(shift).unwrap_or_default()
+    };
+    egui::text::CCursorRange {
+        primary: egui::text::CCursor::new(transform(selection.primary.index)),
+        secondary: egui::text::CCursor::new(transform(selection.secondary.index)),
+    }
+}
+
+fn selected_line_starts(text: &[char], selection: egui::text::CCursorRange) -> Vec<usize> {
+    let [first, last] = selection.sorted();
+    let first = first.index.min(text.len());
+    let last = last.index.min(text.len());
+    let included_last = if first < last { last - 1 } else { last };
+    let mut start = text[..first]
+        .iter()
+        .rposition(|ch| *ch == '\n')
+        .map_or(0, |position| position + 1);
+    let mut starts = Vec::new();
+    loop {
+        starts.push(start);
+        let Some(next) = text[start..]
+            .iter()
+            .position(|ch| *ch == '\n')
+            .map(|position| start + position + 1)
+        else {
+            break;
+        };
+        if next > included_last {
+            break;
+        }
+        start = next;
+    }
+    starts
+}
+
+fn visual_column_at(text: &[char], index: usize, tab_width: usize) -> usize {
+    let start = text[..index.min(text.len())]
+        .iter()
+        .rposition(|ch| *ch == '\n')
+        .map_or(0, |position| position + 1);
+    text[start..index.min(text.len())]
+        .iter()
+        .fold(0, |column, ch| {
+            if *ch == '\t' {
+                ((column / tab_width) + 1) * tab_width
+            } else {
+                column + 1
+            }
+        })
+}
+
+fn insert_auto_indented_newline(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &mut String,
+    tab_width: usize,
+    language: DecoderLanguage,
+) {
+    let tab_width = tab_width.clamp(1, 8);
+    let state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    let range = state.cursor.char_range().unwrap_or_default();
+    let [first, last] = range.sorted();
+    let chars: Vec<char> = text.chars().collect();
+    let index = first.index.min(chars.len());
+    let selection_end = last.index.min(chars.len());
+    let line_start = chars[..index]
+        .iter()
+        .rposition(|ch| *ch == '\n')
+        .map_or(0, |position| position + 1);
+    let line_end = chars[selection_end..]
+        .iter()
+        .position(|ch| *ch == '\n')
+        .map_or(chars.len(), |position| selection_end + position);
+
+    let mut indentation = String::new();
+    let mut column = 0;
+    for ch in &chars[line_start..index] {
+        match *ch {
+            ' ' => {
+                indentation.push(' ');
+                column += 1;
+            }
+            '\t' => {
+                let next = ((column / tab_width) + 1) * tab_width;
+                indentation.push_str(&" ".repeat(next - column));
+                column = next;
+            }
+            _ => break,
+        }
+    }
+
+    let content: String = chars[line_start..index].iter().collect();
+    let trimmed = content.trim();
+    let at_logical_end = chars[selection_end..line_end]
+        .iter()
+        .all(|ch| ch.is_whitespace());
+    let opens_block = at_logical_end
+        && !trimmed.starts_with('#')
+        && (trimmed.ends_with(':')
+            || (language == DecoderLanguage::Yaml
+                && trimmed.starts_with("- ")
+                && trimmed.contains(':')));
+    if opens_block {
+        indentation.push_str(&" ".repeat(tab_width));
+    }
+    let insert = format!("\n{indentation}");
+    edit_source(ctx, id, text, "Paste", Some(&insert));
+}
+
+fn indent_source(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &mut String,
+    tab_width: usize,
+    dedent: bool,
+) {
+    let tab_width = tab_width.clamp(1, 8);
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    let selection = state.cursor.char_range().unwrap_or_default();
+    let chars: Vec<char> = text.chars().collect();
+    let collapsed = selection.primary.index == selection.secondary.index;
+    let edits = if !dedent && collapsed {
+        let index = selection.primary.index.min(chars.len());
+        let column = visual_column_at(&chars, index, tab_width);
+        let spaces = tab_width - column % tab_width;
+        vec![SourceEdit {
+            start: index,
+            remove: 0,
+            insert: " ".repeat(spaces),
+        }]
+    } else {
+        selected_line_starts(&chars, selection)
+            .into_iter()
+            .filter_map(|start| {
+                if !dedent {
+                    return Some(SourceEdit {
+                        start,
+                        remove: 0,
+                        insert: " ".repeat(tab_width),
+                    });
+                }
+                let mut column = 0;
+                let mut remove = 0;
+                for ch in &chars[start..] {
+                    let next = match *ch {
+                        ' ' => column + 1,
+                        '\t' => ((column / tab_width) + 1) * tab_width,
+                        _ => break,
+                    };
+                    if next > tab_width {
+                        break;
+                    }
+                    column = next;
+                    remove += 1;
+                    if column == tab_width {
+                        break;
+                    }
+                }
+                (remove > 0).then_some(SourceEdit {
+                    start,
+                    remove,
+                    insert: String::new(),
+                })
+            })
+            .collect()
+    };
+    if edits.is_empty() {
+        return;
+    }
+    let mut undo = state.undoer();
+    undo.add_undo(&(selection, text.clone()));
+    let range = apply_source_edits(text, selection, &edits);
+    undo.feed_state(ctx.input(|input| input.time), &(range, text.clone()));
+    state.cursor.set_char_range(Some(range));
+    state.set_undoer(undo);
+    state.store(ctx, id);
+    ctx.memory_mut(|memory| memory.request_focus(id));
+}
+
+fn convert_source_indentation(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &mut String,
+    tab_width: usize,
+) {
+    let tab_width = tab_width.clamp(1, 8);
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    let selection = state.cursor.char_range().unwrap_or_default();
+    let chars: Vec<char> = text.chars().collect();
+    let mut edits = Vec::new();
+    let mut indentation = true;
+    let mut column = 0;
+    for (index, ch) in chars.iter().enumerate() {
+        match *ch {
+            '\n' => {
+                indentation = true;
+                column = 0;
+            }
+            ' ' if indentation => column += 1,
+            '\t' if indentation => {
+                let next = ((column / tab_width) + 1) * tab_width;
+                edits.push(SourceEdit {
+                    start: index,
+                    remove: 1,
+                    insert: " ".repeat(next - column),
+                });
+                column = next;
+            }
+            _ => indentation = false,
+        }
+    }
+    if edits.is_empty() {
+        return;
+    }
+    let mut undo = state.undoer();
+    undo.add_undo(&(selection, text.clone()));
+    let range = apply_source_edits(text, selection, &edits);
+    undo.feed_state(ctx.input(|input| input.time), &(range, text.clone()));
+    state.cursor.set_char_range(Some(range));
+    state.set_undoer(undo);
+    state.store(ctx, id);
+    ctx.memory_mut(|memory| memory.request_focus(id));
 }
 
 // Menu actions use the same cursor and undo history as keyboard editing.
@@ -1112,7 +1475,14 @@ pub(crate) fn source_layout(
                     builtin_color(dark)
                 } else if matches!(
                     token,
-                    "true" | "false" | "null" | "~" | "True" | "False" | "None"
+                    "true"
+                        | "false"
+                        | "null"
+                        | "~"
+                        | "True"
+                        | "False"
+                        | "None"
+                        | "remaining"
                 ) || token.parse::<f64>().is_ok()
                     || token.starts_with("0x")
                     || token.starts_with("0b")
@@ -1224,6 +1594,102 @@ mod selected_read_tests {
         assert_eq!(source_char_index(source, 2, 4), 9);
         assert_eq!(source_char_index(source, 2, 200), 15);
         assert_eq!(source_char_index(source, 20, 1), source.chars().count());
+    }
+
+    #[test]
+    fn tab_indents_to_configured_space_stop_and_shift_tab_dedents_lines() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("tab-editor");
+        let mut text = "  first\n  second\n".to_owned();
+        let mut state = egui::text_edit::TextEditState::default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(2),
+        )));
+        state.store(&ctx, id);
+
+        indent_source(&ctx, id, &mut text, 4, false);
+        assert_eq!(text, "    first\n  second\n");
+
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(text.chars().count()),
+        )));
+        state.store(&ctx, id);
+        indent_source(&ctx, id, &mut text, 3, false);
+        assert_eq!(text, "       first\n     second\n");
+        indent_source(&ctx, id, &mut text, 3, true);
+        assert_eq!(text, "    first\n  second\n");
+    }
+
+    #[test]
+    fn enter_preserves_indentation_and_indents_block_openers() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("auto-indent-editor");
+        let run = |text: &mut String, language, width| {
+            let mut state = egui::text_edit::TextEditState::default();
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(text.chars().count()),
+            )));
+            state.store(&ctx, id);
+            insert_auto_indented_newline(&ctx, id, text, width, language);
+        };
+
+        let mut yaml = "structures:".to_owned();
+        run(&mut yaml, DecoderLanguage::Yaml, 4);
+        assert_eq!(yaml, "structures:\n    ");
+
+        let mut list_mapping = "  - name: Record".to_owned();
+        run(&mut list_mapping, DecoderLanguage::Yaml, 2);
+        assert_eq!(list_mapping, "  - name: Record\n    ");
+
+        let mut ordinary = "    value".to_owned();
+        run(&mut ordinary, DecoderLanguage::Yaml, 2);
+        assert_eq!(ordinary, "    value\n    ");
+
+        let mut python = "  if ready:".to_owned();
+        run(&mut python, DecoderLanguage::Python, 2);
+        assert_eq!(python, "  if ready:\n    ");
+    }
+
+    #[test]
+    fn enter_replaces_selection_and_expands_existing_indent_tabs() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("auto-indent-selection-editor");
+        let mut text = "\tname: selected".to_owned();
+        let mut state = egui::text_edit::TextEditState::default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(5),
+            egui::text::CCursor::new(text.chars().count()),
+        )));
+        state.store(&ctx, id);
+        insert_auto_indented_newline(
+            &ctx,
+            id,
+            &mut text,
+            4,
+            DecoderLanguage::Yaml,
+        );
+        assert_eq!(text, "\tname\n    ");
+    }
+
+    #[test]
+    fn indentation_conversion_changes_only_leading_tabs() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("convert-tabs-editor");
+        let mut text = "\tkey: \"keep\tvalue\"\n \tchild: 1\n".to_owned();
+        convert_source_indentation(&ctx, id, &mut text, 4);
+        assert_eq!(text, "    key: \"keep\tvalue\"\n    child: 1\n");
+    }
+
+    #[test]
+    fn editor_tab_width_defaults_to_two_and_is_bounded() {
+        let mut editor = YamlLayoutCache::default();
+        assert_eq!(editor.tab_width(), 2);
+        editor.set_tab_width(0);
+        assert_eq!(editor.tab_width(), 1);
+        editor.set_tab_width(99);
+        assert_eq!(editor.tab_width(), 8);
     }
 
     #[test]

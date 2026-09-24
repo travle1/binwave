@@ -148,6 +148,14 @@ impl BrowserApp {
         let (active_draft, other_draft) = if language == crate::source_editor::DecoderLanguage::Python {
             (saved_python, saved_yaml)
         } else { (saved_yaml, saved_python) };
+        let mut editor = crate::source_editor::YamlLayoutCache::default();
+        if let Some(width) = cc
+            .storage
+            .and_then(|storage| storage.get_string("browser-editor-tab-width"))
+            .and_then(|width| width.parse().ok())
+        {
+            editor.set_tab_width(width);
+        }
         Self {
             layout: cc
                 .storage
@@ -197,7 +205,7 @@ impl BrowserApp {
             decoding_language: language,
             python_stdout: String::new(),
             decoder_error: None,
-            editor: Default::default(),
+            editor,
             decoded: Default::default(),
             table: Default::default(),
             plot: Default::default(),
@@ -1592,6 +1600,10 @@ impl eframe::App for BrowserApp {
         if yaml.len() <= 256 * 1024 { storage.set_string("browser-decoder-yaml", yaml.clone()); }
         if python.len() <= 256 * 1024 { storage.set_string("browser-decoder-python", python.clone()); }
         storage.set_string("browser-decoder-language", if self.language == crate::source_editor::DecoderLanguage::Python { "python" } else { "yaml" }.into());
+        storage.set_string(
+            "browser-editor-tab-width",
+            self.editor.tab_width().to_string(),
+        );
     }
 }
 impl TabViewer for BrowserApp {

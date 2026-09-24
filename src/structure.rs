@@ -226,8 +226,8 @@ pub struct TypeChoice {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum Repeat {
-    Count(Expr),
     Until(String),
+    Count(Expr),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -235,9 +235,13 @@ pub enum Repeat {
 pub enum Expr {
     Unsigned(u64),
     Signed(i64),
+    Keyword(String),
     Ref {
         #[serde(rename = "ref")]
         reference: String,
+    },
+    Choose {
+        choose: ExprChoice,
     },
     Add {
         add: Vec<Expr>,
@@ -251,6 +255,16 @@ pub enum Expr {
     Divide {
         divide: Vec<Expr>,
     },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExprChoice {
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub cases: BTreeMap<String, Expr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otherwise: Option<Box<Expr>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -947,6 +961,52 @@ fn valid_field(field: &Field) -> Result<()> {
             field.name
         );
     }
+    if let Some(length) = &field.length {
+        valid_expr(length, true)?;
+    }
+    for expression in [&field.at, &field.relative, &field.align]
+        .into_iter()
+        .flatten()
+    {
+        valid_expr(expression, false)?;
+    }
+    if let Some(Repeat::Count(count)) = &field.repeat {
+        valid_expr(count, false)?;
+    }
+    Ok(())
+}
+
+fn valid_expr(expr: &Expr, allow_remaining: bool) -> Result<()> {
+    match expr {
+        Expr::Keyword(keyword) if keyword == "remaining" => ensure!(
+            allow_remaining,
+            "`remaining` is only valid as a field length"
+        ),
+        Expr::Keyword(keyword) => {
+            bail!("unknown expression keyword {keyword:?}; use a number, reference, or `remaining` length")
+        }
+        Expr::Choose { choose } => {
+            ensure!(
+                !choose.cases.is_empty() || choose.otherwise.is_some(),
+                "length choose needs at least one case or otherwise"
+            );
+            for branch in choose.cases.values() {
+                valid_expr(branch, allow_remaining)?;
+            }
+            if let Some(branch) = &choose.otherwise {
+                valid_expr(branch, allow_remaining)?;
+            }
+        }
+        Expr::Add { add }
+        | Expr::Subtract { subtract: add }
+        | Expr::Multiply { multiply: add }
+        | Expr::Divide { divide: add } => {
+            for operand in add {
+                valid_expr(operand, false)?;
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 fn validate_actions(actions: &[Action], depth: Address) -> Result<()> {
@@ -957,15 +1017,33 @@ fn validate_actions(actions: &[Action], depth: Address) -> Result<()> {
     for action in actions {
         match action {
             Action::Read(f) => valid_field(f)?,
-            Action::Define(d) => valid_name(&d.name)?,
-            Action::Calculate(c) => valid_name(&c.name)?,
+            Action::Define(d) => {
+                valid_name(&d.name)?;
+                for expression in [
+                    &d.fields.repeat,
+                    &d.fields.length,
+                    &d.fields.at,
+                    &d.fields.relative,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    valid_expr(expression, false)?;
+                }
+            }
+            Action::Calculate(c) => {
+                valid_name(&c.name)?;
+                valid_expr(&c.value, false)?;
+            }
             Action::Choose(c) => {
                 for branch in c.cases.values() {
                     validate_actions(branch, depth + 1)?;
                 }
                 validate_actions(&c.otherwise, depth + 1)?;
             }
-            _ => {}
+            Action::Skip(expression) | Action::Align(expression) => {
+                valid_expr(expression, false)?;
+            }
         }
     }
     Ok(())
@@ -1047,12 +1125,16 @@ impl<'a> Engine<'a> {
         let result = match expr {
             Expr::Unsigned(n) => *n as i128,
             Expr::Signed(n) => *n as i128,
+            Expr::Keyword(keyword) => {
+                bail!("{scope}: {keyword:?} is only valid as a field length")
+            }
             Expr::Ref { reference } => {
                 if reference == "$position" {
                     bail!("use a named earlier value or 'relative' for positions");
                 }
                 self.lookup(reference, scope)?.integer()?
             }
+            Expr::Choose { choose } => self.integer(self.selected_expr(choose, scope)?, scope)?,
             Expr::Add { add } => self.arithmetic(add, scope, "add", i128::checked_add)?,
             Expr::Subtract { subtract } => {
                 self.arithmetic(subtract, scope, "subtract", i128::checked_sub)?
@@ -1073,6 +1155,34 @@ impl<'a> Engine<'a> {
             }
         };
         Ok(result)
+    }
+    fn selected_expr<'b>(&self, choice: &'b ExprChoice, scope: &str) -> Result<&'b Expr> {
+        let key = self.lookup(&choice.reference, scope)?.key();
+        choice
+            .cases
+            .get(&key)
+            .or(choice.otherwise.as_deref())
+            .with_context(|| {
+                format!(
+                    "{scope}: no length mapping for {} = {key:?}",
+                    choice.reference
+                )
+            })
+    }
+    fn field_length(
+        &self,
+        expr: &Expr,
+        scope: &str,
+        start: Address,
+        end: Address,
+    ) -> Result<Address> {
+        match expr {
+            Expr::Keyword(keyword) if keyword == "remaining" => Ok(end - start),
+            Expr::Choose { choose } => {
+                self.field_length(self.selected_expr(choose, scope)?, scope, start, end)
+            }
+            _ => self.size(expr, scope),
+        }
     }
     fn arithmetic(
         &self,
@@ -1253,7 +1363,11 @@ impl<'a> Engine<'a> {
         self.check(depth)?;
         let start = *cursor;
         let kind = self.selected_type(&field.kind, path)?;
-        let length = field.length.as_ref().map(|value| self.size(value, path)).transpose()?;
+        let length = field
+            .length
+            .as_ref()
+            .map(|value| self.field_length(value, path, start, outer_end))
+            .transpose()?;
         let end = if let Some(length) = length {
             checked_end(start, length, outer_end)?
         } else {
@@ -1545,7 +1659,7 @@ impl<'a> Engine<'a> {
         let length = field
             .length
             .as_ref()
-            .map(|v| self.size(v, path))
+            .map(|value| self.field_length(value, path, start, outer_end))
             .transpose()?;
         let end = if let Some(length) = length {
             checked_end(start, length, outer_end)?
@@ -1732,6 +1846,11 @@ impl<'a> Engine<'a> {
             return None;
         }
         let base = if let Some(length) = &field.length {
+            // `remaining` depends on the current enclosing boundary, so it can
+            // never establish a reusable fixed record stride.
+            if contains_remaining(length) {
+                return None;
+            }
             self.size(length, scope).ok()?
         } else if let Some(width) = primitive_width(&kind) {
             width
@@ -2002,11 +2121,33 @@ fn matches_expected(actual: &Value, expected: &Literal) -> bool {
 fn expr_references(expr: &Expr) -> Vec<String> {
     match expr {
         Expr::Ref { reference } => vec![reference.clone()],
+        Expr::Choose { choose } => {
+            let mut references = vec![choose.reference.clone()];
+            references.extend(choose.cases.values().flat_map(expr_references));
+            if let Some(otherwise) = &choose.otherwise {
+                references.extend(expr_references(otherwise));
+            }
+            references
+        }
         Expr::Add { add }
         | Expr::Subtract { subtract: add }
         | Expr::Multiply { multiply: add }
         | Expr::Divide { divide: add } => add.iter().flat_map(expr_references).collect(),
         _ => vec![],
+    }
+}
+fn contains_remaining(expr: &Expr) -> bool {
+    match expr {
+        Expr::Keyword(keyword) => keyword == "remaining",
+        Expr::Choose { choose } => {
+            choose.cases.values().any(contains_remaining)
+                || choose.otherwise.as_deref().is_some_and(contains_remaining)
+        }
+        Expr::Add { add }
+        | Expr::Subtract { subtract: add }
+        | Expr::Multiply { multiply: add }
+        | Expr::Divide { divide: add } => add.iter().any(contains_remaining),
+        _ => false,
     }
 }
 fn field_references(field: &Field) -> Vec<String> {
@@ -2294,6 +2435,72 @@ actions:
         );
         assert_eq!(out.nodes[0].children[1].range, 6..10);
         assert_eq!(out.nodes[0].children[1].children[2].range, 8..9);
+    }
+    #[test]
+    fn conditional_length_can_use_stored_sizes_or_the_remaining_region() {
+        let yaml = r#"
+structures:
+  - name: KnownPayload
+    fields:
+      - {name: value, type: u16}
+  - name: TaggedBlock
+    fields:
+      - {name: kind, type: u8}
+      - {name: stored_length, type: u16}
+      - name: payload
+        type:
+          choose:
+            ref: kind
+            cases: {'1': {structure: KnownPayload}}
+            otherwise: bytes
+        length:
+          choose:
+            ref: kind
+            cases: {'0': remaining}
+            otherwise: {ref: stored_length}
+actions:
+  - read: {name: blocks, type: {structure: TaggedBlock}, repeat: until end}
+"#;
+        let out = run(
+            yaml,
+            vec![1, 2, 0, 0x34, 0x12, 0, 0xff, 0xff, 0xaa, 0xbb, 0xcc, 0xdd],
+        )
+        .unwrap();
+        let blocks = &out.nodes[0].children;
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].children[2].range, 3..5);
+        assert_eq!(blocks[0].children[2].children[0].value, Some(Value::Unsigned(0x1234)));
+        assert_eq!(blocks[1].children[1].value, Some(Value::Unsigned(0xffff)));
+        assert_eq!(blocks[1].children[2].range, 8..12);
+        assert_eq!(
+            blocks[1].children[2].value,
+            Some(Value::Bytes(vec![0xaa, 0xbb, 0xcc, 0xdd]))
+        );
+
+        let saved = serde_yaml_ng::to_string(&Program::parse(yaml).unwrap()).unwrap();
+        assert!(saved.contains("remaining"));
+        Program::parse(&saved).unwrap();
+
+        let bounded = run(
+            "structures:\n  - name: Envelope\n    fields:\n      - {name: body, type: bytes, length: remaining}\nactions:\n  - read: {name: envelope, type: {structure: Envelope}, length: 3}\n  - read: {name: footer, type: u8}\n",
+            vec![1, 2, 3, 4],
+        )
+        .unwrap();
+        assert_eq!(bounded.nodes[0].children[0].range, 0..3);
+        assert_eq!(bounded.nodes[1].value, Some(Value::Unsigned(4)));
+    }
+    #[test]
+    fn remaining_is_only_valid_for_lengths_and_choose_needs_a_matching_branch() {
+        for yaml in [
+            "actions: [{skip: remaining}]",
+            "actions: [{read: {name: value, type: u8, at: remaining}}]",
+            "actions: [{read: {name: value, type: bytes, length: leftover}}]",
+        ] {
+            assert!(Program::parse(yaml).is_err(), "accepted invalid YAML: {yaml}");
+        }
+        let yaml = "actions:\n  - read: {name: kind, type: u8}\n  - read:\n      name: payload\n      type: bytes\n      length: {choose: {ref: kind, cases: {'0': remaining}}}\n";
+        let error = run(yaml, vec![1, 0xaa]).unwrap_err();
+        assert!(format!("{error:#}").contains("no length mapping"));
     }
     #[test]
     fn counts_offsets_arithmetic_and_exact_u64_values_are_preserved() {

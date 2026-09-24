@@ -498,6 +498,10 @@ impl StructureWorkspace {
         self.output.as_ref()?.nodes.iter().find(|n| n.name == name).map(|n| n.range.clone())
     }
     pub fn code_action(&mut self, action: &'static str) { self.yaml_layout.command(action); }
+    pub fn editor_tab_width(&self) -> usize { self.yaml_layout.tab_width() }
+    pub fn set_editor_tab_width(&mut self, width: usize) {
+        self.yaml_layout.set_tab_width(width);
+    }
     pub fn selected_node(&self) -> Option<Node> {
         self.output
             .as_ref()
@@ -1093,14 +1097,20 @@ impl ValueInput {
 fn compound_expression(value: &Expr) -> bool {
     matches!(
         value,
-        Expr::Add { .. } | Expr::Subtract { .. } | Expr::Multiply { .. } | Expr::Divide { .. }
+        Expr::Choose { .. }
+            | Expr::Add { .. }
+            | Expr::Subtract { .. }
+            | Expr::Multiply { .. }
+            | Expr::Divide { .. }
     )
 }
 fn expression_label(value: &Expr) -> String {
     match value {
         Expr::Unsigned(n) => n.to_string(),
         Expr::Signed(n) => n.to_string(),
+        Expr::Keyword(keyword) => keyword.clone(),
         Expr::Ref { reference } => reference.clone(),
+        Expr::Choose { choose } => format!("choose by {}", choose.reference),
         Expr::Add { add } => expression_list("add", add),
         Expr::Subtract { subtract } => expression_list("subtract", subtract),
         Expr::Multiply { multiply } => expression_list("multiply", multiply),
@@ -2990,6 +3000,9 @@ fn expression(text: &str) -> Result<Expr> {
     }
     if text.starts_with('-') && text[1..].chars().all(|c| c.is_ascii_digit()) {
         return Ok(Expr::Signed(text.parse()?));
+    }
+    if text == "remaining" {
+        return Ok(Expr::Keyword(text.into()));
     }
     if !valid_reference(text) {
         bail!("Use a number or field path. Use a Calculate step for arithmetic.");

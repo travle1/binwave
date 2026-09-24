@@ -284,6 +284,13 @@ impl BinwaveApp {
         let mut app = Self::default();
         app.workspace = WorkspaceLayout::load(cc.storage);
         app.restore_file_locations(cc.storage);
+        if let Some(width) = cc
+            .storage
+            .and_then(|storage| storage.get_string("editor-tab-width"))
+            .and_then(|width| width.parse().ok())
+        {
+            app.binary.set_editor_tab_width(width);
+        }
         app
     }
 
@@ -1673,6 +1680,10 @@ impl eframe::App for BinwaveApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.workspace.save(storage);
         self.file_locations.save(storage);
+        storage.set_string(
+            "editor-tab-width",
+            self.binary.editor_tab_width().to_string(),
+        );
     }
 }
 

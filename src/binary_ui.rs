@@ -1520,6 +1520,12 @@ impl BinaryWorkspace {
             && !self.structure_ui.is_parsing()
             && !self.active_authoring_dirty()
     }
+
+    pub fn editor_tab_width(&self) -> usize { self.structure_ui.editor_tab_width() }
+
+    pub fn set_editor_tab_width(&mut self, width: usize) {
+        self.structure_ui.set_editor_tab_width(width);
+    }
     pub fn save_copy(&mut self, ctx: &Context) {
         if self.commands_available() {
             self.choose_save(ctx, false);
