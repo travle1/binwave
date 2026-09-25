@@ -5,7 +5,7 @@ endian: little
 structures:
   - name: Description
     fields:
-      - {name: name, type: text, length: 4}
+      - {name: name, type: string, length: 4}
       - {name: format, type: u8}
       - {name: count, type: u8}
   - name: Definitions

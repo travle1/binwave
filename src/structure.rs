@@ -24,6 +24,7 @@ const MAX_DEPTH: Address = 64;
 const LAZY_THRESHOLD: Address = 128;
 const MAX_PAGE: Address = 512;
 const MAX_TEXT: Address = 1024 * 1024;
+const MAX_PARTIAL_LEAVES: usize = 8_192;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -247,8 +248,8 @@ pub enum Repeat {
     Count(Expr),
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
 pub enum Expr {
     Unsigned(u64),
     Signed(i64),
@@ -272,6 +273,75 @@ pub enum Expr {
     Divide {
         divide: Vec<Expr>,
     },
+}
+
+impl<'de> Deserialize<'de> for Expr {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ExprVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ExprVisitor {
+            type Value = Expr;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(
+                    "a number, remaining, {ref: field}, {choose: ...}, or an arithmetic expression",
+                )
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(Expr::Unsigned(value))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                if value >= 0 {
+                    Ok(Expr::Unsigned(value as u64))
+                } else {
+                    Ok(Expr::Signed(value))
+                }
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(Expr::Keyword(value.into()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(Expr::Keyword(value))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let key: String = map.next_key()?.ok_or_else(|| {
+                    serde::de::Error::custom("an expression mapping cannot be empty")
+                })?;
+                let expression = match key.as_str() {
+                    "ref" => Expr::Ref { reference: map.next_value()? },
+                    "choose" => Expr::Choose { choose: map.next_value()? },
+                    "add" => Expr::Add { add: map.next_value()? },
+                    "subtract" => Expr::Subtract { subtract: map.next_value()? },
+                    "multiply" => Expr::Multiply { multiply: map.next_value()? },
+                    "divide" => Expr::Divide { divide: map.next_value()? },
+                    unknown => {
+                        let _: serde::de::IgnoredAny = map.next_value()?;
+                        return Err(serde::de::Error::unknown_field(
+                            unknown,
+                            &["ref", "choose", "add", "subtract", "multiply", "divide"],
+                        ));
+                    }
+                };
+                if let Some(extra) = map.next_key::<String>()? {
+                    let _: serde::de::IgnoredAny = map.next_value()?;
+                    return Err(serde::de::Error::custom(format!(
+                        "an expression has one operation; remove the extra {extra:?} key"
+                    )));
+                }
+                Ok(expression)
+            }
+        }
+
+        deserializer.deserialize_any(ExprVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -474,6 +544,59 @@ pub struct Node {
     pub references: Vec<String>,
 }
 impl Node {
+    pub fn tree_label(&self) -> String {
+        if self.name.starts_with('[') && self.name.ends_with(']') {
+            if let Some((parent, index)) = self.path.rsplit_once('[') {
+                if let Ok(index) = index.trim_end_matches(']').parse::<usize>() {
+                    let parent = parent.rsplit('.').next().unwrap_or(parent);
+                    return format!("{parent}[{index}]");
+                }
+            }
+        }
+        self.name.clone()
+    }
+    pub fn tree_summary(&self) -> String {
+        if self.lazy.is_some() || self.value.is_some() {
+            return format!("{} · {}", self.kind, self.display());
+        }
+        let bytes = self.range.end.saturating_sub(self.range.start);
+        let section_type = self.children.iter().take(4).find(|child| {
+            matches!(child.name.as_str(), "type" | "kind" | "tag" | "id")
+                || child.name.ends_with("_type")
+        }).and_then(|child| child.value.as_ref().map(|value| format!("{}={value}", child.name)));
+        let section_type = section_type.map_or_else(String::new, |value| format!(" · {value}"));
+        if self.kind == "partial collection" {
+            format!("{} items decoded · incomplete · starts 0x{:X}", self.children.len(), self.range.start)
+        } else if self.kind == "partial" {
+            format!("{bytes} bytes decoded{section_type} · incomplete · starts 0x{:X}", self.range.start)
+        } else if self.kind.ends_with("[]") {
+            format!("{} items · {bytes} bytes · starts 0x{:X}", self.children.len(), self.range.start)
+        } else {
+            format!("{}{section_type} · {bytes} bytes · starts 0x{:X}", self.kind, self.range.start)
+        }
+    }
+    pub fn numeric_tooltip(&self) -> Option<String> {
+        let (decimal, raw) = match self.value.as_ref()? {
+            Value::Signed(value) => (value.to_string(), *value as u64),
+            Value::Unsigned(value) => (value.to_string(), *value),
+            _ => return None,
+        };
+        let bits = match self.kind.as_str() {
+            "u8" | "i8" => 8,
+            "u16" | "i16" => 16,
+            "u24" | "i24" => 24,
+            "u32" | "i32" => 32,
+            "u64" | "i64" => 64,
+            _ => self.range.end.saturating_sub(self.range.start).saturating_mul(8).clamp(1, 64) as usize,
+        };
+        let raw = if bits == 64 { raw } else { raw & ((1_u64 << bits) - 1) };
+        Some(format!(
+            "{} · {bits} bits\nDecimal: {decimal}\nHex: 0x{raw:0hex_width$X}\nBinary: 0b{raw:0binary_width$b}",
+            self.kind,
+            hex_width = (bits + 3) / 4,
+            binary_width = bits,
+        ))
+    }
     pub fn numeric(&self) -> Option<f64> {
         self.value.as_ref().and_then(Value::numeric)
     }
@@ -498,6 +621,12 @@ pub struct ParseOutput {
     pub definitions: Vec<ResolvedDefinition>,
     pub revision: u64,
     pub consumed: Address,
+}
+#[derive(Debug)]
+pub struct ParseFailure {
+    pub error: anyhow::Error,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub output: ParseOutput,
 }
 #[derive(Debug, Clone)]
 pub struct ResolvedDefinition {
@@ -909,17 +1038,36 @@ impl Program {
         Ok(program)
     }
     pub fn run(&self, source: &ByteView, cancel: &AtomicBool) -> Result<ParseOutput> {
-        source.validate()?;
-        let output = self.run_from(source, cancel, source.revision)?;
-        source.validate()?;
+        self.run_with_partial(source, cancel).map_err(|failure| failure.error)
+    }
+    pub fn run_with_partial(
+        &self,
+        source: &ByteView,
+        cancel: &AtomicBool,
+    ) -> std::result::Result<ParseOutput, ParseFailure> {
+        source.validate().map_err(|error| ParseFailure {
+            error,
+            output: ParseOutput { nodes: Vec::new(), definitions: Vec::new(), revision: source.revision, consumed: 0 },
+        })?;
+        let output = self.run_from_with_partial(source, cancel, source.revision)?;
+        source.validate().map_err(|error| ParseFailure { error, output: output.clone() })?;
         Ok(output)
     }
+    #[cfg(test)]
     fn run_from(
         &self,
         source: &dyn Source,
         cancel: &AtomicBool,
         revision: u64,
     ) -> Result<ParseOutput> {
+        self.run_from_with_partial(source, cancel, revision).map_err(|failure| failure.error)
+    }
+    fn run_from_with_partial(
+        &self,
+        source: &dyn Source,
+        cancel: &AtomicBool,
+        revision: u64,
+    ) -> std::result::Result<ParseOutput, ParseFailure> {
         let mut engine = Engine::new(
             source,
             cancel,
@@ -932,7 +1080,7 @@ impl Program {
         }
         let mut cursor = 0;
         let mut nodes = Vec::new();
-        engine.actions(
+        if let Err(error) = engine.actions(
             &self.actions,
             "",
             &mut cursor,
@@ -940,7 +1088,17 @@ impl Program {
             self.endian,
             &mut nodes,
             0,
-        )?;
+        ) {
+            return Err(ParseFailure {
+                error,
+                output: ParseOutput {
+                    nodes: partial_tree(&nodes, &engine.progress),
+                    definitions: engine.definitions,
+                    revision,
+                    consumed: cursor,
+                },
+            });
+        }
         Ok(ParseOutput {
             nodes,
             definitions: engine.definitions,
@@ -1086,6 +1244,92 @@ fn describe(
     }
 }
 
+fn partial_tree(completed: &[Node], progress: &[Node]) -> Vec<Node> {
+    fn segments(path: &str) -> Vec<&str> {
+        let mut parts = Vec::new();
+        for component in path.split('.') {
+            let mut rest = component;
+            while let Some(open) = rest.find('[') {
+                if open > 0 { parts.push(&rest[..open]); }
+                let Some(close) = rest[open..].find(']') else { break; };
+                let close = open + close + 1;
+                parts.push(&rest[open..close]);
+                rest = &rest[close..];
+            }
+            if !rest.is_empty() { parts.push(rest); }
+        }
+        parts
+    }
+    fn insert(nodes: &mut Vec<Node>, parts: &[&str], leaf: &Node, parent: &str) {
+        let Some((name, rest)) = parts.split_first() else { return; };
+        let path = if parent.is_empty() || name.starts_with('[') {
+            format!("{parent}{name}")
+        } else {
+            format!("{parent}.{name}")
+        };
+        let index = nodes.iter().position(|node| node.path == path).unwrap_or_else(|| {
+            nodes.push(Node {
+                name: (*name).to_owned(), path: path.clone(), range: leaf.range.clone(),
+                kind: if rest.first().is_some_and(|part| part.starts_with('[')) {
+                    "partial collection"
+                } else {
+                    "partial"
+                }.into(), value: None, children: Vec::new(), lazy: None,
+                endian: leaf.endian, references: Vec::new(),
+            });
+            nodes.len() - 1
+        });
+        let node = &mut nodes[index];
+        node.range.start = node.range.start.min(leaf.range.start);
+        node.range.end = node.range.end.max(leaf.range.end);
+        if rest.is_empty() {
+            let children = std::mem::take(&mut node.children);
+            *node = leaf.clone();
+            for child in children {
+                if !node.children.iter().any(|preview| preview.path == child.path) {
+                    node.children.push(child);
+                }
+            }
+        } else {
+            insert(&mut node.children, rest, leaf, &path);
+        }
+    }
+
+    let mut roots = Vec::new();
+    for leaf in progress {
+        let parts = segments(&leaf.path);
+        insert(&mut roots, &parts, leaf, "");
+    }
+    for node in completed {
+        if let Some(index) = roots.iter().position(|root| root.path == node.path) {
+            roots[index] = node.clone();
+        } else {
+            roots.push(node.clone());
+        }
+    }
+    roots
+}
+
+/// On a size mismatch, decode only the first item and its first nested item.
+/// Keep the lazy collections for the rest; a bad tentative item must not hide
+/// the partial tree or make the failed run expensive on large files.
+fn preview_first_items(node: &mut Node, source: &dyn Source, cancel: &AtomicBool, depth: u8) {
+    if depth == 0 { return; }
+    if let Some(array) = &node.lazy {
+        if array.count == 0 { return; }
+        if let Ok(mut first) = array.page_from(source, cancel, 0, 1) {
+            for child in &mut first {
+                preview_first_items(child, source, cancel, depth - 1);
+            }
+            node.children = first;
+        }
+    } else {
+        for child in &mut node.children {
+            preview_first_items(child, source, cancel, depth);
+        }
+    }
+}
+
 struct Engine<'a> {
     source: &'a dyn Source,
     cancel: &'a AtomicBool,
@@ -1095,6 +1339,7 @@ struct Engine<'a> {
     values: HashMap<String, Value>,
     collections: HashMap<String, Node>,
     definitions: Vec<ResolvedDefinition>,
+    progress: Vec<Node>,
     nodes: Address,
 }
 impl<'a> Engine<'a> {
@@ -1114,7 +1359,13 @@ impl<'a> Engine<'a> {
             values: HashMap::new(),
             collections: HashMap::new(),
             definitions: Vec::new(),
+            progress: Vec::new(),
             nodes: 0,
+        }
+    }
+    fn record_progress(&mut self, node: &Node) {
+        if node.value.is_some() && self.progress.len() < MAX_PARTIAL_LEAVES {
+            self.progress.push(node.clone());
         }
     }
     fn check(&mut self, depth: Address) -> Result<()> {
@@ -1402,9 +1653,9 @@ impl<'a> Engine<'a> {
                 value = Some(Value::Bytes(self.exact(start, (end - start).min(64))?));
             }
             *cursor = end;
-        } else if kind == "text" {
-            ensure!(length.is_some(), "{path}: text requires a byte length");
-            ensure!(end - start <= MAX_TEXT, "{path}: text exceeds 1 MiB; inspect it as bytes instead");
+        } else if kind == "string" {
+            ensure!(length.is_some(), "{path}: string requires a byte length");
+            ensure!(end - start <= MAX_TEXT, "{path}: string exceeds 1 MiB; inspect it as bytes instead");
             if keep_value {
                 value = Some(Value::Text(String::from_utf8(self.exact(start, end - start)?)
                     .with_context(|| format!("{path}: invalid UTF-8 text"))?));
@@ -1498,8 +1749,11 @@ impl<'a> Engine<'a> {
             scanner.collections.clear();
             scanner.nodes = 0;
             let item_path = format!("{path}[{index}]");
-            scanner.scan_single(element, &item_path, &mut cursor, end, endian, depth + 1, &needed)
-                .with_context(|| format!("item {index} at byte {before}"))?;
+            if scanner.scan_single(element, &item_path, &mut cursor, end, endian, depth + 1, &needed).is_err() {
+                // An index is all-or-nothing. Re-run the ordinary reader on
+                // failure so completed records and fields remain inspectable.
+                return Ok(None);
+            }
             ensure!(cursor > before, "{path}: repeated item consumed no bytes");
             offsets.push(cursor);
         }
@@ -1531,11 +1785,32 @@ impl<'a> Engine<'a> {
             Repeat::Count(expr) => Some(self.size(expr, path)?),
             Repeat::Until(_) => {
                 if let Some(width) = stride.filter(|w| *w > 0) {
-                    ensure!(
-                        (end - start) % width == 0,
-                        "{path}: {} trailing bytes do not form a complete {width}-byte item",
-                        (end - start) % width
-                    );
+                    let region = end - start;
+                    let complete = region / width;
+                    let remainder = region % width;
+                    if remainder != 0 {
+                        if complete > 0 {
+                            let complete_end = start + complete * width;
+                            let mut node = self.fixed_array_node(
+                                field, &element, path, start, complete_end, complete, width, endian,
+                            )?;
+                            preview_first_items(&mut node, self.source, self.cancel, 2);
+                            if self.progress.len() == MAX_PARTIAL_LEAVES {
+                                self.progress.pop();
+                            }
+                            self.progress.push(node);
+                            *cursor = complete_end;
+                        }
+                        let per_item = (complete > 0 && remainder % complete == 0)
+                            .then(|| {
+                                let extra = remainder / complete;
+                                format!(" The excess divides evenly into {extra} {} per complete item; check for an unmodeled per-item header or trailer.", if extra == 1 { "byte" } else { "bytes" })
+                            })
+                            .unwrap_or_default();
+                        anyhow::bail!(
+                            "{path}: fixed-size repeat at byte {start} has {region} bytes available; {complete} complete {width}-byte items fit; {remainder} bytes remain. Their ranges are available as a tentative prefix in Decoded structure; expand an item to decode its fields.{per_item}"
+                        );
+                    }
                     Some((end - start) / width)
                 } else {
                     None
@@ -1549,31 +1824,7 @@ impl<'a> Engine<'a> {
             let array_end = checked_end(start, length, end)?;
             if count > LAZY_THRESHOLD {
                 *cursor = array_end;
-                let node = Node {
-                    name: field.name.clone(),
-                    path: path.into(),
-                    range: start..array_end,
-                    kind: format!("{}[]", self.selected_type(&field.kind, path)?),
-                    value: None,
-                    children: vec![],
-                    lazy: Some(LazyArray {
-                        count,
-                        stride,
-                        offsets: None,
-                        plan: Arc::new(LazyPlan {
-                            field: element,
-                            start,
-                            end: array_end,
-                            path: path.into(),
-                            endian: field.endian.unwrap_or(endian),
-                            values: self.values.clone(),
-                            structures: self.structures.clone(),
-                            revision: self.revision,
-                        }),
-                    }),
-                    endian: field.endian.unwrap_or(endian),
-                    references: field_references(field),
-                };
+                let node = self.fixed_array_node(field, &element, path, start, array_end, count, stride, endian)?;
                 self.collections.insert(path.into(), node.clone());
                 return Ok(node);
             }
@@ -1642,6 +1893,9 @@ impl<'a> Engine<'a> {
                 .with_context(|| format!("item {index} at byte {before}"))?;
             ensure!(*cursor > before, "{path}: repeated item consumed no bytes");
             child.name = format!("[{index}]");
+            if self.progress.len() < MAX_PARTIAL_LEAVES {
+                self.progress.push(child.clone());
+            }
             children.push(child);
         }
         let node = Node {
@@ -1657,6 +1911,34 @@ impl<'a> Engine<'a> {
         };
         self.collections.insert(path.into(), node.clone());
         Ok(node)
+    }
+
+    fn fixed_array_node(
+        &self, field: &Field, element: &Field, path: &str, start: Address,
+        end: Address, count: Address, stride: Address, endian: Endian,
+    ) -> Result<Node> {
+        Ok(Node {
+            name: field.name.clone(),
+            path: path.into(),
+            range: start..end,
+            kind: format!("{}[]", self.selected_type(&field.kind, path)?),
+            value: None,
+            children: vec![],
+            lazy: Some(LazyArray {
+                count,
+                stride,
+                offsets: None,
+                plan: Arc::new(LazyPlan {
+                    field: element.clone(), start, end, path: path.into(),
+                    endian: field.endian.unwrap_or(endian),
+                    values: self.values.clone(),
+                    structures: self.structures.clone(),
+                    revision: self.revision,
+                }),
+            }),
+            endian: field.endian.unwrap_or(endian),
+            references: field_references(field),
+        })
     }
     fn single(
         &mut self,
@@ -1692,11 +1974,11 @@ impl<'a> Engine<'a> {
             ensure!(length.is_some(), "{path}: bytes requires a length");
             value = Some(Value::Bytes(self.exact(start, (end - start).min(64))?));
             *cursor = end;
-        } else if kind == "text" {
-            ensure!(length.is_some(), "{path}: text requires a byte length");
+        } else if kind == "string" {
+            ensure!(length.is_some(), "{path}: string requires a byte length");
             ensure!(
                 end - start <= MAX_TEXT,
-                "{path}: text exceeds 1 MiB; inspect it as bytes instead"
+                "{path}: string exceeds 1 MiB; inspect it as bytes instead"
             );
             let bytes = self.exact(start, end - start)?;
             value = Some(Value::Text(
@@ -1826,6 +2108,7 @@ impl<'a> Engine<'a> {
         if !node.children.is_empty() {
             self.collections.insert(path.into(), node.clone());
         }
+        self.record_progress(&node);
         Ok(node)
     }
     fn exact(&self, offset: Address, length: Address) -> Result<Vec<u8>> {
@@ -1851,7 +2134,7 @@ impl<'a> Engine<'a> {
         // still execute those actions (they may publish definitions for later reads).
         let kind = self.selected_type(&field.kind, scope).ok()?;
         if primitive_width(&kind).is_none()
-            && !matches!(kind.as_str(), "text" | "bytes" | "cstring" | "varuint")
+            && !matches!(kind.as_str(), "string" | "bytes" | "cstring" | "varuint")
             && !self.structures.contains_key(&kind)
         {
             return None;
@@ -1930,7 +2213,7 @@ impl<'a> Engine<'a> {
             primitive_width(&definition.name).is_none()
                 && !matches!(
                     definition.name.as_str(),
-                    "bytes" | "text" | "cstring" | "varuint"
+                    "bytes" | "string" | "cstring" | "varuint"
                 ),
             "structure name {:?} is reserved",
             definition.name
@@ -1999,7 +2282,7 @@ impl<'a> Engine<'a> {
             let kind = self.choice(&definition.fields.kind, &element.path)?;
             ensure!(
                 primitive_width(&kind).is_some()
-                    || matches!(kind.as_str(), "bytes" | "text" | "cstring" | "varuint")
+                    || matches!(kind.as_str(), "bytes" | "string" | "cstring" | "varuint")
                     || self.structures.contains_key(&kind),
                 "discovered type {kind:?} is not a defined structure or primitive"
             );
@@ -2091,7 +2374,7 @@ fn align(cursor: Address, alignment: Address, end: Address) -> Result<Address> {
 }
 /// The editor uses the same built-in type vocabulary as the interpreter.
 pub(crate) fn is_builtin_type(kind: &str) -> bool {
-    primitive_width(kind).is_some() || matches!(kind, "bytes" | "text" | "cstring" | "varuint")
+    primitive_width(kind).is_some() || matches!(kind, "bytes" | "string" | "cstring" | "varuint")
 }
 
 fn primitive_width(kind: &str) -> Option<Address> {
@@ -2208,7 +2491,7 @@ endian: little
 structures:
   - name: Entry
     fields:
-      - {name: label, type: text, length: 4}
+      - {name: label, type: string, length: 4}
       - {name: code, type: u8}
       - {name: count, type: u8}
   - name: Catalog
@@ -2254,7 +2537,21 @@ actions:
             "actions: [{read: {name: x, type: {structure: u32}}}]",
             "actions: [{read: {name: x, type: {choose: {ref: tag, cases: {'1': Record}}}}}]",
             "actions: [{read: {name: x, type: {choose: {ref: tag, otherwise: Record}}}}]",
+            "actions: [{read: {name: label, type: text, length: 4}}]",
         ] { assert!(Program::parse(yaml).is_err(), "unexpectedly accepted {yaml}"); }
+    }
+
+    #[test]
+    fn tree_shows_array_indices_structure_discriminators_and_integer_formats() {
+        let yaml = "structures:\n  - name: Section\n    fields:\n      - {name: section_type, type: u32}\n      - {name: signed_value, type: i16}\nactions:\n  - read: {name: sections, type: {structure: Section}, repeat: 1}\n";
+        let output = run(yaml, vec![4, 0, 0, 0, 0xFE, 0xFF]).unwrap();
+        let section = &output.nodes[0].children[0];
+        assert_eq!(section.tree_label(), "sections[0]");
+        assert!(section.tree_summary().contains("Section · section_type=4"));
+        assert_eq!(section.children[0].tree_summary(), "u32 · 4");
+        assert_eq!(section.children[0].numeric_tooltip().as_deref(), Some("u32 · 32 bits\nDecimal: 4\nHex: 0x00000004\nBinary: 0b00000000000000000000000000000100"));
+        assert_eq!(section.children[1].tree_summary(), "i16 · -2");
+        assert_eq!(section.children[1].numeric_tooltip().as_deref(), Some("i16 · 16 bits\nDecimal: -2\nHex: 0xFFFE\nBinary: 0b1111111111111110"));
     }
 
     #[test]
@@ -2286,7 +2583,7 @@ actions:
 structures:
   - name: Entry
     fields:
-      - {name: format, type: text, length: 3}
+      - {name: format, type: string, length: 3}
 actions:
   - read: {name: definitions, type: {structure: Entry}, repeat: 2}
   - define:
@@ -2558,6 +2855,101 @@ actions:
         .is_err());
         assert!(run("structures: [{name: Loop, fields: [{name: loop, type: {structure: Loop}}]}]\nactions: [{read: {name: x, type: {structure: Loop}}}]", vec![1]).is_err());
         assert!(run("actions: [{read: {name: x, type: u8, expect: 2}}]", vec![1]).is_err());
+    }
+    #[test]
+    fn failed_run_retains_completed_fields_as_a_partial_tree() {
+        let program = Program::parse(
+            "structures:\n  - name: Packet\n    fields:\n      - {name: tag, type: u8}\n      - {name: value, type: u32}\nactions:\n  - read: {name: packet, type: {structure: Packet}}\n",
+        ).unwrap();
+        let failure = program
+            .run_from_with_partial(&Bytes(vec![7, 1]), &AtomicBool::new(false), 9)
+            .unwrap_err();
+
+        assert!(format!("{:#}", failure.error).contains("byte range"));
+        assert_eq!(failure.output.consumed, 1);
+        assert_eq!(failure.output.revision, 9);
+        assert_eq!(failure.output.nodes[0].name, "packet");
+        assert_eq!(failure.output.nodes[0].kind, "partial");
+        assert_eq!(failure.output.nodes[0].children[0].name, "tag");
+        assert_eq!(failure.output.nodes[0].children[0].value, Some(Value::Unsigned(7)));
+        assert_eq!(failure.output.nodes[0].children[0].range, 0..1);
+    }
+    #[test]
+    fn failed_variable_section_keeps_prior_items_and_partial_item() {
+        let yaml = r#"
+structures:
+  - name: Section
+    fields:
+      - {name: tag, type: u8}
+      - {name: size, type: u8}
+      - {name: payload, type: bytes, length: {ref: size}}
+actions:
+  - read: {name: signature, type: u8}
+  - read: {name: sections, type: {structure: Section}, repeat: until end}
+"#;
+        let failure = Program::parse(yaml).unwrap()
+            .run_from_with_partial(&Bytes(vec![9, 1, 1, 42, 2, 3, 99]), &AtomicBool::new(false), 1)
+            .unwrap_err();
+        assert!(format!("{:#}", failure.error).contains("byte range"));
+        let roots = &failure.output.nodes;
+        assert_eq!(roots[0].path, "signature");
+        assert_eq!(roots[1].path, "sections");
+        assert_eq!(roots[1].tree_summary(), "2 items decoded · incomplete · starts 0x1");
+        assert_eq!(roots[1].children[0].tree_label(), "sections[0]");
+        assert_eq!(roots[1].children[0].children[2].value, Some(Value::Bytes(vec![42])));
+        assert_eq!(roots[1].children[1].tree_label(), "sections[1]");
+        assert_eq!(roots[1].children[1].children[0].value, Some(Value::Unsigned(2)));
+    }
+    #[test]
+    fn incomplete_final_block_keeps_previous_sections() {
+        let yaml = r#"
+structures:
+  - name: Data
+    fields:
+      - {name: blocks, type: u16, repeat: until end}
+  - name: Section
+    fields:
+      - {name: kind, type: u8}
+      - {name: size, type: u8}
+      - name: payload
+        type: {choose: {ref: kind, cases: {'0': {structure: Data}}, otherwise: bytes}}
+        length: {ref: size}
+actions:
+  - read: {name: signature, type: u8}
+  - read: {name: sections, type: {structure: Section}, repeat: until end}
+"#;
+        let failure = Program::parse(yaml).unwrap()
+            .run_from_with_partial(&Bytes(vec![9, 1, 1, 42, 0, 3, 1, 2, 3]), &AtomicBool::new(false), 1)
+            .unwrap_err();
+        assert!(format!("{:#}", failure.error).contains("fixed-size repeat"));
+        let sections = &failure.output.nodes[1];
+        assert_eq!(sections.children.len(), 2);
+        assert_eq!(sections.children[0].children[2].value, Some(Value::Bytes(vec![42])));
+        assert_eq!(sections.children[1].children[0].value, Some(Value::Unsigned(0)));
+        assert_eq!(sections.children[1].children[1].value, Some(Value::Unsigned(3)));
+        let completed = &sections.children[1].children[2].children[0];
+        assert_eq!(completed.path, "sections[1].payload.blocks");
+        assert_eq!(completed.lazy.as_ref().unwrap().count, 1);
+        assert_eq!(completed.range, 6..8);
+    }
+    #[test]
+    fn fixed_repeat_size_error_keeps_inspectable_complete_blocks() {
+        let yaml = "structures:\n  - name: Block\n    fields:\n      - {name: samples, type: u16, repeat: 2}\nactions:\n  - read: {name: blocks, type: {structure: Block}, repeat: until end}\n";
+        let bytes = Bytes(vec![1, 0, 2, 0, 3, 0, 4, 0, 9, 9]);
+        let failure = Program::parse(yaml).unwrap()
+            .run_from_with_partial(&bytes, &AtomicBool::new(false), 1)
+            .unwrap_err();
+        let message = format!("{:#}", failure.error);
+        assert!(message.contains("10 bytes available; 2 complete 4-byte items fit; 2 bytes remain"), "{message}");
+        assert!(message.contains("1 byte per complete item"), "{message}");
+        assert_eq!(failure.output.consumed, 8);
+        let blocks = &failure.output.nodes[0];
+        assert_eq!(blocks.lazy.as_ref().unwrap().count, 2);
+        assert_eq!(blocks.range, 0..8);
+        assert_eq!(blocks.children[0].path, "blocks[0]");
+        assert_eq!(blocks.children[0].children[0].children[0].value, Some(Value::Unsigned(1)));
+        let first = blocks.lazy.as_ref().unwrap().page_from(&bytes, &AtomicBool::new(false), 0, 1).unwrap();
+        assert_eq!(first[0].children[0].children[0].value, Some(Value::Unsigned(1)));
     }
     #[test]
     fn text_terminators_leb128_and_bounded_offsets_are_checked() {

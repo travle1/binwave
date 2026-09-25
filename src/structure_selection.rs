@@ -65,6 +65,7 @@ pub(crate) fn sample_for_node(nodes: &[Node], field: &Node) -> Option<(Address, 
 }
 
 /// Resolve one selected field, paging only its containing lazy records.
+#[cfg(any(test, target_arch = "wasm32"))]
 pub(crate) fn resolved_field(
     nodes: &[Node],
     source: &crate::byte_store::ByteView,

@@ -389,6 +389,12 @@ impl StructureViews {
     }
 
     pub fn expand(&mut self, path: &str) { self.expanded.insert(path.into()); self.reveal_tree = Some(path.into()); }
+    pub fn expand_first_page(&mut self, node: &Node, revision: u64) {
+        self.expand(&node.path);
+        if node.children.is_empty() {
+            self.queue_page(node, 0, revision);
+        }
+    }
     pub fn tree(
         &mut self,
         ui: &mut Ui,
@@ -404,6 +410,7 @@ impl StructureViews {
             return None;
         }
         self.select_bytes(output, selection);
+        ui.weak("Expand an item to inspect its fields. Click a row to highlight its bytes in Hex; hover a number for decimal, hex, and binary.");
         let mut clicked = None;
         self.definition_details(ui, output, &mut clicked);
         if let Some(request) = self.desired.clone().filter(|request| {
@@ -463,15 +470,18 @@ impl StructureViews {
                                 ui.add_space(18.);
                             }
                             let response = names(ui, node);
-                            let value_response = ui.selectable_label(self.selected.as_deref() == Some(&node.path), format!(": {}", display(node, 90)));
-                            response.clone().on_hover_text(format!(
+                            let tooltip = format!(
                                 "{}\n{} · 0x{:X}..0x{:X}\n{}",
                                 node.path,
                                 node.kind,
                                 node.range.start,
                                 node.range.end,
                                 node.references.join("\n")
-                            ));
+                            );
+                            let tooltip = node.numeric_tooltip().map_or(tooltip.clone(), |number| format!("{number}\n\n{tooltip}"));
+                            let value_response = ui.selectable_label(self.selected.as_deref() == Some(&node.path), format!("· {}", tree_display(node, 90)))
+                                .on_hover_text(&tooltip);
+                            response.clone().on_hover_text(&tooltip);
                             if response.clicked() || value_response.clicked() {
                                 node_click = Some(node.clone());
                             }
@@ -508,7 +518,7 @@ impl StructureViews {
         clicked: &mut Option<Range<usize>>,
     ) {
         ui.collapsing(
-            format!("Resolved types ({})", output.definitions.len()),
+            format!("Decoder type definitions ({})", output.definitions.len()),
             |ui| {
                 if output.definitions.is_empty() {
                     ui.weak("No resolved types.");
@@ -1923,7 +1933,11 @@ fn flatten_visible<'a>(
                 .filter(|page| page.key.path == node.path && page.key.revision == revision)
                 .and_then(|page| page.result.as_ref().ok())
             {
-                flatten_visible(nodes, depth + 1, expanded, None, revision, rows);
+                for child in nodes {
+                    if !node.children.iter().any(|preview| preview.path == child.path) {
+                        flatten_visible(std::slice::from_ref(child), depth + 1, expanded, None, revision, rows);
+                    }
+                }
             }
         }
     }
@@ -1948,10 +1962,6 @@ fn centered_view(center: usize, width: usize, count: usize) -> Range<usize> {
         .saturating_sub(width / 2)
         .min(count.saturating_sub(width));
     start..start + width
-}
-
-fn resized_view(view: &Range<usize>, width: usize, count: usize) -> Range<usize> {
-    centered_view(view.start.saturating_add(view.len() / 2), width, count)
 }
 
 fn padded_selection(samples: &Range<usize>, count: usize) -> Range<usize> {
@@ -2055,6 +2065,14 @@ fn display(node: &Node, limit: usize) -> String {
             text
         }
         _ => clipped(&node.display(), limit),
+    }
+}
+
+fn tree_display(node: &Node, limit: usize) -> String {
+    if node.value.is_some() || node.lazy.is_some() {
+        display(node, limit)
+    } else {
+        clipped(&node.tree_summary(), limit)
     }
 }
 
@@ -2499,7 +2517,7 @@ actions:
     fn eager_numeric_samples_are_preferred_over_large_non_numeric_collections() {
         let bytes = vec![0; 140];
         let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
-        let output = Program::parse("actions: [{read: {name: strings, type: text, length: 1, repeat: 100}}, {read: {name: measurements, type: u16, repeat: 20}}]")
+        let output = Program::parse("actions: [{read: {name: strings, type: string, length: 1, repeat: 100}}, {read: {name: measurements, type: u16, repeat: 20}}]")
             .unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
         let mut views = StructureViews::default();
         views.initialize_target(&output);
@@ -3210,7 +3228,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
 
     fn navigation_memory(
         ctx: &egui::Context,
-        views: &StructureViews,
+        _views: &StructureViews,
         output: &ParseOutput,
     ) -> egui_plot::PlotMemory {
         let id = egui::Id::new((

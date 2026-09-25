@@ -79,6 +79,15 @@ struct BoundaryFailure {
     region_end: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RepeatSizeFailure {
+    start: u64,
+    region: u64,
+    item_size: u64,
+    complete: u64,
+    remainder: u64,
+}
+
 impl BoundaryFailure {
     fn requested_bytes(self) -> u64 {
         self.requested_end.saturating_sub(self.start)
@@ -97,6 +106,7 @@ impl BoundaryFailure {
 struct ParsingMap {
     steps: Vec<ParseStep>,
     boundary: Option<BoundaryFailure>,
+    repeat_size: Option<RepeatSizeFailure>,
 }
 
 /// Keep the source editor and its console in one bounded vertical split.
@@ -263,6 +273,46 @@ fn parsing_map_ui(ui: &mut Ui, map: &ParsingMap, action: &mut ConsoleAction) {
                 });
             });
     }
+    if let Some(repeat) = map.repeat_size {
+        ui.add_space(6.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.strong("Repeat size check");
+            ui.label(format!(
+                "{} available bytes ÷ {} bytes per item = {} complete items, with {} bytes left over.",
+                repeat.region, repeat.item_size, repeat.complete, repeat.remainder,
+            ));
+            if repeat.complete > 0 && repeat.remainder % repeat.complete == 0 {
+                let extra = repeat.remainder / repeat.complete;
+                ui.label(format!(
+                    "That is {extra} extra {} per complete item if distributed evenly. Check for a missing field, header, or trailer; this is a clue, not proof of its position.",
+                    if extra == 1 { "byte" } else { "bytes" },
+                ));
+            }
+            ui.weak("The complete-sized item ranges form a tentative prefix in Decoded structure. Expand the first item to decode its fields.");
+            ui.horizontal_wrapped(|ui| {
+                if ui.small_button("Show first item in Hex").clicked() {
+                    action.byte = Some(repeat.start);
+                }
+                if let Some(next) = (repeat.complete >= 2).then(|| repeat.start.checked_add(repeat.item_size)).flatten() {
+                    if ui.small_button("Show expected next item").clicked() {
+                        action.byte = Some(next);
+                    }
+                    if repeat.complete > 0 && repeat.remainder % repeat.complete == 0 {
+                        if let Some(candidate) = next.checked_add(repeat.remainder / repeat.complete) {
+                            if ui.small_button("Show candidate next item").clicked() {
+                                action.byte = Some(candidate);
+                            }
+                        }
+                    }
+                }
+                if let Some(leftover_start) = repeat.start.checked_add(repeat.complete.saturating_mul(repeat.item_size)) {
+                    if ui.small_button("Show unmatched tail in Hex").on_hover_text("Where the current item size leaves an unmatched tail; this does not prove the extra bytes are physically at the end.").clicked() {
+                        action.byte = Some(leftover_start);
+                    }
+                }
+            });
+        });
+    }
 }
 
 fn parsing_map(error: &str) -> Option<ParsingMap> {
@@ -289,7 +339,27 @@ fn parsing_map(error: &str) -> Option<ParsingMap> {
     }
 
     map.boundary = parse_boundary_failure(error);
-    (!map.steps.is_empty() || map.boundary.is_some()).then_some(map)
+    map.repeat_size = parse_repeat_size_failure(error);
+    (!map.steps.is_empty() || map.boundary.is_some() || map.repeat_size.is_some()).then_some(map)
+}
+
+fn parse_repeat_size_failure(error: &str) -> Option<RepeatSizeFailure> {
+    let (_, rest) = error.split_once("fixed-size repeat at byte ")?;
+    let (start, rest) = rest.split_once(" has ")?;
+    let (region, rest) = rest.split_once(" bytes available; ")?;
+    let (complete, rest) = rest.split_once(" complete ")?;
+    let (item_size, rest) = rest.split_once("-byte items fit; ")?;
+    let (remainder, _) = rest.split_once(" bytes remain")?;
+    let failure = RepeatSizeFailure {
+        start: start.parse().ok()?,
+        region: region.parse().ok()?,
+        item_size: item_size.parse().ok()?,
+        complete: complete.parse().ok()?,
+        remainder: remainder.parse().ok()?,
+    };
+    (failure.item_size > 0
+        && failure.complete.checked_mul(failure.item_size)?.checked_add(failure.remainder)? == failure.region)
+        .then_some(failure)
 }
 
 fn parse_boundary_failure(error: &str) -> Option<BoundaryFailure> {
@@ -443,5 +513,30 @@ mod tests {
             parse_boundary_failure("byte range 100..90 exceeds enclosing region end 80"),
             None
         );
+    }
+
+    #[test]
+    fn repeat_size_error_shows_arithmetic_and_inspection_targets() {
+        let error = "read records at byte 4096: records: fixed-size repeat at byte 4096 has 82320 bytes available; 40 complete 2048-byte items fit; 400 bytes remain. Their ranges are available as a tentative prefix in Decoded structure.";
+        let repeat = parse_repeat_size_failure(error).unwrap();
+        assert_eq!(repeat.complete, 40);
+        assert_eq!(repeat.remainder / repeat.complete, 10);
+        assert_eq!(repeat.start + repeat.complete * repeat.item_size, 86016);
+        let ctx = egui::Context::default();
+        let frame = || ctx.run(
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900., 600.))), ..Default::default() },
+            |ctx| { egui::CentralPanel::default().show(ctx, |ui| { console(ui, "", Some(error), false); }); },
+        );
+        let _ = frame();
+        let output = frame();
+        let labels: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text()), _ => None,
+        }).collect();
+        assert!(labels.contains(&"Repeat size check"));
+        assert!(labels.iter().any(|label| label.contains("10 extra bytes per complete item")));
+        assert!(labels.contains(&"Show first item in Hex"));
+        assert!(labels.contains(&"Show candidate next item"));
+        assert!(labels.contains(&"Show unmatched tail in Hex"));
+        assert!(parse_repeat_size_failure("fixed-size repeat at byte 3 has 10 bytes available; 2 complete 4-byte items fit; 3 bytes remain").is_none());
     }
 }

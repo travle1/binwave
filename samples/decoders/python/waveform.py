@@ -7,7 +7,7 @@ large byte-backed collection without loading its values into Python or RAM.
 from binwave import Field, Struct
 
 Header = Struct("Header", [
-    Field("signature", "text", length=4, expect="PWAV"),
+    Field("signature", "string", length=4, expect="PWAV"),
     Field("version", "u32", expect=1),
     ("file_bytes", "u64"),
     ("sample_count", "u64"),
@@ -20,12 +20,12 @@ SectionHeader = Struct("SectionHeader", [
 ], endian="little")
 
 Descriptor = Struct("Descriptor", [
-    Field("name", "text", length=16),
+    Field("name", "string", length=16),
     ("format", "u32"), ("byte_width", "u32"),
 ], endian="little")
 
 Footer = Struct("Footer", [
-    Field("marker", "text", length=8, expect="PWAV-END"),
+    Field("marker", "string", length=8, expect="PWAV-END"),
     ("sample_count", "u64"), ("payload_bytes", "u64"),
     ("sample_offset", "u64"), ("final_index", "u64"),
     ("generator_seed", "u64"),

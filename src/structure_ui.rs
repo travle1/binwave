@@ -61,6 +61,7 @@ pub enum RunOutcome {
 struct Decoded {
     data: Option<(Program, ParseOutput)>,
     stdout: String,
+    partial_error: Option<String>,
 }
 type Parsed = (u64, Result<Decoded, String>);
 #[derive(Default)]
@@ -69,6 +70,7 @@ pub struct StructureWorkspace {
     python_source: Option<PythonSource>,
     python_stdout: String,
     output: Option<ParseOutput>,
+    partial_output: Option<ParseOutput>,
     receiver: Option<Receiver<Parsed>>,
     cancel: Arc<AtomicBool>,
     error: Option<String>,
@@ -120,6 +122,12 @@ impl StructureWorkspace {
         self.program.is_some() || self.python_source.is_some()
     }
     pub fn has_output(&self) -> bool {
+        self.output.is_some() || self.partial_output.is_some()
+    }
+    pub fn has_partial_output(&self) -> bool {
+        self.partial_output.is_some()
+    }
+    pub fn has_successful_output(&self) -> bool {
         self.output.is_some()
     }
     pub fn decode_error(&self) -> Option<&str> {
@@ -149,6 +157,7 @@ impl StructureWorkspace {
         self.python_stdout.clear();
         self.last_run_language = None;
         self.output = None;
+        self.partial_output = None;
         self.error = None;
         self.views.reset();
     }
@@ -168,6 +177,7 @@ impl StructureWorkspace {
     }
     pub fn apply(&mut self, yaml: &str, source: ByteView, ctx: &Context) -> bool {
         self.stop_worker();
+        self.partial_output = None;
         self.invalidate_changed_revision(source.revision);
         self.last_run_language = Some(DecoderLanguage::Yaml);
         match Program::parse(yaml) {
@@ -228,6 +238,7 @@ impl StructureWorkspace {
     }
     fn start_run(&mut self, decoder: RunSource, source: ByteView, ctx: &Context, explicit: bool) {
         self.stop_worker();
+        self.partial_output = None;
         self.invalidate_changed_revision(source.revision);
         self.error = None;
         self.last_run_language = Some(decoder.language());
@@ -259,14 +270,21 @@ impl StructureWorkspace {
                             Decoded {
                                 data: result.decoded,
                                 stdout: bounded_console(&result.stdout),
+                                partial_error: None,
                             }
                         }
                         RunSource::Yaml(program) => {
-                            let output = program.run(&source, &cancel)?;
-                            if let Some(check) = &interpretation_check { check.validate(&output)?; }
+                            let (output, partial_error) = match program.run_with_partial(&source, &cancel) {
+                                Ok(output) => (output, None),
+                                Err(failure) => (failure.output, Some(bounded_console(&format!("{:#}", failure.error)))),
+                            };
+                            if partial_error.is_none() {
+                                if let Some(check) = &interpretation_check { check.validate(&output)?; }
+                            }
                             Decoded {
                                 data: Some((program, output)),
                                 stdout: String::new(),
+                                partial_error,
                             }
                         }
                     };
@@ -295,6 +313,7 @@ impl StructureWorkspace {
     pub fn invalidate(&mut self) {
         self.stop_worker();
         self.output = None;
+        self.partial_output = None;
         self.views.invalidate();
     }
     pub fn tick(&mut self, ctx: &Context, source: ByteView) {
@@ -312,33 +331,59 @@ impl StructureWorkspace {
                     if revision == source.revision {
                         match result {
                             Ok(decoded) => {
-                                self.error = None;
-                                if self.last_run_language == Some(DecoderLanguage::Python) {
-                                    self.python_stdout = if decoded.stdout.is_empty() {
-                                        "Script finished. No output.".into()
-                                    } else {
-                                        decoded.stdout
-                                    };
-                                }
-                                let outcome = if let Some((program, output)) = decoded.data {
-                                    // Explicit successful replacement starts a new view;
-                                    // byte-edit refresh retains viewport and selection.
-                                    if explicit {
-                                        self.views.reset();
+                                if let Some(error) = decoded.partial_error {
+                                    self.partial_output = decoded.data.map(|(_, output)| output);
+                                    if let Some(output) = &self.partial_output {
+                                        let mut current = output.nodes.last();
+                                        let mut in_preview = false;
+                                        while let Some(node) = current {
+                                            if node.lazy.is_some() {
+                                                self.views.expand_first_page(node, output.revision);
+                                                in_preview = true;
+                                                current = node.children.first();
+                                                continue;
+                                            }
+                                            if node.children.is_empty() { break; }
+                                            self.views.expand(&node.path);
+                                            current = if in_preview { node.children.first() } else { node.children.last() };
+                                        }
                                     }
-                                    self.program = Some(program);
-                                    self.python_source = match decoder {
-                                        Some(RunSource::Python(python)) => Some(python),
-                                        _ => None,
-                                    };
-                                    self.output = Some(output);
-                                    self.decoded_ready = explicit;
-                                    RunOutcome::Published
+                                    self.error = Some(error.clone());
+                                    self.decoded_ready = false;
+                                    if explicit {
+                                        self.run_finished = Some(RunOutcome::Failed(error));
+                                    }
                                 } else {
-                                    RunOutcome::NoData
-                                };
-                                if explicit {
-                                    self.run_finished = Some(outcome);
+                                    self.error = None;
+                                    self.partial_output = None;
+                                    if self.last_run_language == Some(DecoderLanguage::Python) {
+                                        self.python_stdout = if decoded.stdout.is_empty() {
+                                            "Script finished. No output.".into()
+                                        } else {
+                                            decoded.stdout
+                                        };
+                                    }
+                                    let outcome = if let Some((program, output)) = decoded.data {
+                                        // Explicit successful replacement starts a new view;
+                                        // byte-edit refresh retains viewport and selection.
+                                        if explicit {
+                                            self.views.reset();
+                                        }
+                                        self.program = Some(program);
+                                        self.python_source = match decoder {
+                                            Some(RunSource::Python(python)) => Some(python),
+                                            _ => None,
+                                        };
+                                        self.output = Some(output);
+                                        self.partial_output = None;
+                                        self.decoded_ready = explicit;
+                                        RunOutcome::Published
+                                    } else {
+                                        RunOutcome::NoData
+                                    };
+                                    if explicit {
+                                        self.run_finished = Some(outcome);
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -365,7 +410,7 @@ impl StructureWorkspace {
             }
         }
         self.views.tick(ctx, source);
-        if let Some(output) = &self.output {
+        if let Some(output) = self.partial_output.as_ref().or(self.output.as_ref()) {
             self.views.select_bytes(output, self.selection.clone());
         }
     }
@@ -421,13 +466,14 @@ impl StructureWorkspace {
     }
     pub fn select_bytes(&mut self, range: Range<usize>) {
         self.selection = Some(range.clone());
-        if let Some(output) = &self.output {
+        if let Some(output) = self.partial_output.as_ref().or(self.output.as_ref()) {
             self.views.select_bytes(output, Some(range));
         }
     }
     pub fn highlights(&self) -> Vec<HexHighlight> {
-        self.output
+        self.partial_output
             .as_ref()
+            .or(self.output.as_ref())
             .map(|o| self.views.highlights(o))
             .unwrap_or_default()
     }
@@ -459,9 +505,16 @@ impl StructureWorkspace {
     }
     pub fn tree(&mut self, ui: &mut Ui, selection: Option<Range<usize>>, names: &mut dyn FnMut(&mut Ui, &Node) -> egui::Response) -> Option<Range<usize>> {
         self.selection = selection.clone();
+        if self.has_partial_output() {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "Partial decode · completed sections remain inspectable. The Console shows where parsing stopped.",
+            );
+        }
         let selected = self
-            .output
+            .partial_output
             .as_ref()
+            .or(self.output.as_ref())
             .and_then(|output| self.views.tree(ui, output, selection, names));
         if let Some(range) = &selected {
             self.selection = Some(range.clone());
@@ -503,14 +556,15 @@ impl StructureWorkspace {
         self.yaml_layout.set_tab_width(width);
     }
     pub fn selected_node(&self) -> Option<Node> {
-        self.output
+        self.partial_output
             .as_ref()
+            .or(self.output.as_ref())
             .and_then(|output| self.views.selected_node(output))
     }
 
     pub fn selected_sample(&self) -> Option<(usize, Range<usize>)> {
         let field = self.selected_node()?;
-        crate::structure_selection::sample_for_node(&self.output.as_ref()?.nodes, &field)
+        crate::structure_selection::sample_for_node(&self.partial_output.as_ref().or(self.output.as_ref())?.nodes, &field)
     }
 
     /// Detailed parser information stays behind the inspector's disclosure control.
@@ -518,7 +572,7 @@ impl StructureWorkspace {
         let Some(node) = self.selected_node() else {
             return;
         };
-        let definition = self.output.as_ref().map(|output|
+        let definition = self.partial_output.as_ref().or(self.output.as_ref()).map(|output|
             (output.consumed as u64, output.definitions.len()));
         let field = crate::workspace_inspector::FieldInfo::from_node(&node, None);
         crate::workspace_inspector::field_details(ui, &field, definition);
@@ -902,7 +956,7 @@ impl FormatEditor {
                     .show_header(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.weak("Options");
-                            if matches!(field.kind.as_str(), "bytes" | "text")
+                            if matches!(field.kind.as_str(), "bytes" | "string")
                                 || !field.length.text.is_empty()
                             {
                                 ui.label("Length");
@@ -2379,7 +2433,7 @@ impl Builder {
                             });
                         });
                         ui.horizontal_wrapped(|ui| {
-                            if matches!(field.kind.as_str(), "bytes" | "text") {
+                            if matches!(field.kind.as_str(), "bytes" | "string") {
                                 ui.label("Length");
                                 ui.add(egui::TextEdit::singleline(&mut field.length).desired_width(48.));
                                 ui.weak("bytes");
@@ -2901,7 +2955,7 @@ impl Builder {
 }
 impl DraftField {
     fn change_format(&mut self) {
-        self.length = if matches!(self.kind.as_str(), "bytes" | "text") {
+        self.length = if matches!(self.kind.as_str(), "bytes" | "string") {
             "1".into()
         } else {
             String::new()
@@ -2911,7 +2965,7 @@ impl DraftField {
 fn format_label(kind: &str) -> String {
     match kind {
         "bytes" => "Raw bytes".into(),
-        "text" => "Text (UTF-8)".into(),
+        "string" => "String (UTF-8)".into(),
         "cstring" => "Zero-terminated text".into(),
         "varuint" => "Variable integer".into(),
         "u8" => "Unsigned 8-bit".into(),
@@ -3060,7 +3114,7 @@ fn labeled(ui: &mut Ui, label: &str, text: &mut String) {
 }
 fn available_types(yaml: &str) -> Vec<String> {
     let mut names: Vec<String> = [
-        "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64", "text", "cstring",
+        "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64", "string", "cstring",
         "bytes", "varuint",
     ]
     .into_iter()
@@ -3191,7 +3245,7 @@ mod tests {
         assert!(encode_value(&node, "7").is_err());
         node.kind = "varuint".into();
         assert!(encode_value(&node, "7").is_err());
-        node.kind = "text".into();
+        node.kind = "string".into();
         assert!(encode_value(&node, "7").is_err());
     }
 
@@ -3258,6 +3312,31 @@ mod tests {
         assert!(!workspace.is_parsing(), "parser worker did not complete");
     }
     #[test]
+    fn failed_yaml_run_publishes_inspectable_prefix_without_claiming_success() {
+        let source = bytes(&[9, 1, 1, 42, 2, 3, 99]);
+        let ctx = Context::default();
+        let yaml = r#"
+structures:
+  - name: Section
+    fields:
+      - {name: tag, type: u8}
+      - {name: size, type: u8}
+      - {name: payload, type: bytes, length: {ref: size}}
+actions:
+  - read: {name: signature, type: u8}
+  - read: {name: sections, type: {structure: Section}, repeat: until end}
+"#;
+        let mut workspace = StructureWorkspace::default();
+        assert!(workspace.apply(yaml, source.view(), &ctx));
+        settle(&mut workspace, source.view(), &ctx);
+        assert!(workspace.has_output());
+        assert!(!workspace.is_ready());
+        assert!(!workspace.has_published_program());
+        assert!(!workspace.take_decoded());
+        assert!(matches!(workspace.take_run_finished(), Some(RunOutcome::Failed(_))));
+        assert_eq!(workspace.partial_output.as_ref().unwrap().nodes[1].children.len(), 2);
+    }
+    #[test]
     fn form_links_header_values_to_reused_instances_and_decodes_them() {
         let mut header = Builder::from_range(0..8);
         header.name = "Header".into();
@@ -3307,7 +3386,7 @@ mod tests {
 structures:
   - name: Description
     fields:
-      - {name: label, type: text, length: 4}
+      - {name: label, type: string, length: 4}
       - {name: code, type: u8}
       - {name: count, type: u8}
   - name: Header

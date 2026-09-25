@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum Command {
     OpenFile,
+    OpenRecent,
     SimpleDemo,
     AdvancedDemo,
     SensorDemo,
@@ -111,6 +112,7 @@ pub struct State {
     pub save_decoder: bool,
     pub apply: bool,
     pub busy: bool,
+    pub recent: Vec<String>,
 }
 pub fn menus(s: &State) -> Vec<Item> {
     use Command::*;
@@ -123,6 +125,14 @@ pub fn menus(s: &State) -> Vec<Item> {
         action("Extract selection...", Extract, s.available && s.selection),
         action("Cancel operation", Cancel, s.busy),
     ];
+    if s.native && !s.recent.is_empty() {
+        let entries = s.recent.iter().enumerate().map(|(index, label)| {
+            let mut item = action(label, OpenRecent, s.available);
+            item.argument = index;
+            item
+        }).collect();
+        data.insert(1, Item::menu("Open recent", entries));
+    }
     let mut decoder = vec![
         action("Open decoder...", OpenDecoder, s.available),
         action(
@@ -262,11 +272,18 @@ pub fn decoder_controls(
     enabled: bool,
     busy: bool,
     disabled_reason: Option<&str>,
+    can_save: bool,
 ) -> Option<Command> {
     let mut result = None;
     ui.horizontal(|ui| {
         if crate::decoder_ui::run_button(ui, enabled, disabled_reason).clicked() {
             result = Some(Command::Apply);
+        }
+        if ui.add_enabled(can_save, egui::Button::new("Save decoder…"))
+            .on_hover_text("Save this YAML or Python decoder")
+            .clicked()
+        {
+            result = Some(Command::SaveDecoder);
         }
         if busy && ui.button("Stop").clicked() {
             result = Some(Command::Cancel);

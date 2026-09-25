@@ -14,7 +14,7 @@ structures:
   - name: Chunk
     fields:
       - {name: length, type: u32}
-      - {name: type, type: text, length: 4}
+      - {name: type, type: string, length: 4}
       - name: payload
         type:
           choose:

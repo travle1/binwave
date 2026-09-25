@@ -15,6 +15,7 @@ pub enum Pane {
     Hex,
 }
 impl Pane {
+    #[cfg(test)]
     pub const ALL: [Self; 6] = [
         Self::Hex,
         Self::Structures,

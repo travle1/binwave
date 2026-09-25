@@ -214,7 +214,7 @@ create a type. `define` creates the type. See the complete dynamic example below
 ## Reading the editor colors
 
 The base app and browser share the same editor. YAML keys use blue, built-in type
-values such as `u32`, `f32`, and `text` use teal, and user-defined type names use
+values such as `u32`, `f32`, and `string` use teal, and user-defined type names use
 the normal text color. The legend above the editor identifies these categories.
 Quoted built-in type values and numeric type-choice mappings use the same teal.
 Comments, literal strings, and a field merely named `u32` retain their own colors.
@@ -225,13 +225,13 @@ These are Binwave decoder types; YAML itself does not define them.
 A structure contains `fields`, optional `actions` after its fields, and an optional
 `endian` (`little` or `big`). A field has a `name` and `type`. The same field shape
 is used by a `read` action. Built-in types are `u8`, `i8`, `u16`, `i16`, `u32`, `i32`,
-`u64`, `i64`, `f32`, `f64`, `bytes`, UTF-8 `text`, zero-terminated UTF-8 `cstring`, and
+`u64`, `i64`, `f32`, `f64`, `bytes`, UTF-8 `string`, zero-terminated UTF-8 `cstring`, and
 unsigned LEB128 `varuint`. A named structure can be used wherever a type is used.
 Integers remain exact; only plotting converts values to floating point.
 
 Additional field inputs:
 
-- `length`: byte length. Required for `bytes` and `text`. On a structure it bounds
+- `length`: byte length. Required for `bytes` and `string`. On a structure it bounds
   its contents and consumes any remaining bytes as padding. This lets an unknown
   section stay raw without losing the location of the next section.
 - `repeat`: an item count or `until end` of the enclosing region. Length applies

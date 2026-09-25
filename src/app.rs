@@ -193,6 +193,7 @@ pub struct BinwaveApp {
     show_decoding_guide: bool,
     csv_table: CsvTable,
     pending_config: Option<AppConfig>,
+    pending_recent_decoder: Option<(std::path::PathBuf, std::path::PathBuf)>,
     file_dialog: NativeFileDialog<AppDialogAction>,
     file_locations: FileLocations,
     dialog_template: rfd::AsyncFileDialog,
@@ -248,6 +249,7 @@ impl Default for BinwaveApp {
             show_decoding_guide: false,
             csv_table: CsvTable::default(),
             pending_config: None,
+            pending_recent_decoder: None,
             file_dialog: NativeFileDialog::default(),
             file_locations,
             dialog_template: rfd::AsyncFileDialog::new(),
@@ -531,7 +533,10 @@ impl BinwaveApp {
                             }
                         }
                     }
-                    Err(error) => self.status = format!("CSV selection: {error:#}"),
+                    Err(error) => {
+                        log::error!("CSV selection: {error:#}");
+                        self.status = format!("CSV selection: {error:#}");
+                    }
                 }
             }
         }
@@ -769,6 +774,9 @@ impl BinwaveApp {
             match result {
                 Ok(data) => self.accept_data(data, false),
                 Err(err) => {
+                    if !stopped {
+                        log::error!("CSV: {err:#}");
+                    }
                     self.status = if stopped {
                         "CSV reading stopped.".into()
                     } else {
@@ -1006,7 +1014,37 @@ impl BinwaveApp {
             return;
         }
         self.pending_config = None;
+        self.pending_recent_decoder = None;
         self.binary.open(path, ctx);
+    }
+
+    fn open_recent(&mut self, index: usize, ctx: &Context) {
+        if !self.commands_available() { return; }
+        let Some(pair) = self.file_locations.recent_pairs().get(index).cloned() else { return; };
+        if !pair.data.is_file() {
+            self.cache_message = Some("That recent data file is no longer available. Choose it again with Open file.".into());
+            return;
+        }
+        if let Some(decoder) = &pair.decoder {
+            if !decoder.is_file() {
+                self.cache_message = Some("That recent decoder is no longer available. Open the data file, then choose its decoder again.".into());
+                return;
+            }
+        }
+        self.pending_config = None;
+        self.pending_recent_decoder = pair.decoder.map(|decoder| (pair.data.clone(), decoder));
+        self.binary.open(pair.data, ctx);
+    }
+
+    fn recent_label(pair: &crate::file_dialog::RecentPair) -> String {
+        let data = pair.data.file_name().unwrap_or(pair.data.as_os_str()).to_string_lossy();
+        match &pair.decoder {
+            Some(decoder) => {
+                let name = decoder.file_name().unwrap_or(decoder.as_os_str()).to_string_lossy();
+                format!("{data}  ·  {name}")
+            }
+            None => data.into_owned(),
+        }
     }
 
     fn clear_csv(&mut self) {
@@ -1044,6 +1082,9 @@ impl BinwaveApp {
             self.decoder = Decoder::Layout;
             self.workspace.reveal(Pane::Hex);
             if let OpenedFile::Path(path) = opened {
+                let recent_decoder = self.pending_recent_decoder.take()
+                    .filter(|(data, _)| data == &path)
+                    .map(|(_, decoder)| decoder);
                 let config = self
                     .pending_config
                     .take()
@@ -1056,7 +1097,11 @@ impl BinwaveApp {
                     self.decoder = Decoder::Csv;
                     self.begin_load(cfg, ctx);
                 } else {
-                    self.binary.start_byte_preview(ctx);
+                    if let Some(decoder) = recent_decoder {
+                        self.binary.load_yaml(decoder, ctx);
+                    } else {
+                        self.binary.start_byte_preview(ctx);
+                    }
                 }
             } else {
                 self.pending_config = None;
@@ -1065,6 +1110,11 @@ impl BinwaveApp {
                 self.binary.show_yaml();
             }
             if self.decoder != Decoder::Layout { self.workspace.show_decoder(); }
+        }
+        if let Some(data) = self.binary.source_path() {
+            if file_kind(data) != FileKind::Csv {
+                self.file_locations.remember_pair(data, self.binary.decoder_path());
+            }
         }
         if self.binary.take_bytes_changed() {
             self.invalidate_csv_after_edit();
@@ -1211,7 +1261,10 @@ impl BinwaveApp {
                             Some("Config needs a data_path before it can be opened.".into());
                     }
                 }
-                Err(error) => self.cache_message = Some(format!("Config: {error:#}")),
+                Err(error) => {
+                    log::error!("Config: {error:#}");
+                    self.cache_message = Some(format!("Config: {error:#}"));
+                }
             },
         }
     }
@@ -1221,7 +1274,8 @@ impl BinwaveApp {
         let ctx=ui.ctx().clone();
         let available=self.commands_available();
         let (undo,redo)=self.binary.menu_history();
-        let menus=app_menu::menus(&app_menu::State { native:true, available,
+        let recent=self.file_locations.recent_pairs().iter().map(Self::recent_label).collect();
+        let menus=app_menu::menus(&app_menu::State { native:true, available, recent,
             file:self.binary.has_file(), selection:self.binary.has_selection(), undo,redo,
             save_decoder:self.decoder==Decoder::Layout && self.binary.can_save_definition(), apply:available && if self.decoder==Decoder::Csv { self.binary.source_path().is_some() && !self.binary.has_byte_edits() } else { self.binary.can_apply_definition() },
             busy:self.binary.is_decoding(), });
@@ -1233,6 +1287,7 @@ impl BinwaveApp {
                 self.binary.menu_action(command,&ctx); self.show_view(Pane::Layout);
             } else { match command {
                 OpenFile => self.choose_data_file(&ctx),
+                OpenRecent => self.open_recent(argument, &ctx),
                 SimpleDemo => { self.pending_config=None; self.binary.open_simple_demo(&ctx); },
                 AdvancedDemo => { self.pending_config=None; self.binary.open_advanced_demo(&ctx); },
                 SensorDemo => { self.pending_config=None; self.binary.open_demo(&ctx); },
@@ -1254,7 +1309,15 @@ impl BinwaveApp {
                 Find => { self.show_view(Pane::Hex); self.binary.find_bytes(); },
                 Replace => { self.show_view(Pane::Hex); self.binary.replace_selected_bytes(); },
                 Jump => { self.show_view(Pane::Hex); self.binary.jump_to_byte(); },
-                ClearCache => { self.cache_message=Some(match crate::cache::clear() { Ok(())=>"Disk cache cleared. Open files remain available.".into(),Err(e)=>format!("Cache: {e:#}") }); },
+                ClearCache => {
+                    self.cache_message = Some(match crate::cache::clear() {
+                        Ok(()) => "Disk cache cleared. Open files remain available.".into(),
+                        Err(error) => {
+                            log::error!("Cache: {error:#}");
+                            format!("Cache: {error:#}")
+                        }
+                    });
+                },
                 Help => self.show_decoding_guide=true,
                 _ => {}
             }}
@@ -1356,6 +1419,7 @@ impl BinwaveApp {
     }
 
     fn ui_welcome(&mut self, ui: &mut Ui) {
+        let recent = self.file_locations.recent_pairs();
         ui.add_space((ui.available_height() * 0.22).max(20.));
         ui.vertical_centered(|ui| {
             ui.heading("Inspect and edit a file");
@@ -1374,6 +1438,18 @@ impl BinwaveApp {
             }
             ui.add_space(8.);
             ui.weak("You can also drop a file anywhere in the workspace.");
+            if !recent.is_empty() {
+                ui.add_space(18.);
+                ui.label("Open recent");
+                for (index, pair) in recent.iter().enumerate() {
+                    let label = Self::recent_label(pair);
+                    if ui.add_enabled(self.commands_available(), egui::Button::new(label))
+                        .on_hover_text(format!("Data: {}\nDecoder: {}", pair.data.display(), pair.decoder.as_ref().map_or_else(|| "none".into(), |p| p.display().to_string())))
+                        .clicked() {
+                        self.open_recent(index, ui.ctx());
+                    }
+                }
+            }
             ui.add_space(18.);
             if ui.link("Create a definition").clicked() {
                 if self.decoder == Decoder::Layout {
@@ -1494,7 +1570,10 @@ impl BinwaveApp {
                 self.plot_completed = Some(finished);
                 match result {
                     Ok(lines) => self.plot_lines = lines,
-                    Err(err) => self.plot_error = Some(format!("Plot: {err:#}")),
+                    Err(err) => {
+                        log::error!("Plot: {err:#}");
+                        self.plot_error = Some(format!("Plot: {err:#}"));
+                    }
                 }
             }
         }
@@ -2815,6 +2894,27 @@ mod tests {
         ] {
             assert!(!labels.iter().any(|text| text == pane.title()));
         }
+    }
+
+    #[test]
+    fn open_recent_restores_data_and_its_decoder() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("capture.bin");
+        let decoder = directory.path().join("layout.yaml");
+        std::fs::write(&data, b"TEST").unwrap();
+        std::fs::write(&decoder, "endian: little\nactions: []\n").unwrap();
+        let ctx = Context::default();
+        let mut app = BinwaveApp::default();
+        app.file_locations.remember_pair(&data, Some(&decoder));
+        app.open_recent(0, &ctx);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while app.binary.source_path() != Some(data.as_path()) {
+            workspace_frame(&mut app, &ctx);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(app.binary.decoder_path(), Some(decoder.as_path()));
+        assert_eq!(app.file_locations.recent_pairs()[0].decoder.as_deref(), Some(decoder.as_path()));
     }
 
     #[test]

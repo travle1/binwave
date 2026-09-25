@@ -116,7 +116,7 @@ class ReaderTests(unittest.TestCase):
         outer = runner.Struct("Outer", [
             runner.Field("first", "u8"),
             runner.Field("nested", inner, offset=4, endian="little"),
-            runner.Field("tail", "text", length=2),
+            runner.Field("tail", "string", length=2),
         ], endian="big")
         reader, _ = self.reader(bytes([1, 0, 0, 0, 0x34, 0x12, 65, 0]))
         value = reader.read_struct("header", outer)
@@ -146,7 +146,9 @@ class ReaderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "identifier"):
             runner.Struct("bad name", [])
         with self.assertRaisesRegex(ValueError, "requires length"):
-            runner.Field("text", "text")
+            runner.Field("text", "string")
+        with self.assertRaisesRegex(ValueError, "use a Struct"):
+            runner.Field("legacy", "text", length=4)
         with self.assertRaisesRegex(ValueError, "overlaps"):
             runner.Struct("Bad", [("first", "u64"), runner.Field("next", "u8", offset=1)])
         with self.assertRaisesRegex(ValueError, "smaller"):

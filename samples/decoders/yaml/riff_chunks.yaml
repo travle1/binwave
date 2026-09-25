@@ -12,7 +12,7 @@ structures:
       - {name: bits_per_sample, type: u16}
   - name: Chunk
     fields:
-      - {name: id, type: text, length: 4}
+      - {name: id, type: string, length: 4}
       - {name: length, type: u32}
       - name: payload
         type:
@@ -25,9 +25,9 @@ structures:
       - align: 2
   - name: Wave
     fields:
-      - {name: format, type: text, length: 4, expect: WAVE}
+      - {name: format, type: string, length: 4, expect: WAVE}
       - {name: chunks, type: {structure: Chunk}, repeat: until end}
 actions:
-  - read: {name: signature, type: text, length: 4, expect: RIFF}
+  - read: {name: signature, type: string, length: 4, expect: RIFF}
   - read: {name: length, type: u32}
   - read: {name: container, type: {structure: Wave}, length: {ref: length}}

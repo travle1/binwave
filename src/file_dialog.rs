@@ -29,6 +29,13 @@ impl FileKind {
 }
 
 const FILE_LOCATIONS_KEY: &str = "binwave.file_locations.v1";
+const MAX_RECENT_PAIRS: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecentPair {
+    pub data: PathBuf,
+    pub decoder: Option<PathBuf>,
+}
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -38,6 +45,7 @@ struct SavedLocations {
     python: Option<PathBuf>,
     csv_config: Option<PathBuf>,
     exports: Option<PathBuf>,
+    recent_pairs: Vec<RecentPair>,
 }
 impl SavedLocations {
     fn directory(&self, kind: FileKind) -> &Option<PathBuf> {
@@ -66,6 +74,28 @@ pub struct FileLocations {
     state: Arc<Mutex<SavedLocations>>,
 }
 impl FileLocations {
+    pub fn recent_pairs(&self) -> Vec<RecentPair> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .recent_pairs
+            .clone()
+    }
+
+    /// Keep one current decoder per data file, without storing file contents.
+    pub fn remember_pair(&self, data: &Path, decoder: Option<&Path>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let pair = RecentPair {
+            data: data.to_path_buf(),
+            decoder: decoder.map(Path::to_path_buf),
+        };
+        if state.recent_pairs.first() == Some(&pair) {
+            return;
+        }
+        state.recent_pairs.retain(|old| old.data != pair.data);
+        state.recent_pairs.insert(0, pair);
+        state.recent_pairs.truncate(MAX_RECENT_PAIRS);
+    }
     pub fn load(storage: Option<&dyn eframe::Storage>) -> Self {
         let state = storage
             .and_then(|storage| storage.get_string(FILE_LOCATIONS_KEY))
@@ -358,6 +388,21 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn recent_pairs_replace_decoder_per_file_and_bound_history() {
+        let locations = FileLocations::default();
+        let first = PathBuf::from("/data/first.bin");
+        locations.remember_pair(&first, None);
+        locations.remember_pair(&first, Some(Path::new("/decoders/first.yaml")));
+        assert_eq!(locations.recent_pairs().len(), 1);
+        assert_eq!(locations.recent_pairs()[0].decoder.as_deref(), Some(Path::new("/decoders/first.yaml")));
+        for index in 0..MAX_RECENT_PAIRS + 2 {
+            locations.remember_pair(&PathBuf::from(format!("/data/{index}.bin")), None);
+        }
+        assert_eq!(locations.recent_pairs().len(), MAX_RECENT_PAIRS);
+        assert_eq!(locations.recent_pairs()[0].data, PathBuf::from("/data/9.bin"));
+    }
+
     #[derive(Default)]
     struct LocationsStorage(std::collections::BTreeMap<String, String>);
     impl eframe::Storage for LocationsStorage {
@@ -389,11 +434,13 @@ mod tests {
             assert_eq!(locations.directory(kind), Some(directory));
         }
         let mut storage = LocationsStorage::default();
+        locations.remember_pair(&temporary.path().join("data/sample.bin"), Some(&temporary.path().join("yaml/layout.yaml")));
         locations.save(&mut storage);
         let restored = FileLocations::load(Some(&storage));
         for (kind, name) in categories {
             assert_eq!(restored.directory(kind), Some(temporary.path().join(name)));
         }
+        assert_eq!(restored.recent_pairs(), locations.recent_pairs());
         assert_eq!(storage.0.len(), 1, "One separate versioned settings entry");
     }
 

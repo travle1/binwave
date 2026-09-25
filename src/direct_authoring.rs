@@ -4,6 +4,7 @@ use serde_yaml_ng::Value;
 use std::ops::Range;
 
 /// Empty source is an authoring state, not a failed parser.
+#[cfg(any(test, target_arch = "wasm32"))]
 pub fn empty_draft(source: &str) -> bool {
     source
         .lines()
@@ -17,16 +18,17 @@ pub fn empty_draft(source: &str) -> bool {
             })
 }
 
+#[cfg(test)]
 pub fn results_current(source: &str, applied: &str) -> bool {
     source == applied && !empty_draft(source)
 }
 
 const TYPES: &[&str] = &[
-    "text", "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64", "bytes",
+    "string", "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64", "bytes",
 ];
 fn width(kind: &str) -> Option<u64> {
     Some(match kind {
-        "text" | "bytes" | "u8" | "i8" => 1,
+        "string" | "bytes" | "u8" | "i8" => 1,
         "u16" | "i16" => 2,
         "u32" | "i32" | "f32" => 4,
         "u64" | "i64" | "f64" => 8,
@@ -37,7 +39,7 @@ fn width(kind: &str) -> Option<u64> {
 /// Interpret only a bounded prefix, preserving integer precision and byte order.
 pub fn preview(bytes: &[u8], kind: &str, big: bool) -> String {
     let bytes = &bytes[..bytes.len().min(64)];
-    if kind == "text" {
+    if kind == "string" {
         return format!("{:?}", String::from_utf8_lossy(bytes));
     }
     if kind == "bytes" {
@@ -119,7 +121,7 @@ fn existing(source: &str, range: &Range<u64>) -> Option<Existing> {
                 let custom = field["type"]["structure"].as_str();
                 let kind = field["type"].as_str().or(custom).unwrap_or("");
                 let count = field["repeat"].as_u64().unwrap_or(1);
-                let size = if matches!(kind, "text" | "bytes") {
+                let size = if matches!(kind, "string" | "bytes") {
                     field["length"].as_u64().and_then(|n| n.checked_mul(count))
                 } else {
                     if custom.is_some() {
@@ -137,7 +139,7 @@ fn existing(source: &str, range: &Range<u64>) -> Option<Existing> {
                     })
                 });
                 let fixed = (field["repeat"].is_null() || field["repeat"].as_u64().is_some())
-                    && (matches!(kind, "text" | "bytes") || field["length"].is_null());
+                    && (matches!(kind, "string" | "bytes") || field["length"].is_null());
                 if simple
                     && fixed
                     && field["at"].as_u64() == Some(range.start)
@@ -233,7 +235,7 @@ pub fn change(source: &str, range: Range<u64>, name: &str, kind: &str) -> Result
     }
     let extra = if custom.is_some() {
         String::new()
-    } else if matches!(kind, "text" | "bytes") {
+    } else if matches!(kind, "string" | "bytes") {
         format!(", length: {length}")
     } else if length > size {
         format!(", repeat: {}", length / size)
@@ -375,6 +377,7 @@ pub struct DirectAuthoring {
     error: String,
 }
 impl DirectAuthoring {
+    #[cfg(target_arch = "wasm32")]
     pub fn editing(&self, name: &str) -> bool {
         self.rename.as_ref().is_some_and(|(n, _)| n == name)
     }
@@ -583,7 +586,7 @@ mod tests {
     fn decoded_name_is_selected_for_inline_rename() {
         let ctx = egui::Context::default();
         let mut authoring = DirectAuthoring::default();
-        let mut source = change("actions: []\n", 0..4, "field", "text").unwrap();
+        let mut source = change("actions: []\n", 0..4, "field", "string").unwrap();
         authoring.created("field".into());
         let frame = |authoring: &mut DirectAuthoring, source: &mut String, events| {
             ctx.run(
@@ -627,7 +630,7 @@ mod tests {
 
     #[test]
     fn clearing_source_releases_old_field_and_allows_starting_again() {
-        let old = change("actions: []\n", 0..4, "signature", "text").unwrap();
+        let old = change("actions: []\n", 0..4, "signature", "string").unwrap();
         assert!(!results_current("", &old));
         assert!(!results_current("# starting again\n", &old));
         assert!(!results_current("actions: []\n", &old));
@@ -662,7 +665,7 @@ mod tests {
             labels.iter().all(|text| text.is_ascii()),
             "UI controls need no decorative font glyphs"
         );
-        let fresh = change("", 0..4, "magic", "text").unwrap();
+        let fresh = change("", 0..4, "magic", "string").unwrap();
         assert!(fresh.contains("magic"));
         assert!(!fresh.contains("signature"));
     }
@@ -723,12 +726,12 @@ mod tests {
         let out = frame(&mut editor, &mut source, vec![]);
         click(&mut editor, &mut source, position(&out, "Interpret as"));
         let out = frame(&mut editor, &mut source, vec![]);
-        click(&mut editor, &mut source, position(&out, "text   \"DEMO\""));
+        click(&mut editor, &mut source, position(&out, "string   \"DEMO\""));
         assert!(
             source.contains("name: \"field\""),
             "Choosing a type must create the field immediately: {source}"
         );
-        assert!(source.contains("type: text"));
+        assert!(source.contains("type: string"));
         assert_eq!(source.matches("- read:").count(), 1);
         let out = frame(&mut editor, &mut source, vec![]);
         click(&mut editor, &mut source, position(&out, "Interpret as"));
@@ -753,7 +756,7 @@ mod tests {
 
     #[test]
     fn preview_is_exact_bounded_and_respects_byte_order() {
-        assert_eq!(preview(b"DEMO", "text", false), "\"DEMO\"");
+        assert_eq!(preview(b"DEMO", "string", false), "\"DEMO\"");
         assert_eq!(preview(&[255; 8], "u64", false), u64::MAX.to_string());
         assert_eq!(preview(&[0, 1], "u16", false), "256");
         assert_eq!(preview(&[0, 1], "u16", true), "1");
@@ -763,13 +766,13 @@ mod tests {
     #[test]
     fn add_revise_preserves_comments_and_refuses_referenced_rename() {
         let source = "# private notes stay intact\nendian: little\nactions: []\n";
-        let first = change(source, 0..4, "signature", "text").unwrap();
+        let first = change(source, 0..4, "signature", "string").unwrap();
         let second = change(&first, 4..8, "count", "u32").unwrap();
         let renamed = change(&second, 0..4, "magic", "bytes").unwrap();
         assert!(renamed.starts_with("# private notes stay intact\n"));
         assert!(!renamed.contains("signature"));
         assert_eq!(renamed.matches("- read:").count(), 2);
-        assert!(change(&renamed, 0..4, "count", "text").is_err());
+        assert!(change(&renamed, 0..4, "count", "string").is_err());
         assert!(change(&renamed, 0..3, "bad", "u32").is_err());
         let referenced =
             format!("{second}  - read: {{name: payload, type: u8, repeat: {{ref: count}}}}\n");
@@ -779,8 +782,8 @@ mod tests {
     }
     #[test]
     fn unrelated_nested_yaml_and_inline_comments_survive() {
-        let source = "# catalog\nstructures:\n  - name: Header\n    fields: [{name: flag, type: u8}]\nactions:\n  - read: {name: \"magic\", type: text, at: 0, length: 4} # keep me\n  - read: {name: header, type: {structure: Header}}\n";
-        let changed = change(source, 0..4, "signature", "text").unwrap();
+        let source = "# catalog\nstructures:\n  - name: Header\n    fields: [{name: flag, type: u8}]\nactions:\n  - read: {name: \"magic\", type: string, at: 0, length: 4} # keep me\n  - read: {name: header, type: {structure: Header}}\n";
+        let changed = change(source, 0..4, "signature", "string").unwrap();
         assert!(changed.contains("# keep me\n"));
         assert!(changed.contains("fields: [{name: flag, type: u8}]"));
         assert!(changed.ends_with("  - read: {name: header, type: {structure: Header}}\n"));

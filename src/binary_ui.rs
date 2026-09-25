@@ -607,6 +607,7 @@ impl BinaryWorkspace {
                 self.error = false;
             }
             Err(error) => {
+                log::error!("{error:#}");
                 self.message = format!("{error:#}");
                 self.error = true;
             }
@@ -668,6 +669,9 @@ impl BinaryWorkspace {
     }
     pub fn source_path(&self) -> Option<&Path> {
         self.source.as_deref()
+    }
+    pub fn decoder_path(&self) -> Option<&Path> {
+        self.yaml_path.as_deref()
     }
     pub fn file_len(&self) -> usize {
         self.original
@@ -1015,7 +1019,7 @@ impl BinaryWorkspace {
         // Native dialogs run independently of the event loop. Poll even while the
         // rest of the workspace is rendering so its window keeps answering pings.
         if let Some((action, path)) = self.file_dialog.poll(ctx) {
-            self.finish_file_dialog(action, path, ctx);
+            self.finish_file_dialog(action, path, ctx, true);
         }
         if let Some(result) = self.io_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.io_rx = None;
@@ -1319,6 +1323,7 @@ impl BinaryWorkspace {
         action: FileDialogAction,
         path: Option<PathBuf>,
         ctx: &Context,
+        picker_confirmed: bool,
     ) {
         let Some(path) = path else {
             return;
@@ -1328,10 +1333,16 @@ impl BinaryWorkspace {
             FileDialogAction::Open => self.open(path, ctx),
             FileDialogAction::LoadYaml => self.load_yaml(path, ctx),
             FileDialogAction::Save(content) => {
-                // Preserve the snapshot captured before opening the dialog, and
-                // keep the existing overwrite and source-alias protections.
+                // The native save picker already asks before replacing an existing
+                // file. Do not ask a second time after the user accepts it.
+                // Retain the separate confirmation for callers that did not use
+                // a picker, and retain source-alias checks in the write path.
                 if path.symlink_metadata().is_ok() {
-                    self.overwrite = Some((path, content));
+                    if picker_confirmed {
+                        self.save(ctx, path, content, true);
+                    } else {
+                        self.overwrite = Some((path, content));
+                    }
                 } else {
                     self.save(ctx, path, content, false);
                 }
@@ -1644,8 +1655,10 @@ impl BinaryWorkspace {
     }
     pub fn decoded_ready(&self) -> bool {
         !self.interpretation_stale
-            && (self.structure_ui.has_output()
-                || (!self.structure_ui.has_published_program() && self.document.is_some()))
+            && (self.structure_ui.has_successful_output()
+                || (!self.structure_ui.has_output()
+                    && !self.structure_ui.has_published_program()
+                    && self.document.is_some()))
     }
     fn decoder_status(&self) -> &'static str {
         if self.initial_plot_pending {
@@ -1953,8 +1966,9 @@ impl BinaryWorkspace {
             self.can_apply_definition() && enabled,
             self.is_decoding(),
             self.run_disabled_reason(),
+            self.can_save_definition() && enabled,
         ) {
-            match command { crate::app_menu::Command::Apply=>self.apply_definition(&ctx),crate::app_menu::Command::Cancel=>self.stop_decoding(),_=>{} }
+            match command { crate::app_menu::Command::Apply=>self.apply_definition(&ctx),crate::app_menu::Command::SaveDecoder=>self.save_definition(&ctx),crate::app_menu::Command::Cancel=>self.stop_decoding(),_=>{} }
         }
         crate::decoder_ui::status_banner(
             ui,
@@ -2882,12 +2896,12 @@ impl BinaryWorkspace {
 
     pub fn structures(&mut self, ui: &mut Ui) {
         self.direct_controls(ui, true);
-        if self.structure_ui.has_published_program() {
+        if self.structure_ui.has_output() {
             let mut edit = None;
             let source = &self.yaml;
             let authoring = &mut self.authoring;
             if let Some(range) = self.structure_ui.tree(ui, self.hex_editor.selection(), &mut |ui, node| {
-                let (response, change) = if node.path == node.name { authoring.name_ui(ui, source, &node.name, node.range.start as u64..node.range.end as u64) } else { (ui.selectable_label(false, &node.name), None) };
+                let (response, change) = if node.path == node.name { authoring.name_ui(ui, source, &node.name, node.range.start as u64..node.range.end as u64) } else { (ui.selectable_label(false, node.tree_label()), None) };
                 if change.is_some() { edit = change; }
                 response
             }) {
@@ -3594,6 +3608,7 @@ mod tests {
             FileDialogAction::Save(SaveContent::Yaml(captured.clone(), DecoderLanguage::Python)),
             Some(directories[3].join("saved.py")),
             &ctx,
+            false,
         );
         settle(&mut workspace, &ctx);
         assert_eq!(
@@ -3613,6 +3628,7 @@ mod tests {
             FileDialogAction::Save(SaveContent::Bytes(view, 0..2, false)),
             Some(directories[4].join("selection.bin")),
             &ctx,
+            false,
         );
         settle(&mut workspace, &ctx);
         assert_eq!(
@@ -3647,11 +3663,12 @@ mod tests {
         }
         let mut workspace = BinaryWorkspace::default();
         workspace.set_file_locations(locations.clone());
-        workspace.finish_file_dialog(FileDialogAction::LoadYaml, None, &ctx);
+        workspace.finish_file_dialog(FileDialogAction::LoadYaml, None, &ctx, false);
         workspace.finish_file_dialog(
             FileDialogAction::Save(SaveContent::Yaml("draft".into(), DecoderLanguage::Python)),
             None,
             &ctx,
+            false,
         );
         let invalid = candidate.join("invalid.yaml");
         std::fs::write(&invalid, [0xff]).unwrap();
@@ -3668,6 +3685,7 @@ mod tests {
             FileDialogAction::Save(SaveContent::Yaml("new".into(), DecoderLanguage::Python)),
             Some(existing.clone()),
             &ctx,
+            false,
         );
         assert!(workspace.overwrite.is_some());
         click(&mut workspace, &ctx, "Cancel");
@@ -3683,6 +3701,24 @@ mod tests {
         for kind in [FileKind::Yaml, FileKind::Python, FileKind::Exports] {
             assert_eq!(locations.remembered_directory(kind), Some(original.clone()));
         }
+    }
+
+    #[test]
+    fn confirmed_native_picker_overwrites_without_a_second_app_prompt() {
+        let ctx = Context::default();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("decoder.yaml");
+        std::fs::write(&path, "previous draft").unwrap();
+        let mut workspace = BinaryWorkspace::default();
+        workspace.finish_file_dialog(
+            FileDialogAction::Save(SaveContent::Yaml("new draft".into(), DecoderLanguage::Yaml)),
+            Some(path.clone()),
+            &ctx,
+            true,
+        );
+        assert!(workspace.overwrite.is_none());
+        settle(&mut workspace, &ctx);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "new draft");
     }
 
     #[test]
@@ -4116,7 +4152,7 @@ mod tests {
         workspace.load_yaml(path.clone(), &ctx);
         assert!(workspace.take_reveal_definition());
         workspace.structure_ui.begin_definition(0..1);
-        workspace.finish_file_dialog(FileDialogAction::LoadYaml, None, &ctx);
+        workspace.finish_file_dialog(FileDialogAction::LoadYaml, None, &ctx, false);
         assert!(!workspace.take_reveal_definition());
         assert!(workspace.structure_ui.is_describing());
         workspace.execute(Action::LoadYaml(dir.path().join("missing.yaml")), &ctx);
@@ -4331,7 +4367,7 @@ mod tests {
     }
 
     #[test]
-    fn save_dialog_keeps_captured_byte_revision_through_overwrite_confirmation() {
+    fn save_dialog_keeps_captured_byte_revision_after_picker_confirmation() {
         let ctx = Context::default();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.raw");
@@ -4353,10 +4389,7 @@ mod tests {
         workspace.bytes.as_mut().unwrap().replace(0, &[8]).unwrap();
         completion.send(Some(path.clone())).unwrap();
         settle(&mut workspace, &ctx);
-        assert_eq!(std::fs::read(&path).unwrap(), b"existing");
-        assert!(workspace.overwrite.is_some());
-        click(&mut workspace, &ctx, "Overwrite this file");
-        settle(&mut workspace, &ctx);
+        assert!(workspace.overwrite.is_none());
         assert_eq!(std::fs::read(path).unwrap(), [9, 2, 3, 4]);
         assert_eq!(std::fs::read(source).unwrap(), [1, 2, 3, 4]);
         assert_eq!(

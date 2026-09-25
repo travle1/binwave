@@ -31,7 +31,7 @@ _PRIMITIVES = {
     "i8": ("b", 1), "i16": ("h", 2), "i32": ("i", 4), "i64": ("q", 8),
     "f32": ("f", 4), "f64": ("d", 8),
 }
-_RESERVED = set(_PRIMITIVES) | {"text", "bytes", "cstring", "varuint"}
+_RESERVED = set(_PRIMITIVES) | {"string", "bytes", "cstring", "varuint"}
 
 
 def _name(value, label="name"):
@@ -77,7 +77,7 @@ class Field:
     def __post_init__(self):
         _name(self.name, "field name")
         if not isinstance(self.type, Struct) and self.type not in _RESERVED:
-            raise ValueError(f"{self.name}: use a Struct or one of {', '.join(_PRIMITIVES)}, text, bytes")
+            raise ValueError(f"{self.name}: use a Struct or one of {', '.join(_PRIMITIVES)}, string, bytes")
         if self.type in ("cstring", "varuint"):
             raise ValueError(f"{self.name}: variable-width {self.type} needs Python read/unpack logic; emitted fields must have a fixed size")
         for key in ("length", "count", "offset"):
@@ -85,7 +85,7 @@ class Field:
             if value is not None:
                 object.__setattr__(self, key, _size(value, f"{self.name}.{key}"))
         _endian(self.endian)
-        if self.type in ("bytes", "text") and self.length is None:
+        if self.type in ("bytes", "string") and self.length is None:
             raise ValueError(f"{self.name}: {self.type} requires length in bytes")
         if self.length is not None and self.length < self.natural_size:
             raise ValueError(f"{self.name}: length {self.length} is smaller than the {self.natural_size}-byte value")
@@ -367,9 +367,9 @@ class Reader:
                         record[child.name] = _Values(self, offset + child_offset, child, child.count, endian, child_path)
                 return record
             return self._record(field.type, offset, inherited, path, depth + 1)
-        if field.type in ("bytes", "text"):
+        if field.type in ("bytes", "string"):
             value = self.read_at(offset, field.item_size)
-            if field.type == "text":
+            if field.type == "string":
                 value = value.decode("utf-8")
         else:
             fmt, width = _PRIMITIVES[field.type]

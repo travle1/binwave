@@ -6,7 +6,7 @@ endian: little
 structures:
   - name: Header
     fields:
-      - {name: signature, type: text, length: 4, expect: PWAV}
+      - {name: signature, type: string, length: 4, expect: PWAV}
       - {name: version, type: u32, expect: 1}
       - {name: file_bytes, type: u64}
       - {name: sample_count, type: u64}
@@ -15,7 +15,7 @@ structures:
 
   - name: Field
     fields:
-      - {name: name, type: text, length: 16}
+      - {name: name, type: string, length: 16}
       - {name: format, type: u32}
       - {name: byte_width, type: u32}
 
@@ -43,7 +43,7 @@ structures:
 
   - name: Footer
     fields:
-      - {name: marker, type: text, length: 8, expect: PWAV-END}
+      - {name: marker, type: string, length: 8, expect: PWAV-END}
       - {name: sample_count, type: u64}
       - {name: payload_bytes, type: u64}
       - {name: sample_offset, type: u64}

@@ -4,7 +4,7 @@ endian: little
 structures:
   - name: Header
     fields:
-      - {name: signature, type: text, length: 4, expect: BWAV}
+      - {name: signature, type: string, length: 4, expect: BWAV}
       - {name: wave_count, type: u32}
       - {name: measurement_count, type: u32}
       - {name: event_count, type: u32}

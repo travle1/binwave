@@ -258,7 +258,7 @@ preserved. The real decoder resolves nested fields and references to earlier
 values, then highlights the consumed range. Selecting eight bytes for a structure
 that consumes four highlights those four bytes. A short selection or missing
 reference leaves the YAML and previous decoded results unchanged. Numeric
-selections repeat complete values; text and bytes use the selected length.
+selections repeat complete values; string and bytes use the selected length.
 The type menu previews at most 64 cached bytes; structure decoding uses the
 normal bounded background decoder, including its existing resource limits.
 

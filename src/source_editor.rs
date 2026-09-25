@@ -13,6 +13,25 @@ pub const YAML_EXAMPLES: &[(&str, &str)] = &[
     ("Advanced · Waveform container", include_str!("../samples/decoders/yaml/waveform.yaml")),
 ];
 
+const YAML_INSERT_TEMPLATES: &[(&str, &str)] = &[
+    ("Integer field", "- {name: value, type: u32}"),
+    ("Fixed-length string", "- {name: label, type: string, length: 8}"),
+    ("Length-bounded bytes", "- {name: payload, type: bytes, length: {ref: payload_length}}"),
+    ("Choice by earlier field", "- name: payload\n  type:\n    choose:\n      ref: kind\n      cases:\n        '1': {structure: KnownPayload}\n      otherwise: bytes\n  length: {ref: payload_length}"),
+    ("Repeated records", "- name: records\n  type: {structure: Record}\n  repeat: {ref: count}"),
+    ("Structure definition", "- name: Record\n  fields:\n    - {name: value, type: u32}"),
+    ("Read action", "- read: {name: records, type: {structure: Record}, repeat: until end}"),
+];
+
+const PYTHON_INSERT_TEMPLATES: &[(&str, &str)] = &[
+    ("Import decoder types", "from binwave import Field, Struct"),
+    ("Structure definition", "Record = Struct(\"Record\", [\n    (\"value\", \"u32\"),\n], endian=\"little\")"),
+    ("Fixed-length string field", "Field(\"label\", \"string\", length=8)"),
+    ("Read one structure", "record = file.read_struct(\"record\", Record)"),
+    ("Read repeated records", "records = file.records(\"records\", Record, count=record.count)"),
+    ("Skip known bytes", "file.seek(file.tell() + 4)"),
+];
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum DecoderLanguage {
     #[default]
@@ -67,6 +86,7 @@ print(f"Registered {len(samples):,} samples")
         }
     }
 
+    #[cfg(test)]
     pub fn header_example(self) -> &'static str {
         match self {
             Self::Yaml => {
@@ -127,6 +147,7 @@ pub(crate) struct YamlLayoutCache {
     foreground: Color32,
     language: DecoderLanguage,
     edit_action: Option<&'static str>,
+    insert_template: Option<&'static str>,
     paste: Arc<std::sync::Mutex<Option<String>>>,
     paste_error: Option<String>,
     focused: bool,
@@ -146,6 +167,7 @@ impl Default for YamlLayoutCache {
             foreground: Color32::default(),
             language: DecoderLanguage::default(),
             edit_action: None,
+            insert_template: None,
             paste: Default::default(),
             paste_error: None,
             focused: false,
@@ -164,6 +186,14 @@ struct SourceDiagnostic {
     column: Option<usize>,
     message: String,
     hint: Option<String>,
+    spacing_fix: Option<YamlSpacingFix>,
+}
+
+#[derive(Clone)]
+struct YamlSpacingFix {
+    char_index: usize,
+    key: String,
+    value: String,
 }
 
 impl YamlLayoutCache {
@@ -205,13 +235,26 @@ impl YamlLayoutCache {
             ui.weak("Tab indents; Shift+Tab dedents; Enter continues indentation.");
         });
     }
-    fn edit_menu(&mut self, ui: &mut Ui) {
+    fn edit_menu(&mut self, ui: &mut Ui, language: DecoderLanguage) {
         for action in ["Undo", "Redo", "Cut", "Copy", "Paste", "Select all", "Toggle comments"] {
             if ui.button(action).clicked() {
                 self.edit_action = Some(action);
                 ui.close_menu();
             }
         }
+        ui.separator();
+        ui.menu_button("Insert template", |ui| {
+            let templates = match language {
+                DecoderLanguage::Yaml => YAML_INSERT_TEMPLATES,
+                DecoderLanguage::Python => PYTHON_INSERT_TEMPLATES,
+            };
+            for (label, snippet) in templates {
+                if ui.button(*label).on_hover_text(*snippet).clicked() {
+                    self.insert_template = Some(snippet);
+                    ui.close_menu();
+                }
+            }
+        });
         ui.separator();
         self.tab_width_menu(ui);
         if ui.button("Convert leading tabs to spaces").clicked() {
@@ -251,6 +294,7 @@ impl YamlLayoutCache {
 
     pub(crate) fn editor(&mut self, ui: &mut Ui, yaml: &mut String, language: DecoderLanguage) {
         if let Some(error)=&self.paste_error { ui.colored_label(ui.visuals().error_fg_color,error); }
+        let mut apply_spacing_fix = None;
         if language == DecoderLanguage::Yaml {
             ui.horizontal_wrapped(|ui| {
                 let dark = ui.visuals().dark_mode;
@@ -268,6 +312,7 @@ impl YamlLayoutCache {
                     ui.code("structures:\n  - name: RecordType\n    fields:\n      - {name: value, type: u16}\nactions:\n  - read: {name: records, type: {structure: RecordType}, repeat: 2}");
                     ui.label("Declarations read no bytes. Actions start reads; fields consume bytes in order. A field using a structure creates nested values.");
                     ui.label("repeat counts items; length bounds each item in bytes. ref uses an earlier decoded value. Names are chosen by you.");
+                    ui.label("Right-click in the editor → Insert template to add a field, structure, or read step at the cursor. Python has its own templates.");
                     ui.separator();
                     ui.label("Open Help → Decoder guide for every supported type, field option, action, expression, and a complete Python API reference.");
                 });
@@ -281,7 +326,10 @@ impl YamlLayoutCache {
                     .inner_margin(egui::Margin::symmetric(8., 5.))
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
-                            ui.colored_label(ui.visuals().error_fg_color, "YAML error");
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                if diagnostic.spacing_fix.is_some() { "YAML formatting" } else { "YAML error" },
+                            );
                             if let Some(line) = diagnostic.line {
                                 let location = diagnostic.column.map_or_else(
                                     || format!("Line {line}"),
@@ -295,7 +343,11 @@ impl YamlLayoutCache {
                                     self.go_to_location(line, column);
                                 }
                             }
-                            ui.label(diagnostic.message);
+                            if let Some(fix) = &diagnostic.spacing_fix {
+                                ui.label(format!("`{}:{}` needs a space after the colon.", fix.key, fix.value));
+                            } else {
+                                ui.label(&diagnostic.message);
+                            }
                         });
                         if let Some(line) = diagnostic.line {
                             if let Some(source_line) = yaml.lines().nth(line.saturating_sub(1)) {
@@ -310,6 +362,11 @@ impl YamlLayoutCache {
                         }
                         if let Some(hint) = diagnostic.hint {
                             ui.label(format!("Fix: {hint}"));
+                        }
+                        if let Some(fix) = diagnostic.spacing_fix {
+                            if ui.small_button(format!("Add space after {}:", fix.key)).clicked() {
+                                apply_spacing_fix = Some(fix.char_index);
+                            }
                         }
                     });
             }
@@ -343,6 +400,19 @@ impl YamlLayoutCache {
                                 "decoder_source_text",
                                 language,
                             )));
+                            if let Some(template) = self.insert_template.take() {
+                                insert_source_template(ui.ctx(), editor_id, yaml, template, self.tab_width);
+                            }
+                            if let Some(char_index) = apply_spacing_fix {
+                                let mut state = egui::TextEdit::load_state(ui.ctx(), editor_id)
+                                    .unwrap_or_default();
+                                state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                                    egui::text::CCursor::new(char_index),
+                                )));
+                                state.store(ui.ctx(), editor_id);
+                                edit_source(ui.ctx(), editor_id, yaml, "Paste", Some(" "));
+                                self.refresh_diagnostic(yaml);
+                            }
                             let selection_before = egui::TextEdit::load_state(ui.ctx(), editor_id)
                                 .and_then(|state| state.cursor.char_range());
                             if let Some(paste) = self.paste.lock().unwrap().take() {
@@ -350,14 +420,15 @@ impl YamlLayoutCache {
                             }
                             let focused = ui.memory(|memory| memory.has_focus(editor_id));
                             self.focused = focused;
+                            // Native egui-winit sends Copy/Cut/Paste events itself.
+                            // Handling Ctrl+V again here can insert the same text twice.
+                            #[cfg(target_arch = "wasm32")]
                             if focused {
                                 let shortcut = ui.input_mut(|input| {
                                     if input.consume_key(egui::Modifiers::COMMAND, egui::Key::C) {
                                         Some("Copy")
                                     } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::X) {
                                         Some("Cut")
-                                    } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::V) {
-                                        Some("Paste")
                                     } else {
                                         None
                                     }
@@ -370,7 +441,7 @@ impl YamlLayoutCache {
                                 if action == "Paste" {
                                     #[cfg(not(target_arch = "wasm32"))]
                                     { match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
-                                        Ok(text)=>{*self.paste.lock().unwrap()=Some(text);self.paste_error=None;ui.ctx().request_repaint();},
+                                        Ok(text)=>{edit_source(ui.ctx(), editor_id, yaml, "Paste", Some(&text));self.paste_error=None;},
                                         Err(error)=>self.paste_error=Some(format!("Could not paste: {error}. You can also use Ctrl+V.")),
                                     }}
                                     #[cfg(target_arch = "wasm32")]
@@ -537,7 +608,7 @@ impl YamlLayoutCache {
                                     paint_source_diagnostic(ui, &output, diagnostic);
                                 }
                             }
-                            output.response.context_menu(|ui| { self.edit_menu(ui); });
+                            output.response.context_menu(|ui| { self.edit_menu(ui, language); });
                             if shortcut_changed {
                                 output.response.mark_changed();
                             }
@@ -588,6 +659,7 @@ impl YamlLayoutCache {
                     line,
                     column: location.as_ref().map(|location| location.column()),
                     hint: diagnostic_hint(source, line, &message),
+                    spacing_fix: yaml_spacing_fix(source, line, &message),
                     message,
                 })
             }
@@ -603,6 +675,7 @@ impl YamlLayoutCache {
                     line,
                     column: location.as_ref().map(|location| location.column()),
                     hint: diagnostic_hint(source, line, &message),
+                    spacing_fix: yaml_spacing_fix(source, line, &message),
                     message,
                 }
             }),
@@ -719,6 +792,12 @@ fn source_char_index(source: &str, line: usize, column: usize) -> usize {
 }
 
 fn diagnostic_hint(source: &str, line: Option<usize>, message: &str) -> Option<String> {
+    if let Some(fix) = yaml_spacing_fix(source, line, message) {
+        return Some(format!(
+            "YAML needs a space after the colon: change `{}:{}` to `{}: {}`.",
+            fix.key, fix.value, fix.key, fix.value,
+        ));
+    }
     let line = line?;
     let lines: Vec<&str> = source.lines().collect();
     let current = *lines.get(line.saturating_sub(1))?;
@@ -758,13 +837,48 @@ fn diagnostic_hint(source: &str, line: Option<usize>, message: &str) -> Option<S
         }
         return Some("Check this line's indentation and align it with the sibling key above it.".into());
     }
-    if message.contains("untagged enum Expr") {
+    if message.contains(".choose:")
+        && (message.contains("missing field `ref`") || message.contains("missing field `cases`"))
+    {
+        return Some(
+            "A choose expression requires an indented ref and cases block; otherwise is optional."
+                .into(),
+        );
+    }
+    if message.contains("untagged enum Expr")
+        || message.contains("an expression mapping")
+        || message.contains("an expression has one operation")
+        || (message.contains("unknown field")
+            && message.contains("choose")
+            && message.contains("subtract"))
+    {
         return Some(
             "BinWave could not read this size or offset expression. Use a number, {ref: earlier_field}, or a supported expression such as {subtract: [{ref: total_bytes}, 4]}. A length may also use remaining."
                 .into(),
         );
     }
     None
+}
+
+fn yaml_spacing_fix(source: &str, line: Option<usize>, message: &str) -> Option<YamlSpacingFix> {
+    let line = line?;
+    let unknown = message.split("unknown field `").nth(1)?.split('`').next()?;
+    let (key, value) = unknown.split_once(':')?;
+    if key.is_empty() || value.is_empty() || !message.contains(&format!("`{key}`")) {
+        return None;
+    }
+    let source_line = source.lines().nth(line.checked_sub(1)?)?;
+    let start = source_line.find(unknown)?;
+    let before = source_line[..start].trim_end();
+    if before.ends_with('"') || before.ends_with('\'') {
+        return None;
+    }
+    let column = source_line[..start + key.len() + 1].chars().count() + 1;
+    Some(YamlSpacingFix {
+        char_index: source_char_index(source, line, column),
+        key: key.into(),
+        value: value.into(),
+    })
 }
 
 /// The decoder language reference is rendered inside the application on every platform.
@@ -809,7 +923,7 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
                             ui.code("f32"); ui.label("4"); ui.label("IEEE-754 floating point"); ui.end_row();
                             ui.code("f64"); ui.label("8"); ui.label("IEEE-754 floating point"); ui.end_row();
                             ui.code("bytes"); ui.label("length"); ui.label("Raw bytes; normally requires length"); ui.end_row();
-                            ui.code("text"); ui.label("length"); ui.label("Fixed-length UTF-8 text"); ui.end_row();
+                            ui.code("string"); ui.label("length"); ui.label("Length-bounded UTF-8 string"); ui.end_row();
                             ui.code("cstring"); ui.label("variable"); ui.label("Zero-terminated UTF-8 text"); ui.end_row();
                             ui.code("varuint"); ui.label("variable"); ui.label("Unsigned LEB128 integer"); ui.end_row();
                         });
@@ -908,7 +1022,7 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
                 .show(ui, |ui| {
                     ui.label("Python field strings such as 'u32' use the same Binwave schema names; they are not Python type annotations. Python is useful when a format needs loops, conditions, calculated validation, or structure discovery that is awkward in declarative YAML.");
                     ui.code("from binwave import Field, Struct\n\nHeader = Struct('Header', [('count', 'u32')], endian='little')\nRecord = Struct('Record', [\n    ('timestamp', 'u32'),\n    Field('measurement', 'f32'),\n])\nheader = file.read_struct('header', Header)\nrecords = file.records('records', Record, count=header.count)\nprint(f'{len(records)} records')");
-                    ui.label("Field(name, type, length=None, count=None, offset=None, endian=None, expect=None) accepts a fixed numeric type, text, bytes, or another Struct. (name, type) is shorthand.");
+                    ui.label("Field(name, type, length=None, count=None, offset=None, endian=None, expect=None) accepts a fixed numeric type, string, bytes, or another Struct. (name, type) is shorthand.");
                     ui.label("Struct(name, fields, endian=None) creates a fixed layout and exposes size and fields.");
                     ui.label("file.size is the byte length. file.tell() and file.seek(offset, whence=0) control the cursor. file.read(length) advances it; file.read_at(offset, length) does not. file.unpack(format, offset=None) uses Python struct formats.");
                     ui.label("file.read_struct(name, struct, offset=None) decodes metadata now. file.records(name, struct, count=None, offset=None) registers a lazy collection for Plot and Samples. Without count, records consumes complete records to the end of the file.");
@@ -1201,6 +1315,47 @@ fn convert_source_indentation(
     ctx.memory_mut(|memory| memory.request_focus(id));
 }
 
+fn insert_source_template(
+    ctx: &egui::Context,
+    id: egui::Id,
+    source: &mut String,
+    template: &str,
+    tab_width: usize,
+) {
+    let state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    let selection = state.cursor.char_range().unwrap_or_default();
+    let [first, last] = selection.sorted();
+    let chars: Vec<char> = source.chars().collect();
+    let position = first.index.min(chars.len());
+    let line_start = chars[..position]
+        .iter()
+        .rposition(|ch| *ch == '\n')
+        .map_or(0, |index| index + 1);
+    let line_end = chars[position..]
+        .iter()
+        .position(|ch| *ch == '\n')
+        .map_or(chars.len(), |offset| position + offset);
+    let before: String = chars[line_start..position].iter().collect();
+    let indent: String = chars[line_start..line_end]
+        .iter()
+        .take_while(|ch| **ch == ' ' || **ch == '\t')
+        .collect();
+    let append_line = first.index == last.index
+        && !before.trim().is_empty()
+        && chars[position..line_end].iter().all(|ch| ch.is_whitespace());
+    let indent = if append_line && before.trim_end().ends_with(':') {
+        format!("{indent}{}", " ".repeat(tab_width.clamp(1, 8)))
+    } else {
+        indent
+    };
+    let insert = if append_line {
+        format!("\n{indent}{}", template.replace('\n', &format!("\n{indent}")))
+    } else {
+        template.replace('\n', &format!("\n{indent}"))
+    };
+    edit_source(ctx, id, source, "Paste", Some(&insert));
+}
+
 // Menu actions use the same cursor and undo history as keyboard editing.
 fn edit_source(ctx: &egui::Context, id: egui::Id, text: &mut String, action: &str, paste: Option<&str>) {
     let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
@@ -1213,7 +1368,16 @@ fn edit_source(ctx: &egui::Context, id: egui::Id, text: &mut String, action: &st
         #[cfg(target_arch = "wasm32")]
         crate::browser::copy_text(&selected);
         #[cfg(not(target_arch = "wasm32"))]
-        ctx.output_mut(|out| out.copied_text = selected);
+        {
+            // Keep egui's clipboard path (including Wayland), and write through
+            // to the native clipboard for menu actions that can move focus.
+            ctx.output_mut(|out| out.copied_text = selected.clone());
+            if let Err(error) = arboard::Clipboard::new()
+                .and_then(|mut clipboard| clipboard.set_text(selected))
+            {
+                log::warn!("Could not write decoder selection to system clipboard: {error}");
+            }
+        }
     }
     match action {
         "Cut" | "Paste" => {
@@ -1561,6 +1725,32 @@ mod selected_read_tests {
     }
 
     #[test]
+    fn context_templates_insert_at_caret_with_indentation_and_undo() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("template-editor");
+        let original = "structures:\n  - name: Record\n    fields:";
+        let mut yaml = original.to_owned();
+        let mut state = egui::text_edit::TextEditState::default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(yaml.chars().count()),
+        )));
+        state.store(&ctx, id);
+        insert_source_template(&ctx, id, &mut yaml, YAML_INSERT_TEMPLATES[0].1, 2);
+        assert!(yaml.ends_with("\n      - {name: value, type: u32}"));
+        edit_source(&ctx, id, &mut yaml, "Undo", None);
+        assert_eq!(yaml, original);
+
+        let mut python = "if ready:".to_owned();
+        let mut state = egui::text_edit::TextEditState::default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(python.chars().count()),
+        )));
+        state.store(&ctx, id);
+        insert_source_template(&ctx, id, &mut python, "record = file.read_struct(\"record\", Record)", 4);
+        assert_eq!(python, "if ready:\n    record = file.read_struct(\"record\", Record)");
+    }
+
+    #[test]
     fn yaml_diagnostics_are_live_and_include_parser_locations() {
         let mut editor = YamlLayoutCache::default();
         editor.refresh_diagnostic(
@@ -1578,6 +1768,25 @@ mod selected_read_tests {
     }
 
     #[test]
+    fn missing_inline_mapping_space_gets_a_specific_hint_and_fix() {
+        let source = "structures:\n  - name: Tool\n    fields:\n      - {name: tool_name, type: string, length:5}\nactions:\n  - read: {name: tool, type: {structure: Tool}}\n";
+        let mut editor = YamlLayoutCache::default();
+        editor.refresh_diagnostic(source);
+        let diagnostic = editor.diagnostic.as_ref().expect("missing mapping space");
+        assert_eq!(diagnostic.line, Some(4));
+        assert!(diagnostic.hint.as_deref().is_some_and(|hint| {
+            hint.contains("change `length:5` to `length: 5`")
+        }));
+        let fix = diagnostic.spacing_fix.as_ref().expect("one-click spacing fix");
+        let mut corrected = source.to_owned();
+        let byte_index = corrected.char_indices().nth(fix.char_index).unwrap().0;
+        corrected.insert(byte_index, ' ');
+        assert!(corrected.contains("length: 5"));
+        editor.refresh_diagnostic(&corrected);
+        assert!(editor.diagnostic.is_none());
+    }
+
+    #[test]
     fn nested_expression_errors_point_to_the_field_instead_of_the_file_header() {
         let source = "endian: little\nstructures:\n  - name: Packet\n    fields:\n      - {name: payload, type: bytes, length: {unknown: 4}}\nactions:\n  - read: {name: packet, type: {structure: Packet}}\n";
         let mut editor = YamlLayoutCache::default();
@@ -1587,7 +1796,11 @@ mod selected_read_tests {
         assert_eq!(diagnostic.line, Some(5));
         assert_ne!(diagnostic.line, Some(1));
         assert_ne!(diagnostic.line, Some(4));
-        assert!(diagnostic.message.contains("untagged enum Expr"));
+        assert!(
+            diagnostic.message.contains("unknown field"),
+            "{}",
+            diagnostic.message
+        );
         assert!(diagnostic
             .hint
             .as_deref()
@@ -1600,6 +1813,21 @@ mod selected_read_tests {
             .and_then(serde_yaml_ng::Error::location)
             .expect("run error location");
         assert_eq!(run_location.line(), 5);
+    }
+
+    #[test]
+    fn incomplete_choose_expression_points_to_choose_and_names_required_keys() {
+        let source = "endian: little\nstructures:\n  - name: Packet\n    fields:\n      - name: payload\n        type: bytes\n        length:\n          choose:\nactions:\n  - read: {name: packet, type: {structure: Packet}}\n";
+        let mut editor = YamlLayoutCache::default();
+        editor.refresh_diagnostic(source);
+        let diagnostic = editor.diagnostic.as_ref().expect("incomplete choose expression");
+
+        assert_eq!(diagnostic.line, Some(8), "{}", diagnostic.message);
+        assert!(diagnostic.message.contains("length.choose: missing field `ref`"));
+        assert!(diagnostic
+            .hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("requires an indented ref and cases")));
     }
 
     #[test]
@@ -1758,7 +1986,7 @@ mod selected_read_tests {
     }
 
     #[test]
-    fn right_click_preserves_source_selection_and_copy_shortcut_uses_it() {
+    fn right_click_preserves_source_selection_and_platform_copy_uses_it() {
         let ctx = egui::Context::default();
         let mut editor = YamlLayoutCache::default();
         let mut source = "actions: [{read: {name: value, type: u8}}]\n".to_owned();
@@ -1821,7 +2049,81 @@ mod selected_read_tests {
             .unwrap();
         assert_eq!(selection.sorted()[0].index, 0);
         assert_eq!(selection.sorted()[1].index, source.chars().count());
-        let copied = frame(&mut editor, &mut source, vec![key(egui::Key::C)]);
+        let copied = frame(&mut editor, &mut source, vec![egui::Event::Copy]);
         assert_eq!(copied.platform_output.copied_text, source);
+    }
+
+    #[test]
+    fn menu_select_all_then_copy_uses_the_complete_source() {
+        let ctx = egui::Context::default();
+        let mut editor = YamlLayoutCache::default();
+        let mut source = "structures:\n  - name: Record\nactions:\n  - read: {name: data, type: u8}\n".to_owned();
+        let frame = |editor: &mut YamlLayoutCache, source: &mut String| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(700., 400.),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        editor.editor(ui, source, DecoderLanguage::Yaml);
+                    });
+                },
+            )
+        };
+        frame(&mut editor, &mut source);
+        editor.command("Select all");
+        frame(&mut editor, &mut source);
+        editor.command("Copy");
+        let copied = frame(&mut editor, &mut source);
+        assert_eq!(copied.platform_output.copied_text, source);
+    }
+
+    #[test]
+    fn platform_paste_event_inserts_once() {
+        let ctx = egui::Context::default();
+        let mut editor = YamlLayoutCache::default();
+        let mut source = "actions: []\n".to_owned();
+        let frame = |editor: &mut YamlLayoutCache, source: &mut String, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(700., 400.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        editor.editor(ui, source, DecoderLanguage::Yaml);
+                    });
+                },
+            )
+        };
+        let first = frame(&mut editor, &mut source, vec![]);
+        let position = first
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == source => {
+                    Some(text.pos + egui::vec2(12., 6.))
+                }
+                _ => None,
+            })
+            .expect("source position");
+        for pressed in [true, false] {
+            frame(&mut editor, &mut source, vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        frame(&mut editor, &mut source, vec![egui::Event::Paste("TEST".into())]);
+        assert_eq!(source.matches("TEST").count(), 1);
     }
 }

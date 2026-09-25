@@ -793,6 +793,7 @@ fn read_numeric(
 }
 
 /// Shared viewport query used by native thread workers and browser Web Workers.
+#[cfg(any(test, target_arch = "wasm32"))]
 pub(crate) fn read_for_viewport(
     source: ByteView,
     node: Node,

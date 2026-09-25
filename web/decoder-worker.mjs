@@ -18,9 +18,16 @@ self.onmessage = async ({data: m}) => {
                     ? {nodes:[], collections:[], consumed:'0', noData:true}
                     : JSON.parse(session.decode_plan_json(JSON.stringify(program)));
                 result.stdout = stdout;
-                self.postMessage({type:'decoded', result});
+                self.postMessage(result.partial
+                    ? {type:'decode_failed', result, message:result.error}
+                    : {type:'decoded', result});
             } else {
-                self.postMessage({type:'decoded', result:JSON.parse(m.interpretation ? session.decode_interpretation(m.yaml, m.interpretation.name, m.interpretation.start, m.interpretation.end) : session.decode(m.yaml))});
+                const result = JSON.parse(m.interpretation
+                    ? session.decode_interpretation(m.yaml, m.interpretation.name, m.interpretation.start, m.interpretation.end)
+                    : session.decode(m.yaml));
+                self.postMessage(result.partial
+                    ? {type:'decode_failed', result, message:result.error}
+                    : {type:'decoded', result});
             }
         } else if (m.type === 'pick') {
             const result = m.anchor === undefined

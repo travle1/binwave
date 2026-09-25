@@ -31,7 +31,8 @@ fn js_error(error: anyhow::Error) -> JsValue {
     JsValue::from_str(&format!("{error:#}"))
 }
 fn describe(node: &Node) -> Value {
-    json!({"name":node.name,"path":node.path,"kind":node.kind,
+    json!({"name":node.name,"label":node.tree_label(),"summary":node.tree_summary(),"path":node.path,"kind":node.kind,
+        "numeric_tooltip":node.numeric_tooltip(),
         "start":node.range.start.to_string(),"end":node.range.end.to_string(),
         "value":node.display(),"count":node.lazy.as_ref().map(|a|a.count.to_string()),
         "children":node.children.iter().map(describe).collect::<Vec<_>>()})
@@ -58,6 +59,18 @@ fn collections(nodes: &[Node], result: &mut Vec<Value>) {
             collections(&node.children, result);
         }
     }
+}
+fn last_lazy_path(nodes: &[Node]) -> Option<&str> {
+    nodes.iter().rev().find_map(|node| last_lazy_path(&node.children).or_else(|| node.lazy.as_ref().map(|_| node.path.as_str())))
+}
+fn decoded_json(output: &ParseOutput, partial_error: Option<&str>) -> Result<String> {
+    let mut arrays = Vec::new();
+    if partial_error.is_none() { collections(&output.nodes, &mut arrays); }
+    let preview_path = partial_error.and_then(|_| last_lazy_path(&output.nodes));
+    let nodes: Vec<_> = output.nodes.iter().map(describe).collect();
+    json_result(json!({"nodes":nodes,"partial_preview_path":preview_path,
+        "collections":arrays,"consumed":output.consumed.to_string(),
+        "partial":partial_error.is_some(),"error":partial_error}))
 }
 fn cells(node: &Node, prefix: &str, out: &mut BTreeMap<String, Value>) {
     if out.len() >= 64 {
@@ -129,16 +142,15 @@ impl DecoderSession {
     }
     pub fn decode_interpretation(&mut self, yaml: &str, name: &str, start: &str, end: &str) -> Result<String, JsValue> {
         (|| {
-            let output = Program::parse(yaml)?.run(&self.source, &AtomicBool::new(false))?;
-            if !name.is_empty() {
+            let program = Program::parse(yaml)?;
+            let (output, error) = match program.run_with_partial(&self.source, &AtomicBool::new(false)) {
+                Ok(output) => (output, None),
+                Err(failure) => (failure.output, Some(format!("{:#}", failure.error))),
+            };
+            if error.is_none() && !name.is_empty() {
                 crate::direct_authoring::Interpretation { name: name.into(), range: start.parse()?..end.parse()? }.validate(&output)?;
             }
-            let mut arrays = Vec::new();
-            collections(&output.nodes, &mut arrays);
-            let result = json_result(
-                json!({"nodes":output.nodes.iter().map(describe).collect::<Vec<_>>(),
-                "collections":arrays,"consumed":output.consumed.to_string()}),
-            )?;
+            let result = decoded_json(&output, error.as_deref())?;
             self.output = Some(output);
             Ok(result)
         })()

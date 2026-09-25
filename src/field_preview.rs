@@ -182,7 +182,7 @@ fn preview_one(
         "u16" | "i16" => Some(2),
         "u32" | "i32" | "f32" => Some(4),
         "u64" | "i64" | "f64" => Some(8),
-        "bytes" | "text" | "utf8" | "cstring" => None,
+        "bytes" | "string" | "utf8" | "cstring" => None,
         _ => return Ok("Open structure to preview fields".into()),
     };
     let wanted = if let Some(width) = width {
@@ -382,7 +382,7 @@ mod tests {
         let mut remaining = MAX_BYTES;
         let value = preview_one(
             &store.view(),
-            &field("text", 0, 100_000, Endian::Little),
+            &field("string", 0, 100_000, Endian::Little),
             &mut remaining,
         )
         .unwrap();

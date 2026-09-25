@@ -66,7 +66,7 @@ structure. Changing the bytes still invalidates results until they are refreshed
 from binwave import Field, Struct
 
 Header = Struct("Header", [
-    Field("magic", "text", length=4, expect="DATA"),
+    Field("magic", "string", length=4, expect="DATA"),
     ("count", "u32"),
     ("offset", "u64"),
 ], endian="little")
@@ -133,8 +133,8 @@ Struct(name, fields, endian=None)
 ```
 
 - Types are `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`, `f32`, `f64`,
-  `text`, `bytes`, or another `Struct`. `(name, type)` is shorthand for `Field`.
-- `text` and `bytes` require a byte `length`. Text uses UTF-8 and preserves NULs;
+  `string`, `bytes`, or another `Struct`. `(name, type)` is shorthand for `Field`.
+- `string` and `bytes` require a byte `length`. Strings use UTF-8 and preserve NULs;
   use `.rstrip("\0")` for a padded descriptor name. `length` can also reserve
   padding after a numeric value or nested structure.
 - Fields are consecutive with no implicit alignment. `offset` inserts a gap from

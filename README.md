@@ -327,7 +327,7 @@ there is no hardcoded header or descriptor format. The
 synthetic bytes, supported actions, reference rules, and examples.
 
 The interpreter supports exact integer values, standard fixed-width numeric types,
-UTF-8 text, zero-terminated text, raw byte regions, and unsigned LEB128 `varuint`.
+UTF-8 `string`, zero-terminated `cstring`, raw byte regions, and unsigned LEB128 `varuint`.
 Named calculations use checked `add`, `subtract`, `multiply`, and exact `divide`
 operations. This is a declarative reader with controlled operations; YAML cannot
 execute arbitrary code or access unrelated files.

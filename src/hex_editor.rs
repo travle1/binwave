@@ -832,7 +832,20 @@ A gold underline marks search hits; an orange top edge marks edits.");
         let scrollbar = &ui.spacing().scroll;
         let scrollbar_width =
             scrollbar.bar_width + scrollbar.bar_inner_margin + scrollbar.bar_outer_margin;
-        if self.auto_width {
+        // A decoder/plot selection can request a reveal while the user is already
+        // pressing a byte in the currently visible grid. In that frame the click
+        // must target the bytes under the pointer, not a newly scrolled viewport.
+        let pointer_in_grid = ui.input(|input| {
+            input.pointer.primary_down()
+                && input.pointer.interact_pos().is_some_and(|position| {
+                    ui.available_rect_before_wrap().contains(position)
+                })
+        });
+        if pointer_in_grid {
+            self.reveal = false;
+            self.pending_scroll = None;
+        }
+        if self.auto_width && !pointer_in_grid {
             let previous = self.bytes_per_row;
             self.bytes_per_row = [32, 16, 8]
                 .into_iter()
@@ -882,7 +895,7 @@ A gold underline marks search hits; an orange top edge marks edits.");
             header_painter.text(
                 cell.center(),
                 egui::Align2::CENTER_CENTER,
-                format!("+{column:02X}"),
+                format!("{column:02X}"),
                 font.clone(),
                 ui.visuals().weak_text_color(),
             );
@@ -1943,8 +1956,8 @@ mod tests {
             })
             .collect();
         assert!(labels.contains(&"Offset"));
-        assert!(labels.contains(&"+00"));
-        assert!(labels.contains(&"+0F"));
+        assert!(labels.contains(&"00"));
+        assert!(labels.contains(&"0F"));
         assert!(
             offsets.iter().copied().max().unwrap() > 256,
             "the panel must show more than a fixed 256-byte page"
@@ -2038,6 +2051,59 @@ mod tests {
         assert!(actions.iter().any(
             |action| matches!(action, HexAction::Replace { offset: 0, bytes } if bytes == &[0xAB])
         ));
+    }
+
+    #[test]
+    fn clicking_visible_byte_cancels_pending_external_reveal_before_hit_testing() {
+        let (_dir, source) = fixture();
+        let ctx = egui::Context::default();
+        let mut editor = HexEditor::default();
+        editor.auto_width = false;
+        let frame = |editor: &mut HexEditor, events: Vec<egui::Event>| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 700.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        editor.ui(ui, Some(source.clone()), &[]);
+                    });
+                },
+            )
+        };
+        let initial = frame(&mut editor, vec![]);
+        let address = initial.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "00000000" => Some(text.pos),
+            _ => None,
+        }).expect("first byte row");
+        let width = ctx.fonts(|fonts| fonts.glyph_width(&FontId::monospace(13.0), '0'));
+        let byte = address + egui::vec2(width * 11.5, 6.5);
+        editor.select_range(8192..8193, true);
+        assert!(editor.reveal);
+        frame(&mut editor, vec![
+            egui::Event::PointerMoved(byte),
+            egui::Event::PointerButton {
+                pos: byte,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+        ]);
+        assert_eq!(editor.selection(), Some(0..1));
+        assert!(!editor.reveal);
+        let settled = frame(&mut editor, vec![egui::Event::PointerButton {
+            pos: byte,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }]);
+        assert!(settled.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "00000000")));
     }
 
     #[test]

@@ -73,6 +73,7 @@ pub struct BrowserApp {
     selection_anchor: Option<u64>,
     hex_visible: Option<std::ops::Range<u64>>,
     hex_reveal: Option<u64>,
+    hex_columns: usize,
     authoring: crate::direct_authoring::DirectAuthoring,
     authoring_pane: Pane,
     inline_decode: bool,
@@ -171,6 +172,7 @@ impl BrowserApp {
             selection_anchor: None,
             hex_visible: None,
             hex_reveal: None,
+            hex_columns: 0,
             authoring: Default::default(),
             authoring_pane: Pane::Hex,
             inline_decode: false,
@@ -340,6 +342,27 @@ impl BrowserApp {
                         self.editor.queue_paste(event.source);
                     } else {
                         self.status = "Paste is limited to 256 KiB.".into();
+                    }
+                }
+                "decode_failed" => {
+                    self.direct_pending = None;
+                    if self.inline_decode { self.direct_error = Some(event.message.clone()); }
+                    self.applied_yaml = self.decoding_yaml.clone();
+                    self.applied_language = self.decoding_language;
+                    self.python_stdout = event.result["stdout"].as_str().unwrap_or("").to_owned();
+                    self.decoder_error = Some(event.message.clone());
+                    self.decoding = false;
+                    self.inline_decode = false;
+                    self.decoded = event.result;
+                    self.table = Default::default();
+                    self.plot = Default::default();
+                    self.collection.clear();
+                    self.plot_sources.clear();
+                    self.reveal_results = true;
+                    self.mobile_target = Some(Pane::Structures);
+                    self.status = format!("Partial decode through byte {}. Inspect Decoded structure and the Console error together.", self.decoded["consumed"].as_str().unwrap_or("0"));
+                    if let Some((start, end)) = parse_offset(&self.range_start).zip(parse_offset(&self.range_end)) {
+                        self.request_inspect(start, end);
                     }
                 }
                 "decoded" => {
@@ -563,11 +586,22 @@ impl BrowserApp {
         let address_width = digits as f32 * digit + 8.;
         let cell_width = (2. * digit + 12.).max(if self.stacked { 30. } else { 24. });
         let available = ui.available_width();
-        let columns = if !self.stacked && available >= address_width + 16. * cell_width {
+        let pointer_in_grid = ui.input(|input| input.pointer.primary_down()
+            && input.pointer.interact_pos().is_some_and(|position| {
+                ui.available_rect_before_wrap().contains(position)
+            }));
+        let fitted_columns = if !self.stacked && available >= address_width + 16. * cell_width {
             16
         } else if available >= address_width + 8. * cell_width {
             8
         } else { 4 };
+        let columns = if pointer_in_grid && self.hex_columns > 0 {
+            self.hex_columns
+        } else {
+            fitted_columns
+        };
+        let previous_visible = self.hex_visible.as_ref().map(|range| range.start);
+        let columns_changed = self.hex_columns > 0 && self.hex_columns != columns;
         let ascii_width = columns as f32 * digit + 12.;
         let show_ascii = available >= address_width + columns as f32 * cell_width + ascii_width;
         let row_height = ui.spacing().interact_size.y.max(if self.stacked { 32. } else { 22. });
@@ -599,7 +633,7 @@ impl BrowserApp {
             painter.text(
                 cell.center(),
                 egui::Align2::CENTER_CENTER,
-                format!("+{column:02X}"),
+                format!("{column:02X}"),
                 font.clone(),
                 ui.visuals().weak_text_color(),
             );
@@ -621,17 +655,25 @@ impl BrowserApp {
             egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
         );
 
+        // Keep the displayed byte grid fixed while a press begins in it. A
+        // pending reveal from Decoder/Plot must not scroll different bytes under
+        // the pointer before the click resolves.
+        if pointer_in_grid {
+            self.hex_reveal = None;
+        }
         let reveal = self.hex_reveal.filter(|at| {
             *at >= self.offset && *at < self.offset.saturating_add(self.bytes.len() as u64)
         });
         let desired_scroll = reveal.map(|at| {
             let row = (at - self.offset) / columns as u64;
             (row as f32 * row_height - ui.available_height() * 0.35).max(0.0)
-        });
+        }).or_else(|| columns_changed.then(|| previous_visible.and_then(|at| at.checked_sub(self.offset))
+            .map(|at| (at / columns as u64) as f32 * row_height)
+            .unwrap_or(0.)));
         if reveal.is_some() {
             self.hex_reveal = None;
         }
-        let mut scroll = egui::ScrollArea::both().id_source(("browser-hex", columns));
+        let mut scroll = egui::ScrollArea::both().id_source("browser-hex");
         if let Some(offset) = desired_scroll {
             scroll = scroll.vertical_scroll_offset(offset);
         }
@@ -695,6 +737,7 @@ impl BrowserApp {
             }
         });
         self.hex_visible = visible_bytes;
+        self.hex_columns = columns;
     }
     fn direct_controls(&mut self, ui: &mut egui::Ui, pane: Pane) {
         if pane != self.authoring_pane || self.language == crate::source_editor::DecoderLanguage::Python { return; }
@@ -1080,7 +1123,7 @@ impl BrowserApp {
         };
         let can_run = disabled_reason.is_none();
         if let Some(command)=crate::app_menu::decoder_controls(
-            ui, can_run, self.decoding, disabled_reason) {
+            ui, can_run, self.decoding, disabled_reason, !self.yaml.trim().is_empty()) {
             self.menu_action(command,0);
         }
         if self.size == 0 {
@@ -1093,7 +1136,11 @@ impl BrowserApp {
             && self.yaml == self.applied_yaml
             && self.language == self.applied_language;
         let (headline, detail, tone) = if self.decoder_error.is_some() {
-            ("Run failed", "Use the Console below to inspect the error and jump to its source line.", crate::decoder_ui::StatusTone::Error)
+            if self.decoded["partial"].as_bool() == Some(true) {
+                ("Run stopped", "Decoded structure now shows the completed prefix from this run. Compare its last values with the Console and Hex offset.", crate::decoder_ui::StatusTone::Error)
+            } else {
+                ("Run failed", "Use the Console below to inspect the error and jump to its source line.", crate::decoder_ui::StatusTone::Error)
+            }
         } else if self.decoding {
             ("Running decoder…", "The last successful results remain visible while this run completes.", crate::decoder_ui::StatusTone::Ready)
         } else if self.name.is_empty() {
@@ -1239,25 +1286,38 @@ impl BrowserApp {
     }
     fn structures(&mut self, ui: &mut egui::Ui) {
         self.direct_controls(ui, Pane::Structures);
-        fn tree(ui: &mut egui::Ui, node: &serde_json::Value, selection: &mut Option<(u64, u64)>, authoring: &mut crate::direct_authoring::DirectAuthoring, source: &str, editable: bool, edit: &mut Option<crate::direct_authoring::Edit>) {
+        ui.weak("Expand an item to inspect its fields. Click a row to highlight its bytes in Hex; hover a number for decimal, hex, and binary.");
+        if self.decoded["partial"].as_bool() == Some(true) {
+            ui.colored_label(ui.visuals().error_fg_color, format!("Partial decode through byte {} · values below are from the failed run", self.decoded["consumed"].as_str().unwrap_or("0")));
+        }
+        fn tree(ui: &mut egui::Ui, node: &serde_json::Value, selection: &mut Option<(u64, u64)>, authoring: &mut crate::direct_authoring::DirectAuthoring, source: &str, editable: bool, edit: &mut Option<crate::direct_authoring::Edit>, preview_path: Option<&str>) {
             let range = node["start"].as_str().and_then(parse_offset).zip(node["end"].as_str().and_then(parse_offset));
             ui.push_id(node["path"].as_str().unwrap_or(""), |ui| {
                 ui.horizontal(|ui| {
                     if let Some((start, end)) = range {
                         let name = node["name"].as_str().unwrap_or("");
-                        let (response, change) = if editable && node["path"].as_str() == Some(name) { authoring.name_ui(ui, source, name, start..end) } else { (ui.selectable_label(false, name), None) };
+                        let label = node["label"].as_str().unwrap_or(name);
+                        let (response, change) = if editable && node["path"].as_str() == Some(name) { authoring.name_ui(ui, source, name, start..end) } else { (ui.selectable_label(false, label), None) };
+                        let tooltip = node["numeric_tooltip"].as_str().map(str::to_owned).unwrap_or_else(|| format!("{} · bytes {}..{}", node["kind"].as_str().unwrap_or(""), start, end));
+                        let response = response.on_hover_text(tooltip);
                         if response.clicked() { *selection = Some((start,end)); }
                         if change.is_some() { *edit = change; }
                     }
-                    if ui.selectable_label(false, format!(": {}  {}", node["kind"].as_str().unwrap_or(""), node["value"].as_str().unwrap_or(""))).clicked() { *selection = range; }
+                    if ui.selectable_label(false, format!("· {}", node["summary"].as_str().unwrap_or("")))
+                        .on_hover_text(node["numeric_tooltip"].as_str().unwrap_or_else(|| node["kind"].as_str().unwrap_or("")))
+                        .clicked() { *selection = range; }
                 });
             });
             if node["children"].as_array().is_some_and(|c| c.is_empty()) && node["count"].is_null() { return; }
-            let label = "Fields";
+            let label = "Contents";
+            let path = node["path"].as_str().unwrap_or("");
             egui::CollapsingHeader::new(label)
-                .default_open(authoring.editing(node["name"].as_str().unwrap_or("")))
-                .id_source(node["path"].as_str().unwrap_or(""))
+                .default_open(authoring.editing(node["name"].as_str().unwrap_or("")) || preview_path.is_some_and(|preview| preview == path || preview.starts_with(&format!("{path}.")) || preview.starts_with(&format!("{path}[")) || path.starts_with(&format!("{preview}[0]"))))
+                .id_source(path)
                 .show(ui, |ui| {
+                    if let Some(message) = node["preview_error"].as_str() {
+                        ui.colored_label(ui.visuals().error_fg_color, message);
+                    }
                     if ui
                         .button(format!(
                             "Bytes {}..{}",
@@ -1278,7 +1338,7 @@ impl BrowserApp {
                     }
                     if let Some(children) = node["children"].as_array() {
                         for child in children {
-                            tree(ui, child, selection, authoring, source, editable, edit);
+                            tree(ui, child, selection, authoring, source, editable, edit, preview_path);
                         }
                     }
                 });
@@ -1288,7 +1348,7 @@ impl BrowserApp {
         egui::ScrollArea::both().show(ui, |ui| {
             if let Some(nodes) = self.decoded["nodes"].as_array() {
                 for node in nodes {
-                    tree(ui, node, &mut selection, &mut self.authoring, &self.yaml, self.language == crate::source_editor::DecoderLanguage::Yaml, &mut edit);
+                    tree(ui, node, &mut selection, &mut self.authoring, &self.yaml, self.language == crate::source_editor::DecoderLanguage::Yaml, &mut edit, self.decoded["partial_preview_path"].as_str());
                 }
             } else {
                 ui.label("Select bytes in Hex and name a field; its decoded value will appear here.");

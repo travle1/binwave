@@ -37,6 +37,7 @@ impl FieldInfo {
             sample_end: sample.as_ref().map(|(_, range)| range.end),
         }
     }
+    #[cfg(any(test, target_arch = "wasm32"))]
     pub fn sample_range(&self) -> Option<Range<u64>> {
         self.sample_start
             .zip(self.sample_end)

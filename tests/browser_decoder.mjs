@@ -91,7 +91,7 @@ console.log(`Browser WASM: YAML, lazy 40 GiB offsets, sparse edits, tables, exac
 const headerBytes = new Uint8Array([0x44, 0x45, 0x4d, 0x4f, 0, 0, 0, 0]);
 globalThis.binwaveDecoder = {read(start,length) { return headerBytes.slice(Number(start), Number(start)+length); }};
 const headerSession = new bindings.DecoderSession('8');
-assert.throws(() => headerSession.decode(`endian: little
+const failedGuess = JSON.parse(headerSession.decode(`endian: little
 structures:
   - name: Header
     fields: [{name: count, type: u32}]
@@ -99,14 +99,39 @@ actions:
   - read: {name: header, type: {structure: Header}}
   - read: {name: samples, type: f64, repeat: {ref: header.count}}
 `));
+assert.equal(failedGuess.partial, true);
+assert.ok(failedGuess.error);
 const partial = JSON.parse(headerSession.decode(`actions:
-  - read: {name: signature, type: text, length: 4}
+  - read: {name: signature, type: string, length: 4}
 #  - read: {name: samples, type: f64, repeat: until end}
 `));
 assert.equal(partial.consumed, '4');
 assert.equal(partial.collections.length, 0);
 assert.equal(partial.nodes[0].value, 'DEMO');
 headerSession.free();
+
+// A mismatched fixed-size repeat exposes the first complete-shaped record in
+// the partial structure instead of discarding the entire collection.
+const partialBytes = new Uint8Array(2 * 129 * 2 + 2);
+new DataView(partialBytes.buffer).setUint16(0, 1, true);
+partialBytes.set([9, 9], partialBytes.length - 2);
+globalThis.binwaveDecoder = {read(start,length) { return partialBytes.slice(Number(start), Number(start)+length); }};
+const partialSession = new bindings.DecoderSession(String(partialBytes.length));
+const partialBlocks = JSON.parse(partialSession.decode(`endian: little
+structures:
+  - name: Block
+    fields:
+      - {name: samples, type: u16, repeat: 129}
+actions:
+  - read: {name: blocks, type: {structure: Block}, repeat: until end}
+`));
+assert.equal(partialBlocks.partial, true);
+assert.equal(partialBlocks.partial_preview_path, 'blocks[0].samples');
+assert.equal(partialBlocks.nodes[0].count, '2');
+assert.equal(partialBlocks.nodes[0].children[0].path, 'blocks[0]');
+assert.equal(partialBlocks.nodes[0].children[0].children[0].count, '129');
+assert.equal(partialBlocks.nodes[0].children[0].children[0].children[0].value, '1');
+partialSession.free();
 
 // The shipped beginner pair must produce the documented plot and byte links.
 const simpleBytes = await readFile('samples/quickstart/simple_wave.bin');
@@ -189,8 +214,10 @@ assert.equal(interpreted.nodes[0].children[1].start, '1');
 assert.equal(interpreted.nodes[0].children[1].end, '4');
 const previousStructure = JSON.parse(variableSession.table('field', '0'));
 assert.throws(() => variableSession.decode_interpretation(variableYaml, 'field', '0', '2'), /Selection is too short/);
-assert.throws(() => variableSession.decode_interpretation(variableYaml.replace('ref: count', 'ref: missing'), 'field', '0', '8'));
 assert.deepEqual(JSON.parse(variableSession.table('field', '0')), previousStructure, 'Failed interpretation must retain the published structure');
+const missingReference = JSON.parse(variableSession.decode_interpretation(variableYaml.replace('ref: count', 'ref: missing'), 'field', '0', '8'));
+assert.equal(missingReference.partial, true);
+assert.match(missingReference.error, /missing/);
 variableSession.free();
 console.log('Browser WASM: custom structures, actual variable byte ranges, short selections and missing references passed.');
 
