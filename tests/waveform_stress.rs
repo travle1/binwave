@@ -349,7 +349,7 @@ fn waveform_fixture_rejects_incomplete_records_and_out_of_file_sections() {
             .run(&fixture.view(), &AtomicBool::new(false))
             .unwrap_err()
     );
-    assert!(error.contains("trailing bytes"), "{error}");
+    assert!(error.contains("bytes remain"), "{error}");
     fixture.patch(4088, &(256u64 * STRIDE + FOOTER_SIZE + 1).to_le_bytes());
     assert!(program
         .run(&fixture.view(), &AtomicBool::new(false))

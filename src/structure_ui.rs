@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::egui_compat::ContextRun as _;
 pub use crate::source_editor::DecoderLanguage;
 use crate::source_editor::YamlLayoutCache;
 #[cfg(test)]
@@ -642,7 +644,7 @@ impl StructureWorkspace {
             );
             if action.copy {
                 if let Some(error) = error {
-                    ui.output_mut(|output| output.copied_text = error);
+                    ui.ctx().copy_text(error);
                 }
             }
             if let Some(line) = action.line {
@@ -655,7 +657,7 @@ impl StructureWorkspace {
         }
         if self.editor_page == EditorPage::Steps {
             return egui::ScrollArea::vertical()
-                .id_source("definition_steps")
+                .id_salt("definition_steps")
                 .auto_shrink([false, false])
                 .show(ui, |ui| self.steps.ui(ui, yaml))
                 .inner;
@@ -678,7 +680,7 @@ impl StructureWorkspace {
                 if !text.is_empty() { text.push('\n'); }
                 text.push_str(error);
             }
-            ui.output_mut(|output| output.copied_text = text);
+            ui.ctx().copy_text(text);
         }
         if let Some(line) = action.line {
             self.yaml_layout.go_to_line(line);
@@ -715,7 +717,7 @@ impl StructureWorkspace {
                 self.begin_definition(selection.clone().unwrap());
             }
             ui.add_enabled_ui(!dirty && !names.is_empty(), |ui| {
-                egui::ComboBox::from_id_source("edit_reusable_format")
+                egui::ComboBox::from_id_salt("edit_reusable_format")
                     .selected_text(
                         self.formats
                             .editing
@@ -768,7 +770,7 @@ impl StructureWorkspace {
             return None;
         }
         egui::ScrollArea::vertical()
-            .id_source("definition_fields")
+            .id_salt("definition_fields")
             .max_height((ui.available_height() - 44.).max(60.))
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -877,7 +879,7 @@ impl FormatEditor {
         };
         ui.horizontal_wrapped(|ui| {
             ui.strong(&editing.name);
-            egui::ComboBox::from_id_source("format_byte_order")
+            egui::ComboBox::from_id_salt("format_byte_order")
                 .selected_text(match editing.structure.endian {
                     None => "Inherit byte order",
                     Some(Endian::Little) => "Little endian",
@@ -922,7 +924,7 @@ impl FormatEditor {
                         if field.conditional {
                             ui.label("Type by value");
                         } else {
-                            egui::ComboBox::from_id_source("format_field_type")
+                            egui::ComboBox::from_id_salt("format_field_type")
                                 .width(80.)
                                 .selected_text(&field.kind)
                                 .show_ui(ui, |ui| {
@@ -1193,7 +1195,7 @@ fn reference_menu(ui: &mut Ui, value: &mut String, references: &[String]) {
                 for path in references {
                     if ui.button(path).clicked() {
                         *value = path.clone();
-                        ui.close_menu();
+                        ui.close();
                     }
                 }
             });
@@ -1351,7 +1353,7 @@ impl TypeChoiceDraft {
         }
         ui.horizontal_wrapped(|ui| {
             ui.label("Other values");
-            egui::ComboBox::from_id_source("default_type")
+            egui::ComboBox::from_id_salt("default_type")
                 .selected_text(if self.otherwise.is_empty() {
                     if self.cases.is_empty() {
                         "Value is the type name"
@@ -1468,7 +1470,7 @@ impl ReadStep {
     fn options_ui(&mut self, ui: &mut Ui, references: &[String]) {
         ui.horizontal_wrapped(|ui| {
             ui.label("Read");
-            egui::ComboBox::from_id_source("read_repeat")
+            egui::ComboBox::from_id_salt("read_repeat")
                 .selected_text(
                     ["One item", "A number of items", "Until region ends"][self.repeat_mode],
                 )
@@ -1585,7 +1587,7 @@ impl CalculateStep {
             "Multiply by",
             "Divide by",
         ];
-        egui::ComboBox::from_id_source("calculate_operation")
+        egui::ComboBox::from_id_salt("calculate_operation")
             .selected_text(names[self.operation])
             .show_ui(ui, |ui| {
                 for (index, name) in names.iter().enumerate() {
@@ -1842,7 +1844,7 @@ fn nested_steps(ui: &mut Ui, steps: &mut Vec<StepDraft>, types: &[String], refer
                 .clicked()
             {
                 steps.push(operation.draft());
-                ui.close_menu();
+                ui.close();
             }
         }
     });
@@ -1953,7 +1955,7 @@ impl StepsEditor {
                     .clicked()
                 {
                     begin = operation.draft().build().ok().map(|action| (None, action));
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
@@ -2400,7 +2402,7 @@ impl Builder {
             ui.horizontal(|ui| {
                 ui.strong("Fields");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    egui::ComboBox::from_id_source("describe_byte_order").width(110.).selected_text(if self.endian == Endian::Little { "Little endian" } else { "Big endian" }).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("describe_byte_order").width(110.).selected_text(if self.endian == Endian::Little { "Little endian" } else { "Big endian" }).show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.endian, Endian::Little, "Little endian");
                         ui.selectable_value(&mut self.endian, Endian::Big, "Big endian");
                     }).response.on_hover_text("The byte order used for numbers. The preview updates when you change it.");
@@ -2414,18 +2416,18 @@ impl Builder {
             let field_width = (ui.available_width() - 210.).clamp(60., 200.);
             for (index, field) in self.fields.iter_mut().enumerate() {
                 ui.push_id(("describe_field",index), |ui| {
-                    egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(8.)).show(ui, |ui| {
+                    egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.horizontal_wrapped(|ui| {
                             ui.add(egui::TextEdit::singleline(&mut field.name).desired_width(field_width).hint_text("Field name"));
                             let old_kind = field.kind.clone();
-                            egui::ComboBox::from_id_source("format").width(145.).selected_text(format_label(&field.kind)).show_ui(ui, |ui| {
+                            egui::ComboBox::from_id_salt("format").width(145.).selected_text(format_label(&field.kind)).show_ui(ui, |ui| {
                                 for kind in &available { ui.selectable_value(&mut field.kind, kind.clone(), format_label(kind)); }
                             });
                             if old_kind != field.kind { field.change_format(); }
                             ui.menu_button("...", |ui| {
-                                if ui.add_enabled(index > 0, egui::Button::new("Move earlier")).clicked() { up = Some(index); ui.close_menu(); }
-                                if ui.add_enabled(count > 1, egui::Button::new("Delete field")).clicked() { remove = Some(index); ui.close_menu(); }
+                                if ui.add_enabled(index > 0, egui::Button::new("Move earlier")).clicked() { up = Some(index); ui.close(); }
+                                if ui.add_enabled(count > 1, egui::Button::new("Delete field")).clicked() { remove = Some(index); ui.close(); }
                                 ui.separator();
                                 ui.label("Repeat count"); ui.text_edit_singleline(&mut field.repeat);
                                 ui.label("Absolute file offset"); ui.text_edit_singleline(&mut field.at);
@@ -2445,7 +2447,7 @@ impl Builder {
                         let value = if specs.get(index).is_none() { "Available after decoding" } else if unchanged { self.preview.value(index) } else { "Updating…" };
                         ui.horizontal_wrapped(|ui| {
                             ui.weak("Value");
-                            ui.add(egui::Label::new(egui::RichText::new(value).monospace()).wrap(true));
+                            ui.add(egui::Label::new(egui::RichText::new(value).monospace()).wrap());
                         });
                     });
                 });
@@ -2578,14 +2580,14 @@ impl Builder {
                 .chain(self.fields.iter().map(|f| f.name.clone()))
                 .collect();
             self.bind_field = self.bind_field.min(names.len().saturating_sub(1));
-            egui::ComboBox::from_id_source("reference_field")
+            egui::ComboBox::from_id_salt("reference_field")
                 .selected_text(&names[self.bind_field])
                 .show_ui(ui, |ui| {
                     for (index, name) in names.iter().enumerate() {
                         ui.selectable_value(&mut self.bind_field, index, name);
                     }
                 });
-            egui::ComboBox::from_id_source("reference_use")
+            egui::ComboBox::from_id_salt("reference_use")
                 .selected_text(["Repeat count", "Byte length", "File offset"][self.bind_property])
                 .show_ui(ui, |ui| {
                     for (index, name) in ["Repeat count", "Byte length", "File offset"]
@@ -3146,7 +3148,7 @@ fn collect_defined_types(actions: &[Action], names: &mut Vec<String>) {
     }
 }
 fn type_picker(ui: &mut Ui, id: &str, value: &mut String, names: &[String]) {
-    egui::ComboBox::from_id_source(id)
+    egui::ComboBox::from_id_salt(id)
         .selected_text(value.as_str())
         .show_ui(ui, |ui| {
             for name in names {
@@ -3812,8 +3814,8 @@ actions:
                 events,
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     if let Some(next) =
                         workspace.editor(ui, yaml, Some(0..2), DecoderLanguage::Yaml)
                     {
@@ -4131,8 +4133,8 @@ print(f'{len(samples)} samples')
                 )),
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     workspace.editor(ui, &mut code, None, DecoderLanguage::Python);
                 });
             },
@@ -4172,8 +4174,8 @@ print(f'{len(samples)} samples')
                     )),
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         workspace.editor(ui, &mut draft, None, language);
                     });
                 },
@@ -4223,7 +4225,7 @@ print(f'{len(samples)} samples')
         );
         assert_eq!(job.text, code);
         for section in &job.sections {
-            assert!(code.get(section.byte_range.clone()).is_some());
+            assert!(code.get(section.byte_range.start.0..section.byte_range.end.0).is_some());
         }
         let output = "🦀".repeat(40_000) + "\nValueError: final failure";
         let bounded = bounded_console(&output);
@@ -4293,9 +4295,9 @@ print(f'{len(samples)} samples')
             };
             let next = toggle_source_comments(&mut text, selection);
             assert_eq!(text, "  café\n\tvalue\nlast: 3\n");
-            assert_eq!(next.sorted()[0].index, 0);
-            assert_eq!(next.sorted()[1].index, end - 4);
-            assert_eq!(next.primary.index == 0, reverse);
+            assert_eq!(next.sorted_cursors()[0].index.0, 0);
+            assert_eq!(next.sorted_cursors()[1].index.0, end - 4);
+            assert_eq!(next.primary.index.0 == 0, reverse);
             let restored = toggle_source_comments(&mut text, next);
             assert_eq!(text, original);
             assert_eq!(restored, selection);
@@ -4313,7 +4315,7 @@ print(f'{len(samples)} samples')
         let selection = CCursorRange::one(CCursor::new(10));
         let next = toggle_source_comments(&mut current, selection);
         assert_eq!(current, "🦀 = 1\n  # value\n");
-        assert_eq!(next.primary.index, 12);
+        assert_eq!(next.primary.index.0, 12);
         assert_eq!(toggle_source_comments(&mut current, next), selection);
         assert_eq!(current, "🦀 = 1\n  value\n");
 
@@ -4321,7 +4323,7 @@ print(f'{len(samples)} samples')
         let cursor = CCursorRange::one(CCursor::new(1));
         let next = toggle_source_comments(&mut blank, cursor);
         assert_eq!(blank, "\t# \r\nlast");
-        assert_eq!(next.primary.index, 3);
+        assert_eq!(next.primary.index.0, 3);
         assert_eq!(toggle_source_comments(&mut blank, next), cursor);
         assert_eq!(blank, "\t\r\nlast");
     }
@@ -4343,8 +4345,8 @@ print(f'{len(samples)} samples')
                         events,
                         ..Default::default()
                     },
-                    |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                    |_ctx, ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
                             cache.editor(ui, source, language);
                         });
                     },
@@ -4407,8 +4409,8 @@ print(f'{len(samples)} samples')
                 .cursor
                 .char_range()
                 .unwrap();
-            assert_eq!(selection.sorted()[0].index, 0);
-            assert_eq!(selection.sorted()[1].index, source.chars().count());
+            assert_eq!(selection.sorted_cursors()[0].index.0, 0);
+            assert_eq!(selection.sorted_cursors()[1].index.0, source.chars().count());
             frame(
                 &mut source,
                 vec![key(egui::Key::Z, egui::Modifiers::COMMAND)],
@@ -4481,7 +4483,7 @@ print(f'{len(samples)} samples')
                 assert_eq!(job.wrap.max_width, f32::INFINITY);
                 for section in &job.sections {
                     assert!(
-                        text.get(section.byte_range.clone()).is_some(),
+                        text.get(section.byte_range.start.0..section.byte_range.end.0).is_some(),
                         "UTF-8 token boundaries"
                     );
                 }
@@ -4496,12 +4498,12 @@ print(f'{len(samples)} samples')
         let quoted = job
             .sections
             .iter()
-            .find(|section| &job.text[section.byte_range.clone()] == "\"a # b\"")
+            .find(|section| &job.text[section.byte_range.start.0..section.byte_range.end.0] == "\"a # b\"")
             .unwrap();
         let comment = job
             .sections
             .iter()
-            .find(|section| &job.text[section.byte_range.clone()] == "# comment")
+            .find(|section| &job.text[section.byte_range.start.0..section.byte_range.end.0] == "# comment")
             .unwrap();
         assert_ne!(quoted.format.color, comment.format.color);
     }
@@ -4731,8 +4733,8 @@ actions:
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         if let Some(next) =
                             workspace.editor(ui, yaml, Some(0..15), DecoderLanguage::Yaml)
                         {

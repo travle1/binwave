@@ -1,4 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+#[cfg(test)]
+mod egui_compat;
 
 pub(crate) const APP_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
@@ -80,13 +82,15 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Binwave",
         native_options,
-        Box::new(|cc| Box::new(app::BinwaveApp::new(cc))),
+        Box::new(|cc| Ok(Box::new(app::BinwaveApp::new(cc)))),
     )?;
     Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
+    use wasm_bindgen::JsCast;
+
     console_error_panic_hook::set_once();
     if browser_decoder::in_worker() {
         return;
@@ -98,9 +102,19 @@ fn main() {
             // A failed WebGPU surface can also claim the canvas context type.
             let runner = eframe::WebRunner::new();
             let mut options = eframe::WebOptions::default();
-            options.wgpu_options.supported_backends = backend;
-            match runner.start("binwave", options,
-                Box::new(|cc| Box::new(browser::BrowserApp::new(cc)))).await {
+            if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+                setup.instance_descriptor.backends = backend;
+            }
+            let canvas = web_sys::window()
+                .and_then(|window| window.document())
+                .and_then(|document| document.get_element_by_id("binwave"))
+                .and_then(|element| element.dyn_into::<web_sys::HtmlCanvasElement>().ok());
+            let Some(canvas) = canvas else {
+                browser::startup_error("Could not find the BinWave canvas.");
+                return;
+            };
+            match runner.start(canvas, options,
+                Box::new(|cc| Ok(Box::new(browser::BrowserApp::new(cc))))).await {
                 Ok(()) => return,
                 Err(error) => {
                     failures.push(format!("{name}: {error:?}"));

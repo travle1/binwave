@@ -1,4 +1,6 @@
 //! Shared, bounded-memory byte editing surface. All file reads run off the UI thread.
+#[cfg(test)]
+use crate::egui_compat::ContextRun as _;
 use crate::byte_store::ByteView;
 use egui::{Color32, FontId, Key, RichText, Sense};
 use std::ops::Range;
@@ -321,7 +323,7 @@ impl HexEditor {
             if let Ok(result) = rx.try_recv() {
                 match result {
                     Ok(text) => {
-                        ui.output_mut(|o| o.copied_text = text);
+                        ui.ctx().copy_text(text);
                         self.status = "Copied selection".into();
                     }
                     Err(error) => self.status = error,
@@ -545,7 +547,7 @@ impl HexEditor {
             }
             ui.label("Jump");
             let mut jump = egui::TextEdit::singleline(&mut self.jump)
-                .id_source("hex_jump")
+                .id_salt("hex_jump")
                 .desired_width(120.0)
                 .hint_text("0x100 or +256")
                 .show(ui);
@@ -587,7 +589,7 @@ A gold underline marks search hits; an orange top edge marks edits.");
                         if ui.small_button("×").clicked() { remove = Some(index); }
                     });
                 }
-                if let Some(range) = visit { self.visit(range.start); self.select_range(range, true); ui.close_menu(); }
+                if let Some(range) = visit { self.visit(range.start); self.select_range(range, true); ui.close(); }
                 if let Some(index) = remove { self.bookmarks.remove(index); }
                 if self.bookmarks.is_empty() { ui.weak("Select bytes to name and color a range."); }
             });
@@ -776,38 +778,38 @@ A gold underline marks search hits; an orange top edge marks edits.");
                 .clicked()
             {
                 actions.push(HexAction::Define(self.selection().unwrap()));
-                ui.close_menu();
+                ui.close();
             }
             ui.separator();
             if ui.button("Copy hex").clicked() {
                 self.copy(source, Transfer::Hex);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button("Copy text").clicked() {
                 self.copy(source, Transfer::Text);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button("Extract selection…").clicked() {
                 actions.push(HexAction::Extract(self.selection().unwrap()));
-                ui.close_menu();
+                ui.close();
             }
             if ui.button("Replace bytes…").clicked() {
                 self.show_replace();
-                ui.close_menu();
+                ui.close();
             }
             if ui.button("Name / color range…").clicked() {
                 self.show_bookmark = true;
-                ui.close_menu();
+                ui.close();
             }
         });
         ui.separator();
         if ui.button("Undo byte edit").clicked() {
             actions.push(HexAction::Undo);
-            ui.close_menu();
+            ui.close();
         }
         if ui.button("Redo byte edit").clicked() {
             actions.push(HexAction::Redo);
-            ui.close_menu();
+            ui.close();
         }
     }
 
@@ -819,7 +821,7 @@ A gold underline marks search hits; an orange top edge marks edits.");
         actions: &mut Vec<HexAction>,
     ) {
         let font = FontId::monospace(13.0);
-        let char_width = ui.fonts(|f| f.glyph_width(&font, '0'));
+        let char_width = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
         let row_height = 21.0;
         let offset_chars = format!("{:X}", source.len()).len().max(8);
         let offset_width = (offset_chars + 2) as f32 * char_width;
@@ -917,11 +919,12 @@ A gold underline marks search hits; an orange top edge marks edits.");
         let id = ui.make_persistent_id("hex_byte_surface");
         let mut clicked_offset = None;
         let mut drag_offset = None;
+        let mut focus_requested = false;
         let mut requested_page = None;
         let mut wants_context = false;
         let mut byte_tooltip = None;
         let mut scroll = egui::ScrollArea::both()
-            .id_source("hex_continuous_bytes")
+            .id_salt("hex_continuous_bytes")
             .auto_shrink([false, false]);
         if let Some(offset) = desired_scroll {
             scroll = scroll.vertical_scroll_offset(offset);
@@ -989,12 +992,14 @@ A gold underline marks search hits; an orange top edge marks edits.");
                         self.drag_selecting = true;
                         self.ascii_input = ascii;
                         ui.memory_mut(|m| m.request_focus(id));
+                        focus_requested = true;
                     }
                 }
                 // A completed click gives egui focus to its row response; retain the
                 // stable surface focus without moving the established selection anchor.
                 if (response.clicked() || response.drag_started()) && pointer_byte.is_some() {
                     ui.memory_mut(|m| m.request_focus(id));
+                    focus_requested = true;
                 }
                 if self.drag_selecting && ui.input(|i| i.pointer.primary_down()) {
                     if let Some((byte, _)) = pointer_byte {
@@ -1108,6 +1113,7 @@ A gold underline marks search hits; an orange top edge marks edits.");
                             },
                             0.0,
                             egui::Stroke::new(1.5_f32, ui.visuals().selection.stroke.color),
+                            egui::StrokeKind::Inside,
                         );
                     }
                     if pointer_byte.is_some_and(|(byte, _)| byte == index) {
@@ -1188,6 +1194,9 @@ A gold underline marks search hits; an orange top edge marks edits.");
         }
         if !ui.input(|i| i.pointer.primary_down()) {
             self.drag_selecting = false;
+        }
+        if focus_requested {
+            ui.memory_mut(|m| m.request_focus(id));
         }
         self.focused = ui.memory(|m| m.has_focus(id));
         if self.focused && !wants_context {
@@ -1672,8 +1681,8 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         actions = editor.ui(ui, Some(source.clone()), &highlights);
                     });
                 },
@@ -1689,7 +1698,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let width = ctx.fonts(|f| f.glyph_width(&FontId::monospace(13.0), '0'));
+        let width = ctx.fonts_mut(|f| f.glyph_width(&FontId::monospace(13.0), '0'));
         let at_byte = |index: usize| row + egui::vec2(width * (11.5 + index as f32 * 3.0), 6.5);
         let press = at_byte(3);
         frame(
@@ -1736,15 +1745,18 @@ mod tests {
         // covered rows before it renders the menu that must suppress their tooltip.
         for near_bottom in [false, true] {
             let ctx = egui::Context::default();
-            ctx.style_mut(|style| {
+            ctx.global_style_mut(|style| {
                 style.interaction.tooltip_delay = 0.0;
                 style.interaction.show_tooltips_only_when_still = false;
             });
             let mut editor = HexEditor::default();
+            let time = std::cell::Cell::new(0.0);
             let frame = |editor: &mut HexEditor, events: Vec<egui::Event>| {
+                time.set(time.get() + 0.2);
                 let mut actions = Vec::new();
                 let output = ctx.run(
                     egui::RawInput {
+                        time: Some(time.get()),
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
                             egui::vec2(900.0, 700.0),
@@ -1752,8 +1764,8 @@ mod tests {
                         events,
                         ..Default::default()
                     },
-                    |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                    |_ctx, ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
                             actions = editor.ui(ui, Some(source.clone()), &[]);
                         });
                     },
@@ -1795,7 +1807,7 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            let width = ctx.fonts(|f| f.glyph_width(&FontId::monospace(13.0), '0'));
+            let width = ctx.fonts_mut(|f| f.glyph_width(&FontId::monospace(13.0), '0'));
             let at_byte = |row| rows[row] + egui::vec2(width * 20.5, 6.5);
             let low_row = rows.len() - 3;
             let origin = at_byte(if near_bottom { low_row } else { 0 });
@@ -1856,7 +1868,11 @@ mod tests {
                 .iter()
                 .any(|action| matches!(action, HexAction::Undo)));
             frame(&mut editor, vec![egui::Event::PointerMoved(outside)]);
-            let (output, _) = frame(&mut editor, vec![]);
+            let mut output = frame(&mut editor, vec![]).0;
+            for _ in 0..3 {
+                if has_tooltip(&output) { break; }
+                output = frame(&mut editor, vec![]).0;
+            }
             assert!(text_pos(&output, "Copy hex").is_none());
             assert!(has_tooltip(&output), "details return after the menu closes");
         }
@@ -1889,13 +1905,13 @@ mod tests {
                 )),
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     editor.ui(ui, Some(source.clone()), &[field.clone()]);
                 });
             },
         );
-        let fill = ctx.style().visuals.selection.bg_fill;
+        let fill = ctx.global_style().visuals.selection.bg_fill;
         let mut bands: Vec<_> = output
             .shapes
             .iter()
@@ -1931,8 +1947,8 @@ mod tests {
                 )),
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     editor.ui(ui, Some(source.clone()), &[]);
                 });
             },
@@ -2004,8 +2020,8 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         actions = editor.ui(ui, Some(source.clone()), &[]);
                     });
                 },
@@ -2021,7 +2037,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let width = ctx.fonts(|f| f.glyph_width(&FontId::monospace(13.0), '0'));
+        let width = ctx.fonts_mut(|f| f.glyph_width(&FontId::monospace(13.0), '0'));
         let pos = pos + egui::vec2(width * 11.5, 6.5);
         frame(
             &mut editor,
@@ -2069,8 +2085,8 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         editor.ui(ui, Some(source.clone()), &[]);
                     });
                 },
@@ -2081,7 +2097,7 @@ mod tests {
             egui::Shape::Text(text) if text.galley.text() == "00000000" => Some(text.pos),
             _ => None,
         }).expect("first byte row");
-        let width = ctx.fonts(|fonts| fonts.glyph_width(&FontId::monospace(13.0), '0'));
+        let width = ctx.fonts_mut(|fonts| fonts.glyph_width(&FontId::monospace(13.0), '0'));
         let byte = address + egui::vec2(width * 11.5, 6.5);
         editor.select_range(8192..8193, true);
         assert!(editor.reveal);
@@ -2120,8 +2136,8 @@ mod tests {
                     events: vec![egui::Event::Text(text.into())],
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         editor.keyboard(ui, &source, 500.0, 21.0, &mut actions)
                     });
                 },
@@ -2139,8 +2155,8 @@ mod tests {
                 events: vec![egui::Event::Text("é".into())],
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     editor.keyboard(ui, &source, 500.0, 21.0, &mut actions)
                 });
             },
@@ -2326,8 +2342,8 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         editor.ui(ui, Some(source.clone()), &[]);
                     });
                 },

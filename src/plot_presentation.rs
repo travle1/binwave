@@ -1,4 +1,6 @@
 //! Display-only transforms. Source values and byte provenance never change.
+#[cfg(test)]
+use crate::egui_compat::ContextRun as _;
 use egui_plot::{PlotPoint, PlotTransform};
 use std::collections::BTreeMap;
 
@@ -47,12 +49,12 @@ impl Presentation {
         {
             self.stack(ranges);
             changed = true;
-            ui.close_menu();
+            ui.close();
         }
         if ui.button("Reset positions").clicked() {
             self.series.clear();
             changed = true;
-            ui.close_menu();
+            ui.close();
         }
         ui.separator();
         egui::ScrollArea::vertical()
@@ -73,7 +75,7 @@ impl Presentation {
                                 .add(
                                     egui::DragValue::new(&mut p.scale)
                                         .speed(0.01)
-                                        .clamp_range(1e-12..=1e12),
+                                        .range(1e-12..=1e12),
                                 )
                                 .changed();
                         });
@@ -177,7 +179,6 @@ mod tests {
             egui::Rect::from_min_max(egui::pos2(20., 20.), egui::pos2(220., 220.)),
             egui_plot::PlotBounds::from_min_max([-1., -1.], [1., 1.]),
             false,
-            false,
         );
         let mut frame = |events| {
             let _ = ctx.run(
@@ -189,8 +190,8 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         p.drag(
                             ui,
                             &transform,

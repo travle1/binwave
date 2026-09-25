@@ -1,6 +1,16 @@
 //! Dock arrangement is view state; closing a panel never closes the document.
-use egui_dock::{DockState, Node, NodeIndex, Split, SurfaceIndex};
+use egui_dock::{DockState, Node, NodeIndex, NodePath, Split, SurfaceIndex, TabIndex};
 use serde::{Deserialize, Serialize};
+
+pub(crate) trait LegacyFindTab<T> {
+    fn find_tab_legacy(&self, tab: &T) -> Option<(SurfaceIndex, NodeIndex, TabIndex)>;
+}
+
+impl<T: PartialEq> LegacyFindTab<T> for DockState<T> {
+    fn find_tab_legacy(&self, tab: &T) -> Option<(SurfaceIndex, NodeIndex, TabIndex)> {
+        self.find_tab(tab).map(|path| (path.surface, path.node, path.tab))
+    }
+}
 
 const STORAGE_KEY: &str = "workspace-layout-v3";
 const DECODER_WIDTH: f32 = 0.40;
@@ -91,16 +101,16 @@ impl WorkspaceLayout {
     /// Reveal the existing decoder, or reopen it in its supporting tab group.
     /// Existing user geometry and floating windows remain where the user put them.
     pub fn show_decoder(&mut self) {
-        if self.dock.find_tab(&Pane::Layout).is_none() {
+        if self.dock.find_tab_legacy(&Pane::Layout).is_none() {
             let support = [Pane::Inspector, Pane::Structures]
                 .into_iter()
-                .find_map(|pane| self.dock.find_tab(&pane));
+                .find_map(|pane| self.dock.find_tab_legacy(&pane));
             if let Some((surface, node, _)) = support {
                 self.dock[surface][node].append_tab(Pane::Layout);
             } else if let Some((surface, node, _)) = self.editor_location() {
                 let branch = self.editor_branch(surface, node);
                 self.dock.split(
-                    (surface, branch),
+                    NodePath::new(surface, branch),
                     Split::Left,
                     DECODER_WIDTH,
                     Node::leaf(Pane::Layout),
@@ -115,10 +125,10 @@ impl WorkspaceLayout {
     /// Make a first plot visible above the source bytes. Once Plot has a place,
     /// keep the user's arrangement, including stacks and floating windows.
     pub fn show_initial_plot(&mut self) {
-        if self.dock.find_tab(&Pane::Plot).is_none() {
-            if let Some((surface, node, _)) = self.dock.find_tab(&Pane::Hex) {
+        if self.dock.find_tab_legacy(&Pane::Plot).is_none() {
+            if let Some((surface, node, _)) = self.dock.find_tab_legacy(&Pane::Hex) {
                 self.dock
-                    .split((surface, node), Split::Above, 0.60, Node::leaf(Pane::Plot));
+                    .split(NodePath::new(surface, node), Split::Above, 0.60, Node::leaf(Pane::Plot));
             } else {
                 self.open_editor(Pane::Plot);
             }
@@ -129,11 +139,11 @@ impl WorkspaceLayout {
     /// Reveal samples below the content editors, keeping the decoder visible.
     /// An existing samples panel, including a floating one, is only focused.
     pub fn show_samples(&mut self) {
-        if self.dock.find_tab(&Pane::Table).is_none() {
+        if self.dock.find_tab_legacy(&Pane::Table).is_none() {
             if let Some((surface, node, _)) = self.editor_location() {
                 let target = self.editor_branch(surface, node);
                 self.dock.split(
-                    (surface, target),
+                    NodePath::new(surface, target),
                     Split::Below,
                     0.60,
                     Node::leaf(Pane::Table),
@@ -150,7 +160,7 @@ impl WorkspaceLayout {
             self.show_decoder();
             return;
         }
-        if self.dock.find_tab(&pane).is_none() {
+        if self.dock.find_tab_legacy(&pane).is_none() {
             match pane {
                 Pane::Layout => unreachable!(),
                 Pane::Structures | Pane::Inspector => {
@@ -161,13 +171,13 @@ impl WorkspaceLayout {
                     };
                     let target = [Pane::Layout, companion]
                         .into_iter()
-                        .find_map(|target| self.dock.find_tab(&target));
+                        .find_map(|target| self.dock.find_tab_legacy(&target));
                     if let Some((surface, node, _)) = target {
                         self.dock[surface][node].append_tab(pane);
                     } else if let Some((surface, node, _)) = self.editor_location() {
                         let branch = self.editor_branch(surface, node);
                         self.dock.split(
-                            (surface, branch),
+                            NodePath::new(surface, branch),
                             Split::Left,
                             DECODER_WIDTH,
                             Node::leaf(pane),
@@ -185,7 +195,7 @@ impl WorkspaceLayout {
     fn editor_location(&self) -> Option<(SurfaceIndex, NodeIndex, egui_dock::TabIndex)> {
         [Pane::Hex, Pane::Plot, Pane::Table]
             .into_iter()
-            .find_map(|pane| self.dock.find_tab(&pane))
+            .find_map(|pane| self.dock.find_tab_legacy(&pane))
     }
 
     /// Climb through content-only splits, stopping before the decoder/supporting
@@ -194,7 +204,7 @@ impl WorkspaceLayout {
         while let Some(parent) = node.parent() {
             let contains_support = [Pane::Layout, Pane::Inspector, Pane::Structures]
                 .into_iter()
-                .filter_map(|pane| self.dock.find_tab(&pane))
+                .filter_map(|pane| self.dock.find_tab_legacy(&pane))
                 .any(|(other_surface, other_node, _)| {
                     other_surface == surface && is_within(other_node, parent)
                 });
@@ -213,10 +223,10 @@ impl WorkspaceLayout {
             self.dock[surface][node].append_tab(pane);
         } else if let Some((surface, node, _)) = [Pane::Layout, Pane::Inspector, Pane::Structures]
             .into_iter()
-            .find_map(|pane| self.dock.find_tab(&pane))
+            .find_map(|pane| self.dock.find_tab_legacy(&pane))
         {
             self.dock.split(
-                (surface, node),
+                NodePath::new(surface, node),
                 Split::Right,
                 DECODER_WIDTH,
                 Node::leaf(pane),
@@ -227,9 +237,11 @@ impl WorkspaceLayout {
     }
 
     fn focus(&mut self, pane: Pane) {
-        if let Some((surface, node, tab)) = self.dock.find_tab(&pane) {
-            self.dock[surface].set_active_tab(node, tab);
-            self.dock.set_focused_node_and_surface((surface, node));
+        if let Some((surface, node, tab)) = self.dock.find_tab_legacy(&pane) {
+            self.dock[surface]
+                .set_active_tab(node, tab)
+                .expect("find_tab returned a valid tab");
+            self.dock.set_focused_node_and_surface(NodePath::new(surface, node));
         }
     }
 }
@@ -250,6 +262,9 @@ fn is_within(mut node: NodeIndex, ancestor: NodeIndex) -> bool {
 mod tests {
     use super::*;
     use eframe::Storage;
+    fn tab_path((surface, node, tab): (SurfaceIndex, NodeIndex, TabIndex)) -> egui_dock::TabPath {
+        egui_dock::TabPath::new(surface, node, tab)
+    }
     #[derive(Default)]
     struct MemoryStorage(std::collections::HashMap<String, String>);
     impl eframe::Storage for MemoryStorage {
@@ -259,36 +274,37 @@ mod tests {
         fn set_string(&mut self, key: &str, value: String) {
             self.0.insert(key.to_owned(), value);
         }
-        fn flush(&mut self) {}
+        fn remove_string(&mut self, key: &str) { self.0.remove(key); }
+            fn flush(&mut self) {}
     }
 
     fn assert_decoder_visible(workspace: &WorkspaceLayout) {
-        assert!(workspace.dock.find_tab(&Pane::Layout).is_some());
-        assert!(workspace.dock.find_tab(&Pane::Inspector).is_some());
-        assert!(workspace.dock.find_tab(&Pane::Structures).is_some());
-        let surface = workspace.dock.find_tab(&Pane::Layout).unwrap().0;
-        assert!(matches!(workspace.dock[surface][NodeIndex::root()],
-            Node::Horizontal { fraction, .. } if (fraction - 0.48).abs() < 0.001 || (fraction - 0.40).abs() < 0.001));
+        assert!(workspace.dock.find_tab_legacy(&Pane::Layout).is_some());
+        assert!(workspace.dock.find_tab_legacy(&Pane::Inspector).is_some());
+        assert!(workspace.dock.find_tab_legacy(&Pane::Structures).is_some());
+        let surface = workspace.dock.find_tab_legacy(&Pane::Layout).unwrap().0;
+        assert!(matches!(&workspace.dock[surface][NodeIndex::root()],
+            Node::Horizontal(split) if (split.fraction - 0.48).abs() < 0.001 || (split.fraction - 0.40).abs() < 0.001));
     }
 
     #[test]
     fn default_shows_definition_and_structure_together_beside_hex() {
         let workspace = WorkspaceLayout::default();
         assert_eq!(workspace.dock.iter_all_tabs().count(), 4);
-        assert!(workspace.dock.find_tab(&Pane::Plot).is_none());
-        assert!(workspace.dock.find_tab(&Pane::Table).is_none());
+        assert!(workspace.dock.find_tab_legacy(&Pane::Plot).is_none());
+        assert!(workspace.dock.find_tab_legacy(&Pane::Table).is_none());
         assert_eq!(
-            workspace.dock.find_tab(&Pane::Hex).unwrap().1,
+            workspace.dock.find_tab_legacy(&Pane::Hex).unwrap().1,
             NodeIndex::root().left()
         );
-        let (surface, node, tab) = workspace.dock.find_tab(&Pane::Structures).unwrap();
-        assert!(matches!(&workspace.dock[surface][node], Node::Leaf { active, .. } if *active == tab));
+        let (surface, node, tab) = workspace.dock.find_tab_legacy(&Pane::Structures).unwrap();
+        assert!(matches!(&workspace.dock[surface][node], Node::Leaf(leaf) if leaf.active == tab));
         assert_eq!(node, NodeIndex::root().right().right());
         assert_eq!(
-            workspace.dock.find_tab(&Pane::Layout).unwrap().1,
+            workspace.dock.find_tab_legacy(&Pane::Layout).unwrap().1,
             NodeIndex::root().right().left()
         );
-        assert_eq!(workspace.dock.find_tab(&Pane::Inspector).unwrap().1, node);
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Inspector).unwrap().1, node);
         assert_eq!(Pane::Layout.title(), "Definition");
         assert_eq!(Pane::Structures.title(), "Decoded structure");
     }
@@ -299,18 +315,18 @@ mod tests {
         workspace.show_initial_plot();
         workspace.show_decoder();
         assert_decoder_visible(&workspace);
-        let plot = workspace.dock.find_tab(&Pane::Plot).unwrap();
-        let hex = workspace.dock.find_tab(&Pane::Hex).unwrap();
+        let plot = workspace.dock.find_tab_legacy(&Pane::Plot).unwrap();
+        let hex = workspace.dock.find_tab_legacy(&Pane::Hex).unwrap();
         assert_eq!(plot.1, NodeIndex::root().left().left());
         assert_eq!(hex.1, NodeIndex::root().left().right());
-        assert!(matches!(workspace.dock[plot.0][NodeIndex::root().left()],
-            Node::Vertical { fraction, .. } if (fraction - 0.60).abs() < 0.001));
-        assert!(workspace.dock.find_tab(&Pane::Table).is_none());
+        assert!(matches!(&workspace.dock[plot.0][NodeIndex::root().left()],
+            Node::Vertical(split) if (split.fraction - 0.60).abs() < 0.001));
+        assert!(workspace.dock.find_tab_legacy(&Pane::Table).is_none());
         for _ in 0..3 {
             workspace.show_initial_plot();
         }
-        assert_eq!(workspace.dock.find_tab(&Pane::Plot), Some(plot));
-        assert_eq!(workspace.dock.find_tab(&Pane::Hex), Some(hex));
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Plot), Some(plot));
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Hex), Some(hex));
         assert_eq!(workspace.dock.iter_all_tabs().count(), 5);
     }
 
@@ -320,41 +336,41 @@ mod tests {
         dock.main_surface_mut()
             .split_right(NodeIndex::root(), 0.81, vec![Pane::Layout]);
         let mut workspace = WorkspaceLayout { dock };
-        let hex = workspace.dock.find_tab(&Pane::Hex).unwrap();
-        let plot = workspace.dock.find_tab(&Pane::Plot).unwrap();
+        let hex = workspace.dock.find_tab_legacy(&Pane::Hex).unwrap();
+        let plot = workspace.dock.find_tab_legacy(&Pane::Plot).unwrap();
         workspace.show_initial_plot();
-        assert_eq!(workspace.dock.find_tab(&Pane::Hex), Some(hex));
-        assert_eq!(workspace.dock.find_tab(&Pane::Plot), Some(plot));
-        assert!(matches!(workspace.dock[hex.0][NodeIndex::root()],
-            Node::Horizontal { fraction, .. } if (fraction - 0.81).abs() < 0.001));
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Hex), Some(hex));
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Plot), Some(plot));
+        assert!(matches!(&workspace.dock[hex.0][NodeIndex::root()],
+            Node::Horizontal(split) if (split.fraction - 0.81).abs() < 0.001));
         workspace.dock.detach_tab(
-            plot,
+            tab_path(plot),
             egui::Rect::from_min_size(egui::pos2(60., 70.), egui::vec2(640., 480.)),
         );
-        let floating = workspace.dock.find_tab(&Pane::Plot).unwrap();
+        let floating = workspace.dock.find_tab_legacy(&Pane::Plot).unwrap();
         workspace.focus(Pane::Plot);
         let mut before = MemoryStorage::default();
         workspace.save(&mut before);
         workspace.show_initial_plot();
         let mut after = MemoryStorage::default();
         workspace.save(&mut after);
-        assert_eq!(workspace.dock.find_tab(&Pane::Plot), Some(floating));
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Plot), Some(floating));
         assert_eq!(before.0, after.0);
     }
 
     #[test]
     fn decoder_reopens_in_its_stack_and_other_editors_do_not_add_columns() {
         let mut workspace = WorkspaceLayout::default();
-        let original = workspace.dock.find_tab(&Pane::Layout).unwrap();
-        workspace.dock.remove_tab(original);
+        let original = workspace.dock.find_tab_legacy(&Pane::Layout).unwrap();
+        workspace.dock.remove_tab(tab_path(original));
         workspace.show_decoder();
         workspace.show_decoder();
         assert_decoder_visible(&workspace);
         workspace.reveal(Pane::Plot);
         workspace.reveal(Pane::Table);
-        let hex = workspace.dock.find_tab(&Pane::Hex).unwrap().1;
-        assert_eq!(workspace.dock.find_tab(&Pane::Plot).unwrap().1, hex);
-        assert_eq!(workspace.dock.find_tab(&Pane::Table).unwrap().1, hex);
+        let hex = workspace.dock.find_tab_legacy(&Pane::Hex).unwrap().1;
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Plot).unwrap().1, hex);
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Table).unwrap().1, hex);
         assert_eq!(workspace.dock.iter_all_tabs().count(), Pane::ALL.len());
     }
 
@@ -362,16 +378,16 @@ mod tests {
     fn samples_open_below_hex_while_structure_stays_visible() {
         let mut workspace = WorkspaceLayout::default();
         workspace.show_samples();
-        let table = workspace.dock.find_tab(&Pane::Table).unwrap();
-        let hex = workspace.dock.find_tab(&Pane::Hex).unwrap();
+        let table = workspace.dock.find_tab_legacy(&Pane::Table).unwrap();
+        let hex = workspace.dock.find_tab_legacy(&Pane::Hex).unwrap();
         assert_eq!(hex.1.parent(), Some(NodeIndex::root().left()));
         assert_eq!(table.1, NodeIndex::root().left().right());
         assert_eq!(hex.1, NodeIndex::root().left().left());
-        let (surface, node, tab) = workspace.dock.find_tab(&Pane::Structures).unwrap();
-        assert!(matches!(&workspace.dock[surface][node], Node::Leaf { active, .. } if *active == tab));
+        let (surface, node, tab) = workspace.dock.find_tab_legacy(&Pane::Structures).unwrap();
+        assert!(matches!(&workspace.dock[surface][node], Node::Leaf(leaf) if leaf.active == tab));
         let count = workspace.dock.iter_all_tabs().count();
         workspace.show_samples();
-        assert_eq!(workspace.dock.find_tab(&Pane::Table), Some(table));
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Table), Some(table));
         assert_eq!(workspace.dock.iter_all_tabs().count(), count);
     }
 
@@ -379,26 +395,26 @@ mod tests {
     fn comparison_layout_adds_samples_below_both_plot_and_hex() {
         let mut workspace = WorkspaceLayout::plot_and_bytes();
         assert_decoder_visible(&workspace);
-        let plot = workspace.dock.find_tab(&Pane::Plot).unwrap();
-        let hex = workspace.dock.find_tab(&Pane::Hex).unwrap();
+        let plot = workspace.dock.find_tab_legacy(&Pane::Plot).unwrap();
+        let hex = workspace.dock.find_tab_legacy(&Pane::Hex).unwrap();
         assert_eq!(plot.1.parent(), Some(NodeIndex::root().right()));
         assert_eq!(hex.1.parent(), plot.1.parent());
         assert_ne!(plot.1, hex.1);
-        assert!(workspace.dock.find_tab(&Pane::Table).is_none());
-        assert!(matches!(workspace.dock[plot.0][NodeIndex::root().right()],
-            Node::Vertical { fraction, .. } if (fraction - 0.60).abs() < 0.001));
+        assert!(workspace.dock.find_tab_legacy(&Pane::Table).is_none());
+        assert!(matches!(&workspace.dock[plot.0][NodeIndex::root().right()],
+            Node::Vertical(split) if (split.fraction - 0.60).abs() < 0.001));
         workspace.show_samples();
-        let plot = workspace.dock.find_tab(&Pane::Plot).unwrap();
-        let hex = workspace.dock.find_tab(&Pane::Hex).unwrap();
-        let table = workspace.dock.find_tab(&Pane::Table).unwrap();
+        let plot = workspace.dock.find_tab_legacy(&Pane::Plot).unwrap();
+        let hex = workspace.dock.find_tab_legacy(&Pane::Hex).unwrap();
+        let table = workspace.dock.find_tab_legacy(&Pane::Table).unwrap();
         assert_eq!(plot.1.parent(), hex.1.parent());
         assert_eq!(plot.1.parent(), Some(NodeIndex::root().right().left()));
         assert_eq!(table.1, NodeIndex::root().right().right());
         assert_decoder_visible(&workspace);
         workspace.show_samples();
-        assert_eq!(workspace.dock.find_tab(&Pane::Plot), Some(plot));
-        assert_eq!(workspace.dock.find_tab(&Pane::Hex), Some(hex));
-        assert_eq!(workspace.dock.find_tab(&Pane::Table), Some(table));
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Plot), Some(plot));
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Hex), Some(hex));
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Table), Some(table));
     }
 
     #[test]
@@ -406,22 +422,22 @@ mod tests {
         let mut workspace = WorkspaceLayout::default();
         workspace.show_samples();
         for pane in [Pane::Layout, Pane::Table] {
-            let position = workspace.dock.find_tab(&pane).unwrap();
+            let position = workspace.dock.find_tab_legacy(&pane).unwrap();
             workspace.dock.detach_tab(
-                position,
+                tab_path(position),
                 egui::Rect::from_min_size(egui::pos2(60., 60.), egui::vec2(600., 500.)),
             );
         }
-        let decoder = workspace.dock.find_tab(&Pane::Layout).unwrap();
-        let table = workspace.dock.find_tab(&Pane::Table).unwrap();
-        let hex = workspace.dock.find_tab(&Pane::Hex).unwrap();
+        let decoder = workspace.dock.find_tab_legacy(&Pane::Layout).unwrap();
+        let table = workspace.dock.find_tab_legacy(&Pane::Table).unwrap();
+        let hex = workspace.dock.find_tab_legacy(&Pane::Hex).unwrap();
         for _ in 0..3 {
             workspace.show_decoder();
             workspace.show_samples();
         }
-        assert_eq!(workspace.dock.find_tab(&Pane::Layout), Some(decoder));
-        assert_eq!(workspace.dock.find_tab(&Pane::Table), Some(table));
-        assert_eq!(workspace.dock.find_tab(&Pane::Hex), Some(hex));
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Layout), Some(decoder));
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Table), Some(table));
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Hex), Some(hex));
         assert_eq!(workspace.dock.iter_all_tabs().count(), 5);
     }
 
@@ -438,19 +454,19 @@ mod tests {
         original.save(&mut storage);
         let mut restored = WorkspaceLayout::load(Some(&storage));
         assert!(
-            restored.dock.find_tab(&Pane::Layout).is_none(),
+            restored.dock.find_tab_legacy(&Pane::Layout).is_none(),
             "loading must not migrate a saved arrangement"
         );
-        let hex = restored.dock.find_tab(&Pane::Hex).unwrap();
-        let inspector = restored.dock.find_tab(&Pane::Inspector).unwrap();
+        let hex = restored.dock.find_tab_legacy(&Pane::Hex).unwrap();
+        let inspector = restored.dock.find_tab_legacy(&Pane::Inspector).unwrap();
         restored.show_decoder();
-        assert_eq!(restored.dock.find_tab(&Pane::Hex), Some(hex));
+        assert_eq!(restored.dock.find_tab_legacy(&Pane::Hex), Some(hex));
         assert_eq!(
-            restored.dock.find_tab(&Pane::Layout).unwrap().1,
+            restored.dock.find_tab_legacy(&Pane::Layout).unwrap().1,
             inspector.1
         );
-        assert!(matches!(restored.dock[hex.0][NodeIndex::root()],
-            Node::Horizontal { fraction, .. } if (fraction - 0.81).abs() < 0.001));
+        assert!(matches!(&restored.dock[hex.0][NodeIndex::root()],
+            Node::Horizontal(split) if (split.fraction - 0.81).abs() < 0.001));
     }
 
     #[test]
@@ -465,46 +481,46 @@ mod tests {
         );
         assert_eq!(top, NodeIndex::root().left());
         workspace.show_decoder();
-        let decoder = workspace.dock.find_tab(&Pane::Layout).unwrap();
+        let decoder = workspace.dock.find_tab_legacy(&Pane::Layout).unwrap();
         assert_eq!(decoder.1, NodeIndex::root().left());
         assert_eq!(
-            workspace.dock.find_tab(&Pane::Hex).unwrap().1.parent(),
+            workspace.dock.find_tab_legacy(&Pane::Hex).unwrap().1.parent(),
             Some(NodeIndex::root().right())
         );
         assert_eq!(
-            workspace.dock.find_tab(&Pane::Plot).unwrap().1.parent(),
+            workspace.dock.find_tab_legacy(&Pane::Plot).unwrap().1.parent(),
             Some(NodeIndex::root().right())
         );
-        assert!(matches!(workspace.dock[decoder.0][NodeIndex::root()],
-            Node::Horizontal { fraction, .. } if (fraction - 0.40).abs() < 0.001));
+        assert!(matches!(&workspace.dock[decoder.0][NodeIndex::root()],
+            Node::Horizontal(split) if (split.fraction - 0.40).abs() < 0.001));
     }
 
     #[test]
     fn closing_reopening_and_persisting_panels_does_not_duplicate_them() {
         let mut workspace = WorkspaceLayout::default();
-        let position = workspace.dock.find_tab(&Pane::Hex).unwrap();
-        workspace.dock.remove_tab(position);
-        assert!(workspace.dock.find_tab(&Pane::Hex).is_none());
+        let position = workspace.dock.find_tab_legacy(&Pane::Hex).unwrap();
+        workspace.dock.remove_tab(tab_path(position));
+        assert!(workspace.dock.find_tab_legacy(&Pane::Hex).is_none());
         for pane in Pane::ALL {
             workspace.reveal(pane);
             workspace.reveal(pane);
         }
-        let position = workspace.dock.find_tab(&Pane::Table).unwrap();
+        let position = workspace.dock.find_tab_legacy(&Pane::Table).unwrap();
         let floating = workspace.dock.detach_tab(
-            position,
+            tab_path(position),
             egui::Rect::from_min_size(egui::pos2(60., 60.), egui::vec2(400., 400.)),
         );
         let mut storage = MemoryStorage::default();
         workspace.save(&mut storage);
         let mut restored = WorkspaceLayout::decode(&storage).unwrap();
-        assert_eq!(restored.dock.find_tab(&Pane::Table).unwrap().0, floating);
-        let position = restored.dock.find_tab(&Pane::Table).unwrap();
-        let (surface, node, _) = restored.dock.find_tab(&Pane::Plot).unwrap();
+        assert_eq!(restored.dock.find_tab_legacy(&Pane::Table).unwrap().0, floating);
+        let position = restored.dock.find_tab_legacy(&Pane::Table).unwrap();
+        let (surface, node, _) = restored.dock.find_tab_legacy(&Pane::Plot).unwrap();
         restored.dock.move_tab(
-            position,
-            egui_dock::TabDestination::Node(surface, node, egui_dock::TabInsert::Append),
+            tab_path(position),
+            egui_dock::TabDestination::Node(NodePath::new(surface, node), egui_dock::TabInsert::Append),
         );
-        assert_eq!(restored.dock.find_tab(&Pane::Table).unwrap().0, surface);
+        assert_eq!(restored.dock.find_tab_legacy(&Pane::Table).unwrap().0, surface);
         assert_eq!(restored.dock.iter_all_tabs().count(), Pane::ALL.len());
         storage.set_string(STORAGE_KEY, "invalid".into());
         assert!(WorkspaceLayout::decode(&storage).is_none());

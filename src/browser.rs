@@ -580,7 +580,7 @@ impl BrowserApp {
             ui.label(format!("Bytes {}..{}", self.range_start, self.range_end));
         });
         let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let digit = ui.fonts(|fonts| fonts.layout_no_wrap("0".into(), font.clone(), egui::Color32::WHITE).size().x);
+        let digit = ui.fonts_mut(|fonts| fonts.layout_no_wrap("0".into(), font.clone(), egui::Color32::WHITE).size().x);
         // Keep full addresses, but omit padding that adds no information.
         let digits = format!("{:X}", self.size.saturating_sub(1)).len().max(4);
         let address_width = digits as f32 * digit + 8.;
@@ -673,7 +673,7 @@ impl BrowserApp {
         if reveal.is_some() {
             self.hex_reveal = None;
         }
-        let mut scroll = egui::ScrollArea::both().id_source("browser-hex");
+        let mut scroll = egui::ScrollArea::both().id_salt("browser-hex");
         if let Some(offset) = desired_scroll {
             scroll = scroll.vertical_scroll_offset(offset);
         }
@@ -782,11 +782,11 @@ impl BrowserApp {
     fn hex_menu(&mut self, ui: &mut egui::Ui) {
         if ui.button("Copy selected hex").clicked() {
             self.copy_selected_hex();
-            ui.close_menu();
+            ui.close();
         }
         if ui.button("Interpret selected bytes").clicked() {
             self.status = "Choose a type beside the byte selection, then name the field and press Enter.".into();
-            ui.close_menu();
+            ui.close();
         }
         if ui.button("Select loaded page").clicked() {
         if self.inspected.is_none() && self.selected.is_none() {
@@ -798,7 +798,7 @@ impl BrowserApp {
         }
             self.selection_anchor = Some(self.offset);
             self.set_hex_range(self.offset, self.offset + self.bytes.len() as u64);
-            ui.close_menu();
+            ui.close();
         }
     }
     fn inspector(&mut self, ui: &mut egui::Ui) {
@@ -829,7 +829,7 @@ impl BrowserApp {
                     ui.menu_button("Sample actions", |ui| {
                         if ui.button("Select all bytes of sample").clicked() {
                             reveal = Some((range.start, range.end));
-                            ui.close_menu();
+                            ui.close();
                         }
                     });
                 }
@@ -1192,7 +1192,7 @@ impl BrowserApp {
     }
     fn collection_picker(&mut self, ui: &mut egui::Ui) {
         let mut selected = self.collection.clone();
-        egui::ComboBox::from_id_source("collection")
+        egui::ComboBox::from_id_salt("collection")
             .selected_text(if selected.is_empty() {
                 "Run a decoder"
             } else {
@@ -1236,7 +1236,7 @@ impl BrowserApp {
             }
             let max = self.count().saturating_sub(1);
             let changed = ui
-                .add(egui::DragValue::new(&mut self.table_start).clamp_range(0..=max))
+                .add(egui::DragValue::new(&mut self.table_start).range(0..=max))
                 .changed();
             if changed {
                 self.request_table();
@@ -1313,7 +1313,7 @@ impl BrowserApp {
             let path = node["path"].as_str().unwrap_or("");
             egui::CollapsingHeader::new(label)
                 .default_open(authoring.editing(node["name"].as_str().unwrap_or("")) || preview_path.is_some_and(|preview| preview == path || preview.starts_with(&format!("{path}.")) || preview.starts_with(&format!("{path}[")) || path.starts_with(&format!("{preview}[0]"))))
-                .id_source(path)
+                .id_salt(path)
                 .show(ui, |ui| {
                     if let Some(message) = node["preview_error"].as_str() {
                         ui.colored_label(ui.visuals().error_fg_color, message);
@@ -1413,17 +1413,17 @@ impl BrowserApp {
             ui.menu_button("Go to sample…", |ui| {
                 ui.label("Sample index (starts at 0)");
                 let last=self.plot_count().saturating_sub(1);
-                ui.add(egui::DragValue::new(&mut self.plot_jump).clamp_range(0..=last));
+                ui.add(egui::DragValue::new(&mut self.plot_jump).range(0..=last));
                 if ui.button("Go").clicked() {
                     let count=self.plot_count();let start=self.plot_jump.saturating_sub(128);
                     self.first=start.to_string();self.last=start.saturating_add(256).min(count).to_string();
-                    self.request_plot(1200);ui.close_menu();
+                    self.request_plot(1200);ui.close();
                 }
             });
             ui.menu_button("Plot options", |ui| {
                 ui.label("Drag a trace vertically to position it.");
                 ui.label("Drag empty space to pan; scroll or pinch to zoom.");
-                if ui.button("Inspect selected bytes").clicked() {self.layout.reveal(Pane::Inspector);self.mobile_target=Some(Pane::Inspector);ui.close_menu();}
+                if ui.button("Inspect selected bytes").clicked() {self.layout.reveal(Pane::Inspector);self.mobile_target=Some(Pane::Inspector);ui.close();}
                 ui.weak("Use Open data → Extract selection to export bytes.");
             });
         });
@@ -1454,7 +1454,12 @@ impl BrowserApp {
                 .allow_scroll(!self.stacked)
                 .allow_drag(!self.presentation.is_dragging())
                 .y_axis_label(if self.presentation.series.is_empty() {"Value"} else {"Display position"})
-                .label_formatter(move |name,point| {let p=placements.get(name).copied().unwrap_or_default();format!("{name}\nSample: {:.0}\nValue: {}",point.x,p.original(point.y))});
+                .label_formatter(move |hover| {
+                    if let egui_plot::HoverPosition::NearDataPoint { plot_name, position, .. } = hover {
+                        let p=placements.get(*plot_name).copied().unwrap_or_default();
+                        Some(format!("{plot_name}\nSample: {:.0}\nValue: {}", position.x, p.original(position.y)))
+                    } else { None }
+                });
             if std::mem::take(&mut self.reset_plot) { plot = plot.reset(); }
             let response = plot
             .show(ui, |plot| {
@@ -1568,9 +1573,10 @@ fn parse_offset(text: &str) -> Option<u64> {
     }
 }
 impl eframe::App for BrowserApp {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        let ctx = root_ui.ctx().clone();
         source_editor_focus(false);
-        self.stacked = self.layout_mode == "stacked" || (self.layout_mode == "auto" && ctx.screen_rect().width() < 900.);
+        self.stacked = self.layout_mode == "stacked" || (self.layout_mode == "auto" && ctx.content_rect().width() < 900.);
         self.events();
         if self.reveal_decoder {
             self.layout.show_decoder();
@@ -1587,7 +1593,7 @@ impl eframe::App for BrowserApp {
                 .default_width(560.)
                 .default_height(640.)
                 .resizable(true)
-                .show(ctx, |ui| crate::source_editor::decoding_guide(ui));
+                .show(&ctx, |ui| crate::source_editor::decoding_guide(ui));
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
             self.apply_decoder();
@@ -1608,11 +1614,11 @@ impl eframe::App for BrowserApp {
         });
         publish_menus(&serde_json::to_string(&menus).unwrap(), &if self.name.is_empty() { String::new() } else { format!("{} · {} bytes{}",self.name,self.size,if self.dirty {" · unsaved changes"}else{""}) }, &self.status, crate::APP_VERSION);
         if self.stacked {
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
                 ui.spacing_mut().interact_size.y = 32.;
                 ui.spacing_mut().item_spacing.y = 8.;
                 let target = self.mobile_target.take();
-                egui::ScrollArea::vertical().id_source("mobile-workspace").auto_shrink([false,false]).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("mobile-workspace").auto_shrink([false,false]).show(ui, |ui| {
                     let width = ui.available_width();
                     let editor_height = (ui.clip_rect().height()-56.).clamp(300.,560.);
                     for (pane, height, open) in [
@@ -1628,7 +1634,7 @@ impl eframe::App for BrowserApp {
                                 .show(ui, |ui| {
                                     ui.allocate_ui_with_layout(egui::vec2((width-24.).max(100.),height),egui::Layout::top_down(egui::Align::Min), |ui| {
                                         ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
-                                        self.ui(ui, &mut pane.clone());
+                                        TabViewer::ui(self, ui, &mut pane.clone());
                                     });
                                 });
                             if target == Some(pane) { header.header_response.scroll_to_me(Some(egui::Align::Min)); }
@@ -1641,7 +1647,7 @@ impl eframe::App for BrowserApp {
             // Desktop docking remains independently arranged while mobile stacks
             // the same pane implementations into one scrollable column.
             let mut layout = std::mem::take(&mut self.layout);
-            DockArea::new(&mut layout.dock).show(ctx, self);
+            DockArea::new(&mut layout.dock).show_inside(root_ui, self);
             self.layout = layout;
         }
         if self.sent_yaml.as_ref() != Some(&self.yaml) {
@@ -1668,6 +1674,9 @@ impl eframe::App for BrowserApp {
 }
 impl TabViewer for BrowserApp {
     type Tab = Pane;
+    fn id(&mut self, pane: &mut Pane) -> egui::Id {
+        egui::Id::new(*pane)
+    }
     fn title(&mut self, pane: &mut Pane) -> egui::WidgetText {
         pane.title().into()
     }

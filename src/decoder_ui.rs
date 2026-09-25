@@ -1,4 +1,6 @@
 //! Decoder workflow presentation shared by the native and browser shells.
+#[cfg(test)]
+use crate::egui_compat::ContextRun as _;
 use egui::{Color32, RichText, Ui};
 
 pub const RUN_LABEL: &str = "▶ Run (F5)";
@@ -39,11 +41,11 @@ pub fn run_button(ui: &mut Ui, enabled: bool, disabled_reason: Option<&str>) -> 
 pub fn status_banner(ui: &mut Ui, headline: &str, detail: &str, tone: StatusTone, busy: bool) {
     let color = tone_color(ui, tone);
     let fill = color.gamma_multiply(if ui.visuals().dark_mode { 0.10 } else { 0.06 });
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(fill)
         .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.65)))
-        .rounding(5.0)
-        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+        .corner_radius(5.0)
+        .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 if busy {
@@ -157,7 +159,7 @@ pub fn console(ui: &mut Ui, stdout: &str, error: Option<&str>, running: bool) ->
     let error_count = usize::from(error.is_some());
     let failing_line = error.and_then(error_line);
     egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::same(8.0))
+        .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.strong("Console");
@@ -188,7 +190,7 @@ pub fn console(ui: &mut Ui, stdout: &str, error: Option<&str>, running: bool) ->
             });
             ui.separator();
             egui::ScrollArea::vertical()
-                .id_source("decoder_console_output")
+                .id_salt("decoder_console_output")
                 .auto_shrink([false, false])
                 .max_height(ui.available_height())
                 .show(ui, |ui| {
@@ -210,7 +212,7 @@ pub fn console(ui: &mut Ui, stdout: &str, error: Option<&str>, running: bool) ->
                                                 .monospace()
                                                 .color(ui.visuals().error_fg_color),
                                         )
-                                        .wrap(true),
+                                        .wrap(),
                                     );
                                 });
                             } else {
@@ -220,7 +222,7 @@ pub fn console(ui: &mut Ui, stdout: &str, error: Option<&str>, running: bool) ->
                                             .monospace()
                                             .color(ui.visuals().error_fg_color),
                                     )
-                                    .wrap(true),
+                                    .wrap(),
                                 );
                             }
                         }
@@ -249,11 +251,11 @@ fn parsing_map_ui(ui: &mut Ui, map: &ParsingMap, action: &mut ConsoleAction) {
     if let Some(boundary) = map.boundary {
         ui.add_space(6.0);
         let color = ui.visuals().error_fg_color;
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(color.gamma_multiply(if ui.visuals().dark_mode { 0.10 } else { 0.06 }))
             .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.65)))
-            .rounding(4.0)
-            .inner_margin(egui::Margin::same(7.0))
+            .corner_radius(4.0)
+            .inner_margin(egui::Margin::same(7))
             .show(ui, |ui| {
                 ui.colored_label(color, RichText::new("Read crossed its enclosing boundary").strong());
                 ui.label(format!(
@@ -387,7 +389,7 @@ fn parse_u64_prefix(text: &str) -> Option<u64> {
 
 pub fn empty_state(ui: &mut Ui, title: &str, detail: &str) {
     egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::same(12.0))
+        .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
             ui.strong(title);
             ui.label(detail);
@@ -479,8 +481,8 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         console(ui, "", Some(error), false);
                     });
                 },
@@ -525,7 +527,7 @@ mod tests {
         let ctx = egui::Context::default();
         let frame = || ctx.run(
             egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900., 600.))), ..Default::default() },
-            |ctx| { egui::CentralPanel::default().show(ctx, |ui| { console(ui, "", Some(error), false); }); },
+            |_ctx, ui| { egui::CentralPanel::default().show(ui, |ui| { console(ui, "", Some(error), false); }); },
         );
         let _ = frame();
         let output = frame();

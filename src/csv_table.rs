@@ -1,4 +1,6 @@
 //! Bounded, asynchronous CSV table pages sharing the plot's data source.
+#[cfg(test)]
+use crate::egui_compat::ContextRun as _;
 use crate::data::DataStore;
 use anyhow::Result;
 use egui::Ui;
@@ -169,7 +171,7 @@ impl CsvTable {
             if ui
                 .add(
                     egui::DragValue::new(&mut page)
-                        .clamp_range(1..=max_pages)
+                        .range(1..=max_pages)
                         .prefix("Page "),
                 )
                 .changed()
@@ -214,7 +216,7 @@ impl CsvTable {
                 if ui
                     .add(
                         egui::DragValue::new(&mut page)
-                            .clamp_range(1..=column_pages)
+                            .range(1..=column_pages)
                             .prefix("Columns page "),
                     )
                     .changed()
@@ -340,7 +342,7 @@ impl CsvTable {
         let mut clicked = None;
         let mut reveal_response = None;
         egui::ScrollArea::both()
-            .id_source("csv_table_scroll")
+            .id_salt("csv_table_scroll")
             .show(ui, |ui| {
                 egui::Grid::new("csv_table")
                     .with_row_color(move |row, style| {
@@ -516,8 +518,8 @@ mod tests {
         table.requested = Some(original_key.clone());
         table.rx = Some(rx);
         let render = |table: &mut CsvTable| {
-            let _ = ctx.run(Default::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = ctx.run(Default::default(), |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     table.ui(ui, Some(&data), 1, &[true; 20], true, false);
                 });
             });
@@ -559,19 +561,16 @@ mod tests {
                     egui::Pos2::ZERO,
                     egui::vec2(1200., 600.),
                 )),
-                modifiers: events
-                    .iter()
-                    .rev()
-                    .find_map(|event| match event {
+                events: std::iter::once(egui::Event::ModifiersChanged(
+                    events.iter().rev().find_map(|event| match event {
                         egui::Event::PointerButton { modifiers, .. } => Some(*modifiers),
                         _ => None,
-                    })
-                    .unwrap_or_default(),
-                events,
+                    }).unwrap_or_default(),
+                )).chain(events).collect(),
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     response = table.ui(ui, Some(data), 1, visible, complete, reading);
                 });
             },
@@ -1020,8 +1019,8 @@ mod tests {
                 active: 202
             })
         );
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run(Default::default(), |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 assert_eq!(
                     table.ui(ui, Some(&data), 2, &visible, true, false),
                     CsvTableResponse::default(),

@@ -1,4 +1,6 @@
 //! Direct byte interpretation shared by desktop and browser. No file I/O here.
+#[cfg(test)]
+use crate::egui_compat::ContextRun as _;
 use egui::Ui;
 use serde_yaml_ng::Value;
 use std::ops::Range;
@@ -459,7 +461,7 @@ impl DirectAuthoring {
                     .clicked()
                 {
                     self.created(name.into());
-                    ui.close_menu();
+                    ui.close();
                 }
             });
             (response, None)
@@ -498,7 +500,7 @@ impl DirectAuthoring {
                         .clicked()
                     {
                         chosen = Some(kind.to_string());
-                        ui.close_menu();
+                        ui.close();
                     }
                 }
                 let names = structures(source);
@@ -508,7 +510,7 @@ impl DirectAuthoring {
                     for name in names {
                         if ui.button(&name).clicked() {
                             chosen = Some(format!("structure:{name}"));
-                            ui.close_menu();
+                            ui.close();
                         }
                     }
                 }
@@ -539,6 +541,7 @@ impl DirectAuthoring {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn structures_use_real_nested_lengths_and_keep_declarations() {
         use std::sync::atomic::AtomicBool;
@@ -594,8 +597,8 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         let (_, edit) = authoring.name_ui(ui, source, "field", 0..4);
                         if let Some(Edit::Commit(next)) = edit {
                             *source = next;
@@ -639,8 +642,8 @@ mod tests {
         let ctx = egui::Context::default();
         let mut editor = DirectAuthoring::default();
         let draw = |editor: &mut DirectAuthoring, source: &str| {
-            ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            ctx.run(egui::RawInput::default(), |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     editor.ui(ui, source, Some(0..4), Some(b"DEMO"), 16);
                 });
             })
@@ -685,8 +688,8 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         if let Some(Edit::Interpret(next, _)) =
                             editor.ui(ui, source, Some(0..4), Some(b"DEMO"), 16)
                         {

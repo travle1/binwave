@@ -1,4 +1,6 @@
 //! egui presentation and background jobs for the binary workspace.
+#[cfg(test)]
+use crate::egui_compat::ContextRun as _;
 use crate::binary::{
     self, BinaryDocument, ByteSnapshot, Layout, Original, PlotData, ResolvedLayout, Sample,
     ValueIdentity,
@@ -534,7 +536,7 @@ impl BinaryWorkspace {
             return;
         };
         let mut section = doc.section;
-        egui::ComboBox::from_id_source("binary_section")
+        egui::ComboBox::from_id_salt("binary_section")
             .selected_text(format!("Section: {}", doc.layout.name))
             .show_ui(ui, |ui| {
                 for (i, entry) in doc.structure.sections.iter().enumerate() {
@@ -545,7 +547,7 @@ impl BinaryWorkspace {
             .default_open(true)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
-                    .id_source("section_summary")
+                    .id_salt("section_summary")
                     .max_height(120.)
                     .show(ui, |ui| {
                         if doc.structure.legacy {
@@ -2276,17 +2278,17 @@ impl BinaryWorkspace {
             }
             return;
         }
-        egui::TopBottomPanel::bottom("binary_inspector")
+        egui::Panel::bottom("binary_inspector")
             .resizable(true)
-            .default_height(320.)
-            .min_height(180.)
-            .show_inside(ui, |ui| {
-                egui::SidePanel::right("binary_hex")
+            .default_size(320.)
+            .min_size(180.)
+            .show(ui, |ui| {
+                egui::Panel::right("binary_hex")
                     .resizable(true)
-                    .default_width(410.)
-                    .min_width(260.)
-                    .show_inside(ui, |ui| self.hex(ui));
-                egui::CentralPanel::default().show_inside(ui, |ui| self.table(ui));
+                    .default_size(410.)
+                    .min_size(260.)
+                    .show(ui, |ui| self.hex(ui));
+                egui::CentralPanel::default().show(ui, |ui| self.table(ui));
             });
         if self.document.as_ref().unwrap().layout.fields.is_empty() {
             ui.label("This section contains uninterpreted bytes; select a section with numeric fields to plot or edit.");
@@ -2345,7 +2347,7 @@ impl BinaryWorkspace {
             .collect();
         let previous = (self.x, self.y);
         ui.horizontal_wrapped(|ui| {
-            egui::ComboBox::from_id_source("binary_x")
+            egui::ComboBox::from_id_salt("binary_x")
                 .selected_text(format!(
                     "X: {}",
                     self.x.map(|i| fields[i].as_str()).unwrap_or("Record index")
@@ -2356,7 +2358,7 @@ impl BinaryWorkspace {
                         ui.selectable_value(&mut self.x, Some(i), field);
                     }
                 });
-            egui::ComboBox::from_id_source("binary_y")
+            egui::ComboBox::from_id_salt("binary_y")
                 .selected_text(format!("Y: {}", fields[self.y]))
                 .show_ui(ui, |ui| {
                     for (i, field) in fields.iter().enumerate() {
@@ -2419,13 +2421,13 @@ impl BinaryWorkspace {
                     let points: Vec<_> = data.samples.iter().map(|s| s.point).collect();
                     if self.connect {
                         plot_ui.line(
-                            Line::new(points.clone())
+                            Line::new(&fields[self.y], points.clone())
                                 .color(Color32::from_rgb(70, 165, 220))
                                 .name(&fields[self.y]),
                         );
                     }
                     plot_ui.points(
-                        Points::new(points)
+                        Points::new(&fields[self.y], points)
                             .radius(2.5_f32)
                             .color(Color32::from_rgb(70, 165, 220))
                             .name(&fields[self.y]),
@@ -2433,7 +2435,7 @@ impl BinaryWorkspace {
                 }
                 if let Some(sample) = selected_sample {
                     plot_ui.points(
-                        Points::new(vec![sample.point])
+                        Points::new("selected sample", vec![sample.point])
                             .radius(7.0_f32)
                             .color(Color32::YELLOW)
                             .name(format!(
@@ -2507,7 +2509,7 @@ impl BinaryWorkspace {
         }
         let mut section = self.document.as_ref().unwrap().section;
         ui.push_id("table_section", |ui| {
-            egui::ComboBox::from_id_source("decoded_section")
+            egui::ComboBox::from_id_salt("decoded_section")
                 .selected_text(&self.document.as_ref().unwrap().layout.name)
                 .show_ui(ui, |ui| {
                     for (i, entry) in self
@@ -2548,7 +2550,7 @@ impl BinaryWorkspace {
             if ui
                 .add(
                     egui::DragValue::new(&mut page)
-                        .clamp_range(1..=pages)
+                        .range(1..=pages)
                         .prefix("Page "),
                 )
                 .changed()
@@ -2588,7 +2590,7 @@ impl BinaryWorkspace {
         let mut selection = None;
         let selected_bytes = self.hex_editor.selection();
         egui::ScrollArea::both()
-            .id_source("record_table")
+            .id_salt("record_table")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Grid::new("binary_table_grid")
@@ -2783,10 +2785,7 @@ impl BinaryWorkspace {
                 HexAction::Redo => self.history(ctx, true),
                 HexAction::Define(range) => {
                     if self.is_python() {
-                        ctx.output_mut(|output| {
-                            output.copied_text =
-                                format!("file.read_at(0x{:X}, {})", range.start, range.len())
-                        });
+                        ctx.copy_text(format!("file.read_at(0x{:X}, {})", range.start, range.len()));
                         self.show_yaml();
                         self.reveal_definition = true;
                         continue;
@@ -3075,11 +3074,11 @@ impl BinaryWorkspace {
                             .clicked()
                         {
                             self.plot_action(PlotAction::InspectBytes(range.clone()), ui.ctx());
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.button("Export whole sample…").clicked() {
                             self.choose_export(ui.ctx(), range.clone());
-                            ui.close_menu();
+                            ui.close();
                         }
                     });
                 }
@@ -4284,7 +4283,7 @@ mod tests {
             .unwrap()
             .events
             .push(egui::ViewportEvent::Close);
-        let output = ctx.run(input, |ctx| workspace.tick(ctx));
+        let output = ctx.run(input, |ctx, _ui| workspace.tick(ctx));
         assert!(output.viewport_output[&egui::ViewportId::ROOT]
             .commands
             .contains(&egui::ViewportCommand::CancelClose));
@@ -4319,7 +4318,7 @@ mod tests {
             .unwrap()
             .events
             .push(egui::ViewportEvent::Close);
-        let output = ctx.run(input, |ctx| workspace.tick(ctx));
+        let output = ctx.run(input, |ctx, _ui| workspace.tick(ctx));
         assert!(output.viewport_output[&egui::ViewportId::ROOT]
             .commands
             .contains(&egui::ViewportCommand::CancelClose));
@@ -4425,8 +4424,8 @@ mod tests {
         assert_eq!(node.range, 16..24);
         assert_eq!(node.numeric(), Some(11.));
         assert_eq!(workspace.structure_ui.selected_sample(), Some((1, 16..32)));
-        let shown = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| workspace.selection_inspector(ui));
+        let shown = ctx.run(egui::RawInput::default(), |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| workspace.selection_inspector(ui));
         });
         let labels: Vec<_> = shown
             .shapes
@@ -5035,18 +5034,18 @@ mod tests {
             events,
             ..Default::default()
         };
-        ctx.run(input, |ctx| {
+        ctx.run(input, |ctx, ui| {
             workspace.tick(ctx);
-            egui::TopBottomPanel::top("test_file_toolbar").show(ctx, |ui| {
+            egui::Panel::top("test_file_toolbar").show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     workspace.file_toolbar(ui);
                     workspace.edit_toolbar(ui);
                 });
             });
-            egui::SidePanel::left("test_controls")
-                .exact_width(350.)
-                .show(ctx, |ui| workspace.controls(ui));
-            egui::CentralPanel::default().show(ctx, |ui| workspace.content(ui));
+            egui::Panel::left("test_controls")
+                .exact_size(350.)
+                .show(ui, |ui| workspace.controls(ui));
+            egui::CentralPanel::default().show(ui, |ui| workspace.content(ui));
         })
     }
 
@@ -5425,7 +5424,7 @@ mod tests {
             .unwrap()
             .events
             .push(egui::ViewportEvent::Close);
-        let output = ctx.run(input, |ctx| workspace.tick(ctx));
+        let output = ctx.run(input, |ctx, _ui| workspace.tick(ctx));
         assert!(output.viewport_output[&egui::ViewportId::ROOT]
             .commands
             .contains(&egui::ViewportCommand::CancelClose));

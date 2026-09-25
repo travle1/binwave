@@ -1,4 +1,6 @@
 //! Shared selection and bounded, asynchronous pages for decoded structure views.
+#[cfg(test)]
+use crate::egui_compat::ContextRun as _;
 use crate::structure_selection::{covering, sample_indices_for_bytes, sample_bytes};
 use crate::byte_store::ByteView;
 use crate::hex_editor::HexHighlight;
@@ -441,7 +443,7 @@ impl StructureViews {
             if let Some(index) = rows.iter().position(|(node, _)| node.path == path) { scroll = scroll.vertical_scroll_offset(index as f32 * row_height); }
         }
         scroll
-            .id_source("decoded_structure_tree")
+            .id_salt("decoded_structure_tree")
             .auto_shrink([false, false])
             .show_rows(ui, row_height, rows.len(), |ui, range| {
                 for index in range {
@@ -525,7 +527,7 @@ impl StructureViews {
                     return;
                 }
                 self.definition_index = self.definition_index.min(output.definitions.len() - 1);
-                egui::ComboBox::from_id_source("decoded_definition")
+                egui::ComboBox::from_id_salt("decoded_definition")
                     .selected_text(&output.definitions[self.definition_index].name)
                     .show_ui(ui, |ui| {
                         for (index, definition) in output.definitions.iter().enumerate() {
@@ -555,7 +557,7 @@ impl StructureViews {
                     }
                 }
                 egui::ScrollArea::vertical()
-                    .id_source("resolved_definition_fields")
+                    .id_salt("resolved_definition_fields")
                     .max_height(160.)
                     .show_rows(ui, 20., definition.fields.len(), |ui, range| {
                         for index in range {
@@ -598,7 +600,7 @@ impl StructureViews {
         let previous = self.table_target.clone();
         ui.horizontal_wrapped(|ui| {
             ui.label("Data");
-            egui::ComboBox::from_id_source("structure_collection")
+            egui::ComboBox::from_id_salt("structure_collection")
                 .width(ui.available_width().min(420.).max(120.))
                 .selected_text(if self.table_target.is_empty() {
                     "File elements".to_owned()
@@ -680,7 +682,7 @@ impl StructureViews {
             ui.label("Go to sample");
             let entry = ui.add(
                 egui::DragValue::new(&mut self.table_jump)
-                    .clamp_range(0..=array.count.saturating_sub(1)),
+                    .range(0..=array.count.saturating_sub(1)),
             );
             if ui.button("Go").clicked()
                 || entry.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
@@ -772,7 +774,7 @@ impl StructureViews {
         let table_width =
             (widths.iter().sum::<f32>() + value_width * columns.len() as f32).max(available);
         egui::ScrollArea::horizontal()
-            .id_source("decoded_table_horizontal")
+            .id_salt("decoded_table_horizontal")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.set_min_width(table_width);
@@ -796,7 +798,7 @@ impl StructureViews {
                 });
                 ui.separator();
                 let mut scroll = egui::ScrollArea::vertical()
-                    .id_source(("decoded_table_vertical", &self.table_target))
+                    .id_salt(("decoded_table_vertical", &self.table_target))
                     .auto_shrink([false, false]);
                 if reveal {
                     scroll =
@@ -1110,20 +1112,20 @@ impl StructureViews {
             ui.menu_button("Go to sample…", |ui| {
                 ui.label("Sample index (starts at 0)");
                 self.plot_jump=self.plot_jump.min(count-1);
-                ui.add(egui::DragValue::new(&mut self.plot_jump).clamp_range(0..=count-1));
+                ui.add(egui::DragValue::new(&mut self.plot_jump).range(0..=count-1));
                 if ui.button("Go").clicked() {
                     force_view=Some(centered_view(self.plot_jump,view.len().min(INITIAL_PLOT_SAMPLES).max(64),count));
                     if let Some(bytes)=sample_bytes(node,self.plot_jump..self.plot_jump+1) {picked=Some((bytes,None));}
-                    ui.close_menu();
+                    ui.close();
                 }
             });
             ui.menu_button("Plot options", |ui| {
             let mut lock_y=!self.plot_free_y;
             if ui.checkbox(&mut lock_y,"Lock vertical zoom").changed() {self.plot_free_y=!lock_y;}
-            if ui.button("Fit Y").clicked() {self.plot_fit_y=true;ui.close_menu();}
+            if ui.button("Fit Y").clicked() {self.plot_fit_y=true;ui.close();}
             if ui.add_enabled(selected_samples.is_some(),egui::Button::new("Fit selection")).clicked() {
                 if let Some(samples)=&selected_samples {force_view=Some(padded_selection(samples,count));self.plot_fit_y=true;}
-                ui.close_menu();
+                ui.close();
             }
             ui.weak("Drag a trace vertically to position it. Drag empty space to pan.");
             ui.weak("Wheel/pinch zooms. Right-drag selects a zoom range.");
@@ -1131,9 +1133,9 @@ impl StructureViews {
             let mut first = view.start;
             let mut shown = view.len().max(1);
             ui.label("View from");
-            let first_changed = ui.add(egui::DragValue::new(&mut first).clamp_range(0..=count - 1)).changed();
+            let first_changed = ui.add(egui::DragValue::new(&mut first).range(0..=count - 1)).changed();
             ui.label("Count");
-            let count_changed = ui.add(egui::DragValue::new(&mut shown).clamp_range(1..=count)).changed();
+            let count_changed = ui.add(egui::DragValue::new(&mut shown).range(1..=count)).changed();
             if first_changed || count_changed {
                 force_view = Some(first..first.saturating_add(shown).min(count));
             }
@@ -1142,11 +1144,11 @@ impl StructureViews {
                 ui.label("Whole samples, including every field");
                 ui.horizontal(|ui| {
                     ui.label("First");
-                    ui.add(egui::DragValue::new(&mut self.plot_range_first).clamp_range(0..=count - 1));
+                    ui.add(egui::DragValue::new(&mut self.plot_range_first).range(0..=count - 1));
                 });
                 ui.horizontal(|ui| {
                     ui.label("Last (inclusive)");
-                    ui.add(egui::DragValue::new(&mut self.plot_range_last).clamp_range(0..=count - 1));
+                    ui.add(egui::DragValue::new(&mut self.plot_range_last).range(0..=count - 1));
                 });
                 if ui.button("Select bytes").clicked() {
                     let first = self.plot_range_first.min(self.plot_range_last).min(count - 1);
@@ -1155,7 +1157,7 @@ impl StructureViews {
                         self.plot_anchor = Some(first);
                         picked = Some((bytes, None));
                     }
-                    ui.close_menu();
+                    ui.close();
                 }
             });
             if ui.add_enabled(selected_bytes.is_some(), egui::Button::new("Open in Inspector")).clicked() {
@@ -1309,9 +1311,13 @@ impl StructureViews {
             .allow_drag(egui::Vec2b::new(!self.presentation.is_dragging(), self.plot_free_y && !self.presentation.is_dragging()))
             .allow_zoom(egui::Vec2b::new(true, self.plot_free_y))
             .allow_scroll(false)
-            .label_formatter(move |name, point| {
-                let p=placements.get(name).copied().unwrap_or_default();
-                format!("{name}\nSample: {:.0}\nValue: {}",point.x,p.original(point.y))
+            .label_formatter(move |position| {
+                if let egui_plot::HoverPosition::NearDataPoint { plot_name, position, .. } = position {
+                    let p = placements.get(*plot_name).copied().unwrap_or_default();
+                    Some(format!("{plot_name}\nSample: {:.0}\nValue: {}", position.x, p.original(position.y)))
+                } else {
+                    None
+                }
             })
             .y_axis_label(if self.presentation.series.is_empty() {"Value"} else {"Display position"})
             .x_axis_label("Sample index")
@@ -1347,7 +1353,7 @@ impl StructureViews {
                         });
                         decoded_channel(plot_ui, name, color, points.clone(), bands.as_deref());
                         if data.quality == PlotQuality::Exact && values.len() <= canvas_width as usize / 5 {
-                            plot_ui.points(Points::new(points).name(name).color(color).radius(2.5_f32));
+                            plot_ui.points(Points::new(name, points).color(color).radius(2.5_f32));
                         }
                     }
                 }
@@ -1374,16 +1380,25 @@ impl StructureViews {
                     && (axis_hover.is_some() || plot_ui.response().hovered())
                 {
                     let (scroll, shift, pinch, pointer) = plot_ctx.input(|input| {
+                        let scroll = input.raw.events.iter().filter_map(|event| match event {
+                            egui::Event::MouseWheel { delta, .. } => Some(*delta),
+                            _ => None,
+                        }).fold(egui::Vec2::ZERO, |sum, delta| sum + delta);
+                        let shift = input.modifiers.shift;
                         (
-                            input.raw_scroll_delta,
-                            input.modifiers.shift,
-                            input.zoom_delta_2d(),
+                            scroll,
+                            shift,
+                            if shift && scroll != egui::Vec2::ZERO {
+                                egui::Vec2::splat(1.)
+                            } else {
+                                input.zoom_delta_2d()
+                            },
                             input.pointer.hover_pos(),
                         )
                     });
                     if let Some(pointer) = pointer {
                         let old = plot_ui.plot_bounds();
-                        let transform = PlotTransform::new(inner, old, false, false);
+                        let transform = PlotTransform::new(inner, old, false);
                         let center = transform.value_from_position(pointer);
                         if let Some((axis, _)) =
                             axis_hover.filter(|_| pinch != egui::Vec2::splat(1.))
@@ -1546,6 +1561,7 @@ impl StructureViews {
                         band,
                         0.,
                         egui::Stroke::new(1_f32, ui.visuals().selection.stroke.color),
+                        egui::StrokeKind::Inside,
                     );
                 }
             }
@@ -1660,11 +1676,11 @@ impl StructureViews {
             if let Some(bytes) = &selected_bytes {
                 if ui.button("Inspect / edit selected bytes").clicked() {
                     self.plot_action = Some(PlotAction::InspectBytes(bytes.clone()));
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button("Export selected bytes…").clicked() {
                     self.plot_action = Some(PlotAction::ExportBytes(bytes.clone()));
-                    ui.close_menu();
+                    ui.close();
                 }
             } else {
                 ui.label("Select a point or sample range first.");
@@ -1880,7 +1896,7 @@ fn table_cell(
         },
     );
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, selected, text)
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, text)
     });
     if ui.is_rect_visible(rect) {
         let visuals = ui.style().interact_selectable(&response, selected);
@@ -2193,13 +2209,13 @@ mod tests {
         let ctx = egui::Context::default();
         let mut views = StructureViews::default();
         views.tick(&ctx, store.view());
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| views.target_controls(ui, &output));
+        let _ = ctx.run(Default::default(), |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| views.target_controls(ui, &output));
         });
         assert_eq!(views.table_target, "items");
         views.table_target.clear();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| views.target_controls(ui, &output));
+        let _ = ctx.run(Default::default(), |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| views.target_controls(ui, &output));
         });
         assert!(views.table_target.is_empty());
     }
@@ -2292,12 +2308,11 @@ actions:
                     egui::Pos2::ZERO,
                     egui::vec2(900., 600.),
                 )),
-                events,
-                modifiers,
+                events: std::iter::once(egui::Event::ModifiersChanged(modifiers)).chain(events).collect(),
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     selection = views.table(ui, output, store.view());
                 });
             },
@@ -2597,8 +2612,8 @@ actions:
             ..Default::default()
         };
         let mut render = || {
-            ctx.run(input.clone(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            ctx.run(input.clone(), |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     views.table(ui, &output, store.view());
                 });
             })
@@ -2619,8 +2634,8 @@ actions:
             );
         }
         views.select_bytes(&output, Some(8 + 100 * 8..8 + 101 * 8));
-        let scrolled = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let scrolled = ctx.run(input, |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 views.table(ui, &output, store.view());
             });
         });
@@ -2640,18 +2655,22 @@ actions:
         events: Vec<egui::Event>,
         modifiers: egui::Modifiers,
     ) -> Option<Range<usize>> {
+        let events = events.into_iter().map(|event| match event {
+            egui::Event::MouseWheel { unit, delta, phase, .. } =>
+                egui::Event::MouseWheel { unit, delta, phase, modifiers },
+            other => other,
+        });
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(1200., 700.),
             )),
-            events,
-            modifiers,
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers)).chain(events).collect(),
             ..Default::default()
         };
         let mut selection = None;
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run(input, |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 selection = views.plot(ui, output, store.view());
             });
         });
@@ -2922,8 +2941,8 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 )),
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     views.plot(ui, output, store.view());
                 });
             },
@@ -2944,7 +2963,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                     }
                 }
                 egui::Shape::Path(path)
-                    if !path.closed && path.stroke.color == color && path.points.len() > 4 =>
+                    if !path.closed && path.stroke.color == egui::epaint::ColorMode::Solid(color) && path.points.len() > 4 =>
                 {
                     traces.push(path.points.clone());
                 }
@@ -3065,7 +3084,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
         let primitives = ctx.tessellate(rendered.shapes, rendered.pixels_per_point);
         let atlas = ctx.fonts(|fonts| fonts.image());
         let pixels: Vec<[u8; 4]> = atlas
-            .srgba_pixels(None)
+            .pixels.iter()
             .map(|pixel| pixel.to_array())
             .collect();
         let meshes: Vec<_> = primitives.into_iter().filter_map(|primitive| {
@@ -3175,8 +3194,8 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 )),
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     views.plot(ui, &output, store.view());
                 });
             },
@@ -3212,7 +3231,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             match shape {
                 egui::Shape::Vec(shapes) => shapes.iter().any(|shape| series_color(shape, color)),
                 egui::Shape::Path(path) => {
-                    path.stroke.color == color || path.fill == color.gamma_multiply(0.23)
+                    path.stroke.color == egui::epaint::ColorMode::Solid(color) || path.fill == color.gamma_multiply(0.23)
                 }
                 _ => false,
             }
@@ -3474,7 +3493,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 &mut views,
                 &output,
                 &store,
-                vec![egui::Event::Scroll(egui::vec2(0., 80.))],
+                vec![egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0., 80.), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE }],
                 egui::Modifiers::NONE,
             );
             settle_plot(&ctx, &mut views, &output, &store);
@@ -3577,7 +3596,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 &output,
                 &store,
                 pointer,
-                egui::Event::Scroll(egui::vec2(0., 48.)),
+                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0., 48.), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE },
                 egui::Modifiers::NONE,
             );
             settle_plot(&ctx, &mut views, &output, &store);
@@ -3628,7 +3647,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 &output,
                 &store,
                 pointer,
-                egui::Event::Scroll(egui::vec2(48., 0.)),
+                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(48., 0.), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE },
                 shift,
             );
             let immediately_after = *navigation_memory(&ctx, &views, &output).bounds();
@@ -3722,11 +3741,11 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
         let corner = egui::pos2(frame.left() - 8., frame.bottom() + 8.);
         for (event, modifiers) in [
             (
-                egui::Event::Scroll(egui::vec2(0., 48.)),
+                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0., 48.), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE },
                 egui::Modifiers::NONE,
             ),
             (
-                egui::Event::Scroll(egui::vec2(48., 0.)),
+                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(48., 0.), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE },
                 egui::Modifiers {
                     shift: true,
                     ..Default::default()
@@ -3762,7 +3781,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 &output,
                 &store,
                 pointer,
-                egui::Event::Scroll(egui::vec2(0., 80.)),
+                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0., 80.), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE },
                 egui::Modifiers::NONE,
             );
             let immediately_after = *navigation_memory(&ctx, &views, &output).bounds();

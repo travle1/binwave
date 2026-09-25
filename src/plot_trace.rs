@@ -1,6 +1,6 @@
 //! Draw resolvable traces as lines and subpixel cycles as amplitude coverage.
 use egui::{Color32, Id, Rect, Shape, Ui};
-use egui_plot::{Line, PlotBounds, PlotGeometry, PlotItem, PlotPoint, PlotTransform};
+use egui_plot::{Line, PlotBounds, PlotGeometry, PlotItem, PlotItemBase, PlotPoint, PlotTransform};
 use std::ops::RangeInclusive;
 
 /// Stable series colors do not depend on selection order or the number of traces.
@@ -25,14 +25,14 @@ pub fn decoded_channel(
             }
             // Flat polygons have no area and can tessellate to non-finite vertices.
             if low < high {
-                plot.polygon(egui_plot::Polygon::new(vec![
+                plot.polygon(egui_plot::Polygon::new(name, vec![
                     [left, low], [right, low], [right, high], [left, high],
                 ]).name(name).fill_color(color.gamma_multiply(0.23))
                     .stroke(egui::Stroke::new(0_f32, color)));
             }
             for (i, value) in [low, high].into_iter().enumerate() {
                 if i == 1 && low == high { continue; }
-                plot.line(Line::new(vec![[left, value], [right, value]])
+                plot.line(Line::new(name, vec![[left, value], [right, value]])
                     .name(name).color(color).width(0.8_f32));
             }
         }
@@ -48,13 +48,13 @@ const ENVELOPE_RADIUS: usize = 2;
 /// Retains the line's original point geometry for legends, hover and selection.
 /// Only its painted representation changes when cycles cannot be resolved.
 pub struct AdaptiveTrace {
-    line: Line,
+    line: Line<'static>,
 }
 
 impl AdaptiveTrace {
     pub fn new(points: Vec<[f64; 2]>, name: impl Into<String>, color: Color32) -> Self {
         Self {
-            line: Line::new(points).name(name.into()).color(color),
+            line: Line::new(name.into(), points).color(color),
         }
     }
 }
@@ -74,7 +74,7 @@ impl PlotItem for AdaptiveTrace {
                 self.color().gamma_multiply(alpha),
             );
             if !mesh.is_empty() {
-                shapes.push(Shape::Mesh(mesh));
+                shapes.push(Shape::Mesh(mesh.into()));
             }
         } else {
             self.line.shapes(ui, transform, shapes);
@@ -102,8 +102,14 @@ impl PlotItem for AdaptiveTrace {
     fn bounds(&self) -> PlotBounds {
         self.line.bounds()
     }
-    fn id(&self) -> Option<Id> {
+    fn id(&self) -> Id {
         PlotItem::id(&self.line)
+    }
+    fn base(&self) -> &PlotItemBase {
+        PlotItem::base(&self.line)
+    }
+    fn base_mut(&mut self) -> &mut PlotItemBase {
+        PlotItem::base_mut(&mut self.line)
     }
 }
 
@@ -338,7 +344,6 @@ mod tests {
         PlotTransform::new(
             Rect::from_min_size(egui::pos2(10.25, 20.5), egui::vec2(width, 400.0)),
             PlotBounds::from_min_max([0.0, -4.0], [count as f64 - 1.0, 4.0]),
-            false,
             false,
         )
     }

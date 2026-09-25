@@ -1,4 +1,6 @@
 //! Shared decoder source editor and starter templates for native and browser shells.
+#[cfg(test)]
+use crate::egui_compat::ContextRun as _;
 use egui::{Color32, Ui};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -228,7 +230,7 @@ impl YamlLayoutCache {
                 ui.label("Spaces");
                 ui.add(
                     egui::DragValue::new(&mut self.tab_width)
-                        .clamp_range(1..=8)
+                        .range(1..=8)
                         .speed(1),
                 );
             });
@@ -239,7 +241,7 @@ impl YamlLayoutCache {
         for action in ["Undo", "Redo", "Cut", "Copy", "Paste", "Select all", "Toggle comments"] {
             if ui.button(action).clicked() {
                 self.edit_action = Some(action);
-                ui.close_menu();
+                ui.close();
             }
         }
         ui.separator();
@@ -251,7 +253,7 @@ impl YamlLayoutCache {
             for (label, snippet) in templates {
                 if ui.button(*label).on_hover_text(*snippet).clicked() {
                     self.insert_template = Some(snippet);
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         });
@@ -259,7 +261,7 @@ impl YamlLayoutCache {
         self.tab_width_menu(ui);
         if ui.button("Convert leading tabs to spaces").clicked() {
             self.edit_action = Some("Convert indentation");
-            ui.close_menu();
+            ui.close();
         }
     }
     pub(crate) fn layout(
@@ -289,7 +291,7 @@ impl YamlLayoutCache {
             self.dark = dark;
             self.foreground = foreground;
         }
-        ui.fonts(|fonts| fonts.layout_job(self.job.as_ref().unwrap().clone()))
+        ui.fonts_mut(|fonts| fonts.layout_job(self.job.as_ref().unwrap().clone()))
     }
 
     pub(crate) fn editor(&mut self, ui: &mut Ui, yaml: &mut String, language: DecoderLanguage) {
@@ -298,7 +300,7 @@ impl YamlLayoutCache {
         if language == DecoderLanguage::Yaml {
             ui.horizontal_wrapped(|ui| {
                 let dark = ui.visuals().dark_mode;
-                let compact = ui.ctx().screen_rect().width() < 900.;
+                let compact = ui.ctx().content_rect().width() < 900.;
                 if !compact { ui.colored_label(if dark { Color32::from_rgb(140,194,238) } else { Color32::from_rgb(25,89,149) }, "Keyword");
                 ui.colored_label(builtin_color(dark), "Built-in type");
                 ui.label("User-defined name"); }
@@ -320,10 +322,10 @@ impl YamlLayoutCache {
             });
             self.refresh_diagnostic(yaml);
             if let Some(diagnostic) = self.diagnostic.clone() {
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(ui.visuals().error_fg_color.gamma_multiply(0.08))
                     .stroke(egui::Stroke::new(1_f32, ui.visuals().error_fg_color.gamma_multiply(0.55)))
-                    .inner_margin(egui::Margin::symmetric(8., 5.))
+                    .inner_margin(egui::Margin::symmetric(8, 5))
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.colored_label(
@@ -376,17 +378,17 @@ impl YamlLayoutCache {
         let mut font = egui::TextStyle::Monospace.resolve(ui.style());
         font.size = font.size.max(13.);
         let lines = yaml.bytes().filter(|byte| *byte == b'\n').count() + 1;
-        let gutter_width = ui.fonts(|fonts| fonts.glyph_width(&font, '0'))
+        let gutter_width = ui.fonts_mut(|fonts| fonts.glyph_width(&font, '0'))
             * lines.to_string().len().max(2) as f32
             + 20.;
-        egui::Frame::none()
+        egui::Frame::NONE
             .fill(ui.visuals().extreme_bg_color)
-            .inner_margin(egui::Margin::same(6.))
+            .inner_margin(egui::Margin::same(6))
             .show(ui, |ui| {
                 let size = ui.available_size();
                 let mut caret = None;
                 let scroll = egui::ScrollArea::both()
-                    .id_source(("decoder_source", language))
+                    .id_salt(("decoder_source", language))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.horizontal_top(|ui| {
@@ -559,14 +561,14 @@ impl YamlLayoutCache {
                                     }
                                 }
                             }
-                            let mut layouter = |ui: &Ui, text: &str, _width: f32| {
-                                self.layout(ui, text, &font, language)
+                            let mut layouter = |ui: &Ui, text: &dyn egui::TextBuffer, _width: f32| {
+                                self.layout(ui, text.as_str(), &font, language)
                             };
                             let mut output = egui::TextEdit::multiline(yaml)
                                 .id(editor_id)
                                 .code_editor()
                                 .font(font.clone())
-                                .frame(false)
+                                .frame(egui::Frame::NONE)
                                 .desired_width(text_width)
                                 .min_size(egui::vec2(text_width, size.y))
                                 .layouter(&mut layouter)
@@ -580,9 +582,10 @@ impl YamlLayoutCache {
                                 })
                                 .show(ui);
                             caret = output.cursor_range.map(|range| {
+                                let cursor = output.galley.layout_from_cursor(range.primary);
                                 (
-                                    range.primary.rcursor.row + 1,
-                                    range.primary.rcursor.column + 1,
+                                    cursor.row + 1,
+                                    cursor.column.0 + 1,
                                 )
                             });
                             let secondary_pressed = ui.input(|input| {
@@ -593,7 +596,7 @@ impl YamlLayoutCache {
                             });
                             if (secondary_pressed || output.response.secondary_clicked())
                                 && selection_before.is_some_and(|selection| {
-                                    selection.primary.index != selection.secondary.index
+                                    selection.primary.index.0 != selection.secondary.index.0
                                 })
                             {
                                 let mut state = egui::TextEdit::load_state(ui.ctx(), editor_id)
@@ -623,9 +626,9 @@ impl YamlLayoutCache {
                             );
                             let clip = ui.clip_rect();
                             for (index, row) in output.galley.rows.iter().enumerate() {
-                                let y = output.galley_pos.y + row.rect.center().y;
-                                if y >= clip.top() - row.rect.height()
-                                    && y <= clip.bottom() + row.rect.height()
+                                let y = output.galley_pos.y + row.rect().center().y;
+                                if y >= clip.top() - row.rect().height()
+                                    && y <= clip.bottom() + row.rect().height()
                                 {
                                     ui.painter().text(
                                         egui::pos2(gutter.right() - 8., y),
@@ -691,7 +694,7 @@ fn paint_caret_status(
 ) {
     let Some((line, column)) = caret else { return; };
     let label = format!("Ln {line}, Col {column}");
-    let digit = ui.fonts(|fonts| fonts.glyph_width(font, '0')).max(1.);
+    let digit = ui.fonts_mut(|fonts| fonts.glyph_width(font, '0')).max(1.);
     let size = egui::vec2(digit * label.chars().count() as f32 + 14., font.size + 8.);
     let badge = egui::Rect::from_min_size(
         egui::pos2(rect.right() - size.x - 4., rect.bottom() - size.y - 4.),
@@ -703,6 +706,7 @@ fn paint_caret_status(
         badge,
         3.,
         egui::Stroke::new(1_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::StrokeKind::Inside,
     );
     painter.text(
         badge.center(),
@@ -724,7 +728,7 @@ fn paint_source_diagnostic(
     let Some(row) = output.galley.rows.get(row_index) else {
         return;
     };
-    let row_rect = row.rect.translate(output.galley_pos.to_vec2());
+    let row_rect = row.rect().translate(output.galley_pos.to_vec2());
     let line_rect = egui::Rect::from_min_max(
         egui::pos2(output.text_clip_rect.left(), row_rect.top()),
         egui::pos2(output.text_clip_rect.right(), row_rect.bottom()),
@@ -744,20 +748,20 @@ fn paint_source_diagnostic(
     if let Some(column) = diagnostic.column {
         let caret = output
             .galley
-            .pos_from_rcursor(egui::epaint::text::cursor::RCursor {
+            .pos_from_layout_cursor(&egui::epaint::text::cursor::LayoutCursor {
             row: row_index,
-            column: column.saturating_sub(1),
+            column: column.saturating_sub(1).into(),
         });
         let x = output.galley_pos.x + caret.left();
         let width = ui
-            .fonts(|fonts| fonts.glyph_width(&egui::TextStyle::Monospace.resolve(ui.style()), '0'))
+            .fonts_mut(|fonts| fonts.glyph_width(&egui::TextStyle::Monospace.resolve(ui.style()), '0'))
             .max(3.);
         let column_rect = egui::Rect::from_min_max(
             egui::pos2(x, row_rect.top()),
             egui::pos2(x + width, row_rect.bottom()),
         )
         .intersect(output.text_clip_rect);
-        painter.rect_stroke(column_rect, 1., egui::Stroke::new(1.5_f32, color));
+        painter.rect_stroke(column_rect, 1., egui::Stroke::new(1.5_f32, color), egui::StrokeKind::Inside);
         painter.hline(
             column_rect.x_range(),
             column_rect.bottom() - 1.,
@@ -1094,15 +1098,16 @@ fn apply_source_edits(
         index.checked_add_signed(shift).unwrap_or_default()
     };
     egui::text::CCursorRange {
-        primary: egui::text::CCursor::new(transform(selection.primary.index)),
-        secondary: egui::text::CCursor::new(transform(selection.secondary.index)),
+        primary: egui::text::CCursor::new(transform(selection.primary.index.0)),
+        secondary: egui::text::CCursor::new(transform(selection.secondary.index.0)),
+        h_pos: None,
     }
 }
 
 fn selected_line_starts(text: &[char], selection: egui::text::CCursorRange) -> Vec<usize> {
-    let [first, last] = selection.sorted();
-    let first = first.index.min(text.len());
-    let last = last.index.min(text.len());
+    let [first, last] = selection.sorted_cursors();
+    let first = first.index.0.min(text.len());
+    let last = last.index.0.min(text.len());
     let included_last = if first < last { last - 1 } else { last };
     let mut start = text[..first]
         .iter()
@@ -1152,10 +1157,10 @@ fn insert_auto_indented_newline(
     let tab_width = tab_width.clamp(1, 8);
     let state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
     let range = state.cursor.char_range().unwrap_or_default();
-    let [first, last] = range.sorted();
+    let [first, last] = range.sorted_cursors();
     let chars: Vec<char> = text.chars().collect();
-    let index = first.index.min(chars.len());
-    let selection_end = last.index.min(chars.len());
+    let index = first.index.0.min(chars.len());
+    let selection_end = last.index.0.min(chars.len());
     let line_start = chars[..index]
         .iter()
         .rposition(|ch| *ch == '\n')
@@ -1211,9 +1216,9 @@ fn indent_source(
     let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
     let selection = state.cursor.char_range().unwrap_or_default();
     let chars: Vec<char> = text.chars().collect();
-    let collapsed = selection.primary.index == selection.secondary.index;
+    let collapsed = selection.primary.index.0 == selection.secondary.index.0;
     let edits = if !dedent && collapsed {
-        let index = selection.primary.index.min(chars.len());
+        let index = selection.primary.index.0.min(chars.len());
         let column = visual_column_at(&chars, index, tab_width);
         let spaces = tab_width - column % tab_width;
         vec![SourceEdit {
@@ -1324,9 +1329,9 @@ fn insert_source_template(
 ) {
     let state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
     let selection = state.cursor.char_range().unwrap_or_default();
-    let [first, last] = selection.sorted();
+    let [first, last] = selection.sorted_cursors();
     let chars: Vec<char> = source.chars().collect();
-    let position = first.index.min(chars.len());
+    let position = first.index.0.min(chars.len());
     let line_start = chars[..position]
         .iter()
         .rposition(|ch| *ch == '\n')
@@ -1340,7 +1345,7 @@ fn insert_source_template(
         .iter()
         .take_while(|ch| **ch == ' ' || **ch == '\t')
         .collect();
-    let append_line = first.index == last.index
+    let append_line = first.index.0 == last.index.0
         && !before.trim().is_empty()
         && chars[position..line_end].iter().all(|ch| ch.is_whitespace());
     let indent = if append_line && before.trim_end().ends_with(':') {
@@ -1362,16 +1367,16 @@ fn edit_source(ctx: &egui::Context, id: egui::Id, text: &mut String, action: &st
     let mut range = state.cursor.char_range().unwrap_or_default();
     let mut undo = state.undoer();
     if action != "Undo" && action != "Redo" { undo.add_undo(&(range, text.clone())); }
-    let [first, last] = range.sorted();
+    let [first, last] = range.sorted_cursors();
     if matches!(action, "Copy" | "Cut") {
-        let selected: String = text.chars().skip(first.index).take(last.index - first.index).collect();
+        let selected: String = text.chars().skip(first.index.0).take(last.index.0 - first.index.0).collect();
         #[cfg(target_arch = "wasm32")]
         crate::browser::copy_text(&selected);
         #[cfg(not(target_arch = "wasm32"))]
         {
             // Keep egui's clipboard path (including Wayland), and write through
             // to the native clipboard for menu actions that can move focus.
-            ctx.output_mut(|out| out.copied_text = selected.clone());
+            ctx.copy_text(selected.clone());
             if let Err(error) = arboard::Clipboard::new()
                 .and_then(|mut clipboard| clipboard.set_text(selected))
             {
@@ -1383,9 +1388,9 @@ fn edit_source(ctx: &egui::Context, id: egui::Id, text: &mut String, action: &st
         "Cut" | "Paste" => {
             let insert = paste.unwrap_or("");
             let chars: Vec<char> = text.chars().collect();
-            *text = chars[..first.index.min(chars.len())].iter().collect::<String>()
-                + insert + &chars[last.index.min(chars.len())..].iter().collect::<String>();
-            range = egui::text::CCursorRange::one(egui::text::CCursor::new(first.index + insert.chars().count()));
+            *text = chars[..first.index.0.min(chars.len())].iter().collect::<String>()
+                + insert + &chars[last.index.0.min(chars.len())..].iter().collect::<String>();
+            range = egui::text::CCursorRange::one(egui::text::CCursor::new(first.index.0 + insert.chars().count()));
         }
         "Select all" => range = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count())),
         "Toggle comments" => range = toggle_source_comments(text, range),
@@ -1408,16 +1413,16 @@ pub(crate) fn toggle_source_comments(
     mut selection: egui::text::CCursorRange,
 ) -> egui::text::CCursorRange {
     let chars: Vec<char> = text.chars().collect();
-    selection.primary.index = selection.primary.index.min(chars.len());
-    selection.secondary.index = selection.secondary.index.min(chars.len());
-    let [first, last] = selection.sorted();
+    selection.primary.index = selection.primary.index.0.min(chars.len()).into();
+    selection.secondary.index = selection.secondary.index.0.min(chars.len()).into();
+    let [first, last] = selection.sorted_cursors();
     // A selection ending at the start of a line excludes that following line.
-    let last = if first.index < last.index {
-        last.index - 1
+    let last = if first.index.0 < last.index.0 {
+        last.index.0 - 1
     } else {
-        last.index
+        last.index.0
     };
-    let mut start = chars[..first.index]
+    let mut start = chars[..first.index.0]
         .iter()
         .rposition(|&ch| ch == '\n')
         .map_or(0, |position| position + 1);
@@ -1430,7 +1435,7 @@ pub(crate) fn toggle_source_comments(
         let content = (start..end).find(|&position| !matches!(chars[position], ' ' | '\t' | '\r'));
         if let Some(position) = content {
             positions.push(position);
-        } else if selection.primary.index == selection.secondary.index {
+        } else if selection.primary.index.0 == selection.secondary.index.0 {
             // On an empty current line, keep its indentation before inserting '# '.
             positions.push(if end > start && chars[end - 1] == '\r' {
                 end - 1
@@ -1461,10 +1466,10 @@ pub(crate) fn toggle_source_comments(
         let added = if uncomment { 0 } else { 2 };
         let adjusted_position = position.checked_add_signed(shift).unwrap();
         for cursor in [&mut selection.primary, &mut selection.secondary] {
-            if cursor.index >= adjusted_position {
-                cursor.index = adjusted_position
+            if cursor.index.0 >= adjusted_position {
+                cursor.index = (adjusted_position
                     + added
-                    + cursor.index.saturating_sub(adjusted_position + removed);
+                    + cursor.index.0.saturating_sub(adjusted_position + removed)).into();
             }
         }
         shift += added as isize - removed as isize;
@@ -1687,7 +1692,7 @@ mod highlighting_tests {
             let normal=if dark {Color32::WHITE} else {Color32::BLACK};
             let job=source_layout(text,egui::FontId::monospace(13.),dark,normal,DecoderLanguage::Yaml);
             assert_eq!(job.text,text);
-            let color_at=|index|job.sections.iter().find(|s|s.byte_range.contains(&index)).unwrap().format.color;
+            let color_at=|index: usize|job.sections.iter().find(|s|s.byte_range.contains(&index.into())).unwrap().format.color;
             for needle in ["u32", "\"f32\"", "i16", "f64", "bytes"] {
                 assert_eq!(color_at(text.find(needle).unwrap()),builtin_color(dark));
             }
@@ -1962,8 +1967,8 @@ mod selected_read_tests {
                 )),
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     let (rect, _) = ui.allocate_exact_size(
                         egui::vec2(650., 80.),
                         egui::Sense::hover(),
@@ -2000,8 +2005,8 @@ mod selected_read_tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         editor.editor(ui, source, DecoderLanguage::Yaml);
                     });
                 },
@@ -2047,10 +2052,10 @@ mod selected_read_tests {
             .cursor
             .char_range()
             .unwrap();
-        assert_eq!(selection.sorted()[0].index, 0);
-        assert_eq!(selection.sorted()[1].index, source.chars().count());
+        assert_eq!(selection.sorted_cursors()[0].index.0, 0);
+        assert_eq!(selection.sorted_cursors()[1].index.0, source.chars().count());
         let copied = frame(&mut editor, &mut source, vec![egui::Event::Copy]);
-        assert_eq!(copied.platform_output.copied_text, source);
+        assert_eq!(copied.platform_output.commands.contains(&egui::OutputCommand::CopyText(source.clone())), true);
     }
 
     #[test]
@@ -2067,8 +2072,8 @@ mod selected_read_tests {
                     )),
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         editor.editor(ui, source, DecoderLanguage::Yaml);
                     });
                 },
@@ -2079,7 +2084,7 @@ mod selected_read_tests {
         frame(&mut editor, &mut source);
         editor.command("Copy");
         let copied = frame(&mut editor, &mut source);
-        assert_eq!(copied.platform_output.copied_text, source);
+        assert_eq!(copied.platform_output.commands.contains(&egui::OutputCommand::CopyText(source.clone())), true);
     }
 
     #[test]
@@ -2097,8 +2102,8 @@ mod selected_read_tests {
                     events,
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         editor.editor(ui, source, DecoderLanguage::Yaml);
                     });
                 },

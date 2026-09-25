@@ -1,4 +1,6 @@
 //! One command hierarchy for desktop egui and the browser's user-activation-safe DOM bar.
+#[cfg(test)]
+use crate::egui_compat::ContextRun as _;
 use crate::workspace_layout::Pane;
 use serde::{Deserialize, Serialize};
 
@@ -244,7 +246,7 @@ pub fn native_bar(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)>
                     .clicked()
                 {
                     *selected = Some((command, item.argument));
-                    ui.close_menu();
+                    ui.close();
                 }
             } else {
                 ui.menu_button(&item.label, |ui| entries(ui, &item.children, selected));
@@ -252,7 +254,7 @@ pub fn native_bar(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)>
         }
     }
     let mut selected = None;
-    egui::menu::bar(ui, |ui| {
+    egui::MenuBar::new().ui(ui, |ui| {
         for menu in menus {
             ui.menu_button(&menu.label, |ui| entries(ui, &menu.children, &mut selected));
         }
@@ -310,8 +312,8 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         native_bar(ui, &model);
                     });
                 },

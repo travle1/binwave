@@ -1,3 +1,7 @@
+#[cfg(test)]
+use crate::egui_compat::ContextRun as _;
+#[cfg(test)]
+use crate::workspace_layout::LegacyFindTab as _;
 use crate::binary_ui::{BinaryWorkspace, OpenedFile};
 use crate::cache::LoadProgress;
 use crate::config::AppConfig;
@@ -836,7 +840,7 @@ impl BinwaveApp {
         ui.separator();
         if self.decoder == Decoder::Csv {
             egui::ScrollArea::vertical()
-                .id_source("csv_decoder_settings")
+                .id_salt("csv_decoder_settings")
                 .show(ui, |ui| self.ui_csv_decoder(ui));
         } else {
             self.binary.decoder_controls(ui);
@@ -872,7 +876,7 @@ impl BinwaveApp {
             .spacing(egui::vec2(12., 10.))
             .show(ui, |ui| {
                 ui.label("Separator");
-                egui::ComboBox::from_id_source("csv_separator")
+                egui::ComboBox::from_id_salt("csv_separator")
                     .selected_text(match self.cfg.csv.delimiter {
                         ',' => "Comma",
                         '\t' => "Tab",
@@ -1324,12 +1328,13 @@ impl BinwaveApp {
         }
         if self.binary.has_file() {
             let title=self.binary.source_path().and_then(|p|p.file_name()).map(|n|n.to_string_lossy().into_owned()).unwrap_or_else(||"Embedded demo".into());
-            ui.add(egui::Label::new(format!("{title} · {} bytes{}",self.binary.file_len(),if self.binary.is_dirty(){" · unsaved changes"}else{""})).truncate(true));
+            ui.add(egui::Label::new(format!("{title} · {} bytes{}",self.binary.file_len(),if self.binary.is_dirty(){" · unsaved changes"}else{""})).truncate());
         }
     }
 
-    fn ui_workspace(&mut self, ctx: &Context) {
-        self.poll_workspace(ctx);
+    fn ui_workspace(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = root_ui.ctx().clone();
+        self.poll_workspace(&ctx);
         let open = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
         let save = egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
@@ -1344,31 +1349,29 @@ impl BinwaveApp {
             self.binary.jump_to_byte();
         }
         if ctx.input_mut(|i| i.consume_shortcut(&open)) {
-            self.choose_data_file(ctx);
+            self.choose_data_file(&ctx);
         }
         if ctx.input_mut(|i| i.consume_shortcut(&save))
             && self.commands_available()
             && self.binary.has_file()
         {
-            self.binary.save_copy(ctx);
+            self.binary.save_copy(&ctx);
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F5))
             && self.commands_available()
         {
-            self.run_active_decoder(ctx);
+            self.run_active_decoder(&ctx);
         }
         for file in ctx.input(|i| i.raw.dropped_files.clone()) {
-            if let Some(path) = file.path {
-                self.open_path(path, ctx);
-            }
+            self.open_path(file.path().to_path_buf(), &ctx);
         }
-        egui::TopBottomPanel::top("workspace_toolbar").show(ctx, |ui| self.ui_toolbar(ui));
+        egui::Panel::top("workspace_toolbar").show(root_ui, |ui| self.ui_toolbar(ui));
         if self.show_decoding_guide {
-            egui::Window::new("Decoding guide").open(&mut self.show_decoding_guide).default_width(540.).resizable(true).show(ctx, |ui| {
+            egui::Window::new("Decoding guide").open(&mut self.show_decoding_guide).default_width(540.).resizable(true).show(&ctx, |ui| {
                 crate::source_editor::decoding_guide(ui);
             });
         }
-        egui::TopBottomPanel::bottom("workspace_status").show(ctx, |ui| {
+        egui::Panel::bottom("workspace_status").show(root_ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if self.binary.busy() || self.loader_rx.is_some() || self.csv_link_request.is_some()
                 {
@@ -1397,7 +1400,7 @@ impl BinwaveApp {
             });
         });
         let mut workspace = std::mem::take(&mut self.workspace);
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
             if !self.binary.has_file() && !self.show_empty_workspace {
                 self.ui_welcome(ui);
                 return;
@@ -1408,7 +1411,7 @@ impl BinwaveApp {
                 .show_inside(ui, &mut WorkspaceViewer { app: self });
         });
         self.workspace = workspace;
-        self.poll_csv_links(ctx);
+        self.poll_csv_links(&ctx);
         if ctx
             .data_mut(|data| data.remove_temp::<bool>(egui::Id::new("welcome_definitions")))
             .unwrap_or(false)
@@ -1665,7 +1668,7 @@ impl BinwaveApp {
                 for (i, name, points) in &self.plot_lines {
                     if self.visible.get(*i) == Some(&true) {
                         plot_ui.line(
-                            Line::new(points.iter().map(|sample| sample.point).collect::<Vec<_>>())
+                            Line::new(name, points.iter().map(|sample| sample.point).collect::<Vec<_>>())
                                 .name(name),
                         );
                     }
@@ -1673,7 +1676,7 @@ impl BinwaveApp {
                 if let Some(selection) = &self.csv_selection {
                     for row in std::iter::once(&selection.row).chain(selection.anchor.as_ref()) {
                         if let Some(&x) = row.values.first().filter(|x| x.is_finite()) {
-                            plot_ui.vline(VLine::new(x).color(egui::Color32::YELLOW));
+                            plot_ui.vline(VLine::new("selection", x).color(egui::Color32::YELLOW));
                         }
                     }
                     let selected_points: Vec<_> = selected_samples
@@ -1681,7 +1684,7 @@ impl BinwaveApp {
                         .map(|(_, sample)| sample.point)
                         .collect();
                     plot_ui.points(
-                        Points::new(selected_points)
+                        Points::new("selection", selected_points)
                             .color(egui::Color32::YELLOW)
                             .radius(5_f32),
                     );
@@ -1750,11 +1753,11 @@ impl BinwaveApp {
 }
 
 impl eframe::App for BinwaveApp {
-    fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.dialog_template = rfd::AsyncFileDialog::new().set_parent(frame);
         self.binary
             .set_dialog_template(self.dialog_template.clone());
-        self.ui_workspace(ctx);
+        self.ui_workspace(ui);
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.workspace.save(storage);
@@ -1916,12 +1919,12 @@ mod tests {
                 events,
                 ..Default::default()
             },
-            |ctx| {
+            |ctx, ui| {
                 app.poll_loader(ctx);
-                egui::SidePanel::left("controls")
-                    .exact_width(350.)
-                    .show(ctx, |ui| app.ui_decoder(ui));
-                egui::CentralPanel::default().show(ctx, |ui| app.ui_plot(ui));
+                egui::Panel::left("controls")
+                    .exact_size(350.)
+                    .show(ui, |ui| app.ui_decoder(ui));
+                egui::CentralPanel::default().show(ui, |ui| app.ui_plot(ui));
             },
         )
     }
@@ -1963,7 +1966,7 @@ mod tests {
                 )),
                 ..Default::default()
             },
-            |ctx| app.ui_workspace(ctx),
+            |_ctx, ui| app.ui_workspace(ui),
         )
     }
 
@@ -1981,7 +1984,7 @@ mod tests {
                 events,
                 ..Default::default()
             },
-            |ctx| app.ui_workspace(ctx),
+            |_ctx, ui| app.ui_workspace(ui),
         )
     }
     fn workspace_click(app: &mut BinwaveApp, ctx: &Context, label: &str) {
@@ -2082,13 +2085,13 @@ mod tests {
             "CSV must keep its native bounded decoder"
         );
         for pane in [Pane::Plot, Pane::Hex, Pane::Table, Pane::Layout] {
-            let (surface, node, tab) = app.workspace.dock.find_tab(&pane).unwrap();
+            let (surface, node, tab) = app.workspace.dock.find_tab_legacy(&pane).unwrap();
             assert!(matches!(&app.workspace.dock[surface][node],
-                egui_dock::Node::Leaf { active, .. } if *active == tab));
+                egui_dock::Node::Leaf(leaf) if leaf.active == tab));
         }
         assert_ne!(
-            app.workspace.dock.find_tab(&Pane::Plot).unwrap().1,
-            app.workspace.dock.find_tab(&Pane::Hex).unwrap().1,
+            app.workspace.dock.find_tab_legacy(&Pane::Plot).unwrap().1,
+            app.workspace.dock.find_tab_legacy(&Pane::Hex).unwrap().1,
             "the initial plot must not hide the source bytes"
         );
         assert_eq!(
@@ -2112,12 +2115,12 @@ mod tests {
             .as_ref()
             .unwrap()
             .bounds(app.data.as_ref().unwrap());
-        let plot = app.workspace.dock.find_tab(&Pane::Plot).unwrap();
-        app.workspace.dock.remove_tab(plot);
+        let plot = app.workspace.dock.find_tab_legacy(&Pane::Plot).unwrap();
+        app.workspace.dock.remove_tab(egui_dock::TabPath::new(plot.0, plot.1, plot.2));
         app.request_csv_rows(16_384, &ctx);
         wait_csv(&mut app, &ctx);
         assert!(
-            app.workspace.dock.find_tab(&Pane::Plot).is_none(),
+            app.workspace.dock.find_tab_legacy(&Pane::Plot).is_none(),
             "continuing CSV reads must not reopen a plot the user closed"
         );
         assert_eq!(app.dataset, dataset);
@@ -2428,10 +2431,10 @@ mod tests {
             1,
             "explicit marker retains its identity after decimation"
         );
-        let (surface, node, plot_tab) = app.workspace.dock.find_tab(&Pane::Plot).unwrap();
+        let (surface, node, plot_tab) = app.workspace.dock.find_tab_legacy(&Pane::Plot).unwrap();
         match &app.workspace.dock[surface][node] {
-            egui_dock::Node::Leaf { active, .. } => {
-                assert_eq!(*active, plot_tab, "linking bytes must not hide the plot")
+            egui_dock::Node::Leaf(leaf) => {
+                assert_eq!(leaf.active, plot_tab, "linking bytes must not hide the plot")
             }
             _ => panic!("plot is not docked in a leaf"),
         }
@@ -2642,9 +2645,9 @@ mod tests {
                     .bounds(app.data.as_ref().unwrap()),
                 bounds
             );
-            let (surface, node, plot_tab) = app.workspace.dock.find_tab(&Pane::Plot).unwrap();
+            let (surface, node, plot_tab) = app.workspace.dock.find_tab_legacy(&Pane::Plot).unwrap();
             match &app.workspace.dock[surface][node] {
-                egui_dock::Node::Leaf { active, .. } => assert_eq!(*active, plot_tab),
+                egui_dock::Node::Leaf(leaf) => assert_eq!(leaf.active, plot_tab),
                 _ => panic!("plot is not docked in a leaf"),
             }
         }
@@ -2676,8 +2679,8 @@ mod tests {
         }
         assert!(!visible.contains("Decoded RAM cache"));
         assert!(!visible.contains("Data interpretation"));
-        let inspected = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| app.ui_inspector(ui));
+        let inspected = ctx.run(Default::default(), |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| app.ui_inspector(ui));
         });
         assert!(
             !text(inspected).contains("X column"),
@@ -2827,7 +2830,7 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(app.workspace.dock.find_tab(&Pane::Table).is_none());
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Table).is_none());
         app.show_view(Pane::Layout);
         workspace_events(
             &mut app,
@@ -2840,31 +2843,31 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             }],
         );
-        while app.workspace.dock.find_tab(&Pane::Table).is_none() {
+        while app.workspace.dock.find_tab_legacy(&Pane::Table).is_none() {
             workspace_frame(&mut app, &ctx);
             assert!(Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let output = workspace_frame(&mut app, &ctx);
-        let (surface, table, _) = app.workspace.dock.find_tab(&Pane::Table).unwrap();
+        let (surface, table, _) = app.workspace.dock.find_tab_legacy(&Pane::Table).unwrap();
         let rect = app.workspace.dock[surface][table].rect().unwrap();
         assert!(
             rect.width() > 600. && rect.height() > 250.,
             "Sample table should remain readable beside the decoder: {rect:?}"
         );
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,egui::epaint::Shape::Text(text) if text.galley.text()=="temperature")));
-        let location = app.workspace.dock.find_tab(&Pane::Table).unwrap();
-        app.workspace.dock.remove_tab(location);
+        let location = app.workspace.dock.find_tab_legacy(&Pane::Table).unwrap();
+        app.workspace.dock.remove_tab(egui_dock::TabPath::new(location.0, location.1, location.2));
         for _ in 0..5 {
             workspace_frame(&mut app, &ctx);
         }
         assert!(
-            app.workspace.dock.find_tab(&Pane::Table).is_none(),
+            app.workspace.dock.find_tab_legacy(&Pane::Table).is_none(),
             "completed workers must not reopen a closed view"
         );
         app.binary.apply_definition(&ctx);
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
-        while app.workspace.dock.find_tab(&Pane::Table).is_none() {
+        while app.workspace.dock.find_tab_legacy(&Pane::Table).is_none() {
             workspace_frame(&mut app, &ctx);
             assert!(Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2977,19 +2980,19 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            let (surface, node, _) = app.workspace.dock.find_tab(&Pane::Hex).unwrap();
+            let (surface, node, _) = app.workspace.dock.find_tab_legacy(&Pane::Hex).unwrap();
             assert!(app.workspace.dock[surface][node].rect().unwrap().width() > 400.);
-            let (surface, node, _) = app.workspace.dock.find_tab(&Pane::Inspector).unwrap();
+            let (surface, node, _) = app.workspace.dock.find_tab_legacy(&Pane::Inspector).unwrap();
             assert!(app.workspace.dock[surface][node].rect().unwrap().width() > 400.);
-            let (surface, node, _) = app.workspace.dock.find_tab(&Pane::Hex).unwrap();
+            let (surface, node, _) = app.workspace.dock.find_tab_legacy(&Pane::Hex).unwrap();
             let hex_rect = app.workspace.dock[surface][node].rect().unwrap();
             assert!(hex_rect.height() > 250.);
-            assert!(app.workspace.dock.find_tab(&Pane::Layout).is_some());
-            let (plot_surface, plot_node, _) = app.workspace.dock.find_tab(&Pane::Plot).unwrap();
+            assert!(app.workspace.dock.find_tab_legacy(&Pane::Layout).is_some());
+            let (plot_surface, plot_node, _) = app.workspace.dock.find_tab_legacy(&Pane::Plot).unwrap();
             let plot_rect = app.workspace.dock[plot_surface][plot_node].rect().unwrap();
             assert!(plot_rect.height() > hex_rect.height());
             assert!(plot_rect.bottom() <= hex_rect.top());
-            assert!(app.workspace.dock.find_tab(&Pane::Table).is_none());
+            assert!(app.workspace.dock.find_tab_legacy(&Pane::Table).is_none());
             for pane in [Pane::Hex, Pane::Layout, Pane::Structures, Pane::Inspector] {
                 assert!(
                     labels.iter().any(|text| text == pane.title()),
@@ -3024,7 +3027,7 @@ mod tests {
             wait_byte_preview(&mut app, &ctx);
             assert!(!app.binary.status().1, "{}", app.binary.status().0);
             assert!(!app.binary.is_dirty());
-            assert!(app.workspace.dock.find_tab(&Pane::Plot).is_some());
+            assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_some());
             workspace_click(&mut app, &ctx, mode);
             let shown = text(workspace_frame(&mut app, &ctx));
             let saved_field = if extension == "py" {
@@ -3054,9 +3057,9 @@ mod tests {
         workspace_frame(&mut app, &ctx);
         assert!(!app.binary.showing_byte_preview());
         assert!(!app.binary.is_decoding());
-        assert!(app.workspace.dock.find_tab(&Pane::Plot).is_none());
-        assert!(app.workspace.dock.find_tab(&Pane::Hex).is_some());
-        assert!(app.workspace.dock.find_tab(&Pane::Layout).is_some());
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_none());
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Hex).is_some());
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Layout).is_some());
     }
 
     #[test]
@@ -3242,8 +3245,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         workspace_frame(&mut app, &ctx);
-        let hex = app.workspace.dock.find_tab(&Pane::Hex).unwrap();
-        app.workspace.dock.remove_tab(hex);
+        let hex = app.workspace.dock.find_tab_legacy(&Pane::Hex).unwrap();
+        app.workspace.dock.remove_tab(egui_dock::TabPath::new(hex.0, hex.1, hex.2));
         workspace_events(
             &mut app,
             &ctx,
@@ -3255,7 +3258,7 @@ mod tests {
                 modifiers: egui::Modifiers::COMMAND,
             }],
         );
-        assert!(app.workspace.dock.find_tab(&Pane::Hex).is_some());
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Hex).is_some());
         workspace_frame(&mut app, &ctx);
         workspace_events(&mut app, &ctx, vec![egui::Event::Text("0x100".into())]);
         workspace_events(
@@ -3378,6 +3381,7 @@ mod tests {
             fn set_string(&mut self, key: &str, value: String) {
                 self.0.insert(key.to_owned(), value);
             }
+            fn remove_string(&mut self, key: &str) { self.0.remove(key); }
             fn flush(&mut self) {}
         }
         let root = tempfile::tempdir().unwrap();
@@ -3461,7 +3465,7 @@ mod tests {
         // Raw data starts with bytes and meaning. Source controls are one tab away.
         workspace_click(&mut app, &ctx, "Definition");
         let opened_output = workspace_frame(&mut app, &ctx);
-        let (surface, node, _) = app.workspace.dock.find_tab(&Pane::Layout).unwrap();
+        let (surface, node, _) = app.workspace.dock.find_tab_legacy(&Pane::Layout).unwrap();
         let decoder_rect = app.workspace.dock[surface][node].rect().unwrap();
         assert!(
             !opened_output.shapes.iter().any(|shape| {
@@ -3498,12 +3502,12 @@ mod tests {
             decoded.iter().any(|text| text.contains("structures:")),
             "running must keep the source visible"
         );
-        let (_, editor, _) = app.workspace.dock.find_tab(&Pane::Layout).unwrap();
-        let (_, samples, _) = app.workspace.dock.find_tab(&Pane::Table).unwrap();
+        let (_, editor, _) = app.workspace.dock.find_tab_legacy(&Pane::Layout).unwrap();
+        let (_, samples, _) = app.workspace.dock.find_tab_legacy(&Pane::Table).unwrap();
         assert_ne!(editor, samples);
         workspace_click(&mut app, &ctx, "View");
         workspace_click(&mut app, &ctx, "Plot");
-        assert!(app.workspace.dock.find_tab(&Pane::Plot).is_some());
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_some());
         let plotted = labels(workspace_frame(&mut app, &ctx));
         assert!(plotted.iter().any(|text| text.contains("structures:")));
     }
@@ -3551,13 +3555,13 @@ mod tests {
         let output = workspace_frame(&mut app, &ctx);
         assert!(!app.binary.showing_byte_preview());
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "amplitude")));
-        assert!(app.workspace.dock.find_tab(&Pane::Table).is_some());
-        let (_, editor, _) = app.workspace.dock.find_tab(&Pane::Layout).unwrap();
-        let (_, table, _) = app.workspace.dock.find_tab(&Pane::Table).unwrap();
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Table).is_some());
+        let (_, editor, _) = app.workspace.dock.find_tab_legacy(&Pane::Layout).unwrap();
+        let (_, table, _) = app.workspace.dock.find_tab_legacy(&Pane::Table).unwrap();
         assert_ne!(editor, table);
         workspace_click(&mut app, &ctx, "View");
         workspace_click(&mut app, &ctx, "Plot");
-        assert!(app.workspace.dock.find_tab(&Pane::Plot).is_some());
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_some());
     }
 
     #[test]
@@ -3595,7 +3599,7 @@ mod tests {
         let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
         let atlas = ctx.fonts(|fonts| fonts.image());
         let pixels: Vec<[u8; 4]> = atlas
-            .srgba_pixels(None)
+            .pixels.iter()
             .map(|pixel| pixel.to_array())
             .collect();
         let meshes: Vec<_> = primitives.into_iter().filter_map(|primitive| {

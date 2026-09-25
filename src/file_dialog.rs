@@ -1,5 +1,7 @@
 //! Native file dialogs that never wait on egui's event loop.
 
+#[cfg(test)]
+use crate::egui_compat::ContextRun as _;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -412,7 +414,8 @@ mod tests {
         fn set_string(&mut self, key: &str, value: String) {
             self.0.insert(key.into(), value);
         }
-        fn flush(&mut self) {}
+        fn remove_string(&mut self, key: &str) { self.0.remove(key); }
+            fn flush(&mut self) {}
     }
 
     #[test]
@@ -578,9 +581,9 @@ mod tests {
         ));
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         for frame in 0..180 {
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
+            let output = ctx.run(egui::RawInput::default(), |ctx, ui| {
                 assert!(dialog.poll(ctx).is_none());
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     ui.label(format!("Responsive frame {frame}"));
                 });
             });
@@ -609,7 +612,7 @@ mod tests {
         dialog.begin_test(ControlledDialog(state.clone()), (), &ctx);
         // Consume initial requests, as when the app is idle behind the picker.
         for _ in 0..4 {
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx, _ui| {
                 assert!(dialog.poll(ctx).is_none());
             });
         }
