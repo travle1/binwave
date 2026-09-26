@@ -53,6 +53,10 @@ observed extrema. Exact views and the minimum bucket count can exceed this
 target. This reduces retained display geometry but does not bound decoded tile
 memory, in-flight work, or the first accurate scan. Raster and GPU geometry
 workers keep the prior valid image visible while preparing an update.
+Numeric plot points now share the fixed parts of each field path and retain
+the sample index; the full path string is formatted only for selection or
+inspection. This removes per-point path-string allocations from numeric
+query output. Byte ranges and exact sample indices remain attached to points.
 
 For unchanged local files without byte edits, close-range numeric tiles can
 also be stored as versioned decoded chunks under the app cache directory.

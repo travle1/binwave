@@ -354,6 +354,12 @@ The UI also now scans each resident decoded page for nested collection names
 once, instead of repeating that traversal on every frame; discovered-path
 deduplication uses a hash set. A focused page-reuse test passes. The effect on
 live frame time with hundreds of nested collections is not yet measured.
+Numeric plot output also shares each field's fixed path parts among its
+points and resolves a complete indexed path only on selection. This removes
+one path-string allocation per numeric point and preserves existing byte
+provenance. Allocation volume and frame-time effects are not yet measured;
+other display structures still clone or retain more data than the Phase 6
+target.
 
 ### Limited synthetic measurement
 

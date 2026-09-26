@@ -2389,7 +2389,7 @@ impl StructureViews {
                             .min_by(|a, b| a.0.total_cmp(&b.0));
                     if let Some((_, point)) = nearest {
                         self.plot_anchor = Some(point.index);
-                        picked = Some((point.bytes.clone(), Some(point.path.clone())));
+                        picked = Some((point.bytes.clone(), Some(point.path.to_string())));
                     } else if let Some(bytes) = sample_bytes(&node, index..index + 1) {
                         self.plot_anchor = Some(index);
                         picked = Some((bytes, None));
@@ -3489,7 +3489,7 @@ actions:
         assert!(views.plot_sources.contains(sensor_path));
         assert_eq!(views.plot_target, sensor_path);
         assert_eq!(views.plot_jump, 130);
-        views.choose_plot_bytes(&output, bytes, Some(plotted_point.path));
+        views.choose_plot_bytes(&output, bytes, Some(plotted_point.path.to_string()));
         assert_eq!(views.table_target, sensor_path);
         assert_eq!(views.desired.as_ref().unwrap().key.path, sensor_path);
         assert_eq!(views.table_jump, 130);

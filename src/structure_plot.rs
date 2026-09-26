@@ -11,9 +11,10 @@ use std::collections::BTreeSet;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -72,7 +73,32 @@ pub struct PlotSample {
     pub index: Address,
     pub value: f64,
     pub bytes: Range<Address>,
-    pub path: String,
+    pub path: PlotPath,
+}
+/// Numeric points share the path's fixed parts across a field. The full path
+/// is formed only when selection or inspection needs it.
+#[derive(Clone, Debug)]
+pub enum PlotPath {
+    Concrete(String),
+    Indexed { parts: Arc<(String, String)>, index: Address },
+}
+impl PartialEq for PlotPath {
+    fn eq(&self, other: &Self) -> bool { self.to_string() == other.to_string() }
+}
+impl Eq for PlotPath {}
+impl From<String> for PlotPath {
+    fn from(path: String) -> Self { Self::Concrete(path) }
+}
+impl From<&str> for PlotPath {
+    fn from(path: &str) -> Self { Self::Concrete(path.to_owned()) }
+}
+impl std::fmt::Display for PlotPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Concrete(path) => f.write_str(path),
+            Self::Indexed { parts, index } => write!(f, "{}[{index}]{}", parts.0, parts.1),
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlotQuality {
@@ -859,7 +885,7 @@ impl Reduction {
                     index,
                     value,
                     bytes: node.range.clone(),
-                    path: node.path.clone(),
+                    path: node.path.clone().into(),
                 },
             );
         }
@@ -1237,13 +1263,15 @@ impl NumericReduction {
         let mut series: BTreeMap<String, Vec<PlotSample>> = BTreeMap::new();
         let mut envelopes = BTreeMap::new();
         for (field_index, field) in self.plan.fields.iter().enumerate() {
+            let path_parts = Arc::new((field.source_path.as_deref().unwrap_or(&self.plan.path).to_owned(),
+                field.suffix.clone()));
             let sample = |point: NumericPoint| {
                 let start = self.plan.offset(point.index).unwrap_or(self.plan.start) + field.offset;
                 PlotSample {
                     index: point.index,
                     value: point.value,
                     bytes: start..start + field.span,
-                    path: format!("{}[{}]{}", field.source_path.as_deref().unwrap_or(&self.plan.path), point.index, field.suffix),
+                    path: PlotPath::Indexed { parts: path_parts.clone(), index: point.index },
                 }
             };
             let points = if self.quality != PlotQuality::Exact {
@@ -2076,7 +2104,7 @@ mod tests {
                 for index in 0..2 {
                     reduction.push(format!("field{field}"), PlotSample {
                         index, value: field as f64 + index as f64,
-                        bytes: (index*130+field*2)..(index*130+field*2+2), path: format!("samples[{index}].field{field}"),
+                        bytes: (index*130+field*2)..(index*130+field*2+2), path: format!("samples[{index}].field{field}").into(),
                     });
                 }
             }
@@ -2643,6 +2671,20 @@ actions:
             "nearby pan may extend prefetch but must reuse visible tiles");
     }
     #[test]
+    fn numeric_points_share_path_parts_and_resolve_exact_indices() {
+        let (store, node) = fixture(1024, usize::MAX);
+        let data = read_plot(&request(store.view(), node, 0..1024, true),
+            &AtomicBool::new(false), |_| {}).unwrap();
+        let points = data.series.values().next().unwrap();
+        let (PlotPath::Indexed { parts: first, index: first_index },
+            PlotPath::Indexed { parts: second, index: second_index }) =
+            (&points[0].path, &points[1].path) else { panic!("numeric paths must be indexed"); };
+        assert!(Arc::ptr_eq(first, second));
+        assert_ne!(first_index, second_index);
+        assert_eq!(points[0].path.to_string(), format!("{}[{}]{}", first.0, first_index, first.1));
+        assert_eq!(points[1].path.to_string(), format!("{}[{}]{}", second.0, second_index, second.1));
+    }
+    #[test]
     fn exact_plot_is_independent_of_128_row_pages_and_preserves_byte_provenance() {
         let (store, node) = fixture(4096, usize::MAX);
         let data = read_plot(
@@ -2659,7 +2701,7 @@ actions:
         assert_eq!(points[0].index, 251);
         assert_eq!(points[1023].index, 1274);
         assert_eq!(points[1023].bytes, 5096..5100);
-        assert_eq!(points[1023].path, "samples[1274]");
+        assert_eq!(points[1023].path.to_string(), "samples[1274]");
     }
     #[test]
     fn repeated_numeric_fields_use_segmented_fast_plan_across_groups() {
@@ -2808,7 +2850,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                         point.bytes,
                         point.index * 24 + field_index * 8..point.index * 24 + field_index * 8 + 8
                     );
-                    assert_eq!(point.path, format!("samples[{}].{name}", point.index));
+                    assert_eq!(point.path.to_string(), format!("samples[{}].{name}", point.index));
                 }
             }
         }
@@ -2875,7 +2917,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 let index = 3342 + offset;
                 assert_eq!(sample.index, index);
                 assert_eq!(sample.bytes, index * 4..index * 4 + 4);
-                assert_eq!(sample.path, format!("samples[{index}]"));
+                assert_eq!(sample.path.to_string(), format!("samples[{index}]"));
             }
         }
     }
@@ -2940,7 +2982,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
         assert_eq!(envelope.max.index, spike.index);
         assert_eq!(envelope.max.value, spike.value);
         assert_eq!(envelope.max.bytes, spike.bytes);
-        assert_eq!(envelope.max.path, "samples[33333]");
+        assert_eq!(envelope.max.path.to_string(), "samples[33333]");
         assert_eq!(envelope.min.value, -8.);
         assert!(envelope.range.contains(&envelope.min.index));
     }
@@ -3094,7 +3136,7 @@ actions:
                 band.min.bytes,
                 band.min.index * 16 + 4..band.min.index * 16 + 12
             );
-            assert_eq!(band.max.path, format!("samples[{}].sine", band.max.index));
+            assert_eq!(band.max.path.to_string(), format!("samples[{}].sine", band.max.index));
         }
         for band in &numeric.envelopes["ramp"] {
             assert_eq!(band.min.value, 0.);
