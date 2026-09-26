@@ -109,6 +109,7 @@ pub struct PlotReader {
     data: Option<Arc<PlotData>>,
     error: Option<String>,
     cache: VecDeque<Cached>,
+    data_generation: u64,
 }
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for PlotReader {
@@ -172,6 +173,7 @@ impl PlotReader {
             running.cancel.store(true, Ordering::Relaxed);
         }
         self.data = None;
+        self.data_generation = self.data_generation.wrapping_add(1);
         self.error = None;
         // Retaining the request also retains its decode plan, so pointer identity
         // cannot be recycled while a cached interpretation is still present.
@@ -185,6 +187,7 @@ impl PlotReader {
             match source.validate() {
                 Ok(()) => {
                     self.data = Some(cached.data.clone());
+                    self.data_generation = self.data_generation.wrapping_add(1);
                     self.cache.push_front(cached);
                 }
                 Err(error) => {
@@ -216,9 +219,11 @@ impl PlotReader {
                                 self.cache.truncate(CACHE_ENTRIES);
                             }
                             self.data = Some(data);
+                            self.data_generation = self.data_generation.wrapping_add(1);
                         }
                         Err(error) => {
                             self.data = None;
+                            self.data_generation = self.data_generation.wrapping_add(1);
                             self.error = Some(error);
                         }
                     }
@@ -274,6 +279,7 @@ impl PlotReader {
         }
         self.desired = None;
         self.data = None;
+        self.data_generation = self.data_generation.wrapping_add(1);
         self.error = None;
         self.cache.clear();
     }
@@ -285,6 +291,9 @@ impl PlotReader {
     }
     pub fn data(&self) -> Option<&PlotData> {
         self.data.as_deref()
+    }
+    pub fn data_generation(&self) -> u64 {
+        self.data_generation
     }
     #[cfg(test)]
     pub(crate) fn requested_fields(&self) -> Option<&[String]> {

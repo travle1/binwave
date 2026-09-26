@@ -10,6 +10,7 @@ use crate::structure_plot::{PlotData, PlotQuality, PlotReader};
 use egui::{Color32, Ui};
 use egui_plot::{Plot, PlotBounds, PlotPoint, PlotTransform, Points};
 use std::collections::{BTreeMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -106,6 +107,9 @@ pub struct StructureViews {
     plot_sources: std::collections::BTreeSet<String>,
     plot_sources_initialized: bool,
     extra_plot_readers: std::collections::BTreeMap<String, PlotReader>,
+    plot_overlay: Option<(u64, PlotData)>,
+    #[cfg(test)]
+    plot_overlay_builds: usize,
     plot_view: Option<Range<usize>>,
     plot_axis_width: f32,
     plot_force_view: Option<Range<usize>>,
@@ -137,6 +141,7 @@ impl StructureViews {
     }
     pub fn invalidate(&mut self) {
         self.plot_reader.invalidate();
+        self.plot_overlay = None;
         self.plot_catalog_target.clear();
         self.plot_catalog.clear();
         for reader in self.extra_plot_readers.values_mut() { reader.invalidate(); }
@@ -1616,6 +1621,29 @@ impl StructureViews {
         if let Some(error) = self.plot_reader.error() {
             ui.colored_label(Color32::LIGHT_RED, error);
         }
+        let mut overlay_hash = std::collections::hash_map::DefaultHasher::new();
+        output.revision.hash(&mut overlay_hash);
+        self.plot_target.hash(&mut overlay_hash);
+        requested.start.hash(&mut overlay_hash);
+        requested.end.hash(&mut overlay_hash);
+        self.plot_reader.data_generation().hash(&mut overlay_hash);
+        for (path, reader) in &self.extra_plot_readers {
+            path.hash(&mut overlay_hash);
+            reader.data_generation().hash(&mut overlay_hash);
+        }
+        for path in &self.plot_sources { path.hash(&mut overlay_hash); }
+        let mut hidden_fields: Vec<_> = self.plot_hidden.iter().collect();
+        hidden_fields.sort_unstable();
+        for field in hidden_fields { field.hash(&mut overlay_hash); }
+        for (name, placement) in &self.presentation.series {
+            name.hash(&mut overlay_hash);
+            placement.scale.to_bits().hash(&mut overlay_hash);
+            placement.offset.to_bits().hash(&mut overlay_hash);
+        }
+        let overlay_key = overlay_hash.finish();
+        if self.plot_overlay.as_ref().map(|(key, _)| *key) != Some(overlay_key) {
+        #[cfg(test)]
+        { self.plot_overlay_builds += 1; }
         let mut combined = self.plot_reader.data().map(|raw| PlotData {
             range: raw.range.clone(),
             series: raw.series.iter().filter_map(|(name, points)| {
@@ -1657,8 +1685,10 @@ impl StructureViews {
             for (name,points) in &mut data.series { let p=self.presentation.placement(name); for point in points {point.value=p.display(point.value);} }
             for (name,bands) in &mut data.envelopes {let p=self.presentation.placement(name);for band in bands {band.min.value=p.display(band.min.value);band.max.value=p.display(band.max.value);}}
         }
+        self.plot_overlay = combined.map(|data| (overlay_key, data));
+        }
         let placements=self.presentation.series.clone();
-        let data = combined.as_ref();
+        let data = self.plot_overlay.as_ref().map(|(_, data)| data);
         let plot_id = egui::Id::new(("decoded_structure_plot", "overlay", output.revision));
         let hidden = self.plot_hidden.clone();
         let y_fit = if self.plot_fit_y && self.plot_range_zoom.is_none() {
@@ -1732,9 +1762,11 @@ impl StructureViews {
                                 band.min.value, band.max.value,
                             ]).collect::<Vec<_>>()
                         });
-                        decoded_channel(plot_ui, name, color, points.clone(), bands.as_deref());
                         if data.quality == PlotQuality::Exact && values.len() <= canvas_width as usize / 5 {
+                            decoded_channel(plot_ui, name, color, points.clone(), bands.as_deref());
                             plot_ui.points(Points::new(name, points).color(color).radius(2.5_f32));
+                        } else {
+                            decoded_channel(plot_ui, name, color, points, bands.as_deref());
                         }
                     }
                 }
@@ -3583,6 +3615,9 @@ actions:
             views.plot_reader.data().unwrap().series["value"].len(),
             1024
         );
+        let builds = views.plot_overlay_builds;
+        render_plot(&ctx, &mut views, &output, &store, Vec::new(), Default::default());
+        assert_eq!(views.plot_overlay_builds, builds, "steady frames should reuse prepared plot data");
         assert_eq!(views.desired.as_ref().unwrap().key.start, 128);
         let id = egui::Id::new((
             "decoded_structure_plot",
