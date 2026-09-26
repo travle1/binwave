@@ -297,8 +297,10 @@ per-file Keep control, pending-write status, and explicit removal. Keep covers
 newly decoded selected numeric fields; it does not initiate a full scan.
 
 These changes do **not** yet satisfy the full plan. Loaded coverage is not
-independent of viewport resolution, RAM ownership is still per reader, the
-summary index is not multilevel or persistent. Decoded chunks now share
+independent of viewport resolution. Active readers now divide a shared RAM
+tile/summary allowance, but in-flight buffers, display output, and queued disk
+writes lack a coordinated global budget. The summary index is not multilevel
+or persistent. Decoded chunks now share
 columns across compatible field selections, but partial field hits still
 decode the entire requested group before merging new columns. Variable-record
 checkpoints and render-pipeline

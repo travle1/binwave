@@ -1439,6 +1439,13 @@ impl StructureViews {
         self.group_plot_readers.retain(|key, _| grouped_plans.contains_key(key));
         self.extra_plot_readers.retain(|path, _| self.plot_sources.contains(path)
             && path != &self.plot_target && !grouped_paths.contains(path));
+        let reader_count = 1 + grouped_plans.len().saturating_sub(usize::from(primary_group.is_some()))
+            + self.plot_sources.iter().filter(|path| *path != &self.plot_target
+                && !grouped_paths.contains(*path)).count();
+        let reader_budget = crate::structure_plot::group_buffer_bytes() / reader_count.max(1);
+        self.plot_reader.set_cache_budget(reader_budget);
+        for reader in self.group_plot_readers.values_mut() { reader.set_cache_budget(reader_budget); }
+        for reader in self.extra_plot_readers.values_mut() { reader.set_cache_budget(reader_budget); }
         if self.plot_catalog_target != self.plot_target {
             self.plot_catalog_target = self.plot_target.clone();
             self.plot_catalog = node.lazy.as_ref().and_then(|array| array.numeric_plan())
@@ -1737,6 +1744,7 @@ impl StructureViews {
         for (key, (group_node, plan, paths)) in grouped_plans.iter() {
             if paths.iter().any(|path| path == &self.plot_target) { continue; }
             let reader = self.group_plot_readers.entry(key.clone()).or_default();
+            reader.set_cache_budget(reader_budget);
             let was_loading = reader.is_loading();
             if !self.plot_paused && (was_loading || active_readers < plot_worker_count()) {
                 let count = collection_count(group_node);
@@ -1760,6 +1768,7 @@ impl StructureViews {
             if let Some(&extra) = collection_by_path.get(path.as_str()) {
                 let count = collection_count(&extra);
                 let reader = self.extra_plot_readers.entry(path.clone()).or_default();
+                reader.set_cache_budget(reader_budget);
                 let was_loading = reader.is_loading();
                 if !self.plot_paused && (was_loading || active_readers < plot_worker_count()) {
                     let range = requested.start.min(count)..requested.end.min(count);
@@ -3315,6 +3324,7 @@ structures:
             type: {ref: width, cases: {'2': i16}}
             repeat: {ref: groups}
             items_per_group: {ref: items_per_group}
+            layout: interleaved
   - name: Block
     fields:
       - {name: header, type: bytes, length: 2}

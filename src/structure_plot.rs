@@ -34,7 +34,7 @@ const GROUP_TILE_SAMPLES: Address = 4096;
 #[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_GROUP_BUFFER_BYTES: usize = 256 * 1024 * 1024;
 #[cfg(not(target_arch = "wasm32"))]
-fn group_buffer_bytes() -> usize {
+pub(crate) fn group_buffer_bytes() -> usize {
     static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| {
         let configured = std::env::var("BINWAVE_PLOT_CACHE_MB").ok()
@@ -60,7 +60,7 @@ fn group_buffer_bytes() -> usize {
         let bytes = configured.or_else(|| available.map(|bytes|
             (bytes / 32).clamp(128 * 1024 * 1024, 1024 * 1024 * 1024)
         )).unwrap_or(DEFAULT_GROUP_BUFFER_BYTES);
-        log::info!("Plot RAM tile cache budget: {} MiB per grouped reader", bytes / (1024 * 1024));
+        log::info!("Plot RAM tile/summary budget: {} MiB shared by active readers", bytes / (1024 * 1024));
         bytes
     })
 }
@@ -286,7 +286,6 @@ struct TileFlight {
     ready: Condvar,
 }
 #[cfg(not(target_arch = "wasm32"))]
-#[derive(Default)]
 struct GroupTileCache {
     signature: Option<GroupSignature>,
     tiles: LruMap<Arc<GroupTile>>,
@@ -294,11 +293,39 @@ struct GroupTileCache {
     summaries: LruMap<Arc<GroupTileSummary>>,
     summary_bytes: usize,
     in_flight: HashMap<(GroupSignature, Address), Arc<TileFlight>>,
+    budget_bytes: usize,
     #[cfg(test)]
     loads: usize,
 }
 #[cfg(not(target_arch = "wasm32"))]
+impl Default for GroupTileCache {
+    fn default() -> Self {
+        Self {
+            signature: None, tiles: LruMap::default(), bytes: 0,
+            summaries: LruMap::default(), summary_bytes: 0,
+            in_flight: HashMap::new(), budget_bytes: group_buffer_bytes(),
+            #[cfg(test)] loads: 0,
+        }
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
 impl GroupTileCache {
+    fn set_budget(&mut self, bytes: usize) {
+        self.budget_bytes = bytes;
+        self.trim();
+    }
+    fn trim(&mut self) {
+        let raw = self.budget_bytes.saturating_mul(3) / 4;
+        let summary = self.budget_bytes.saturating_sub(raw);
+        while self.bytes > raw {
+            let Some(old) = self.tiles.pop_oldest() else { break; };
+            self.bytes = self.bytes.saturating_sub(old.bytes());
+        }
+        while self.summary_bytes > summary {
+            let Some(old) = self.summaries.pop_oldest() else { break; };
+            self.summary_bytes = self.summary_bytes.saturating_sub(old.bytes());
+        }
+    }
     fn prepare(&mut self, signature: &GroupSignature) {
         if self.signature.as_ref() != Some(signature) {
             self.signature = Some(signature.clone());
@@ -313,19 +340,17 @@ impl GroupTileCache {
         self.tiles.get(start)
     }
     fn insert(&mut self, tile: Arc<GroupTile>) {
-        if !self.tiles.insert(tile.start, tile.clone()) { return; }
-        self.bytes = self.bytes.saturating_add(tile.bytes());
-        #[cfg(test)] { self.loads += 1; }
+        if tile.bytes() <= self.budget_bytes.saturating_mul(3) / 4
+            && self.tiles.insert(tile.start, tile.clone()) {
+            self.bytes = self.bytes.saturating_add(tile.bytes());
+            #[cfg(test)] { self.loads += 1; }
+        }
         let summary = tile.summary.clone();
-        if self.summaries.insert(summary.start, summary.clone()) {
+        if summary.bytes() <= self.budget_bytes / 4
+            && self.summaries.insert(summary.start, summary.clone()) {
             self.summary_bytes += summary.bytes();
         }
-        while self.bytes > group_buffer_bytes() && self.tiles.len() > 1 {
-            if let Some(old) = self.tiles.pop_oldest() { self.bytes -= old.bytes(); }
-        }
-        while self.summary_bytes > group_buffer_bytes().saturating_mul(4) && self.summaries.len() > 1 {
-            if let Some(old) = self.summaries.pop_oldest() { self.summary_bytes -= old.bytes(); }
-        }
+        self.trim();
     }
     fn summary(&mut self, start: Address) -> Option<Arc<GroupTileSummary>> {
         self.summaries.get(start)
@@ -649,7 +674,10 @@ impl PlotReader {
         self.data_generation = self.data_generation.wrapping_add(1);
         self.error = None;
         self.cache.clear();
-        *self.group_tiles.lock().unwrap() = GroupTileCache::default();
+        let mut tiles = self.group_tiles.lock().unwrap();
+        let budget = tiles.budget_bytes;
+        *tiles = GroupTileCache::default();
+        tiles.set_budget(budget);
     }
     pub fn stop(&mut self) {
         if let Some(running) = &self.running {
@@ -667,6 +695,9 @@ impl PlotReader {
     }
     pub fn data_generation(&self) -> u64 {
         self.data_generation
+    }
+    pub(crate) fn set_cache_budget(&mut self, bytes: usize) {
+        self.group_tiles.lock().unwrap().set_budget(bytes);
     }
     pub(crate) fn persist_available_tiles(&self) {
         let Some(request) = self.desired.clone() else { return; };
@@ -1745,8 +1776,10 @@ fn read_group_buffered(request: &Request, plan: NumericPlan, quality: PlotQualit
     let mut published = false;
     let signature = group_signature(request);
     let tile_bytes = tile_size.saturating_mul(field_count).saturating_mul(std::mem::size_of::<f64>());
-    let workers = rayon::current_num_threads().max(1);
-    let batch_tiles = (group_buffer_bytes() / tile_bytes.max(1)).clamp(1, workers.saturating_mul(2));
+    let headroom = std::thread::available_parallelism().map_or(1, |cores| cores.get().saturating_sub(2).max(1));
+    let workers = rayon::current_num_threads().min(headroom).max(1);
+    let budget = cache.lock().unwrap().budget_bytes;
+    let batch_tiles = ((budget / 2) / tile_bytes.max(1)).clamp(1, workers.saturating_mul(2));
     if request.key.range.len() > AUTO_SCAN_LIMIT {
         log::info!("Grouped plot scan: {} Rayon threads, up to {} tiles per batch, {} samples per tile",
             workers, batch_tiles, tile_size);
@@ -2150,6 +2183,21 @@ actions:
         assert_eq!(cache.pop_oldest(), Some(0));
         assert_eq!(cache.pop_oldest(), None);
         assert_eq!(cache.len(), 0);
+    }
+    #[test]
+    fn reader_budgets_trim_raw_tiles_and_summaries() {
+        let mut caches = [GroupTileCache::default(), GroupTileCache::default()];
+        for cache in &mut caches {
+            cache.set_budget(64 * 1024);
+            for tile in 0..8 {
+                cache.insert(Arc::new(GroupTile::from_values(tile * 1024,
+                    vec![vec![tile as f64; 1024]])));
+            }
+            assert!(cache.bytes + cache.summary_bytes <= 64 * 1024);
+        }
+        caches[0].set_budget(0);
+        assert_eq!(caches[0].bytes + caches[0].summary_bytes, 0);
+        assert!(caches[1].bytes + caches[1].summary_bytes <= 64 * 1024);
     }
     #[test]
     fn concurrent_group_tile_requests_share_one_decode() {

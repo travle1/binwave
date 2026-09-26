@@ -25,16 +25,21 @@ running plot read until the view is changed or Fit is requested again.
 Selected fields from one compatible group, including the primary plotted
 field, share one scan. Grouped numeric tiles load in parallel and are merged
 in sample order.
-The RAM tile cache budget is chosen from available memory on Linux and Windows
-(capped at 1 GiB per grouped reader), with a 256 MiB fallback elsewhere. Set
-`BINWAVE_PLOT_CACHE_MB` to choose 64–4096 MiB per grouped reader. Rayon uses
-the available CPU threads; `RAYON_NUM_THREADS` can override its thread count.
+The RAM tile/summary cache budget is chosen from available memory on Linux and
+Windows (capped at 1 GiB total for active plot readers), with a 256 MiB
+fallback elsewhere. Set `BINWAVE_PLOT_CACHE_MB` to choose 64–4096 MiB shared
+across active readers. Each reader receives a share; 75% of its share is for
+raw decoded tiles and 25% for summaries. In-flight scan batches are bounded
+separately by half that share or one tile. Parallel scan batches cap their
+tile count below the reported logical CPU count when possible; the Rayon pool
+itself still uses the available threads. `RAYON_NUM_THREADS` can override the
+pool's thread count.
 Native numeric tiles now use direct hash lookups and an LRU order, and eligible
 ordinary collections use the same tiled path as grouped fields. Compatible
 prior plot data stays visible while a new viewport request loads. The RAM
-allowance remains **per reader**, so several selected collections can exceed
-one `BINWAVE_PLOT_CACHE_MB` allowance; a global memory scheduler is still
-needed.
+allowance is divided among selected collection readers. Retained completed
+plot output, queued disk writes, and in-flight tiles are not included in this
+RAM cache allowance; a full global scheduler is still needed.
 
 For unchanged local files without byte edits, close-range numeric tiles can
 also be stored as versioned decoded chunks under the app cache directory.
