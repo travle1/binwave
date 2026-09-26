@@ -320,6 +320,23 @@ Synthetic over-cap and invalid-gap tests pass, but live frame-time and GPU
 upload measurements remain required before the rendering acceptance gate can
 be marked complete.
 
+The next Phase 2 increment separates the visible viewport from aligned numeric
+query coverage. A pan within that coverage reuses its completed result; the
+file-backed regression test observes zero additional source reads. Compatible
+data remains paintable while a boundary pan loads. Intermediate raster results
+also remain visible while a newer generation is prepared. Broad scans still
+walk fine tiles because multilevel summaries are not yet implemented.
+
+An allocated 80 MB, 20-million-sample generic `i32` file on the same Ryzen 9
+7950X and tmpfs-backed `/tmp` measured 81.8 ms for its first accurate overview.
+Forty nearby requests had query-latency p50 below 0.01 ms and p95 of 19.0 ms;
+11 requests changed query coverage, and all 4,883 source reads (80 MB) occurred
+during the overview. This is a warm-OS-cache loader measurement, not a UI frame
+or gesture-to-paint measurement. Run
+`BINWAVE_BENCH_SAMPLES=20000000 cargo test --release --bin binwave benchmark_plot_reader_navigation_trace -- --ignored --nocapture`
+to repeat it. Retained display output, in-flight memory, GPU uploads, and
+first-scan performance on a 100 GB file remain unverified.
+
 ### Limited synthetic measurement
 
 Command: `BINWAVE_BENCH_SAMPLES=20000000 cargo test --release --bin binwave

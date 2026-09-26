@@ -367,6 +367,7 @@ pub struct PlotReader {
     error: Option<String>,
     cache: VecDeque<Cached>,
     group_tiles: Arc<Mutex<GroupTileCache>>,
+    cache_budget: usize,
     data_generation: u64,
 }
 #[cfg(not(target_arch = "wasm32"))]
@@ -434,16 +435,14 @@ impl PlotReader {
         let count = node.lazy.as_ref().map_or(node.children.len(), |array| array.count);
         let start = range.start.min(count);
         let range = start..range.end.max(start).min(count);
-        let (buckets, exact_limit) = request_resolution(&range, pixel_width, Some(plan.fields.len()));
         self.desired.as_ref().is_some_and(|request| {
             let key = &request.key;
             key.revision == revision && key.definition == identity(node)
-                && key.path == node.path && key.range == range
-                && key.buckets == buckets
-                && key.exact_limit == exact_limit
+                && key.path == node.path
                 && key.refine == refine
                 && key.fields.as_ref().is_some_and(|fields| fields.len() == plan.fields.len()
                     && fields.iter().zip(&plan.fields).all(|(name, field)| name == &field.name))
+                && covers_view(key, &range, pixel_width, Some(plan.fields.len()))
         })
     }
 
@@ -459,18 +458,15 @@ impl PlotReader {
         let start = range.start.min(count);
         let range = start..range.end.max(start).min(count);
         let plan = eligible_numeric_plan(node, None);
-        let (buckets, exact_limit) = request_resolution(&range, pixel_width,
-            plan.as_ref().map(|plan| plan.fields.len()));
         self.desired.as_ref().is_some_and(|request| {
             let key = &request.key;
             key.revision == revision
                 && key.definition == identity(node)
                 && key.path == node.path
-                && key.range == range
-                && key.buckets == buckets
-                && key.exact_limit == exact_limit
                 && key.refine == refine
                 && key.fields.is_none()
+                && covers_view(key, &range, pixel_width,
+                    plan.as_ref().map(|plan| plan.fields.len()))
         })
     }
 
@@ -493,12 +489,23 @@ impl PlotReader {
         let start = range.start.min(count);
         let range = start..range.end.max(start).min(count);
         let field_count = numeric_plan.as_ref().map(|plan| plan.fields.len());
-        let (buckets, exact_limit) = request_resolution(&range, pixel_width, field_count);
+        if self.desired.as_ref().is_some_and(|request| {
+            let key = &request.key;
+            key.revision == source.revision && key.definition == identity(&node)
+                && key.path == node.path && key.refine == refine
+                && key.fields.as_deref() == fields.as_deref()
+                && covers_view(key, &range, pixel_width, field_count)
+        }) { return; }
+        let query_range = if numeric_plan.is_some() && refine {
+            numeric_query_coverage(&range, count)
+        } else { range.clone() };
+        let (buckets, exact_limit) = query_resolution(&range, &query_range,
+            pixel_width, field_count);
         let key = Key {
             revision: source.revision,
             definition: identity(&node),
             path: node.path.clone(),
-            range,
+            range: query_range,
             buckets,
             exact_limit,
             refine,
@@ -648,6 +655,9 @@ impl PlotReader {
                             key: request.key.clone(),
                             result: result.map_err(|error| format!("{error:#}")),
                         });
+                        // The visible result is ready even if neighbor prefetch
+                        // continues in this worker after publication.
+                        ctx.request_repaint();
                     }
                     if succeeded && !cancel.load(Ordering::Relaxed) {
                         if let (Some(plan), Some(tiles)) = (&request.numeric_plan, &request.group_tiles) {
@@ -697,6 +707,8 @@ impl PlotReader {
         self.data_generation
     }
     pub(crate) fn set_cache_budget(&mut self, bytes: usize) {
+        if self.cache_budget == bytes { return; }
+        self.cache_budget = bytes;
         self.group_tiles.lock().unwrap().set_budget(bytes);
     }
     pub(crate) fn persist_available_tiles(&self) {
@@ -956,6 +968,42 @@ fn request_resolution(
         exact_limit(pixel_width)
     };
     (buckets, exact)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn numeric_query_coverage(view: &Range<Address>, count: Address) -> Range<Address> {
+    if view.is_empty() { return view.clone(); }
+    // A modest aligned margin means a short pan changes only the plot transform.
+    // The cap prevents broad scans from growing substantially beyond the view.
+    let quantum = view.len().div_ceil(4).checked_next_power_of_two()
+        .unwrap_or(Address::MAX).clamp(256, 4096);
+    let start = view.start.saturating_sub(quantum) / quantum * quantum;
+    let end = view.end.saturating_add(quantum).div_ceil(quantum)
+        .saturating_mul(quantum).min(count);
+    start..end.max(view.end)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn query_resolution(view: &Range<Address>, query: &Range<Address>,
+    pixel_width: Address, field_count: Option<usize>) -> (Address, Address) {
+    let (base_buckets, base_exact) = request_resolution(view, pixel_width, field_count);
+    let field_cap = field_count.map_or(MAX_BUCKETS, |count|
+        (MAX_TOTAL_NUMERIC_POINTS / count.max(1)).max(1).min(MAX_BUCKETS));
+    let buckets = base_buckets.saturating_mul(query.len())
+        .div_ceil(view.len().max(1)).clamp(1, field_cap);
+    let exact = if view.len() <= base_exact { query.len() } else { base_exact };
+    (buckets, exact)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn covers_view(key: &Key, view: &Range<Address>, pixel_width: Address,
+    field_count: Option<usize>) -> bool {
+    if key.range.start > view.start || key.range.end < view.end { return false; }
+    let (_, wanted_exact) = request_resolution(view, pixel_width, field_count);
+    if view.len() <= wanted_exact && key.range.len() > key.exact_limit { return false; }
+    if key.range.len() <= key.exact_limit { return true; }
+    let (needed_buckets, _) = query_resolution(view, &key.range, pixel_width, field_count);
+    key.buckets >= needed_buckets
 }
 
 fn reduction_buckets(quality: PlotQuality, requested: Address) -> Address {
@@ -2170,6 +2218,57 @@ actions:
                 after.0 - before.0, after.1 - before.1, tiles.lock().unwrap().loads);
         }
     }
+    /// An allocated, format-neutral file exercises the UI's request/coverage
+    /// path. The source remains OS-cache warm; this is not a cold-disk result.
+    #[test]
+    #[ignore = "manual native navigation measurement"]
+    fn benchmark_plot_reader_navigation_trace() {
+        let count = std::env::var("BINWAVE_BENCH_SAMPLES").ok()
+            .and_then(|value| value.parse::<usize>().ok()).unwrap_or(1_000_000);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut output = std::io::BufWriter::new(std::fs::File::create(file.path()).unwrap());
+        use std::io::Write;
+        for index in 0..count { output.write_all(&((index % 1024) as i32).to_le_bytes()).unwrap(); }
+        output.flush().unwrap();
+        drop(output);
+        let source = Arc::new(crate::file_source::FileSource::open(file.path()).unwrap());
+        let store = ByteStore::from_file(source.clone());
+        let node = parse(&store.view(),
+            "actions:\n  - read: {name: samples, type: i32, repeat: until end}\n");
+        let ctx = egui::Context::default();
+        let mut reader = PlotReader::default();
+        let mut timings = Vec::new();
+        let mut query_changes = 0;
+        let mut measure = |label: &str, range: Range<Address>, width: Address,
+            timings: &mut Vec<f64>| {
+            let before = source.io_stats();
+            let generation = reader.data_generation();
+            let started = Instant::now();
+            reader.request(&ctx, store.view(), node.clone(), range, width, true);
+            settle(&mut reader, &ctx);
+            let ms = started.elapsed().as_secs_f64() * 1000.;
+            let after = source.io_stats();
+            if reader.data_generation() != generation { query_changes += 1; }
+            println!("plot_trace phase={label} latency_ms={ms:.3} source_calls={} source_bytes={} query_changed={} coverage={:?}",
+                after.0 - before.0, after.1 - before.1,
+                reader.data_generation() != generation, reader.data().unwrap().range);
+            timings.push(ms);
+        };
+        measure("overview", 0..count, 1920, &mut timings);
+        let overview_ms = timings.pop().unwrap();
+        let center = count / 2;
+        for index in 0..40 {
+            let offset = match index % 8 { 0 => 0, 1 => 128, 2 => 256, 3 => 384,
+                4 => 512, 5 => 384, 6 => 256, _ => 128 };
+            let start = center.saturating_add(offset).min(count.saturating_sub(1024));
+            measure("nearby", start..start + 1024, 1920, &mut timings);
+        }
+        timings.sort_by(f64::total_cmp);
+        let p50 = timings[timings.len() / 2];
+        let p95 = timings[(timings.len() * 95 / 100).min(timings.len() - 1)];
+        println!("plot_trace summary overview_ms={overview_ms:.3} nearby_p50_ms={p50:.3} nearby_p95_ms={p95:.3} query_changes={query_changes} source_calls={} source_bytes={} tile_loads={}",
+            source.io_stats().0, source.io_stats().1, reader.group_buffer_stats().1);
+    }
     #[test]
     fn tile_lookup_keeps_constant_time_eviction_order() {
         let mut cache = LruMap::default();
@@ -2422,13 +2521,42 @@ actions:
             20_000..30_000, 1280, true);
         settle(&mut reader, &ctx);
         let loads = reader.group_buffer_stats().1;
-        assert!(!reader.matches_group_request(store.view().revision, &node, &plan,
+        assert!(reader.matches_group_request(store.view().revision, &node, &plan,
             25_000..35_000, 1280, true));
+        let first = reader.data.as_ref().unwrap().clone();
         reader.request_group(&ctx, store.view(), node, plan,
             25_000..35_000, 1280, true);
         settle(&mut reader, &ctx);
-        assert_eq!(reader.data().unwrap().range, 25_000..35_000);
-        assert!(reader.group_buffer_stats().1 <= loads + 2);
+        assert!(reader.data().unwrap().range.start <= 25_000);
+        assert!(reader.data().unwrap().range.end >= 35_000);
+        assert!(Arc::ptr_eq(reader.data.as_ref().unwrap(), &first));
+        assert_eq!(reader.group_buffer_stats().1, loads);
+    }
+    #[test]
+    fn aligned_coverage_reuses_result_for_small_pan_without_source_reads() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let bytes: Vec<u8> = (0..20_000i32).flat_map(i32::to_le_bytes).collect();
+        std::fs::write(file.path(), bytes).unwrap();
+        let source = Arc::new(crate::file_source::FileSource::open(file.path()).unwrap());
+        let store = ByteStore::from_file(source.clone());
+        let node = parse(&store.view(),
+            "actions:\n  - read: {name: samples, type: i32, repeat: until end}\n");
+        let ctx = egui::Context::default();
+        let mut reader = PlotReader::default();
+        reader.request(&ctx, store.view(), node.clone(), 1000..2000, 1280, true);
+        settle(&mut reader, &ctx);
+        let first = reader.data.as_ref().unwrap().clone();
+        assert!(first.range.start < 1000 && first.range.end > 2000);
+        let before = source.io_stats();
+        reader.request(&ctx, store.view(), node.clone(), 1100..2100, 1280, true);
+        assert!(Arc::ptr_eq(reader.data.as_ref().unwrap(), &first));
+        assert_eq!(source.io_stats(), before);
+        reader.request(&ctx, store.view(), node, 2000..3000, 1280, true);
+        assert!(reader.is_loading());
+        assert!(Arc::ptr_eq(reader.data.as_ref().unwrap(), &first));
+        settle(&mut reader, &ctx);
+        assert!(reader.data().unwrap().range.start <= 2000);
+        assert!(reader.data().unwrap().range.end >= 3000);
     }
     #[test]
     fn ordinary_numeric_collection_uses_the_tile_cache() {
@@ -2644,7 +2772,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             let data = reader.data().unwrap();
             assert_eq!(data.quality, PlotQuality::MinMax);
             assert_eq!(data.scanned, 12_496);
-            assert_eq!(data.envelopes["value"].len(), display_buckets(width));
+            assert!(data.envelopes["value"].len() >= display_buckets(width));
             assert!(data.series["value"]
                 .iter()
                 .any(|point| point.index == 33_451 && point.value == 100_000.));
@@ -2693,7 +2821,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
         for (width, quality) in [
             (512, PlotQuality::MinMax),
             (1200, PlotQuality::Exact),
-            (512, PlotQuality::MinMax),
+            (512, PlotQuality::Exact),
         ] {
             reader.request(&ctx, store.view(), node.clone(), 0..2179, width, false);
             settle(&mut reader, &ctx);
@@ -3042,7 +3170,7 @@ actions:
         assert_eq!(first.envelopes["value"].len(), MAX_BUCKETS);
         reader.request(&ctx, store.view(), node.clone(), 1000..33_768, 2048, false);
         settle(&mut reader, &ctx);
-        assert_eq!(reader.cache.len(), 2);
+        assert_eq!(reader.cache.len(), 1);
         assert!(Arc::ptr_eq(
             reader.data.as_ref().unwrap(),
             &reader.cache.front().unwrap().data
@@ -3051,7 +3179,7 @@ actions:
         settle(&mut reader, &ctx);
         assert!(Arc::ptr_eq(reader.data.as_ref().unwrap(), &first));
         assert!(Arc::ptr_eq(&reader.cache.front().unwrap().data, &first));
-        assert_eq!(reader.cache.len(), 2);
+        assert_eq!(reader.cache.len(), 1);
     }
 
     #[test]

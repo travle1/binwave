@@ -40,6 +40,14 @@ prior plot data stays visible while a new viewport request loads. The RAM
 allowance is divided among selected collection readers. Retained completed
 plot output, queued disk writes, and in-flight tiles are not included in this
 RAM cache allowance; a full global scheduler is still needed.
+Native numeric plots request aligned coverage around the visible viewport.
+Small pans inside that coverage reuse the same result without new source reads.
+For many visible traces, the plot reduces per-series min/max resolution toward
+an approximately one-million-point display target; each bucket preserves its
+observed extrema. Exact views and the minimum bucket count can exceed this
+target. This reduces retained display geometry but does not bound decoded tile
+memory, in-flight work, or the first accurate scan. Raster and GPU geometry
+workers keep the prior valid image visible while preparing an update.
 
 For unchanged local files without byte edits, close-range numeric tiles can
 also be stored as versioned decoded chunks under the app cache directory.

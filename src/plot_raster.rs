@@ -11,6 +11,8 @@ use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 
 struct PendingRaster {
     key: u64,
+    bounds: [f64; 4],
+    generation: u64,
     receiver: Receiver<ColorImage>,
     cancel: Arc<AtomicBool>,
 }
@@ -51,9 +53,6 @@ impl PlotRaster {
         if width == 0 || height == 0
             || !bounds.min().iter().chain(bounds.max().iter()).all(|v| v.is_finite())
             || bounds.width() <= 0. || bounds.height() <= 0. { return; }
-        if self.texture_generation.is_some_and(|generation| generation != data_generation) {
-            self.invalidate();
-        }
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.epoch.hash(&mut hasher);
         data_generation.hash(&mut hasher);
@@ -63,22 +62,19 @@ impl PlotRaster {
         for value in bounds.min().into_iter().chain(bounds.max()) { value.to_bits().hash(&mut hasher); }
         let key = hasher.finish();
         let requested_bounds = [bounds.min()[0], bounds.min()[1], bounds.max()[0], bounds.max()[1]];
-        if let Some(pending) = &self.pending {
-            if pending.key != key { pending.cancel.store(true, Ordering::Relaxed); }
-        }
         if let Some(pending) = self.pending.take() {
             match pending.receiver.try_recv() {
-                Ok(image) if pending.key == key => {
+                Ok(image) => {
                     if let Some(texture) = &mut self.texture {
                         texture.set(image, TextureOptions::NEAREST);
                     } else {
                         self.texture = Some(ctx.load_texture("decoded-plot-traces", image, TextureOptions::NEAREST));
                     }
-                    self.key = Some(key);
-                    self.texture_bounds = Some(requested_bounds);
-                    self.texture_generation = Some(data_generation);
+                    self.key = Some(pending.key);
+                    self.texture_bounds = Some(pending.bounds);
+                    self.texture_generation = Some(pending.generation);
                 }
-                Ok(_) | Err(TryRecvError::Disconnected) => {}
+                Err(TryRecvError::Disconnected) => {}
                 Err(TryRecvError::Empty) => self.pending = Some(pending),
             }
         }
@@ -98,7 +94,8 @@ impl PlotRaster {
                 }
                 repaint.request_repaint();
             });
-            self.pending = Some(PendingRaster { key, receiver, cancel });
+            self.pending = Some(PendingRaster { key, bounds: requested_bounds,
+                generation: data_generation, receiver, cancel });
         }
         if let (Some(texture), Some(image_bounds)) = (&self.texture, self.texture_bounds) {
             let center = PlotPoint::new((image_bounds[0] + image_bounds[2]) * 0.5,
@@ -296,11 +293,21 @@ mod tests {
                     });
                 });
             });
-            if raster.key.is_some() { break; }
+            if raster.texture_bounds == Some([0., 0., 10., 10.]) { break; }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert!(raster.texture.is_some(), "background raster did not publish");
         assert_eq!(raster.texture_bounds, Some([0., 0., 10., 10.]));
+        ctx.run(input, |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                egui_plot::Plot::new("raster-worker-test").show(ui, |plot| {
+                    plot.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                        [0., 0.], [10., 10.]));
+                    raster.show(&ctx, plot, &series, &HashSet::new(), 2);
+                });
+            });
+        });
+        assert!(raster.texture.is_some(), "new data must retain the previous image while loading");
         raster.invalidate();
         assert!(raster.texture.is_none());
     }
