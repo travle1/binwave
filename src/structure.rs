@@ -704,6 +704,9 @@ pub(crate) struct NumericPlan {
     pub fields: Vec<NumericField>,
 }
 impl NumericPlan {
+    pub(crate) fn physical_stride(&self) -> Address {
+        self.segmented.as_ref().map_or(self.stride, |segment| segment.inner_stride)
+    }
     pub(crate) fn offset(&self, index: Address) -> Option<Address> {
         if let Some(segment) = &self.segmented {
             let group = index / segment.inner_count;
@@ -911,47 +914,56 @@ impl LazyArray {
             preview: None,
         })
     }
-    /// One fixed-size item from a repeated group in each parent record.
-    /// The item itself contains a fixed-size sample array.
-    pub(crate) fn flattened_group_child(parent: &Node, group: &Node, child: &Node, index: Address) -> Option<Node> {
+    /// One indexed value from every fixed-size group in every parent record.
+    pub(crate) fn flattened_group_sensor(parent: &Node, group: &Node, child: &Node, index: Address) -> Option<Node> {
         let outer = parent.lazy.as_ref()?;
         let groups = group.lazy.as_ref()?;
-        let inner = child.lazy.as_ref()?;
-        if index >= groups.count || outer.count == 0 || inner.count == 0
-            || outer.stride == 0 || groups.stride == 0 || inner.stride == 0
+        let (inner_count, width, value_start, mut plan) = if let Some(inner) = child.lazy.as_ref() {
+            (inner.count, inner.stride, inner.bounds(index)?.start, (*inner.plan).clone())
+        } else {
+            let item = child.children.get(usize::try_from(index).ok()?)?;
+            let width = item.range.end.checked_sub(item.range.start)?;
+            if width == 0 || child.children.iter().enumerate().any(|(position, value)|
+                value.range.end.checked_sub(value.range.start) != Some(width)
+                    || (position as Address).checked_mul(width)
+                        .and_then(|offset| child.range.start.checked_add(offset)) != Some(value.range.start)) {
+                return None;
+            }
+            let mut plan = (*groups.plan).clone();
+            plan.field = Field::scalar("value", item.kind.clone());
+            plan.endian = item.endian;
+            (child.children.len() as Address, width, item.range.start, plan)
+        };
+        if index >= inner_count || outer.count == 0 || groups.count == 0 || inner_count == 0
+            || outer.stride == 0 || groups.stride == 0 || width == 0
             || outer.offsets.is_some() || outer.segmented.is_some()
             || groups.offsets.is_some() || groups.segmented.is_some()
-            || inner.offsets.is_some() || inner.segmented.is_some() {
+            || child.lazy.as_ref().is_some_and(|inner| inner.offsets.is_some() || inner.segmented.is_some()) {
             return None;
         }
         let outer_start = outer.bounds(0)?.start;
-        let group_start = groups.bounds(index)?.start;
-        let first_group_start = groups.bounds(0)?.start;
-        let child_start = inner.bounds(0)?.start;
-        let inner_offset = group_start.checked_sub(outer_start)?
-            .checked_add(child_start.checked_sub(first_group_start)?)?;
-        let inner_bytes = inner.count.checked_mul(inner.stride)?;
-        if inner_offset.checked_add(inner_bytes)? > outer.stride { return None; }
+        let inner_offset = value_start.checked_sub(outer_start)?;
+        let last_group_offset = (groups.count - 1).checked_mul(groups.stride)?;
+        if inner_offset.checked_add(last_group_offset)?.checked_add(width)? > outer.stride { return None; }
         let item_prefix = format!("{}[0]", parent.path);
         let group_suffix = group.path.strip_prefix(&item_prefix)?;
         let child_suffix = child.path.strip_prefix(&format!("{}[0]", group.path))?;
         if !group_suffix.starts_with('.') || !child_suffix.starts_with('.') { return None; }
         let path = format!("{}{}[{index}]{}", parent.path, group_suffix, child_suffix);
-        let count = outer.count.checked_mul(inner.count)?;
-        let mut plan = (*inner.plan).clone();
+        let count = outer.count.checked_mul(groups.count)?;
         plan.start = outer_start.checked_add(inner_offset)?;
         plan.end = parent.range.end;
         plan.path = path.clone();
         let array = Self {
             count,
-            stride: inner.stride,
+            stride: width,
             offsets: None,
             segmented: Some(SegmentedArray {
                 outer_start,
                 outer_stride: outer.stride,
                 inner_offset,
-                inner_count: inner.count,
-                inner_stride: inner.stride,
+                inner_count: groups.count,
+                inner_stride: groups.stride,
             }),
             plan: Arc::new(plan),
         };
@@ -960,7 +972,7 @@ impl LazyArray {
             name: format!("{}[{index}] across {}", group.name, parent.name),
             path,
             range: outer_start.checked_add(inner_offset)?..end,
-            kind: child.kind.clone(),
+            kind: if child.lazy.is_some() { child.kind.clone() } else { child.children[0].kind.clone() },
             value: None,
             children: Vec::new(),
             lazy: Some(array),
@@ -1005,7 +1017,7 @@ impl LazyArray {
                 .checked_add(group.checked_mul(segment.outer_stride)?)?
                 .checked_add(segment.inner_offset)?
                 .checked_add(within.checked_mul(segment.inner_stride)?)?;
-            return Some(start..start.checked_add(segment.inner_stride)?);
+            return Some(start..start.checked_add(self.stride)?);
         }
         if let Some(offsets) = &self.offsets {
             let index = usize::try_from(index).ok()?;

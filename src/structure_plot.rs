@@ -802,6 +802,7 @@ fn read_numeric(
     let mut last_publish = Instant::now();
     let range = request.key.range.clone();
     let stride = reduction.plan.stride;
+    let physical_stride = reduction.plan.physical_stride();
     // Window size and physical read size are independent: even very wide
     // records are read in chunks no larger than the ByteView's 1 MiB limit.
     let windows = if quality == PlotQuality::SampledPreview {
@@ -811,7 +812,7 @@ fn read_numeric(
     } else {
         vec![range]
     };
-    let batch = (READ_LIMIT / stride.max(1)).max(1);
+    let batch = (READ_LIMIT / physical_stride.max(1)).max(1);
     for window in windows {
         let mut index = window.start;
         while index < window.end {
@@ -821,18 +822,22 @@ fn read_numeric(
             ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
             let start = reduction.plan.offset(span.start)
                 .ok_or_else(|| anyhow::anyhow!("plot offset overflow"))?;
-            let length = (span.end - span.start)
-                .checked_mul(stride)
+            let length = (span.end - span.start - 1)
+                .checked_mul(physical_stride)
+                .and_then(|length| length.checked_add(stride))
                 .ok_or_else(|| anyhow::anyhow!("plot length overflow"))?;
             let bytes = request.source.read(start, length)?;
             ensure!(
                 bytes.len() as Address == length,
                 "source ended during plot read"
             );
-            for (offset, record) in bytes.chunks_exact(stride as usize).enumerate() {
+            for offset in 0..(span.end - span.start) {
                 if offset % 128 == 0 {
                     ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
                 }
+                let start = usize::try_from(offset * physical_stride)?;
+                let end = start + usize::try_from(stride)?;
+                let record = &bytes[start..end];
                 reduction.record(record, span.start + offset as Address)?;
                 scanned += 1;
             }
