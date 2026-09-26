@@ -2014,13 +2014,18 @@ impl SeriesTree {
 fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut std::collections::BTreeSet<String>) -> bool {
     let mut changed=false;
     ui.menu_button("Collections", |ui| {
-        for node in collections {
-            let mut enabled=selected.contains(&node.path);
-            if ui.checkbox(&mut enabled,collection_label(node)).changed() {
-                if enabled {selected.insert(node.path.clone());} else {selected.remove(&node.path);}
-                changed=true;
-            }
-        }
+        egui::ScrollArea::vertical()
+            .id_salt("plot_collection_choices")
+            .max_height(ui.ctx().content_rect().height().min(420.0))
+            .show(ui, |ui| {
+                for node in collections {
+                    let mut enabled=selected.contains(&node.path);
+                    if ui.checkbox(&mut enabled,collection_label(node)).changed() {
+                        if enabled {selected.insert(node.path.clone());} else {selected.remove(&node.path);}
+                        changed=true;
+                    }
+                }
+            });
     });
     changed
 }
