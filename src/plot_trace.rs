@@ -143,7 +143,8 @@ const MAX_COLUMNS: usize = 16_384;
 // egui-wgpu allocates one vertex/index buffer for the entire frame. Budget
 // across traces, not per trace, to stay below the device's buffer-size limit.
 const MAX_LINE_POINTS_TOTAL: usize = 200_000;
-const MAX_MESH_COLUMNS_TOTAL: usize = 1_000_000;
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_MESH_COLUMNS_TOTAL: usize = 500_000;
 const ENVELOPE_RADIUS: usize = 2;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -156,12 +157,13 @@ struct MeshKey {
     line_limit: usize,
     column_limit: usize,
     highlighted: bool,
+    outlined_envelope: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl MeshKey {
     fn new(transform: &PlotTransform, pixels_per_point: f32, color: Color32,
-        line_limit: usize, column_limit: usize, highlighted: bool) -> Self {
+        line_limit: usize, column_limit: usize, highlighted: bool, outlined_envelope: bool) -> Self {
         let bounds = transform.bounds();
         let frame = transform.frame();
         Self {
@@ -170,7 +172,7 @@ impl MeshKey {
             frame: [frame.left().to_bits(), frame.top().to_bits(),
                 frame.right().to_bits(), frame.bottom().to_bits()],
             pixels_per_point: pixels_per_point.to_bits(),
-            color: color.to_array(), line_limit, column_limit, highlighted,
+            color: color.to_array(), line_limit, column_limit, highlighted, outlined_envelope,
         }
     }
 }
@@ -198,6 +200,7 @@ pub struct AdaptiveTrace<'a> {
     line: Line<'a>,
     line_point_limit: usize,
     mesh_column_limit: usize,
+    outlined_envelope: bool,
     #[cfg(not(target_arch = "wasm32"))]
     mesh_cache: Option<Arc<TraceMeshCache>>,
 }
@@ -209,6 +212,7 @@ impl AdaptiveTrace<'static> {
             line: Line::new(name.into(), points).color(color),
             line_point_limit: MAX_LINE_POINTS_TOTAL,
             mesh_column_limit: MAX_COLUMNS,
+            outlined_envelope: false,
             #[cfg(not(target_arch = "wasm32"))]
             mesh_cache: None,
         }
@@ -223,6 +227,7 @@ impl<'a> AdaptiveTrace<'a> {
             line: Line::new(name.into(), points).color(color),
             line_point_limit: (MAX_LINE_POINTS_TOTAL / count).max(1),
             mesh_column_limit: (MAX_MESH_COLUMNS_TOTAL / count).clamp(1, MAX_COLUMNS),
+            outlined_envelope: count > 16,
             mesh_cache: None,
         }
     }
@@ -240,22 +245,31 @@ impl PlotItem for AdaptiveTrace<'_> {
         let pixels_per_point = ui.ctx().pixels_per_point();
         #[cfg(not(target_arch = "wasm32"))]
         let key = MeshKey::new(transform, pixels_per_point, self.color(),
-            self.line_point_limit, self.mesh_column_limit, self.highlighted());
+            self.line_point_limit, self.mesh_column_limit, self.highlighted(), self.outlined_envelope);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(mesh) = self.mesh_cache.as_ref().and_then(|cache| cache.get(self.name(), key)) {
             shapes.push(Shape::Mesh(mesh));
             return;
         }
         let too_many_points = exceeds_visible_point_limit(points, transform, self.line_point_limit);
-        if too_many_points || has_dense_cycles(points, transform, pixels_per_point) {
-            let alpha = if self.highlighted() { 0.72 } else { 0.45 };
-            let mesh = amplitude_mesh(
+        let physical_columns = (transform.frame().width() * pixels_per_point).ceil().max(1.) as usize;
+        let unresolved_cycles = !too_many_points
+            && exceeds_visible_point_limit(points, transform, physical_columns)
+            && has_dense_cycles(points, transform, pixels_per_point);
+        if too_many_points || unresolved_cycles {
+            let mut mesh = amplitude_mesh(
                 points,
                 transform,
                 pixels_per_point,
-                self.color().gamma_multiply(alpha),
+                self.color(),
                 self.mesh_column_limit,
             );
+            if self.outlined_envelope {
+                outline_envelope(&mut mesh, self.color(), pixels_per_point, self.highlighted());
+            } else {
+                let color = self.color().gamma_multiply(if self.highlighted() { 0.72 } else { 0.45 });
+                for vertex in &mut mesh.vertices { vertex.color = color; }
+            }
             if !mesh.is_empty() {
                 let mesh: Arc<egui::epaint::Mesh> = mesh.into();
                 #[cfg(not(target_arch = "wasm32"))]
@@ -520,6 +534,37 @@ fn amplitude_mesh(
     mesh
 }
 
+/// In a crowded plot, a solid extrema rectangle hides the neighboring traces.
+/// Keep the observed range visible while giving its upper and lower edges a
+/// stronger, stable series color. The fill stays below the grid in contrast.
+fn outline_envelope(mesh: &mut egui::epaint::Mesh, color: Color32, pixels_per_point: f32, highlighted: bool) {
+    let fill = color.gamma_multiply(if highlighted { 0.14 } else { 0.08 });
+    let edge = color.gamma_multiply(if highlighted { 1.0 } else { 0.8 });
+    let edge_height = 1.0 / pixels_per_point.max(0.01);
+    let fill_vertices = mesh.vertices.len();
+    for index in (0..fill_vertices).step_by(4) {
+        let mut rect = Rect::NOTHING;
+        for vertex in &mesh.vertices[index..index + 4] {
+            rect.extend_with(vertex.pos);
+        }
+        for vertex in &mut mesh.vertices[index..index + 4] {
+            vertex.color = fill;
+        }
+        if !rect.is_positive() {
+            continue;
+        }
+        for y in [rect.top(), (rect.bottom() - edge_height).max(rect.top())] {
+            let bottom = (y + edge_height).min(rect.bottom());
+            if bottom > y {
+                mesh.add_colored_rect(
+                    Rect::from_min_max(egui::pos2(rect.left(), y), egui::pos2(rect.right(), bottom)),
+                    edge,
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,12 +622,16 @@ mod tests {
         let transform = transform(4_000.0, points.len());
         let trace = AdaptiveTrace::borrowed_with_series_count(&points, "signal", Color32::RED, traces);
         assert!(exceeds_visible_point_limit(&points, &transform, trace.line_point_limit));
-        let mesh = amplitude_mesh(&points, &transform, 1.0, Color32::RED, trace.mesh_column_limit);
+        let mut mesh = amplitude_mesh(&points, &transform, 1.0, Color32::RED, trace.mesh_column_limit);
+        assert!(trace.outlined_envelope);
+        outline_envelope(&mut mesh, Color32::RED, 1.0, false);
         assert!(!mesh.is_empty());
-        assert!(mesh.vertices.len() <= trace.mesh_column_limit * 4);
-        assert!(mesh.indices.len() <= trace.mesh_column_limit * 6);
-        let total_index_bytes = traces * trace.mesh_column_limit * 6 * std::mem::size_of::<u32>();
-        let total_vertex_bytes = traces * trace.mesh_column_limit * 4 * std::mem::size_of::<egui::epaint::Vertex>();
+        assert!(mesh.vertices.len() <= trace.mesh_column_limit * 12);
+        assert!(mesh.indices.len() <= trace.mesh_column_limit * 18);
+        assert!(mesh.vertices.iter().any(|vertex| vertex.color == Color32::RED.gamma_multiply(0.08)));
+        assert!(mesh.vertices.iter().any(|vertex| vertex.color == Color32::RED.gamma_multiply(0.8)));
+        let total_index_bytes = traces * trace.mesh_column_limit * 18 * std::mem::size_of::<u32>();
+        let total_vertex_bytes = traces * trace.mesh_column_limit * 12 * std::mem::size_of::<egui::epaint::Vertex>();
         assert!(total_index_bytes < 268_435_456);
         assert!(total_vertex_bytes < 268_435_456);
     }

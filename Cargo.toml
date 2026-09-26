@@ -42,8 +42,8 @@ js-sys = "0.3"
 console_error_panic_hook = "0.1"
 web-time = "0.2"
 
-[target.'cfg(windows)'.dev-dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl"] }
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_SystemInformation"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 naga = { version = "30.0.1", features = ["wgsl-in"] }

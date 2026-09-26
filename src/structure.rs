@@ -740,7 +740,9 @@ impl NumericPlan {
         Some(combined)
     }
     pub(crate) fn physical_stride(&self) -> Address {
-        self.segmented.as_ref().map_or(self.stride, |segment| segment.inner_stride)
+        self.segmented.as_ref().map_or(self.stride, |segment| {
+            if segment.inner_count == 1 { segment.outer_stride } else { segment.inner_stride }
+        })
     }
     pub(crate) fn offset(&self, index: Address) -> Option<Address> {
         if let Some(segment) = &self.segmented {
@@ -755,7 +757,8 @@ impl NumericPlan {
     }
     pub(crate) fn contiguous_count(&self, index: Address) -> Address {
         self.segmented.as_ref().map_or(Address::MAX, |segment|
-            segment.inner_count - index % segment.inner_count)
+            if segment.inner_count == 1 { Address::MAX }
+            else { segment.inner_count - index % segment.inner_count })
     }
 }
 #[derive(Clone)]
@@ -2827,6 +2830,27 @@ fn field_references(field: &Field) -> Vec<String> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn one_item_segments_are_one_strided_read_run() {
+        let plan = NumericPlan {
+            start: 6,
+            stride: 2,
+            segmented: Some(SegmentedArray {
+                outer_start: 0,
+                outer_stride: 10,
+                inner_offset: 6,
+                inner_count: 1,
+                inner_stride: 2,
+            }),
+            path: "rows.values".into(),
+            revision: 1,
+            fields: Vec::new(),
+        };
+        assert_eq!(plan.physical_stride(), 10);
+        assert_eq!(plan.contiguous_count(1), Address::MAX);
+        assert_eq!(plan.offset(4097), Some(4097 * 10 + 6));
+    }
 
     #[test]
     fn reference_selects_an_earlier_section_by_decoded_field_not_position() {

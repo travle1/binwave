@@ -24,8 +24,7 @@ impl PlotRaster {
         let ppp = ctx.pixels_per_point();
         let requested_width = (frame.width() * ppp).ceil().max(1.) as usize;
         let requested_height = (frame.height() * ppp).ceil().max(1.) as usize;
-        // Rayon uses a private histogram per worker. Bound that temporary RAM
-        // and let the texture scale on unusually large/high-DPI displays.
+        // Bound the texture and the per-worker coverage mask on large displays.
         let scale = (2_000_000_f64 / requested_width.saturating_mul(requested_height).max(1) as f64)
             .sqrt().min(1.);
         let width = (requested_width as f64 * scale).round().max(1.) as usize;
@@ -62,45 +61,95 @@ impl PlotRaster {
 }
 
 fn rasterize(series: &[(&str, &[PlotPoint])], width: usize, height: usize, bounds: [f64; 4]) -> ColorImage {
-    // Build each trace's per-pixel extrema independently, then composite in
-    // stable series order so colors and crossings remain deterministic.
-    let prepared: Vec<_> = series.par_iter().map(|(name, points)| {
-            let mut columns = vec![(i32::MAX, i32::MIN); width];
-            for point in *points {
-                if !point.x.is_finite() || !point.y.is_finite()
-                    || point.x < bounds[0] || point.x > bounds[2] { continue; }
-                let x = (((point.x - bounds[0]) / (bounds[2] - bounds[0])) * width as f64)
-                    .floor().clamp(0., (width - 1) as f64) as usize;
-                let y = (((bounds[3] - point.y) / (bounds[3] - bounds[1])) * height as f64)
-                    .floor().clamp(0., (height - 1) as f64) as i32;
-                columns[x].0 = columns[x].0.min(y);
-                columns[x].1 = columns[x].1.max(y);
-            }
-            let color = series_color(name).to_array();
-            (columns, [color[0], color[1], color[2]])
-        }).collect();
     let mut pixels = vec![[0u8; 4]; width * height];
-    for (columns, color) in prepared {
-        let mut previous: Option<(usize, i32, i32)> = None;
-        for (x, &(top, bottom)) in columns.iter().enumerate() {
-            if top > bottom { continue; }
-            let (start, old_top, old_bottom) = previous.unwrap_or((x, top, bottom));
-            for column in start..=x {
-                if previous.is_some() && column == start { continue; }
-                let fraction = if x == start { 1. } else {
-                    (column - start) as f64 / (x - start) as f64
-                };
-                let line_top = (old_top as f64 + (top - old_top) as f64 * fraction).round() as i32;
-                let line_bottom = (old_bottom as f64 + (bottom - old_bottom) as f64 * fraction).round() as i32;
-                for y in line_top.min(line_bottom)..=line_top.max(line_bottom) {
-                    blend(&mut pixels[y as usize * width + column], color);
+    // Work on a few series at a time so parallel coverage masks stay bounded.
+    // Each series contributes at most once per pixel; dense oscillations cannot
+    // brighten themselves into a solid min/max rectangle.
+    for batch in series.chunks(8) {
+        let prepared: Vec<_> = batch.par_iter().map(|(name, points)| {
+            let mut covered = vec![false; width * height];
+            let mut touched = Vec::new();
+            let mut mark = |x: i32, y: i32| {
+                let index = y as usize * width + x as usize;
+                if !covered[index] {
+                    covered[index] = true;
+                    touched.push(index);
+                }
+            };
+            for pair in points.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                if !a.x.is_finite() || !a.y.is_finite() || !b.x.is_finite() || !b.y.is_finite()
+                    || b.x < a.x { continue; }
+                let x0 = (a.x - bounds[0]) / (bounds[2] - bounds[0]) * (width - 1) as f64;
+                let y0 = (bounds[3] - a.y) / (bounds[3] - bounds[1]) * (height - 1) as f64;
+                let x1 = (b.x - bounds[0]) / (bounds[2] - bounds[0]) * (width - 1) as f64;
+                let y1 = (bounds[3] - b.y) / (bounds[3] - bounds[1]) * (height - 1) as f64;
+                if let Some(((x0, y0), (x1, y1))) = clip_line(x0, y0, x1, y1, width, height) {
+                    raster_line(x0, y0, x1, y1, &mut mark);
                 }
             }
-            previous = Some((x, top, bottom));
+            if points.len() == 1 {
+                let point = points[0];
+                if point.x.is_finite() && point.y.is_finite() {
+                    let x = (point.x - bounds[0]) / (bounds[2] - bounds[0]) * (width - 1) as f64;
+                    let y = (bounds[3] - point.y) / (bounds[3] - bounds[1]) * (height - 1) as f64;
+                    if x >= 0. && x < width as f64 && y >= 0. && y < height as f64 {
+                        mark(x.round() as i32, y.round() as i32);
+                    }
+                }
+            }
+            let [r, g, b, _] = series_color(name).to_array();
+            (touched, [r, g, b])
+        }).collect();
+        for (touched, color) in prepared {
+            for index in touched {
+                blend(&mut pixels[index], color);
+            }
         }
     }
     ColorImage::new([width, height], pixels.into_iter().map(|p|
         Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])).collect())
+}
+
+fn clip_line(x0: f64, y0: f64, x1: f64, y1: f64, width: usize, height: usize)
+    -> Option<((i32, i32), (i32, i32))> {
+    if ![x0, y0, x1, y1].iter().all(|v| v.is_finite()) { return None; }
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    if !dx.is_finite() || !dy.is_finite() { return None; }
+    let mut first: f64 = 0.;
+    let mut last: f64 = 1.;
+    for (p, q) in [(-dx, x0), (dx, width as f64 - 1. - x0),
+        (-dy, y0), (dy, height as f64 - 1. - y0)] {
+        if p == 0. {
+            if q < 0. { return None; }
+        } else {
+            let t = q / p;
+            if p < 0. { first = first.max(t); } else { last = last.min(t); }
+            if first > last { return None; }
+        }
+    }
+    let endpoint = |t: f64| {
+        ((x0 + t * dx).round().clamp(0., width as f64 - 1.) as i32,
+         (y0 + t * dy).round().clamp(0., height as f64 - 1.) as i32)
+    };
+    Some((endpoint(first), endpoint(last)))
+}
+
+fn raster_line(mut x0: i32, mut y0: i32, x1: i32, y1: i32,
+    mark: &mut impl FnMut(i32, i32)) {
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut error = dx + dy;
+    loop {
+        mark(x0, y0);
+        if x0 == x1 && y0 == y1 { break; }
+        let doubled = 2 * error;
+        if doubled >= dy { error += dy; x0 += sx; }
+        if doubled <= dx { error += dx; y0 += sy; }
+    }
 }
 
 fn blend(pixel: &mut [u8; 4], color: [u8; 3]) {
@@ -140,5 +189,23 @@ mod tests {
         let lower = [PlotPoint::new(0., 2.), PlotPoint::new(10., 2.)];
         let image = rasterize(&[("upper", &upper), ("lower", &lower)], 11, 11, [0., 0., 10., 10.]);
         assert_ne!(image.pixels[2 * 11 + 5], image.pixels[8 * 11 + 5]);
+    }
+    #[test]
+    fn a_spike_near_one_column_does_not_fill_the_following_columns() {
+        let points = [PlotPoint::new(0., 0.), PlotPoint::new(0.1, 10.),
+            PlotPoint::new(0.2, 0.), PlotPoint::new(10., 0.)];
+        let image = rasterize(&[("trace", &points)], 11, 11, [0., 0., 10., 10.]);
+        assert_ne!(image.pixels[0], Color32::TRANSPARENT);
+        assert_ne!(image.pixels[10 * 11 + 5], Color32::TRANSPARENT);
+        assert_eq!(image.pixels[5 * 11 + 5], Color32::TRANSPARENT);
+    }
+    #[test]
+    fn one_trace_blends_only_once_per_pixel() {
+        let straight = [PlotPoint::new(0., 5.), PlotPoint::new(10., 5.)];
+        let retraced = [PlotPoint::new(0., 5.), PlotPoint::new(10., 5.),
+            PlotPoint::new(0., 5.), PlotPoint::new(10., 5.)];
+        let once = rasterize(&[("trace", &straight)], 11, 11, [0., 0., 10., 10.]);
+        let repeated = rasterize(&[("trace", &retraced)], 11, 11, [0., 0., 10., 10.]);
+        assert_eq!(once.pixels, repeated.pixels);
     }
 }

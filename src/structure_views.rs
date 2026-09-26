@@ -149,7 +149,7 @@ pub struct StructureViews {
     plot_range_zoom: Option<RangeZoom>,
     plot_zoom_y: Option<(f64, f64)>,
     plot_follow_selection: bool,
-    plot_refine: bool,
+    plot_sampled_preview: bool,
     plot_paused: bool,
     plot_anchor: Option<usize>,
     plot_jump: usize,
@@ -191,7 +191,6 @@ impl StructureViews {
         // reset() still starts fresh for a different file or definition.
         self.plot_force_view = self.plot_view.clone();
         self.plot_fit_y = true;
-        self.plot_refine = false;
         self.plot_paused = false;
         self.plot_anchor = None;
         self.table_anchor = None;
@@ -1269,7 +1268,6 @@ impl StructureViews {
                             self.plot_force_view = Some(view.clone());
                             self.plot_view = Some(view);
                             self.plot_fit_y = true;
-                            self.plot_refine = false;
                         }
                     }
                 }
@@ -1359,18 +1357,6 @@ impl StructureViews {
             .map(|node| (node.path.as_str(), *node)).collect();
         if !self.plot_sources_initialized {
             self.plot_sources_initialized = true;
-            // Nested virtual collections arrive in batches. Never let a batch's
-            // first item become an implicit plot selection.
-            let eligible: Vec<_> = collections.iter().filter(|n|
-                !self.flattened_collections.iter().any(|flat| flat.path == n.path)
-                    && collection_score(n, output).0).collect();
-            if eligible.len() > 8 {
-                if let Some(best) = eligible.into_iter().max_by_key(|n| collection_score(n, output)) {
-                    self.plot_sources.insert(best.path.clone());
-                }
-            } else {
-                self.plot_sources.extend(eligible.into_iter().map(|n| n.path.clone()));
-            }
         }
         let mut changed = false;
         if self.plot_collections_open {
@@ -1379,8 +1365,10 @@ impl StructureViews {
             egui::Window::new("Plot collections")
                 .id(egui::Id::new("plot_collections_window"))
                 .open(&mut open)
-                .default_size([420.0, 560.0])
-                .resizable(true)
+                .default_size([380.0, 560.0])
+                .min_width(340.0)
+                .max_width(380.0)
+                .resizable(egui::Vec2b::new(false, true))
                 .show(&ctx, |ui| {
                     changed |= plot_collection_choices(ui, &collections, &mut self.plot_sources,
                         &mut self.plot_collection_filter);
@@ -1440,9 +1428,11 @@ impl StructureViews {
         let group_key = group_hash.finish();
         if self.group_plan_cache.as_ref().map(|(key, _)| *key) != Some(group_key) {
             self.group_plan_cache = Some((group_key, Arc::new(grouped_numeric_plans(
-                &self.plot_sources, &collection_by_path, &self.plot_target))));
+                &self.plot_sources, &collection_by_path))));
         }
         let grouped_plans = self.group_plan_cache.as_ref().unwrap().1.clone();
+        let primary_group = grouped_plans.iter().find(|(_, (_, _, paths))|
+            paths.iter().any(|path| path == &self.plot_target));
         log_slow_plot_phase(&mut phase_clock, "prepare collections and group plans");
         let grouped_paths: HashSet<_> = grouped_plans.values().flat_map(|(_, _, paths)| paths.iter().cloned()).collect();
         self.group_plot_readers.retain(|key, _| grouped_plans.contains_key(key));
@@ -1484,10 +1474,14 @@ impl StructureViews {
             .plot_view
             .clone()
             .unwrap_or(0..count.min(INITIAL_PLOT_SAMPLES));
-        let mut ranges: Vec<_> = std::iter::once((&self.plot_target, &self.plot_reader)).chain(self.extra_plot_readers.iter())
-            .flat_map(|(path,reader)| reader.data().into_iter().flat_map(move |d| d.bounds.iter().map(move |(name,(min,max))| {
-                (format!("{path} / {name}"),*min,*max)
-            }))).collect();
+        let mut ranges: Vec<_> = self.plot_reader.data().into_iter().flat_map(|data|
+            data.bounds.iter().map(|(name, (min, max))| {
+                (if primary_group.is_some() { name.clone() }
+                 else { format!("{} / {name}", self.plot_target) }, *min, *max)
+            })).collect();
+        ranges.extend(self.extra_plot_readers.iter().flat_map(|(path, reader)|
+            reader.data().into_iter().flat_map(move |data| data.bounds.iter().map(move |(name, (min, max))|
+                (format!("{path} / {name}"), *min, *max)))));
         for reader in self.group_plot_readers.values() {
             if let Some(data) = reader.data() {
                 ranges.extend(data.bounds.iter().map(|(name, (min, max))| (name.clone(), *min, *max)));
@@ -1570,6 +1564,11 @@ impl StructureViews {
                 }
             });
             ui.menu_button("Plot options", |ui| {
+            if ui.checkbox(&mut self.plot_sampled_preview, "Fast sampled preview")
+                .on_hover_text("May miss peaks. Off by default; full scans run in the background and can be stopped.")
+                .changed() {
+                self.plot_paused = false;
+            }
             let mut lock_y=!self.plot_free_y;
             if ui.checkbox(&mut lock_y,"Lock vertical zoom").changed() {self.plot_free_y=!lock_y;}
             let mut show_dots = self.plot_dot_radius.unwrap_or(2.5) > 0.0;
@@ -1652,9 +1651,6 @@ impl StructureViews {
         if changed { self.plot_fit_y=true; }
         if let Some(forced) = &force_view {
             self.plot_paused = false;
-            if self.plot_view.as_ref() != Some(forced) {
-                self.plot_refine = false;
-            }
             self.plot_view = Some(forced.clone());
         }
         let requested = self.plot_view.clone().unwrap_or(view);
@@ -1675,23 +1671,27 @@ impl StructureViews {
         let selected_fields = (!self.plot_catalog.is_empty()).then(|| self.plot_catalog.iter()
             .filter(|name| !self.plot_hidden.contains(&format!("{} / {name}", self.plot_target)))
             .cloned().collect::<Vec<_>>());
-        if selected_fields.as_ref().is_some_and(Vec::is_empty) {
+        if primary_group.is_none() && selected_fields.as_ref().is_some_and(Vec::is_empty) {
             self.plot_reader.stop();
         } else if !self.plot_paused {
-            let buffered_plan = sensor_group_key(&node)
-                .and_then(|_| node.lazy.as_ref()?.numeric_plan())
-                .filter(|plan| selected_fields.as_ref().is_none_or(|selected|
-                    selected.len() == plan.fields.len()));
-            if let Some(plan) = buffered_plan {
-                if !self.plot_reader.matches_group_request(source.revision, &node, &plan,
-                    requested.clone(), pixel_width, self.plot_refine) {
-                    self.plot_reader.request_group(ui.ctx(), source.clone(), node.clone(), plan,
-                        requested.clone(), pixel_width, self.plot_refine);
+            let buffered = primary_group.map(|(_, (group_node, plan, _))|
+                (group_node.clone(), plan.clone())).or_else(|| {
+                let plan = sensor_group_key(&node)
+                    .and_then(|_| node.lazy.as_ref()?.numeric_plan())
+                    .filter(|plan| selected_fields.as_ref().is_none_or(|selected|
+                        selected.len() == plan.fields.len()))?;
+                Some((node.clone(), plan))
+            });
+            if let Some((group_node, plan)) = buffered {
+                if !self.plot_reader.matches_group_request(source.revision, &group_node, &plan,
+                    requested.clone(), pixel_width, !self.plot_sampled_preview) {
+                    self.plot_reader.request_group(ui.ctx(), source.clone(), group_node, plan,
+                        requested.clone(), pixel_width, !self.plot_sampled_preview);
                 }
             } else {
                 self.plot_reader.request_filtered(
                     ui.ctx(), source.clone(), node.clone(), requested.clone(),
-                    pixel_width, self.plot_refine, selected_fields.clone(),
+                    pixel_width, !self.plot_sampled_preview, selected_fields.clone(),
                 );
             }
         }
@@ -1702,15 +1702,16 @@ impl StructureViews {
             + self.extra_plot_readers.values().filter(|reader| reader.is_loading()).count()
             + self.group_plot_readers.values().filter(|reader| reader.is_loading()).count();
         for (key, (group_node, plan, paths)) in grouped_plans.iter() {
+            if paths.iter().any(|path| path == &self.plot_target) { continue; }
             let reader = self.group_plot_readers.entry(key.clone()).or_default();
             let was_loading = reader.is_loading();
             if !self.plot_paused && (was_loading || active_readers < plot_worker_count()) {
                 let count = collection_count(group_node);
                 let range = requested.start.min(count)..requested.end.min(count);
                 if !reader.matches_group_request(source.revision, group_node, plan,
-                    range.clone(), pixel_width, self.plot_refine) {
+                    range.clone(), pixel_width, !self.plot_sampled_preview) {
                     reader.request_group(ui.ctx(), source.clone(), group_node.clone(), plan.clone(),
-                        range, pixel_width, self.plot_refine);
+                        range, pixel_width, !self.plot_sampled_preview);
                 }
             } else if !was_loading && !self.plot_paused {
                 queued_collections += paths.len();
@@ -1729,8 +1730,8 @@ impl StructureViews {
                 let was_loading = reader.is_loading();
                 if !self.plot_paused && (was_loading || active_readers < plot_worker_count()) {
                     let range = requested.start.min(count)..requested.end.min(count);
-                    if !reader.matches_background_request(source.revision, extra, range.clone(), pixel_width, self.plot_refine) {
-                        reader.request_background(ui.ctx(), source.clone(), extra.clone(), range, pixel_width, self.plot_refine);
+                    if !reader.matches_background_request(source.revision, extra, range.clone(), pixel_width, !self.plot_sampled_preview) {
+                        reader.request_background(ui.ctx(), source.clone(), extra.clone(), range, pixel_width, !self.plot_sampled_preview);
                     }
                 } else if !was_loading && !self.plot_paused {
                     queued_collections += 1;
@@ -1758,7 +1759,7 @@ impl StructureViews {
                 if matches!(data.quality, PlotQuality::SampledPreview) {
                     ui.weak("Bands show observed ranges from sampled windows.");
                     if ui.button("Scan for all peaks").clicked() {
-                        self.plot_refine = true;
+                        self.plot_sampled_preview = false;
                         self.plot_paused = false;
                     }
                 }
@@ -1788,7 +1789,6 @@ impl StructureViews {
                 for reader in self.extra_plot_readers.values_mut() { reader.stop(); }
                 for reader in self.group_plot_readers.values_mut() { reader.stop(); }
                 self.plot_paused = true;
-                self.plot_refine = false;
             }
             if self.plot_catalog.len() > 32 {
                 ui.weak(format!("{} available fields; select fields in Series", self.plot_catalog.len()));
@@ -1837,7 +1837,13 @@ impl StructureViews {
             let (_, combined) = self.plot_overlay.as_mut().unwrap();
             let primary_generation = self.plot_reader.data_generation();
             if self.plot_overlay_generations.get(&self.plot_target) != Some(&primary_generation) {
-                update_overlay_source(combined, &mut self.plot_overlay_points, &self.plot_target, Some(raw), &self.plot_hidden, &self.presentation);
+                if let Some((_, (_, _, paths))) = primary_group {
+                    update_group_overlay(combined, &mut self.plot_overlay_points, paths, Some(raw),
+                        &self.plot_hidden, &self.presentation);
+                } else {
+                    update_overlay_source(combined, &mut self.plot_overlay_points, &self.plot_target,
+                        Some(raw), &self.plot_hidden, &self.presentation);
+                }
                 self.plot_mesh_cache.clear();
                 self.plot_raster.invalidate();
                 self.plot_gpu.invalidate();
@@ -1872,6 +1878,7 @@ impl StructureViews {
                 }
             }
             for (key, (group_node, _, paths)) in grouped_plans.iter() {
+                if paths.iter().any(|path| path == &self.plot_target) { continue; }
                 let Some(reader) = self.group_plot_readers.get(key) else { continue; };
                 let count = collection_count(group_node);
                 let extra = reader.data().filter(|data| data.range ==
@@ -1963,26 +1970,26 @@ impl StructureViews {
                     ));
                 }
                 if let Some(data) = data {
+                    let visible_trace_count = self.plot_overlay_points.keys()
+                        .filter(|name| !hidden.contains(*name)).count();
                     gpu_mode = data.quality != PlotQuality::SampledPreview
-                        && data.series.len() >= 64
+                        && visible_trace_count >= 64
                         && self.plot_gpu.update(&self.plot_overlay_points, &hidden, overlay_key);
                     let raster_mode = !gpu_mode && data.quality != PlotQuality::SampledPreview
-                        && data.series.len() >= 64;
+                        && visible_trace_count >= 16
+                        && (data.quality != PlotQuality::Exact
+                            || requested.len() > pixel_width);
                     if raster_mode {
                         self.plot_raster.show(&plot_ctx, plot_ui, &self.plot_overlay_points,
                             &hidden, overlay_key);
                     }
-                    let dense_group = data.series.len() > 16
-                        && requested.len() > pixel_width.saturating_mul(4);
-                    let opacity = if dense_group { 1.0 / data.series.len() as f32 } else { 1.0 };
-                    let visible_trace_count = data.series.keys().filter(|name| !hidden.contains(*name)).count();
                     for (name, values) in data.series.iter() {
                         if raster_mode || gpu_mode { break; }
                         if hidden.contains(name) {
                             continue;
                         }
                         let Some(points) = self.plot_overlay_points.get(name).map(Vec::as_slice) else { continue; };
-                        let color = plot_series_color(name).gamma_multiply(opacity);
+                        let color = plot_series_color(name);
                         let bands = (data.quality == PlotQuality::SampledPreview).then(|| {
                             data.envelopes.get(name).into_iter().flatten().map(|band| [
                                 band.range.start as f64 - 0.5, band.range.end as f64 - 0.5,
@@ -2136,7 +2143,6 @@ impl StructureViews {
         }
         if self.plot_view.as_ref() != Some(&actual) {
             self.plot_view = Some(actual.clone());
-            self.plot_refine = false;
             self.plot_paused = false;
             ui.ctx().request_repaint();
         }
@@ -2190,7 +2196,6 @@ impl StructureViews {
                             zoom.transform.bounds().max()[1],
                         ));
                         self.plot_fit_y = false;
-                        self.plot_refine = false;
                         ui.ctx().request_repaint();
                     }
                 } else {
@@ -2345,12 +2350,16 @@ impl StructureViews {
             }
         });
         // The plot owns its range request. Paging the table never changes this range.
-        if !self.plot_paused && !selected_fields.as_ref().is_some_and(Vec::is_empty) {
-            self.plot_reader.request_filtered(
-                ui.ctx(), source, node.clone(), actual,
-                (response.transform.frame().width() * ui.ctx().pixels_per_point()).ceil() as usize,
-                self.plot_refine, selected_fields,
-            );
+        if !self.plot_paused && (primary_group.is_some()
+            || !selected_fields.as_ref().is_some_and(Vec::is_empty)) {
+            let width = (response.transform.frame().width() * ui.ctx().pixels_per_point()).ceil() as usize;
+            if let Some((_, (group_node, plan, _))) = primary_group {
+                self.plot_reader.request_group(ui.ctx(), source, group_node.clone(), plan.clone(),
+                    actual, width, !self.plot_sampled_preview);
+            } else {
+                self.plot_reader.request_filtered(ui.ctx(), source, node.clone(), actual,
+                    width, !self.plot_sampled_preview, selected_fields);
+            }
         }
         log_slow_plot_phase(&mut phase_clock, "handle plot interaction");
         if let Some((bytes, path)) = picked {
@@ -2456,6 +2465,7 @@ fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut st
     let query = filter.trim().to_lowercase();
     egui::ScrollArea::vertical()
         .id_salt("plot_collection_choices")
+        .auto_shrink([false, false])
         .max_height(ui.available_height().max(100.0))
         .show(ui, |ui| {
                 for node in single {
@@ -2555,11 +2565,9 @@ fn sensor_group_key(node: &Node) -> Option<(String, usize)> {
 fn grouped_numeric_plans(
     selected: &std::collections::BTreeSet<String>,
     collections: &HashMap<&str, &Node>,
-    primary: &str,
 ) -> BTreeMap<String, (Node, NumericPlan, Vec<String>)> {
     let mut candidates: BTreeMap<String, Vec<(&Node, NumericPlan)>> = BTreeMap::new();
     for path in selected {
-        if path == primary { continue; }
         let Some(&node) = collections.get(path.as_str()) else { continue; };
         let (Some((key, _)), Some(plan)) = (sensor_group_key(node), node.lazy.as_ref().and_then(|array| array.numeric_plan())) else { continue; };
         candidates.entry(key).or_default().push((node, plan));
@@ -3051,6 +3059,29 @@ fn tree_display(node: &Node, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_new_decode_waits_for_an_explicit_plot_collection() {
+        let yaml = "actions: [{read: {name: samples, type: u8, repeat: 128}}]";
+        let store = ByteStore::from_snapshot(Original::from_bytes(&[7; 128]).unwrap());
+        let output = Program::parse(yaml).unwrap()
+            .run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        views.plot_collections_open = true;
+        ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200., 700.))),
+            ..Default::default()
+        }, |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                views.plot(ui, &output, store.view());
+            });
+        });
+        assert!(views.plot_sources.is_empty());
+        assert!(views.plot_reader.data().is_none());
+        let dialog = ctx.memory(|memory| memory.area_rect(egui::Id::new("plot_collections_window"))).unwrap();
+        assert!(dialog.width() <= 381., "dialog has unused horizontal space: {dialog:?}");
+    }
+
+    #[test]
     fn wide_numeric_collection_starts_with_bounded_visible_fields() {
         let mut yaml = String::from("structures:\n  - name: Record\n    fields:\n");
         for index in 0..128 {
@@ -3298,9 +3329,9 @@ actions:
             .map(|(_, node)| node.path.clone()).collect();
         let by_path: HashMap<&str, &Node> = references.iter()
             .map(|node| (node.path.as_str(), *node)).collect();
-        let grouped = grouped_numeric_plans(&selected, &by_path, &sensors[0].1.path);
+        let grouped = grouped_numeric_plans(&selected, &by_path);
         let (group_node, group_plan, group_paths) = &grouped["blocks.payload.field_0.values"];
-        assert_eq!(group_paths.len(), 2);
+        assert_eq!(group_paths.len(), 3);
         let mut group_reader = crate::structure_plot::PlotReader::default();
         group_reader.request_group(&ctx, store.view(), group_node.clone(), group_plan.clone(),
             129..131, 800, false);
@@ -3309,7 +3340,7 @@ actions:
             group_reader.tick(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        for sensor_index in 1..3 {
+        for sensor_index in 0..3 {
             let name = format!("blocks.payload.field_0[{sensor_index}].values / value");
             let values = &group_reader.data().unwrap().series[&name];
             assert_eq!(values.iter().map(|point| point.value).collect::<Vec<_>>(),
@@ -3379,15 +3410,22 @@ actions:
         views.plot_view = Some(129..131);
         views.plot_force_view = None;
         views.plot_follow_selection = false;
-        while !views.group_plot_readers.values().any(|reader| reader.data().is_some_and(|data| data.complete)) {
+        while !views.plot_reader.data().is_some_and(|data| data.complete && data.series.len() == 3) {
             render_plot(&ctx, &mut views, &output, &store, vec![], Default::default());
-            assert!(std::time::Instant::now() < deadline, "grouped plot UI timed out");
+            assert!(std::time::Instant::now() < deadline, "grouped plot UI timed out: {:?}",
+                views.plot_reader.error());
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         render_plot(&ctx, &mut views, &output, &store, vec![], Default::default());
         assert!(views.plot_overlay.as_ref().is_some_and(|(_, data)|
             data.series.contains_key("blocks.payload.field_0[2].values / value")));
+        assert_eq!(views.plot_reader.data().unwrap().series.len(), 3);
+        assert!(views.group_plot_readers.is_empty(), "one group needs only the primary reader");
         assert!(!views.extra_plot_readers.contains_key("blocks.payload.field_0[2].values"));
+        views.plot_hidden.insert("blocks.payload.field_0[0].values / value".into());
+        render_plot(&ctx, &mut views, &output, &store, vec![], Default::default());
+        assert!(views.plot_overlay.as_ref().is_some_and(|(_, data)|
+            data.series.contains_key("blocks.payload.field_0[2].values / value")));
     }
     #[test]
     fn indexed_virtual_series_supports_lazy_group_values() {
@@ -3978,6 +4016,24 @@ actions:
         events: Vec<egui::Event>,
         modifiers: egui::Modifiers,
     ) -> Option<Range<usize>> {
+        // Plot interaction tests exercise an explicitly chosen set. Production
+        // decoding leaves the selection empty until the user chooses one.
+        if !views.plot_sources_initialized && views.plot_sources.is_empty() {
+            let mut collections = Vec::new();
+            collect_collections(&output.nodes, &mut collections);
+            collections.extend(views.flattened_collections.iter());
+            let eligible: Vec<_> = collections.into_iter().filter(|node|
+                !views.flattened_collections.iter().any(|flat| flat.path == node.path)
+                    && collection_score(node, output).0).collect();
+            if eligible.len() > 8 {
+                if let Some(best) = eligible.into_iter().max_by_key(|node| collection_score(node, output)) {
+                    views.plot_sources.insert(best.path.clone());
+                }
+            } else {
+                views.plot_sources.extend(eligible.into_iter().map(|node| node.path.clone()));
+            }
+            views.plot_sources_initialized = true;
+        }
         let events = events.into_iter().map(|event| match event {
             egui::Event::MouseWheel { unit, delta, phase, .. } =>
                 egui::Event::MouseWheel { unit, delta, phase, modifiers },
@@ -4466,10 +4522,13 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
         views.plot_force_view = Some(0..count);
         settle_plot(&ctx, &mut views, &output, &store);
         let data = views.plot_reader.data().unwrap();
-        assert_eq!(data.quality, PlotQuality::SampledPreview);
+        assert_eq!(data.quality, PlotQuality::MinMax);
         assert!(data.envelopes["value"]
             .iter()
             .all(|band| band.min.value == 7. && band.max.value == 7.));
+        views.plot_sampled_preview = true;
+        settle_plot(&ctx, &mut views, &output, &store);
+        assert_eq!(views.plot_reader.data().unwrap().quality, PlotQuality::SampledPreview);
         let rendered = waveform_plot_frame(&ctx, &mut views, &output, &store);
         let primitives = ctx.tessellate(rendered.shapes, rendered.pixels_per_point);
         assert!(!primitives.is_empty());
@@ -4508,13 +4567,15 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
         views.plot_fit_y = true;
         settle_plot(&ctx, &mut views, &output, &store);
         let data = views.plot_reader.data().unwrap();
-        assert_eq!(data.quality, PlotQuality::SampledPreview);
-        assert!(data.scanned <= 65_536 && data.scanned < count);
+        assert_eq!(data.quality, PlotQuality::MinMax);
+        assert_eq!(data.scanned, count);
         let envelopes = &data.envelopes["value"];
         assert!(!envelopes.is_empty());
-        assert!(envelopes
-            .iter()
-            .all(|band| band.min.value < -0.99 && band.max.value > 0.99));
+        assert!(envelopes.iter().any(|band| band.min.value < -0.99));
+        assert!(envelopes.iter().any(|band| band.max.value > 0.99));
+        views.plot_sampled_preview = true;
+        settle_plot(&ctx, &mut views, &output, &store);
+        assert_eq!(views.plot_reader.data().unwrap().quality, PlotQuality::SampledPreview);
         let rendered = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(

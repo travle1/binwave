@@ -1,5 +1,6 @@
-//! Viewport-driven plotting of generic decoded collections. Workers retain only
-//! bounded pages and extrema; opening a large range never starts a full scan.
+//! Viewport-driven plotting of generic decoded collections. Workers retain
+//! bounded pages and extrema while scanning a requested range; an optional
+//! sampled preview avoids a full scan when explicitly selected.
 use crate::byte_store::{ByteView, READ_LIMIT};
 use crate::structure::{Address, Node, NumericPlan};
 use anyhow::{ensure, Result};
@@ -29,9 +30,38 @@ const CACHE_ENTRIES: Address = 3;
 #[cfg(not(target_arch = "wasm32"))]
 const GROUP_TILE_SAMPLES: Address = 4096;
 #[cfg(not(target_arch = "wasm32"))]
-const GROUP_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_GROUP_BUFFER_BYTES: usize = 256 * 1024 * 1024;
 #[cfg(not(target_arch = "wasm32"))]
-const GROUP_SUMMARY_BYTES: usize = 1024 * 1024 * 1024;
+fn group_buffer_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let configured = std::env::var("BINWAVE_PLOT_CACHE_MB").ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|mb| mb.clamp(64, 4096).saturating_mul(1024 * 1024));
+        #[cfg(target_os = "linux")]
+        let available = std::fs::read_to_string("/proc/meminfo").ok()
+            .and_then(|text| text.lines().find_map(|line| {
+                let kb = line.strip_prefix("MemAvailable:")?
+                    .split_whitespace().next()?.parse::<usize>().ok()?;
+                Some(kb.saturating_mul(1024))
+            }));
+        #[cfg(windows)]
+        let available = {
+            use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+            let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+            status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+            (unsafe { GlobalMemoryStatusEx(&mut status) } != 0)
+                .then(|| usize::try_from(status.ullAvailPhys).unwrap_or(usize::MAX))
+        };
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let available: Option<usize> = None;
+        let bytes = configured.or_else(|| available.map(|bytes|
+            (bytes / 32).clamp(128 * 1024 * 1024, 1024 * 1024 * 1024)
+        )).unwrap_or(DEFAULT_GROUP_BUFFER_BYTES);
+        log::info!("Plot RAM tile cache budget: {} MiB per grouped reader", bytes / (1024 * 1024));
+        bytes
+    })
+}
 #[cfg(not(target_arch = "wasm32"))]
 const GROUP_SUMMARY_SAMPLES: Address = 1024;
 
@@ -186,10 +216,10 @@ impl GroupTileCache {
             self.summary_bytes += summary.bytes();
             self.summaries.push_front((summary.start, summary));
         }
-        while self.bytes > GROUP_BUFFER_BYTES && self.tiles.len() > 1 {
+        while self.bytes > group_buffer_bytes() && self.tiles.len() > 1 {
             if let Some((_, old)) = self.tiles.pop_back() { self.bytes -= old.bytes(); }
         }
-        while self.summary_bytes > GROUP_SUMMARY_BYTES && self.summaries.len() > 1 {
+        while self.summary_bytes > group_buffer_bytes().saturating_mul(4) && self.summaries.len() > 1 {
             if let Some((_, old)) = self.summaries.pop_back() { self.summary_bytes -= old.bytes(); }
         }
     }
@@ -275,12 +305,13 @@ impl PlotReader {
         let count = node.lazy.as_ref().map_or(node.children.len(), |array| array.count);
         let start = range.start.min(count);
         let range = start..range.end.max(start).min(count);
+        let (buckets, exact_limit) = request_resolution(&range, pixel_width, Some(plan.fields.len()));
         self.desired.as_ref().is_some_and(|request| {
             let key = &request.key;
             key.revision == revision && key.definition == identity(node)
                 && key.path == node.path && key.range == range
-                && key.buckets == display_buckets(pixel_width)
-                && key.exact_limit == exact_limit(pixel_width)
+                && key.buckets == buckets
+                && key.exact_limit == exact_limit
                 && key.refine == refine
                 && key.fields.as_ref().is_some_and(|fields| fields.len() == plan.fields.len()
                     && fields.iter().zip(&plan.fields).all(|(name, field)| name == &field.name))
@@ -298,14 +329,15 @@ impl PlotReader {
         let count = node.lazy.as_ref().map_or(node.children.len(), |array| array.count);
         let start = range.start.min(count);
         let range = start..range.end.max(start).min(count);
+        let (buckets, exact_limit) = request_resolution(&range, pixel_width, None);
         self.desired.as_ref().is_some_and(|request| {
             let key = &request.key;
             key.revision == revision
                 && key.definition == identity(node)
                 && key.path == node.path
                 && key.range == range
-                && key.buckets == display_buckets(pixel_width)
-                && key.exact_limit == exact_limit(pixel_width)
+                && key.buckets == buckets
+                && key.exact_limit == exact_limit
                 && key.refine == refine
                 && key.fields.is_none()
         })
@@ -329,15 +361,15 @@ impl PlotReader {
             .map_or(node.children.len(), |array| array.count);
         let start = range.start.min(count);
         let range = start..range.end.max(start).min(count);
-        // Quantized widths avoid restarting a query for single-pixel pane changes.
-        let buckets = display_buckets(pixel_width);
+        let field_count = numeric_plan.as_ref().map(|plan| plan.fields.len());
+        let (buckets, exact_limit) = request_resolution(&range, pixel_width, field_count);
         let key = Key {
             revision: source.revision,
             definition: identity(&node),
             path: node.path.clone(),
             range,
             buckets,
-            exact_limit: exact_limit(pixel_width),
+            exact_limit,
             refine,
             fields,
         };
@@ -721,6 +753,24 @@ fn display_buckets(pixel_width: Address) -> Address {
         * 64
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn request_resolution(
+    range: &Range<Address>, pixel_width: Address, field_count: Option<usize>,
+) -> (Address, Address) {
+    // A grouped scan has a shared point budget. Wider canvases cannot add
+    // buckets once that budget is reached, so they should reuse the same scan.
+    let buckets = field_count.map_or(display_buckets(pixel_width), |count| {
+        display_buckets(pixel_width)
+            .min((MAX_TOTAL_NUMERIC_POINTS / count.max(1)).max(1))
+    });
+    let exact = if range.len() > MAX_EXACT_LIMIT {
+        MAX_EXACT_LIMIT
+    } else {
+        exact_limit(pixel_width)
+    };
+    (buckets, exact)
+}
+
 fn reduction_buckets(quality: PlotQuality, requested: Address) -> Address {
     if quality == PlotQuality::SampledPreview {
         requested.clamp(2, PREVIEW_WINDOWS)
@@ -1047,7 +1097,10 @@ fn load_group_tile(request: &Request, plan: &NumericPlan, start: Address, size: 
         }
         Ok(values)
     };
-    let values: Vec<Vec<f64>> = if plan.fields.len() > 8 && end - start >= 1024 {
+    // A wide standalone tile can use field parallelism. During a parallel
+    // tile scan, the outer batch already occupies the Rayon pool.
+    let values: Vec<Vec<f64>> = if plan.fields.len() > 8 && end - start >= 1024
+        && rayon::current_thread_index().is_none() {
         use rayon::prelude::*;
         plan.fields.par_iter().map(decode_field).collect::<Result<Vec<_>>>()?
     } else {
@@ -1106,6 +1159,7 @@ fn cached_group_summary(request: &Request, plan: &NumericPlan,
 fn read_group_buffered(request: &Request, plan: NumericPlan, quality: PlotQuality,
     cache: &Arc<Mutex<GroupTileCache>>, cancel: &AtomicBool,
     mut publish: impl FnMut(PlotData)) -> Result<PlotData> {
+    use rayon::prelude::*;
     let field_count = plan.fields.len().max(1);
     let quality = if quality == PlotQuality::Exact
         && request.key.range.len().saturating_mul(field_count) > MAX_TOTAL_NUMERIC_POINTS {
@@ -1119,12 +1173,30 @@ fn read_group_buffered(request: &Request, plan: NumericPlan, quality: PlotQualit
     let mut scanned = 0;
     let mut last_publish = Instant::now();
     let mut last_progress = Instant::now();
+    let mut last_reported = 0;
     let mut published = false;
     let signature = group_signature(request);
+    let tile_bytes = tile_size.saturating_mul(field_count).saturating_mul(std::mem::size_of::<f64>());
+    let workers = rayon::current_num_threads().max(1);
+    let batch_tiles = (group_buffer_bytes() / tile_bytes.max(1)).clamp(1, workers.saturating_mul(2));
+    if request.key.range.len() > AUTO_SCAN_LIMIT {
+        log::info!("Grouped plot scan: {} Rayon threads, up to {} tiles per batch, {} samples per tile",
+            workers, batch_tiles, tile_size);
+    }
     while index < request.key.range.end {
         ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
-        let tile_start = index / tile_size * tile_size;
-        let summary = cached_group_summary(request, &plan, cache, &signature, tile_start, cancel)?;
+        // File reads and field decoding are independent for each tile. Prepare
+        // a bounded batch in parallel, then fold summaries in sample order.
+        // This keeps the reduction deterministic and partial updates useful.
+        let first_tile = index / tile_size;
+        let last_tile = (request.key.range.end - 1) / tile_size;
+        let starts: Vec<_> = (first_tile..=last_tile).take(batch_tiles)
+            .map(|tile| tile * tile_size).collect();
+        let summaries: Vec<_> = starts.par_iter().map(|&start|
+            cached_group_summary(request, &plan, cache, &signature, start, cancel)
+        ).collect::<Result<_>>()?;
+        for summary in summaries {
+        ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
         let end = summary.end.min(request.key.range.end);
         let mut raw: Option<Arc<GroupTile>> = None;
         for (bin_range, fields) in &summary.bins {
@@ -1150,7 +1222,7 @@ fn read_group_buffered(request: &Request, plan: NumericPlan, quality: PlotQualit
                     }
                 }
             } else {
-                if raw.is_none() { raw = Some(cached_group_tile(request, &plan, cache, &signature, tile_start, cancel)?); }
+                if raw.is_none() { raw = Some(cached_group_tile(request, &plan, cache, &signature, summary.start, cancel)?); }
                 let tile = raw.as_ref().unwrap();
                 for sample in first..last {
                     let position = sample - tile.start;
@@ -1163,8 +1235,10 @@ fn read_group_buffered(request: &Request, plan: NumericPlan, quality: PlotQualit
         }
         index = end;
         if last_progress.elapsed() >= Duration::from_secs(5) {
-            log::info!("Plot load progress: {} — {} of {} samples scanned",
-                request.key.path, scanned, request.key.range.len());
+            log::info!("Plot load progress: {} — {} of {} samples scanned ({:.0} samples/s over last interval)",
+                request.key.path, scanned, request.key.range.len(),
+                (scanned - last_reported) as f64 / last_progress.elapsed().as_secs_f64().max(0.001));
+            last_reported = scanned;
             last_progress = Instant::now();
         }
         if request.partial_updates && (!published || last_publish.elapsed() >= Duration::from_secs(1)) {
@@ -1172,6 +1246,7 @@ fn read_group_buffered(request: &Request, plan: NumericPlan, quality: PlotQualit
             publish(reduction.data(scanned, false));
             last_publish = Instant::now();
             published = true;
+        }
         }
     }
     request.source.validate()?;
@@ -1490,11 +1565,20 @@ actions:
         let plan = flat.lazy.as_ref().unwrap().numeric_plan().unwrap();
         assert_eq!(plan.fields.len(), 4);
         assert_eq!(plan.fields[3].name, "sensors.[2]");
-        let data = read_for_viewport(store.view(), flat, 255..257, 800).unwrap();
+        let data = read_for_viewport(store.view(), flat.clone(), 255..257, 800).unwrap();
         let points = &data.series["sensors.[2]"];
         assert_eq!(points.iter().map(|point| point.value).collect::<Vec<_>>(), [11., 22.]);
         assert_eq!(points[0].bytes, first..first + 2);
         assert_eq!(points[1].bytes, second..second + 2);
+        let mut query = request(store.view(), flat, 0..130 * 256, true);
+        query.numeric_plan = Some(plan);
+        query.group_tiles = Some(Arc::new(Mutex::new(GroupTileCache::default())));
+        let grouped = read_plot(&query, &AtomicBool::new(false), |_| {}).unwrap();
+        assert_eq!(grouped.scanned, 130 * 256);
+        let band = grouped.envelopes["sensors.[2]"].iter()
+            .find(|band| band.range.contains(&256)).unwrap();
+        assert_eq!(band.max.value, 22.);
+        assert_eq!(band.max.bytes, second..second + 2);
     }
     #[test]
     fn exact_point_budget_scales_with_plot_width_and_remains_bounded() {
@@ -1648,6 +1732,18 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 .any(|point| point.index == 33_451 && point.value == 100_000.));
         }
         assert_eq!(reader.cache.len(), 2);
+    }
+
+    #[test]
+    fn grouped_scan_resolution_stays_stable_after_point_budget_is_reached() {
+        let range = 0..100_000;
+        let expected_buckets = MAX_TOTAL_NUMERIC_POINTS / 512;
+        for width in [640, 1280, 1920, 4096] {
+            assert_eq!(request_resolution(&range, width, Some(512)),
+                (expected_buckets, MAX_EXACT_LIMIT));
+        }
+        assert_ne!(request_resolution(&range, 640, Some(1)),
+            request_resolution(&range, 1280, Some(1)));
     }
 
     #[test]

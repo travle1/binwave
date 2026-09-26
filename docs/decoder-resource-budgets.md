@@ -18,9 +18,17 @@ one virtual collection spanning all parent records. It retains the original
 byte locations and decodes only requested pages. Plot discovers this view from
 one parent record in the background, without requiring tree expansion.
 Fixed numeric layouts use a batched plot reader that skips the gaps between
-parent records. Large plot overviews use a bounded sample preview, and the
-Stop control cancels a running plot read until the view is changed or Fit is
-requested again.
+parent records. Plot overviews scan the visible range for min/max peaks by
+default, with bounded output and progress while reading. An optional fast
+sampled preview in Plot options can miss peaks. The Stop control cancels a
+running plot read until the view is changed or Fit is requested again.
+Selected fields from one compatible group, including the primary plotted
+field, share one scan. Grouped numeric tiles load in parallel and are merged
+in sample order.
+The RAM tile cache budget is chosen from available memory on Linux and Windows
+(capped at 1 GiB per grouped reader), with a 256 MiB fallback elsewhere. Set
+`BINWAVE_PLOT_CACHE_MB` to choose 64–4096 MiB per grouped reader. Rayon uses
+the available CPU threads; `RAYON_NUM_THREADS` can override its thread count.
 
 ## Follow-up work
 
