@@ -272,9 +272,9 @@ Use the Phase 0 variable-record workloads to determine how much navigation time 
 ## Completion checklist
 
 - [ ] Baseline and reproducible native navigation benchmark recorded.
-- [ ] Raw and summary cache operations avoid linear scans.
-- [ ] Valid prior geometry stays visible through navigation; aligned coverage is reused.
-- [ ] Eligible ordinary and grouped numeric layouts share the query/cache engine.
+- [x] Raw and summary cache operations avoid linear scans.
+- [x] Valid prior geometry stays visible through navigation; aligned coverage is reused.
+- [x] Eligible ordinary and grouped numeric layouts share the query/cache engine.
 - [ ] Memory and CPU/I/O work have coordinated, documented budgets.
 - [ ] Multilevel summaries support bounded broad-view queries and resumable persistence.
 - [ ] Limited persistent decoded caching is enabled by default, with measured quota/admission behavior.
