@@ -10,20 +10,36 @@ use std::sync::OnceLock;
 fn transparent_corners() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        // Wayland compositors and the Windows/macOS window surfaces support
-        // alpha. X11 has no reliable compositor query through eframe, so use
-        // the conservative square frame there.
-        let available = cfg!(target_os = "windows")
-            || cfg!(target_os = "macos")
-            || (cfg!(target_os = "linux")
-                && std::env::var("XDG_SESSION_TYPE").is_ok_and(|value| value == "wayland")
-                && std::env::var_os("WAYLAND_DISPLAY").is_some());
+        // eframe does not expose the chosen surface alpha mode to the app.
+        // Stay square on X11 (including an explicit X11 backend override),
+        // where compositor support cannot be confirmed from this API.
+        let available = transparent_corners_for(
+            cfg!(target_os = "windows"),
+            cfg!(target_os = "macos"),
+            cfg!(target_os = "linux"),
+            std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+            std::env::var("WINIT_UNIX_BACKEND").ok().as_deref(),
+        );
         log::info!(
             "Window frame: {} corners (platform transparency assessment)",
             if available { "rounded" } else { "square" }
         );
         available
     })
+}
+
+fn transparent_corners_for(
+    windows: bool,
+    macos: bool,
+    linux: bool,
+    session: Option<&str>,
+    wayland_display: bool,
+    backend_override: Option<&str>,
+) -> bool {
+    windows
+        || macos
+        || linux && session == Some("wayland") && wayland_display && backend_override != Some("x11")
 }
 
 fn resize_direction(rect: Rect, pointer: egui::Pos2, grab: f32) -> Option<ResizeDirection> {
@@ -84,6 +100,26 @@ fn caption_button(ui: &mut Ui, rect: Rect, id: &str, icon: &str, tip: &str, dang
     response.on_hover_text(tip).clicked()
 }
 
+fn header_regions(
+    rect: Rect,
+    button_width: f32,
+    button_height: f32,
+    grab: f32,
+) -> (Rect, Rect, Rect, Rect) {
+    let button_top = rect.center().y - button_height / 2.;
+    let close = Rect::from_min_size(
+        pos2(rect.right() - button_width, button_top),
+        vec2(button_width, button_height),
+    );
+    let maximize = close.translate(vec2(-button_width, 0.));
+    let minimize = maximize.translate(vec2(-button_width, 0.));
+    let drag = Rect::from_min_max(
+        pos2(rect.left() + grab, rect.top() + grab),
+        pos2(minimize.left(), rect.bottom()),
+    );
+    (minimize, maximize, close, drag)
+}
+
 fn header(ui: &mut Ui, maximized: bool) {
     let t = &DARK;
     let (rect, _) = ui.allocate_exact_size(
@@ -92,18 +128,9 @@ fn header(ui: &mut Ui, maximized: bool) {
     );
     let button_width = t.size.caption_button[0];
     let button_height = t.size.caption_button[1];
-    let button_top = rect.center().y - button_height / 2.;
-    let close = Rect::from_min_size(
-        pos2(rect.right() - button_width, button_top),
-        vec2(button_width, button_height),
-    );
-    let maximize = close.translate(vec2(-button_width, 0.));
-    let minimize = maximize.translate(vec2(-button_width, 0.));
     let grab = t.size.frame_resize_grab;
-    let drag_rect = Rect::from_min_max(
-        pos2(rect.left() + grab, rect.top() + grab),
-        pos2(minimize.left(), rect.bottom()),
-    );
+    let (minimize, maximize, close, drag_rect) =
+        header_regions(rect, button_width, button_height, grab);
     let drag = ui.interact(
         drag_rect,
         ui.id().with("header_drag"),
@@ -213,6 +240,30 @@ pub fn show(ui: &mut Ui, content: impl FnOnce(&mut Ui)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egui_compat::ContextRun as _;
+
+    fn frame(ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<ViewportCommand> {
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1600., 1000.))),
+                events,
+                ..Default::default()
+            },
+            |_ctx, ui| show(ui, |_| {}),
+        );
+        output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .clone()
+    }
+
+    fn pointer_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
 
     #[test]
     fn edge_resize_includes_corners_and_excludes_interior() {
@@ -230,5 +281,152 @@ mod tests {
             Some(ResizeDirection::North)
         );
         assert_eq!(resize_direction(rect, pos2(800., 500.), 6.), None);
+    }
+
+    #[test]
+    fn caption_buttons_have_documented_size_and_leave_a_drag_region() {
+        let header = Rect::from_min_size(pos2(0., 0.), vec2(1600., DARK.size.header_height));
+        let (minimize, maximize, close, drag) = header_regions(
+            header,
+            DARK.size.caption_button[0],
+            DARK.size.caption_button[1],
+            DARK.size.frame_resize_grab,
+        );
+        for button in [minimize, maximize, close] {
+            assert_eq!(button.size(), vec2(46., 36.));
+            assert_eq!(button.center().y, header.center().y);
+        }
+        assert_eq!(close.right(), header.right());
+        assert_eq!(drag.right(), minimize.left());
+        assert!(drag.contains(pos2(200., header.center().y)));
+        assert!(!drag.contains(minimize.center()));
+    }
+
+    #[test]
+    fn transparency_falls_back_to_square_corners_on_x11() {
+        assert!(transparent_corners_for(
+            true, false, false, None, false, None
+        ));
+        assert!(transparent_corners_for(
+            false, true, false, None, false, None
+        ));
+        assert!(transparent_corners_for(
+            false,
+            false,
+            true,
+            Some("wayland"),
+            true,
+            None
+        ));
+        assert!(!transparent_corners_for(
+            false,
+            false,
+            true,
+            Some("x11"),
+            false,
+            None
+        ));
+        assert!(!transparent_corners_for(
+            false,
+            false,
+            true,
+            Some("wayland"),
+            true,
+            Some("x11")
+        ));
+    }
+
+    #[test]
+    fn caption_close_and_edge_resize_emit_native_viewport_commands() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        frame(&ctx, vec![]);
+        let close = pos2(1560., 30.);
+        frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(close),
+                pointer_button(close, true),
+            ],
+        );
+        let commands = frame(&ctx, vec![pointer_button(close, false)]);
+        assert!(commands.contains(&ViewportCommand::Close), "{commands:?}");
+
+        let edge = pos2(2., 500.);
+        let commands = frame(
+            &ctx,
+            vec![egui::Event::PointerMoved(edge), pointer_button(edge, true)],
+        );
+        assert!(
+            commands.contains(&ViewportCommand::BeginResize(ResizeDirection::West)),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn header_drag_and_caption_buttons_emit_window_commands() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        frame(&ctx, vec![]);
+        let drag = pos2(300., 30.);
+        let commands = frame(
+            &ctx,
+            vec![egui::Event::PointerMoved(drag), pointer_button(drag, true)],
+        );
+        assert!(
+            commands.contains(&ViewportCommand::StartDrag),
+            "{commands:?}"
+        );
+        frame(&ctx, vec![pointer_button(drag, false)]);
+
+        let minimize = pos2(1470., 30.);
+        frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(minimize),
+                pointer_button(minimize, true),
+            ],
+        );
+        let commands = frame(&ctx, vec![pointer_button(minimize, false)]);
+        assert!(
+            commands.contains(&ViewportCommand::Minimized(true)),
+            "{commands:?}"
+        );
+
+        let maximize = pos2(1520., 30.);
+        frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(maximize),
+                pointer_button(maximize, true),
+            ],
+        );
+        let commands = frame(&ctx, vec![pointer_button(maximize, false)]);
+        assert!(
+            commands.contains(&ViewportCommand::Maximized(true)),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn double_clicking_header_toggles_maximize() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        frame(&ctx, vec![]);
+        let header = pos2(300., 30.);
+        frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(header),
+                pointer_button(header, true),
+            ],
+        );
+        frame(&ctx, vec![pointer_button(header, false)]);
+        frame(&ctx, vec![pointer_button(header, true)]);
+        let commands = frame(&ctx, vec![pointer_button(header, false)]);
+        assert!(
+            commands.contains(&ViewportCommand::Maximized(true)),
+            "{commands:?}"
+        );
     }
 }
