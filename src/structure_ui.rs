@@ -1273,6 +1273,7 @@ impl Operation {
                         otherwise: None,
                     },
                     repeat: None,
+                    items_per_group: None,
                     length: None,
                     at: None,
                     relative: None,
@@ -1617,6 +1618,7 @@ struct DefineStep {
     label_enum: String,
     choice: TypeChoiceDraft,
     repeat: ValueInput,
+    items_per_group: ValueInput,
     length: ValueInput,
     at: ValueInput,
     relative: ValueInput,
@@ -1636,6 +1638,7 @@ impl DefineStep {
                 .and_then(|r| r.enum_name.clone()).unwrap_or_default(),
             choice: TypeChoiceDraft::from_choice(&value.fields.kind),
             repeat: ValueInput::from_expr(value.fields.repeat.clone()),
+            items_per_group: ValueInput::from_expr(value.fields.items_per_group.clone()),
             length: ValueInput::from_expr(value.fields.length.clone()),
             at: ValueInput::from_expr(value.fields.at.clone()),
             relative: ValueInput::from_expr(value.fields.relative.clone()),
@@ -1658,6 +1661,7 @@ impl DefineStep {
                 }),
                 kind: self.choice.build()?,
                 repeat: self.repeat.optional()?,
+                items_per_group: self.items_per_group.optional()?,
                 length: self.length.optional()?,
                 at: self.at.optional()?,
                 relative: self.relative.optional()?,
@@ -1679,6 +1683,8 @@ impl DefineStep {
         self.choice.ui(ui, types, &[]);
         self.repeat
             .ui(ui, "Item count property (optional)", "e.g. count", &[]);
+        self.items_per_group
+            .ui(ui, "Items per group (optional)", "e.g. samples_per_group", &[]);
         self.length
             .ui(ui, "Byte length property (optional)", "e.g. length", &[]);
         self.relative.ui(
@@ -2902,6 +2908,7 @@ impl Builder {
                         otherwise: None,
                     },
                     repeat: optional_expr(&self.mapping.repeat)?,
+                    items_per_group: None,
                     length: optional_expr(&self.mapping.length)?,
                     at: None,
                     relative: optional_expr(&self.mapping.relative)?,

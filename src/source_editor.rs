@@ -1013,6 +1013,8 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
                     ui.label("define is different from choose. choose selects an existing type; define creates a new type from an earlier description collection. Creating the type consumes no payload bytes—the later read does that.");
                     ui.code("- define:\n    name: GeneratedRecord\n    from: description.fields\n    fields:\n      name: {ref: label}\n      type: {ref: format, cases: {'1': u16, '2': i16, '3': f32}}\n      repeat: {ref: count}");
                     ui.label("Optional mappings also include length, at, and relative. Generated names and formats come from decoded data, but the mapping from numeric format codes to Binwave types belongs to the decoder definition.");
+                    ui.code("repeat: {ref: group_count}\nitems_per_group: {ref: values_per_group}");
+                    ui.label("For grouped values, repeat counts the groups and items_per_group counts consecutive values in each group. Leave items_per_group out for a flat repeated field.");
                     ui.label("Because define executes during parsing, the description bytes and define action must occur before any read that references GeneratedRecord.");
                 });
 

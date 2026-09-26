@@ -387,7 +387,7 @@ impl StructureViews {
             if page.key.revision != output.revision { continue; }
             let Some(parent) = find_node(&output.nodes, &page.key.path) else { continue; };
             let Some(first) = page.result.as_ref().ok().and_then(|rows| rows.first()) else { continue; };
-            collect_flattened_descendants(parent, first, &mut found);
+            collect_flattened_descendants(parent, first, None, &mut found);
         }
         if !found.is_empty() {
             found.retain(|node| !self.flattened_collections.iter().any(|existing| existing.path == node.path));
@@ -412,7 +412,7 @@ impl StructureViews {
         }
     }
     fn start_nested_discovery(&mut self, output: &ParseOutput, source: ByteView, ctx: &egui::Context) {
-        if self.discovery_rx.is_some() || !self.flattened_collections.is_empty() { return; }
+        if self.discovery_rx.is_some() { return; }
         let mut candidates = Vec::new();
         collect_collections(&output.nodes, &mut candidates);
         candidates.retain(|node| node.lazy.is_some() && !numeric_kind(&node.kind)
@@ -430,7 +430,7 @@ impl StructureViews {
                 let first = array.page(&source, &AtomicBool::new(false), 0, 1)?;
                 let mut found = Vec::new();
                 if let Some(row) = first.first() {
-                    collect_flattened_descendants(&parent, row, &mut found);
+                    collect_flattened_descendants(&parent, row, Some(&source), &mut found);
                 }
                 Ok(found)
             })().map_err(|error| format!("{}: {error:#}", parent.path));
@@ -2017,13 +2017,16 @@ fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut st
         egui::ScrollArea::vertical()
             .id_salt("plot_collection_choices")
             .max_height(ui.ctx().content_rect().height().min(420.0))
-            .show(ui, |ui| {
-                for node in collections {
-                    let mut enabled=selected.contains(&node.path);
-                    if ui.checkbox(&mut enabled,collection_label(node)).changed() {
-                        if enabled {selected.insert(node.path.clone());} else {selected.remove(&node.path);}
-                        changed=true;
-                    }
+            .show_rows(ui, ui.spacing().interact_size.y, collections.len(), |ui, range| {
+                for index in range {
+                    let node = collections[index];
+                    ui.push_id(&node.path, |ui| {
+                        let mut enabled=selected.contains(&node.path);
+                        if ui.checkbox(&mut enabled,collection_label(node)).changed() {
+                            if enabled {selected.insert(node.path.clone());} else {selected.remove(&node.path);}
+                            changed=true;
+                        }
+                    });
                 }
             });
     });
@@ -2070,12 +2073,29 @@ fn collect_collections<'a>(nodes: &'a [Node], output: &mut Vec<&'a Node>) {
         collect_collections(&node.children, output);
     }
 }
-fn collect_flattened_descendants(parent: &Node, node: &Node, output: &mut Vec<Node>) {
+fn collect_flattened_descendants(parent: &Node, node: &Node, source: Option<&ByteView>, output: &mut Vec<Node>) {
     for child in &node.children {
         if let Some(flat) = LazyArray::flattened_child(parent, child) {
             output.push(flat);
         }
-        collect_flattened_descendants(parent, child, output);
+        if let (Some(source), Some(groups)) = (source, child.lazy.as_ref()) {
+            if !numeric_kind(&child.kind) && groups.count > 0 {
+                if let Ok(first) = groups.page(source, &AtomicBool::new(false), 0, 1) {
+                    if let Some(group_item) = first.first() {
+                        for inner in &group_item.children {
+                            if inner.lazy.is_some() {
+                                for index in 0..groups.count {
+                                    if let Some(flat) = LazyArray::flattened_group_child(parent, child, inner, index) {
+                                        output.push(flat);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        collect_flattened_descendants(parent, child, source, output);
     }
 }
 fn containing_collection<'a>(nodes: &'a [Node], range: &Range<usize>) -> Option<&'a Node> {
@@ -2530,6 +2550,75 @@ mod tests {
         let boundary = left.lazy.as_ref().unwrap().page(&store.view(), &AtomicBool::new(false), 255, 2).unwrap();
         assert_eq!(boundary.iter().map(Node::numeric).collect::<Vec<_>>(), [Some(255.), Some(100.)]);
         assert_eq!(left.lazy.as_ref().unwrap().bounds(256), Some(1028..1030));
+    }
+    #[test]
+    fn configured_groups_expose_each_inner_array_across_records() {
+        let yaml = r#"
+structures:
+  - name: Descriptor
+    fields:
+      - {name: width, type: u8}
+      - {name: groups, type: u8}
+  - name: Metadata
+    fields:
+      - {name: items_per_group, type: u8}
+      - {name: descriptors, type: {structure: Descriptor}, repeat: 1}
+    actions:
+      - define:
+          name: Generated
+          from: descriptors
+          fields:
+            type: {ref: width, cases: {'2': i16}}
+            repeat: {ref: groups}
+            items_per_group: {ref: items_per_group}
+  - name: Block
+    fields:
+      - {name: header, type: bytes, length: 2}
+      - {name: payload, type: {structure: Generated}}
+actions:
+  - read: {name: metadata, type: {structure: Metadata}}
+  - read: {name: blocks, type: {structure: Block}, repeat: 130}
+"#;
+        let mut bytes = vec![129, 2, 130];
+        for block in 0..130_i16 {
+            bytes.extend([0xAA, 0xBB]);
+            for index in 0..16_770_i16 { bytes.extend((block * 100 + index).to_le_bytes()); }
+        }
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let output = Program::parse(yaml).unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let mut views = StructureViews::default();
+        let ctx = egui::Context::default();
+        views.request(&output.nodes[1], 0, output.revision, &ctx);
+        settle(&mut views, store.view());
+        views.discover_flattened_collections(&output);
+        assert!(views.flattened_collections.iter().any(|node| node.path == "blocks.payload.field_0"));
+        views.start_nested_discovery(&output, store.view(), &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !views.flattened_collections.iter().any(|node| node.path == "blocks.payload.field_0[2].values") {
+            assert!(std::time::Instant::now() < deadline, "discovery timed out: {:?}", views.discovery_error);
+            views.discover_flattened_collections(&output);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        for sensor in 0..3 {
+            let path = format!("blocks.payload.field_0[{sensor}].values");
+            let node = views.flattened_collections.iter().find(|node| node.path == path).unwrap();
+            let array = node.lazy.as_ref().unwrap();
+            assert_eq!(array.count, 130 * 129);
+            let boundary = array.page(&store.view(), &AtomicBool::new(false), 128, 2).unwrap();
+            assert_eq!(boundary.iter().map(Node::numeric).collect::<Vec<_>>(),
+                [Some((sensor * 129 + 128) as f64), Some((100 + sensor * 129) as f64)]);
+        }
+        let sensor = views.flattened_collections.iter()
+            .find(|node| node.path == "blocks.payload.field_0[2].values").unwrap().clone();
+        let mut reader = crate::structure_plot::PlotReader::default();
+        reader.request(&ctx, store.view(), sensor, 128..130, 800, false);
+        while !reader.data().is_some_and(|data| data.complete) {
+            assert!(std::time::Instant::now() < deadline, "plot worker timed out: {:?}", reader.error());
+            reader.tick(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let points = &reader.data().unwrap().series["value"];
+        assert_eq!(points.iter().map(|point| point.value).collect::<Vec<_>>(), [386., 358.]);
     }
     #[test]
     fn expanded_nested_lazy_page_shows_record_fields() {

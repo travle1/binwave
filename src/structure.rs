@@ -482,6 +482,8 @@ pub struct FieldMapping {
     #[serde(default)]
     pub repeat: Option<Expr>,
     #[serde(default)]
+    pub items_per_group: Option<Expr>,
+    #[serde(default)]
     pub length: Option<Expr>,
     #[serde(default)]
     pub at: Option<Expr>,
@@ -684,9 +686,9 @@ struct LazyPlan {
     end: Address,
     path: String,
     endian: Endian,
-    values: HashMap<String, Value>,
-    structures: BTreeMap<String, Structure>,
-    enums: Vec<EnumDef>,
+    values: Arc<HashMap<String, Value>>,
+    structures: Arc<BTreeMap<String, Structure>>,
+    enums: Arc<Vec<EnumDef>>,
     revision: u64,
 }
 /// A conservative numeric projection of a constant decoded structure. Unsupported
@@ -909,6 +911,64 @@ impl LazyArray {
             preview: None,
         })
     }
+    /// One fixed-size item from a repeated group in each parent record.
+    /// The item itself contains a fixed-size sample array.
+    pub(crate) fn flattened_group_child(parent: &Node, group: &Node, child: &Node, index: Address) -> Option<Node> {
+        let outer = parent.lazy.as_ref()?;
+        let groups = group.lazy.as_ref()?;
+        let inner = child.lazy.as_ref()?;
+        if index >= groups.count || outer.count == 0 || inner.count == 0
+            || outer.stride == 0 || groups.stride == 0 || inner.stride == 0
+            || outer.offsets.is_some() || outer.segmented.is_some()
+            || groups.offsets.is_some() || groups.segmented.is_some()
+            || inner.offsets.is_some() || inner.segmented.is_some() {
+            return None;
+        }
+        let outer_start = outer.bounds(0)?.start;
+        let group_start = groups.bounds(index)?.start;
+        let first_group_start = groups.bounds(0)?.start;
+        let child_start = inner.bounds(0)?.start;
+        let inner_offset = group_start.checked_sub(outer_start)?
+            .checked_add(child_start.checked_sub(first_group_start)?)?;
+        let inner_bytes = inner.count.checked_mul(inner.stride)?;
+        if inner_offset.checked_add(inner_bytes)? > outer.stride { return None; }
+        let item_prefix = format!("{}[0]", parent.path);
+        let group_suffix = group.path.strip_prefix(&item_prefix)?;
+        let child_suffix = child.path.strip_prefix(&format!("{}[0]", group.path))?;
+        if !group_suffix.starts_with('.') || !child_suffix.starts_with('.') { return None; }
+        let path = format!("{}{}[{index}]{}", parent.path, group_suffix, child_suffix);
+        let count = outer.count.checked_mul(inner.count)?;
+        let mut plan = (*inner.plan).clone();
+        plan.start = outer_start.checked_add(inner_offset)?;
+        plan.end = parent.range.end;
+        plan.path = path.clone();
+        let array = Self {
+            count,
+            stride: inner.stride,
+            offsets: None,
+            segmented: Some(SegmentedArray {
+                outer_start,
+                outer_stride: outer.stride,
+                inner_offset,
+                inner_count: inner.count,
+                inner_stride: inner.stride,
+            }),
+            plan: Arc::new(plan),
+        };
+        let end = array.bounds(count - 1)?.end;
+        Some(Node {
+            name: format!("{}[{index}] across {}", group.name, parent.name),
+            path,
+            range: outer_start.checked_add(inner_offset)?..end,
+            kind: child.kind.clone(),
+            value: None,
+            children: Vec::new(),
+            lazy: Some(array),
+            endian: child.endian,
+            references: child.references.clone(),
+            preview: None,
+        })
+    }
     pub(crate) fn indices_for_bytes(&self, bytes: &Range<Address>) -> Option<Range<Address>> {
         if self.count == 0 || bytes.is_empty() { return None; }
         if self.segmented.is_some() {
@@ -1042,11 +1102,11 @@ impl LazyArray {
             source,
             cancel,
             self.plan.endian,
-            self.plan.structures.clone(),
-            self.plan.enums.clone(),
+            (*self.plan.structures).clone(),
+            (*self.plan.enums).clone(),
             self.plan.revision,
         );
-        engine.values = self.plan.values.clone();
+        engine.values = (*self.plan.values).clone();
         let end = start.saturating_add(count).min(self.count);
         let mut nodes =
             Vec::with_capacity(usize::try_from(end - start).context("page exceeds memory range")?);
@@ -1057,7 +1117,7 @@ impl LazyArray {
             // valid records must not fail because their node counts add up.
             engine.nodes = 0;
             if self.offsets.is_some() {
-                engine.values = self.plan.values.clone();
+                engine.values = (*self.plan.values).clone();
                 engine.collections.clear();
             }
             let path = format!("{}[{index}]", self.plan.path);
@@ -2041,9 +2101,9 @@ impl<'a> Engine<'a> {
                                 end: array_end,
                                 path: path.into(),
                                 endian: field.endian.unwrap_or(endian),
-                                values: self.values.clone(),
-                                structures: self.structures.clone(),
-                                enums: self.enums.clone(),
+                                values: Arc::new(self.values.clone()),
+                                structures: Arc::new(self.structures.clone()),
+                                enums: Arc::new(self.enums.clone()),
                                 revision: self.revision,
                             }),
                         }),
@@ -2122,9 +2182,9 @@ impl<'a> Engine<'a> {
                 plan: Arc::new(LazyPlan {
                     field: element.clone(), start, end, path: path.into(),
                     endian: field.endian.unwrap_or(endian),
-                    values: self.values.clone(),
-                    structures: self.structures.clone(),
-                    enums: self.enums.clone(),
+                    values: Arc::new(self.values.clone()),
+                    structures: Arc::new(self.structures.clone()),
+                    enums: Arc::new(self.enums.clone()),
                     revision: self.revision,
                 }),
             }),
@@ -2468,6 +2528,7 @@ impl<'a> Engine<'a> {
         );
         let mut structure = Structure::default();
         let mut names = std::collections::HashSet::new();
+        let mut group_item_types = HashMap::<(String, Address, Option<Address>), String>::new();
         for (index, element) in children.iter().enumerate() {
             let name = if let Some(reference) = &definition.fields.name {
                 let key = self.lookup(&reference.reference, &element.path)?.key();
@@ -2518,6 +2579,34 @@ impl<'a> Engine<'a> {
                     ))
                 })
                 .transpose()?;
+            if let Some(items_per_group) = &definition.fields.items_per_group {
+                ensure!(field.repeat.is_some(), "items_per_group requires repeat for the group count");
+                let count = resolve(items_per_group)?;
+                ensure!(constant_size(&count).is_some_and(|count| count > 0), "items_per_group must be positive");
+                let value_kind = match &field.kind {
+                    TypeSpec::Name(kind) => kind.clone(),
+                    TypeSpec::Select { .. } => unreachable!(),
+                };
+                let key = (value_kind.clone(), constant_size(&count).unwrap(), field.length.as_ref().and_then(constant_size));
+                let item_kind = if let Some(existing) = group_item_types.get(&key) {
+                    existing.clone()
+                } else {
+                    let item_kind = format!("{}__item_{index}", definition.name);
+                    ensure!(!self.structures.contains_key(&item_kind), "structure {item_kind:?} is already defined");
+                    ensure!(self.structures.len() < 512, "at most 512 static and discovered structures are allowed");
+                    let mut item_field = Field::scalar("values", value_kind);
+                    item_field.repeat = Some(Repeat::Count(count));
+                    item_field.length = field.length.clone();
+                    valid_field(&item_field)?;
+                    self.structures.insert(item_kind.clone(), Structure {
+                        fields: vec![item_field], ..Structure::default()
+                    });
+                    group_item_types.insert(key, item_kind.clone());
+                    item_kind
+                };
+                field.length = None;
+                field.kind = TypeSpec::Name(item_kind);
+            }
             valid_field(&field)?;
             structure.fields.push(field);
         }
