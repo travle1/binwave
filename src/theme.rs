@@ -60,7 +60,6 @@ pub struct Syntax {
 pub struct HexRegions {
     pub file_header: Color32,
     pub section_header: Color32,
-    pub data_section: Color32,
     pub entry_a: Color32,
     pub entry_b: Color32,
 }
@@ -184,7 +183,6 @@ pub const DARK: Theme = Theme {
         hex_regions: HexRegions {
             file_header: rgb(0xF0, 0xB4, 0x5E),
             section_header: rgb(0x9F, 0xB0, 0xFF),
-            data_section: rgb(0x5F, 0xD0, 0xBC),
             entry_a: rgb(0xE4, 0xE7, 0xEC),
             entry_b: rgb(0xB7, 0xBE, 0xCB),
         },
