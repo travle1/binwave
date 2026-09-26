@@ -379,14 +379,7 @@ impl StructureViews {
             if page.key.revision != output.revision { continue; }
             let Some(parent) = find_node(&output.nodes, &page.key.path) else { continue; };
             let Some(first) = page.result.as_ref().ok().and_then(|rows| rows.first()) else { continue; };
-            for child in &first.children {
-                if let Some(flat) = LazyArray::flattened_child(parent, child) {
-                    if !self.flattened_collections.iter().any(|node| node.path == flat.path)
-                        && !found.iter().any(|node: &Node| node.path == flat.path) {
-                        found.push(flat);
-                    }
-                }
-            }
+            collect_flattened_descendants(parent, first, &mut found);
         }
         if !found.is_empty() {
             found.retain(|node| !self.flattened_collections.iter().any(|existing| existing.path == node.path));
@@ -427,8 +420,11 @@ impl StructureViews {
             let result = (|| -> anyhow::Result<Vec<Node>> {
                 let array = parent.lazy.as_ref().unwrap();
                 let first = array.page(&source, &AtomicBool::new(false), 0, 1)?;
-                Ok(first.first().into_iter().flat_map(|row| row.children.iter())
-                    .filter_map(|child| LazyArray::flattened_child(&parent, child)).collect())
+                let mut found = Vec::new();
+                if let Some(row) = first.first() {
+                    collect_flattened_descendants(&parent, row, &mut found);
+                }
+                Ok(found)
             })().map_err(|error| format!("{}: {error:#}", parent.path));
             let _ = tx.send((revision, result));
             ctx.request_repaint();
@@ -2066,6 +2062,14 @@ fn collect_collections<'a>(nodes: &'a [Node], output: &mut Vec<&'a Node>) {
         collect_collections(&node.children, output);
     }
 }
+fn collect_flattened_descendants(parent: &Node, node: &Node, output: &mut Vec<Node>) {
+    for child in &node.children {
+        if let Some(flat) = LazyArray::flattened_child(parent, child) {
+            output.push(flat);
+        }
+        collect_flattened_descendants(parent, child, output);
+    }
+}
 fn containing_collection<'a>(nodes: &'a [Node], range: &Range<usize>) -> Option<&'a Node> {
     let mut collections = Vec::new();
     collect_collections(nodes, &mut collections);
@@ -2491,6 +2495,33 @@ mod tests {
         }
         assert_eq!(views.plot_target, "groups.items");
         assert_eq!(views.table_target, "groups.items");
+    }
+    #[test]
+    fn nested_channel_arrays_form_virtual_series_across_records() {
+        let yaml = "structures:\n  - name: Payload\n    fields:\n      - {name: left, type: i16, repeat: 256}\n      - {name: right, type: i16, repeat: 256}\n  - name: Block\n    fields:\n      - {name: header, type: bytes, length: 2}\n      - {name: payload, type: {structure: Payload}}\nactions:\n  - read: {name: blocks, type: {structure: Block}, repeat: 130}\n";
+        let mut bytes = Vec::new();
+        for block in 0..130_i16 {
+            bytes.extend([0xAA, 0xBB]);
+            for index in 0..512_i16 { bytes.extend((block * 100 + index).to_le_bytes()); }
+        }
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let output = Program::parse(yaml).unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let mut views = StructureViews::default();
+        let ctx = egui::Context::default();
+        views.start_nested_discovery(&output, store.view(), &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while views.flattened_collections.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "discovery timed out: {:?}", views.discovery_error);
+            views.discover_flattened_collections(&output);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let left = views.flattened_collections.iter().find(|node| node.path == "blocks.payload.left").unwrap();
+        let right = views.flattened_collections.iter().find(|node| node.path == "blocks.payload.right").unwrap();
+        assert_eq!(left.lazy.as_ref().unwrap().count, 130 * 256);
+        assert_eq!(right.lazy.as_ref().unwrap().count, 130 * 256);
+        let boundary = left.lazy.as_ref().unwrap().page(&store.view(), &AtomicBool::new(false), 255, 2).unwrap();
+        assert_eq!(boundary.iter().map(Node::numeric).collect::<Vec<_>>(), [Some(255.), Some(100.)]);
+        assert_eq!(left.lazy.as_ref().unwrap().bounds(256), Some(1028..1030));
     }
     #[test]
     fn expanded_nested_lazy_page_shows_record_fields() {

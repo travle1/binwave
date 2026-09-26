@@ -874,7 +874,10 @@ impl LazyArray {
             return None;
         }
         let count = outer.count.checked_mul(inner.count)?;
-        let path = format!("{}.{}", parent.path, child.name);
+        let item_prefix = format!("{}[0]", parent.path);
+        let child_suffix = child.path.strip_prefix(&item_prefix)?;
+        if !child_suffix.starts_with('.') { return None; }
+        let path = format!("{}{}", parent.path, child_suffix);
         let mut plan = (*inner.plan).clone();
         plan.start = inner_start;
         plan.end = parent.range.end;
