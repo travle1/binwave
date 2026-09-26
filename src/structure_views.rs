@@ -1320,7 +1320,6 @@ impl StructureViews {
                 .config(egui::containers::menu::MenuConfig::new()
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
                 .ui(ui, |ui| {
-                ui.strong("Collections");
                 changed |= plot_collection_choices(ui,&collections,&mut self.plot_sources);
                 if !names.is_empty() {
                     ui.separator();
@@ -2082,10 +2081,10 @@ fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut st
     let (single, groups) = grouped_collection_choices(collections);
     let grouped_containers: HashSet<_> = groups.values().filter_map(|sensors|
         sensors.first().and_then(|(_, node)| node.path.rsplit_once('[').map(|(path, _)| path.to_owned()))).collect();
-    egui::containers::menu::MenuButton::new("Collections")
-        .config(egui::containers::menu::MenuConfig::new()
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
-        .ui(ui, |ui| {
+    egui::CollapsingHeader::new("Collections")
+        .id_salt("plot_collections")
+        .default_open(true)
+        .show(ui, |ui| {
         egui::ScrollArea::vertical()
             .id_salt("plot_collection_choices")
             .max_height(ui.ctx().content_rect().height().min(420.0))
