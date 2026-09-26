@@ -220,6 +220,11 @@ interpreter does not infer field layouts from arbitrary bytes.
 `ref` retrieves an earlier value; it does not read additional bytes. For example,
 `{ref: /header.count}` retrieves a decoded field called `count` beneath a
 file-level read called `header`. It does not refer to the `Header` declaration.
+When the position of an earlier item can vary, select it by one of its decoded
+scalar fields: `{ref: "/sections[kind=1].payload.count"}`. This finds the item
+whose `kind` is `1` and reads its `payload.count`, regardless of the item's
+index. The selector must match exactly one earlier item; zero matches or more
+than one match is an error. It does not search forward into unread bytes.
 An unqualified `{ref: count}` searches the current element and its enclosing
 scopes. A leading `/` anchors the reference to the file level. See the detailed
 reference rules below, including restrictions for lazy collections.

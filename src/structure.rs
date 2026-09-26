@@ -1540,6 +1540,23 @@ impl<'a> Engine<'a> {
             if let Some(value) = self.values.get(&path) {
                 return Ok(value);
             }
+            if let Some((collection, selector, expected, tail)) = selected_reference(&path) {
+                let prefix = format!("{collection}[");
+                let suffix = format!("].{selector}");
+                let mut matches = self.values.iter().filter_map(|(key, value)| {
+                    let index = key.strip_prefix(&prefix)?.strip_suffix(&suffix)?;
+                    (index.parse::<Address>().is_ok() && value.key() == expected)
+                        .then_some(index)
+                });
+                if let Some(index) = matches.next() {
+                    ensure!(matches.next().is_none(),
+                        "{scope}: reference {reference:?} matches multiple earlier {collection} items");
+                    let target = format!("{collection}[{index}]{tail}");
+                    if let Some(value) = self.values.get(&target) {
+                        return Ok(value);
+                    }
+                }
+            }
         }
         bail!("{scope}: reference {reference:?} is not an earlier decoded value")
     }
@@ -2528,6 +2545,18 @@ fn candidates(reference: &str, scope: &str) -> Vec<String> {
     result.push(reference.into());
     result
 }
+/// Resolve a collection item by a scalar field already decoded in that item.
+/// The selector is deliberately limited to one equality test so references
+/// remain readable and cannot become an expression language.
+fn selected_reference(path: &str) -> Option<(&str, &str, &str, &str)> {
+    let (collection, rest) = path.split_once('[')?;
+    let (selector, tail) = rest.split_once(']')?;
+    let (field, expected) = selector.split_once('=')?;
+    let field = field.trim();
+    let expected = expected.trim();
+    (!collection.is_empty() && !field.is_empty() && !expected.is_empty() && tail.starts_with('.'))
+        .then_some((collection, field, expected, tail))
+}
 fn child_path(scope: &str, name: &str) -> String {
     if scope.is_empty() {
         name.into()
@@ -2657,6 +2686,46 @@ fn field_references(field: &Field) -> Vec<String> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn reference_selects_an_earlier_section_by_decoded_field_not_position() {
+        let yaml = r#"
+structures:
+  - name: Config
+    fields:
+      - {name: count, type: u8}
+  - name: Data
+    fields:
+      - name: values
+        type: u8
+        repeat: {ref: "/sections[kind=1].payload.count"}
+  - name: Section
+    fields:
+      - {name: kind, type: u8}
+      - name: payload
+        type:
+          choose:
+            ref: kind
+            cases: {'1': {structure: Config}, '2': {structure: Data}}
+            otherwise: bytes
+        length:
+          choose:
+            ref: kind
+            cases: {'1': 1, '2': 3}
+            otherwise: 1
+actions:
+  - read: {name: sections, type: {structure: Section}, repeat: 3}
+"#;
+        for bytes in [
+            vec![0, 99, 1, 3, 2, 10, 11, 12],
+            vec![1, 3, 0, 99, 2, 10, 11, 12],
+        ] {
+            let output = run(yaml, bytes).unwrap();
+            let values = &output.nodes[0].children[2].children[1].children[0];
+            assert_eq!(values.children.len(), 3);
+            assert_eq!(values.children.iter().map(|node| node.numeric().unwrap() as u8).collect::<Vec<_>>(), [10, 11, 12]);
+        }
+    }
     struct Bytes(Vec<u8>);
     impl Source for Bytes {
         fn len(&self) -> Address {
