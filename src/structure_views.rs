@@ -133,7 +133,8 @@ pub struct StructureViews {
     group_plan_cache: Option<(u64, Arc<BTreeMap<String, (Node, NumericPlan, Vec<String>)>>)>,
     plot_overlay: Option<(u64, PlotData)>,
     plot_overlay_generations: BTreeMap<String, u64>,
-    plot_overlay_points: BTreeMap<String, Vec<PlotPoint>>,
+    plot_overlay_points: BTreeMap<String, Arc<Vec<PlotPoint>>>,
+    plot_overlay_revision: u64,
     plot_mesh_cache: Arc<TraceMeshCache>,
     plot_raster: PlotRaster,
     plot_gpu: GpuPlot,
@@ -1857,6 +1858,7 @@ impl StructureViews {
             self.plot_overlay = None;
             self.plot_overlay_generations.clear();
             self.plot_overlay_points.clear();
+            self.plot_overlay_revision = self.plot_overlay_revision.wrapping_add(1);
             self.plot_mesh_cache.clear();
             self.plot_raster.invalidate();
             self.plot_gpu.invalidate();
@@ -1886,7 +1888,7 @@ impl StructureViews {
                 }
                 self.plot_mesh_cache.clear();
                 self.plot_raster.invalidate();
-                self.plot_gpu.invalidate();
+                self.plot_overlay_revision = self.plot_overlay_revision.wrapping_add(1);
                 self.plot_overlay_generations.insert(self.plot_target.clone(), primary_generation);
                 #[cfg(test)] { self.plot_overlay_builds += 1; }
             }
@@ -1902,7 +1904,7 @@ impl StructureViews {
                     update_overlay_source(combined, &mut self.plot_overlay_points, path, extra, &self.plot_hidden, &self.presentation);
                     self.plot_mesh_cache.clear();
                     self.plot_raster.invalidate();
-                    self.plot_gpu.invalidate();
+                    self.plot_overlay_revision = self.plot_overlay_revision.wrapping_add(1);
                     self.plot_overlay_generations.insert(path.clone(), generation);
                     #[cfg(test)] { self.plot_overlay_builds += 1; }
                 }
@@ -1922,7 +1924,7 @@ impl StructureViews {
                         &self.plot_hidden, &self.presentation);
                     self.plot_mesh_cache.clear();
                     self.plot_raster.invalidate();
-                    self.plot_gpu.invalidate();
+                    self.plot_overlay_revision = self.plot_overlay_revision.wrapping_add(1);
                     self.plot_overlay_generations.insert(generation_key, generation);
                     #[cfg(test)] { self.plot_overlay_builds += 1; }
                 }
@@ -2006,7 +2008,8 @@ impl StructureViews {
                         .filter(|name| !hidden.contains(*name)).count();
                     gpu_mode = data.quality != PlotQuality::SampledPreview
                         && visible_trace_count >= 64
-                        && self.plot_gpu.update(&self.plot_overlay_points, &hidden, overlay_key);
+                        && self.plot_gpu.update(&plot_ctx, &self.plot_overlay_points, &hidden,
+                            overlay_key ^ self.plot_overlay_revision.rotate_left(17));
                     let raster_mode = !gpu_mode && data.quality != PlotQuality::SampledPreview
                         && visible_trace_count >= 16
                         && (data.quality != PlotQuality::Exact
@@ -2020,7 +2023,7 @@ impl StructureViews {
                         if hidden.contains(name) {
                             continue;
                         }
-                        let Some(points) = self.plot_overlay_points.get(name).map(Vec::as_slice) else { continue; };
+                        let Some(points) = self.plot_overlay_points.get(name).map(|points| points.as_slice()) else { continue; };
                         let color = plot_series_color(name);
                         let bands = (data.quality == PlotQuality::SampledPreview).then(|| {
                             data.envelopes.get(name).into_iter().flatten().map(|band| [
@@ -2637,7 +2640,7 @@ fn field_color(path: &str) -> Color32 {
 }
 fn update_overlay_source(
     overlay: &mut PlotData,
-    prepared: &mut BTreeMap<String, Vec<PlotPoint>>,
+    prepared: &mut BTreeMap<String, Arc<Vec<PlotPoint>>>,
     path: &str,
     source: Option<&PlotData>,
     hidden: &HashSet<String>,
@@ -2654,7 +2657,7 @@ fn update_overlay_source(
         let placement = presentation.placement(&full);
         let mut points = points.clone();
         for point in &mut points { point.value = placement.display(point.value); }
-        prepared.insert(full.clone(), points.iter().map(|point| PlotPoint::new(point.index as f64, point.value)).collect());
+        prepared.insert(full.clone(), Arc::new(points.iter().map(|point| PlotPoint::new(point.index as f64, point.value)).collect()));
         overlay.series.insert(full, points);
     }
     for (name, bands) in &source.envelopes {
@@ -2671,7 +2674,7 @@ fn update_overlay_source(
 }
 fn update_group_overlay(
     overlay: &mut PlotData,
-    prepared: &mut BTreeMap<String, Vec<PlotPoint>>,
+    prepared: &mut BTreeMap<String, Arc<Vec<PlotPoint>>>,
     paths: &[String],
     source: Option<&PlotData>,
     hidden: &HashSet<String>,
@@ -2687,7 +2690,7 @@ fn update_group_overlay(
         let placement = presentation.placement(name);
         let mut points = points.clone();
         for point in &mut points { point.value = placement.display(point.value); }
-        prepared.insert(name.clone(), points.iter().map(|point| PlotPoint::new(point.index as f64, point.value)).collect());
+        prepared.insert(name.clone(), Arc::new(points.iter().map(|point| PlotPoint::new(point.index as f64, point.value)).collect()));
         overlay.series.insert(name.clone(), points);
     }
     for (name, bands) in &source.envelopes {

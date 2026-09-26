@@ -2,14 +2,14 @@
 //! viewport navigation updates a small uniform buffer in the paint callback.
 use crate::plot_trace::series_color;
 use eframe::{egui_wgpu, wgpu};
-use egui::{Painter, Rect};
+use egui::{Context, Painter, Rect};
 use egui_plot::{PlotPoint, PlotTransform};
 use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, OnceLock};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc::{self, Receiver, TryRecvError}, Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use wgpu::util::DeviceExt;
 
-const MAX_SEGMENTS: usize = 2_000_000;
+const MAX_SEGMENTS: usize = 1_000_000;
 static TARGET_FORMAT: OnceLock<wgpu::TextureFormat> = OnceLock::new();
 static NEXT_UPLOAD: AtomicU64 = AtomicU64::new(1);
 
@@ -42,44 +42,60 @@ pub struct GpuPlot {
     x_origin: f64,
     y_origin: f64,
     generation: u64,
+    pending: Option<PendingUpload>,
+}
+struct PendingUpload {
+    key: u64,
+    receiver: Receiver<PreparedSegments>,
+    cancel: Arc<AtomicBool>,
+}
+struct PreparedSegments {
+    segments: Vec<Segment>,
+    x_origin: f64,
+    y_origin: f64,
 }
 impl GpuPlot {
     pub fn available() -> bool { TARGET_FORMAT.get().is_some() }
-    pub fn invalidate(&mut self) { self.key = None; }
-    pub fn update(&mut self, points: &BTreeMap<String, Vec<PlotPoint>>,
+    pub fn invalidate(&mut self) {
+        if let Some(pending) = self.pending.take() { pending.cancel.store(true, Ordering::Relaxed); }
+        self.key = None;
+        self.segments = Arc::new(Vec::new());
+    }
+    pub fn update(&mut self, ctx: &Context, points: &BTreeMap<String, Arc<Vec<PlotPoint>>>,
         hidden: &HashSet<String>, key: u64) -> bool {
         if !Self::available() { return false; }
-        if self.key == Some(key) { return !self.segments.is_empty(); }
-        let Some(first) = points.iter().filter(|(name, _)| !hidden.contains(*name))
-            .flat_map(|(_, values)| values.iter()).find(|p| p.x.is_finite() && p.y.is_finite()) else {
-            self.segments = Arc::new(Vec::new()); self.key = Some(key); return false;
-        };
-        let x_origin = first.x;
-        let y_origin = first.y;
-        let mut segments = Vec::new();
-        for (name, values) in points {
-            if hidden.contains(name) { continue; }
-            let [r, g, b, _] = series_color(name).to_array();
-            let color = u32::from(r) | u32::from(g) << 8 | u32::from(b) << 16 | 180 << 24;
-            for pair in values.windows(2) {
-                let [a, b] = [pair[0], pair[1]];
-                if ![a.x, a.y, b.x, b.y].iter().all(|v| v.is_finite()) || a.x >= b.x { continue; }
-                if segments.len() >= MAX_SEGMENTS {
-                    self.segments = Arc::new(Vec::new()); self.key = Some(key); return false;
+        if let Some(pending) = self.pending.take() {
+            match pending.receiver.try_recv() {
+                Ok(prepared) => {
+                    self.x_origin = prepared.x_origin;
+                    self.y_origin = prepared.y_origin;
+                    self.segments = Arc::new(prepared.segments);
+                    self.key = Some(pending.key);
+                    self.generation = NEXT_UPLOAD.fetch_add(1, Ordering::Relaxed);
                 }
-                segments.push(Segment {
-                    coords: [(a.x - x_origin) as f32, (a.y - y_origin) as f32,
-                        (b.x - x_origin) as f32, (b.y - y_origin) as f32],
-                    color, pad: [0; 3],
-                });
+                Err(TryRecvError::Disconnected) => {}
+                Err(TryRecvError::Empty) => self.pending = Some(pending),
             }
         }
-        self.x_origin = x_origin;
-        self.y_origin = y_origin;
-        self.segments = Arc::new(segments);
-        self.key = Some(key);
-        self.generation = NEXT_UPLOAD.fetch_add(1, Ordering::Relaxed);
-        !self.segments.is_empty()
+        if self.key == Some(key) { return !self.segments.is_empty(); }
+        if self.pending.is_some() { return true; }
+        // Cloning Arc handles is cheap even when the decoded arrays are large.
+        // Segment reduction runs entirely off the UI thread.
+        let visible: Vec<_> = points.iter().filter(|(name, _)| !hidden.contains(*name))
+            .map(|(name, values)| (name.clone(), Arc::clone(values))).collect();
+        if visible.is_empty() { self.segments = Arc::new(Vec::new()); self.key = Some(key); return false; }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(prepared) = prepare_segments(&visible, &worker_cancel) {
+                let _ = sender.send(prepared);
+            }
+            repaint.request_repaint();
+        });
+        self.pending = Some(PendingUpload { key, receiver, cancel });
+        true
     }
     pub fn paint(&self, painter: &Painter, transform: &PlotTransform) {
         if self.segments.is_empty() { return; }
@@ -98,6 +114,86 @@ impl GpuPlot {
         painter.with_clip_rect(frame).add(egui::Shape::Callback(
             egui_wgpu::Callback::new_paint_callback(Rect::from_min_max(frame.min, frame.max), callback)));
     }
+}
+
+fn prepare_segments(visible: &[(String, Arc<Vec<PlotPoint>>)], cancel: &AtomicBool)
+    -> Option<PreparedSegments> {
+    let first = visible.iter().flat_map(|(_, values)| values.iter())
+        .find(|p| p.x.is_finite() && p.y.is_finite())?;
+    let x_origin = first.x;
+    let y_origin = first.y;
+    let per_series = (MAX_SEGMENTS / visible.len().max(1)).max(1);
+    let mut segments = Vec::new();
+    for (name, values) in visible {
+        if cancel.load(Ordering::Relaxed) { return None; }
+        if segments.len() >= MAX_SEGMENTS { break; }
+        let [r, g, b, _] = series_color(name).to_array();
+        let color = u32::from(r) | u32::from(g) << 8 | u32::from(b) << 16 | 180 << 24;
+        let budget = per_series.min(MAX_SEGMENTS - segments.len());
+        append_series_segments(&mut segments, values, budget, color, x_origin, y_origin);
+    }
+    Some(PreparedSegments { segments, x_origin, y_origin })
+}
+
+/// Limit the total upload without dropping an entire plot back to egui's
+/// per-trace mesh path. Every reduced group retains its extrema and endpoints.
+fn append_series_segments(out: &mut Vec<Segment>, values: &[PlotPoint], budget: usize,
+    color: u32, x_origin: f64, y_origin: f64) {
+    if values.len() < 2 || budget == 0 { return; }
+    let mut runs = Vec::new();
+    let mut start = 0;
+    for index in 0..values.len() {
+        let point = values[index];
+        if !point.x.is_finite() || !point.y.is_finite()
+            || (index > start && point.x < values[index - 1].x) {
+            if index.saturating_sub(start) >= 2 { runs.push(start..index); }
+            start = index + usize::from(!point.x.is_finite() || !point.y.is_finite());
+        }
+    }
+    if values.len().saturating_sub(start) >= 2 { runs.push(start..values.len()); }
+    for (index, run) in runs.iter().enumerate() {
+        let share = budget / runs.len() + usize::from(index < budget % runs.len());
+        append_run_segments(out, &values[run.clone()], share, color, x_origin, y_origin);
+    }
+}
+
+fn append_run_segments(out: &mut Vec<Segment>, values: &[PlotPoint], budget: usize,
+    color: u32, x_origin: f64, y_origin: f64) {
+    if values.len() < 2 || budget == 0 { return; }
+    let push = |out: &mut Vec<Segment>, a: PlotPoint, b: PlotPoint| {
+        if a.x > b.x { return; }
+        out.push(Segment { coords: [(a.x - x_origin) as f32, (a.y - y_origin) as f32,
+            (b.x - x_origin) as f32, (b.y - y_origin) as f32], color, pad: [0; 3] });
+    };
+    if values.len() - 1 <= budget {
+        for pair in values.windows(2) { push(out, pair[0], pair[1]); }
+        return;
+    }
+    if budget < 4 {
+        push(out, values[0], values[values.len() - 1]);
+        return;
+    }
+    let groups = (budget / 4).max(1);
+    let chunk_size = values.len().div_ceil(groups);
+    let mut previous = None;
+    let start_len = out.len();
+    for chunk in values.chunks(chunk_size) {
+        let mut extrema = [chunk[0], chunk[0]];
+        for &point in chunk {
+            if point.y < extrema[0].y { extrema[0] = point; }
+            if point.y > extrema[1].y { extrema[1] = point; }
+        }
+        let mut retained = [chunk[0], extrema[0], extrema[1], chunk[chunk.len() - 1]];
+        retained.sort_by(|a, b| a.x.total_cmp(&b.x));
+        for point in retained {
+            if previous.is_some_and(|last: PlotPoint| last.x == point.x && last.y == point.y) {
+                continue;
+            }
+            if let Some(last) = previous { push(out, last, point); }
+            previous = Some(point);
+        }
+    }
+    debug_assert!(out.len() - start_len <= budget);
 }
 
 struct TraceCallback {
@@ -182,6 +278,54 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn crowded_plot_prepares_off_ui_thread_without_falling_back() {
+        use super::*;
+        configure(wgpu::TextureFormat::Bgra8Unorm);
+        let ctx = Context::default();
+        let samples = Arc::new((0..10_000).map(|index|
+            PlotPoint::new(index as f64, (index % 17) as f64)).collect::<Vec<_>>());
+        let points: BTreeMap<_, _> = (0..128).map(|index|
+            (format!("trace {index}"), Arc::clone(&samples))).collect();
+        let mut gpu = GpuPlot::default();
+        assert!(gpu.update(&ctx, &points, &HashSet::new(), 1));
+        assert!(gpu.pending.is_some());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while gpu.pending.is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            gpu.update(&ctx, &points, &HashSet::new(), 1);
+        }
+        assert!(gpu.pending.is_none(), "GPU geometry worker did not finish");
+        assert!(!gpu.segments.is_empty());
+        assert!(gpu.segments.len() <= MAX_SEGMENTS);
+    }
+    #[test]
+    fn crowded_plot_keeps_gpu_segments_bounded_and_preserves_peak() {
+        use super::*;
+        let values: Vec<_> = (0..20_000).map(|index| PlotPoint::new(index as f64,
+            if index == 12_345 { 1000. } else { 1. })).collect();
+        let mut segments = Vec::new();
+        append_series_segments(&mut segments, &values, 400, 0, 0., 0.);
+        assert!(!segments.is_empty());
+        assert!(segments.len() <= 400);
+        assert!(segments.iter().any(|segment| segment.coords[1] == 1000.
+            || segment.coords[3] == 1000.));
+        assert_eq!(segments.first().unwrap().coords[0], 0.);
+        assert_eq!(segments.last().unwrap().coords[2], 19_999.);
+    }
+    #[test]
+    fn reduced_gpu_trace_does_not_join_across_invalid_gap() {
+        use super::*;
+        let mut values: Vec<_> = (0..1000).map(|index| PlotPoint::new(index as f64, 1.)).collect();
+        values[500].y = f64::NAN;
+        let mut segments = Vec::new();
+        append_series_segments(&mut segments, &values, 80, 0, 0., 0.);
+        assert!(!segments.is_empty());
+        assert!(segments.iter().all(|segment| segment.coords[0] <= segment.coords[2]));
+        assert!(segments.iter().all(|segment| segment.coords[0] < 500.
+            && segment.coords[2] < 500. || segment.coords[0] > 500.
+            && segment.coords[2] > 500.));
+    }
     #[test]
     fn trace_shader_parses_and_validates() {
         let module = naga::front::wgsl::parse_str(include_str!("plot_gpu.wgsl"))

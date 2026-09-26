@@ -36,7 +36,7 @@ impl PlotRaster {
     }
 
     pub fn show(&mut self, ctx: &Context, plot: &mut PlotUi<'_>,
-        series: &BTreeMap<String, Vec<PlotPoint>>, hidden: &HashSet<String>,
+        series: &BTreeMap<String, Arc<Vec<PlotPoint>>>, hidden: &HashSet<String>,
         data_generation: u64) {
         let bounds = plot.plot_bounds();
         let frame = plot.response().rect;
@@ -84,7 +84,7 @@ impl PlotRaster {
         }
         if self.key != Some(key) && self.pending.is_none() {
             let visible: Vec<_> = series.iter().filter(|(name, _)| !hidden.contains(*name))
-                .map(|(name, points)| (name.clone(), points.clone())).collect();
+                .map(|(name, points)| (name.clone(), Arc::clone(points))).collect();
             let (sender, receiver) = mpsc::sync_channel(1);
             let repaint = ctx.clone();
             let cancel = Arc::new(AtomicBool::new(false));
@@ -278,9 +278,9 @@ mod tests {
     fn raster_worker_publishes_on_a_later_ui_frame() {
         let ctx = egui::Context::default();
         let mut raster = PlotRaster::default();
-        let series = BTreeMap::from([("trace".to_owned(), vec![
+        let series = BTreeMap::from([("trace".to_owned(), Arc::new(vec![
             PlotPoint::new(0., 0.), PlotPoint::new(10., 10.),
-        ])]);
+        ]))]);
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
                 egui::vec2(400., 300.))),
