@@ -361,6 +361,15 @@ provenance. Allocation volume and frame-time effects are not yet measured;
 other display structures still clone or retain more data than the Phase 6
 target.
 
+An in-memory hierarchy now merges adjacent numeric tile summaries and reuses
+the largest complete block that fits one display bucket. It retains the
+original extrema sample indices and avoids coarsening across a fully invalid
+bin. On the same warm 80 MB synthetic file, the first overview took 74.6 ms;
+the overview revisit took 44.0 ms with zero source reads, while nearby zoom,
+pan, and return took 0.88, 0.35, and 0.31 ms. This is a single run, not a p95
+claim. The hierarchy is RAM only, and the revisit still processes many fine
+boundaries; versioned persistent pages and a broad-view work bound remain open.
+
 ### Limited synthetic measurement
 
 Command: `BINWAVE_BENCH_SAMPLES=20000000 cargo test --release --bin binwave

@@ -37,6 +37,9 @@ pool's thread count. At most eight collection readers run concurrently by
 default, leaving two reported logical cores as headroom. Set
 `BINWAVE_PLOT_WORKERS` to choose 1 through that headroom limit. This bounds
 reader concurrency; each active reader can still submit tile work to Rayon.
+Adjacent numeric summaries also form coarser RAM summaries within the same
+25% summary allowance. Wide revisits can skip complete blocks that fit one
+display bucket; incomplete or invalid blocks fall back to finer data.
 Native numeric tiles now use direct hash lookups and an LRU order, and eligible
 ordinary collections use the same tiled path as grouped fields. Compatible
 prior plot data stays visible while a new viewport request loads. The RAM

@@ -191,12 +191,36 @@ struct GroupTileSummary {
     start: Address,
     end: Address,
     bins: Vec<(Range<Address>, Vec<Option<NumericBucket>>)>,
+    complete_fields: bool,
 }
 #[cfg(not(target_arch = "wasm32"))]
 impl GroupTileSummary {
     fn bytes(&self) -> usize {
         self.bins.len().saturating_mul(self.bins.first().map_or(0, |(_, fields)| fields.len()))
             .saturating_mul(std::mem::size_of::<NumericBucket>())
+    }
+    fn merge(left: &Self, right: &Self) -> Option<Self> {
+        if !left.complete_fields || !right.complete_fields
+            || left.end != right.start || left.bins.first()?.1.len() != right.bins.first()?.1.len() {
+            return None;
+        }
+        let field_count = left.bins.first()?.1.len();
+        let mut fields: Vec<Option<NumericBucket>> = vec![None; field_count];
+        for (_, bins) in left.bins.iter().chain(&right.bins) {
+            for (target, bucket) in fields.iter_mut().zip(bins) {
+                if let Some(bucket) = bucket {
+                    match target {
+                        Some(target) => target.merge(*bucket),
+                        slot => *slot = Some(*bucket),
+                    }
+                }
+            }
+        }
+        Some(Self {
+            start: left.start, end: right.end,
+            bins: vec![(left.start..right.end, fields)],
+            complete_fields: true,
+        })
     }
 }
 #[cfg(not(target_arch = "wasm32"))]
@@ -225,7 +249,8 @@ impl GroupTile {
             }
             bins.push((bin_start..bin_end, fields));
         }
-        let summary = Arc::new(GroupTileSummary { start, end, bins });
+        let complete_fields = bins.iter().all(|(_, fields)| fields.iter().all(Option::is_some));
+        let summary = Arc::new(GroupTileSummary { start, end, bins, complete_fields });
         Self { start, end, values, summary }
     }
 }
@@ -317,11 +342,14 @@ struct GroupTileCache {
     tiles: LruMap<Arc<GroupTile>>,
     bytes: usize,
     summaries: LruMap<Arc<GroupTileSummary>>,
+    coarse_summaries: Vec<LruMap<Arc<GroupTileSummary>>>,
     summary_bytes: usize,
     in_flight: HashMap<(GroupSignature, Address), Arc<TileFlight>>,
     budget_bytes: usize,
     #[cfg(test)]
     loads: usize,
+    #[cfg(test)]
+    coarse_hits: usize,
 }
 #[cfg(not(target_arch = "wasm32"))]
 impl Default for GroupTileCache {
@@ -329,8 +357,10 @@ impl Default for GroupTileCache {
         Self {
             signature: None, tiles: LruMap::default(), bytes: 0,
             summaries: LruMap::default(), summary_bytes: 0,
+            coarse_summaries: Vec::new(),
             in_flight: HashMap::new(), budget_bytes: group_buffer_bytes(),
             #[cfg(test)] loads: 0,
+            #[cfg(test)] coarse_hits: 0,
         }
     }
 }
@@ -348,7 +378,9 @@ impl GroupTileCache {
             self.bytes = self.bytes.saturating_sub(old.bytes());
         }
         while self.summary_bytes > summary {
-            let Some(old) = self.summaries.pop_oldest() else { break; };
+            let old = self.summaries.pop_oldest().or_else(|| self.coarse_summaries.iter_mut()
+                .find_map(LruMap::pop_oldest));
+            let Some(old) = old else { break; };
             self.summary_bytes = self.summary_bytes.saturating_sub(old.bytes());
         }
     }
@@ -358,6 +390,7 @@ impl GroupTileCache {
             self.tiles.clear();
             self.bytes = 0;
             self.summaries.clear();
+            self.coarse_summaries.clear();
             self.summary_bytes = 0;
             self.in_flight.clear();
         }
@@ -365,7 +398,7 @@ impl GroupTileCache {
     fn get(&mut self, start: Address) -> Option<Arc<GroupTile>> {
         self.tiles.get(start)
     }
-    fn insert(&mut self, tile: Arc<GroupTile>) {
+    fn insert(&mut self, tile: Arc<GroupTile>, tile_size: Address) {
         if tile.bytes() <= self.budget_bytes.saturating_mul(3) / 4
             && self.tiles.insert(tile.start, tile.clone()) {
             self.bytes = self.bytes.saturating_add(tile.bytes());
@@ -375,8 +408,47 @@ impl GroupTileCache {
         if summary.bytes() <= self.budget_bytes / 4
             && self.summaries.insert(summary.start, summary.clone()) {
             self.summary_bytes += summary.bytes();
+            self.promote_summary(summary, tile_size);
         }
         self.trim();
+    }
+    fn promote_summary(&mut self, mut current: Arc<GroupTileSummary>, tile_size: Address) {
+        let mut span = tile_size;
+        for level in 0..usize::BITS as usize {
+            let Some(sibling_start) = (current.start / span ^ 1).checked_mul(span) else { break; };
+            let sibling = if level == 0 { self.summaries.get(sibling_start) }
+                else { self.coarse_summaries.get_mut(level - 1).and_then(|map| map.get(sibling_start)) };
+            let Some(sibling) = sibling else { break; };
+            let (left, right) = if current.start < sibling.start {
+                (&current, &sibling)
+            } else { (&sibling, &current) };
+            let Some(parent) = GroupTileSummary::merge(left, right).map(Arc::new) else { break; };
+            if parent.bytes() > self.budget_bytes / 4 { break; }
+            if self.coarse_summaries.len() <= level {
+                self.coarse_summaries.push(LruMap::default());
+            }
+            if !self.coarse_summaries[level].insert(parent.start, parent.clone()) { break; }
+            self.summary_bytes = self.summary_bytes.saturating_add(parent.bytes());
+            current = parent;
+            let Some(next) = span.checked_mul(2) else { break; };
+            span = next;
+        }
+    }
+    fn covering_summary(&mut self, index: Address, range: &Range<Address>, buckets: Address)
+        -> Option<Arc<GroupTileSummary>> {
+        for level in (0..self.coarse_summaries.len()).rev() {
+            let Some(summary) = self.coarse_summaries[level].get(index) else { continue; };
+            if !summary.complete_fields || summary.end > range.end { continue; }
+            let first_bucket = ((index - range.start) as u128 * buckets as u128
+                / range.len().max(1) as u128) as Address;
+            let last_bucket = ((summary.end - 1 - range.start) as u128 * buckets as u128
+                / range.len().max(1) as u128) as Address;
+            if first_bucket == last_bucket {
+                #[cfg(test)] { self.coarse_hits += 1; }
+                return Some(summary);
+            }
+        }
+        None
     }
     fn summary(&mut self, start: Address) -> Option<Arc<GroupTileSummary>> {
         self.summaries.get(start)
@@ -1192,6 +1264,11 @@ struct NumericBucket {
     last: NumericPoint,
 }
 impl NumericBucket {
+    fn merge(&mut self, next: Self) {
+        if next.min.value < self.min.value { self.min = next.min; }
+        if next.max.value > self.max.value { self.max = next.max; }
+        self.last = next.last;
+    }
     fn push(&mut self, point: NumericPoint) {
         if point.value < self.min.value {
             self.min = point;
@@ -1817,7 +1894,7 @@ fn cached_group_tile(request: &Request, plan: &NumericPlan,
             cache.in_flight.remove(&key);
         }
         if !cancel.load(Ordering::Relaxed) && cache.signature.as_ref() == Some(signature) {
-            if let Ok(tile) = &result { cache.insert(tile.clone()); }
+            if let Ok(tile) = &result { cache.insert(tile.clone(), size); }
         }
     }
     *flight.result.lock().unwrap() = Some(result.as_ref().map(Arc::clone)
@@ -1868,6 +1945,25 @@ fn read_group_buffered(request: &Request, plan: NumericPlan, quality: PlotQualit
     }
     while index < request.key.range.end {
         ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
+        if quality != PlotQuality::Exact {
+            let coarse = cache.lock().unwrap().covering_summary(index, &request.key.range, buckets);
+            if let Some(coarse) = coarse {
+                for (field_index, bucket) in coarse.bins[0].1.iter().enumerate() {
+                    let bucket = bucket.expect("complete summary has all selected fields");
+                    let mut points = [bucket.first, bucket.min, bucket.max, bucket.last];
+                    points.sort_unstable_by_key(|point| point.index);
+                    let mut previous = None;
+                    for point in points {
+                        if previous == Some(point.index) { continue; }
+                        previous = Some(point.index);
+                        reduction.record_value(field_index, point.value, point.index);
+                    }
+                }
+                scanned += coarse.end - index;
+                index = coarse.end;
+                continue;
+            }
+        }
         // File reads and field decoding are independent for each tile. Prepare
         // a bounded batch in parallel, then fold summaries in sample order.
         // This keeps the reduction deterministic and partial updates useful.
@@ -2241,6 +2337,7 @@ actions:
             ("zoom", count / 2..(count / 2 + 8192).min(count)),
             ("adjacent", count / 2 + 4096..(count / 2 + 12_288).min(count)),
             ("return", count / 2..(count / 2 + 8192).min(count)),
+            ("overview_return", 0..count),
         ] {
             query.key.range = range;
             let start = Instant::now();
@@ -2358,13 +2455,48 @@ actions:
         assert_eq!(cache.len(), 0);
     }
     #[test]
+    fn coarse_summaries_keep_spike_identity_and_stop_at_invalid_gaps() {
+        let mut cache = GroupTileCache::default();
+        cache.set_budget(16 * 1024 * 1024);
+        for tile in 0..16 {
+            let mut values = vec![tile as f64; 1024];
+            if tile == 6 { values[5] = 100_000.0; }
+            if tile == 10 { values.fill(f64::NAN); }
+            cache.insert(Arc::new(GroupTile::from_values(tile * 1024, vec![values])), 1024);
+        }
+        let left = cache.covering_summary(0, &(0..16_384), 1).unwrap();
+        assert_eq!(left.end, 8192);
+        let peak = left.bins[0].1[0].unwrap().max;
+        assert_eq!((peak.index, peak.value), (6 * 1024 + 5, 100_000.0));
+        assert!(cache.covering_summary(10 * 1024, &(0..16_384), 1).is_none());
+    }
+    #[test]
+    fn repeated_wide_query_uses_coarse_summaries_without_changing_points() {
+        let (store, node) = fixture(65_536, 12_345);
+        let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
+        let cache = Arc::new(Mutex::new(GroupTileCache::default()));
+        let mut query = request(store.view(), node, 0..65_536, true);
+        query.key.buckets = 8;
+        query.numeric_plan = Some(plan);
+        query.group_tiles = Some(cache.clone());
+        let first = read_plot(&query, &AtomicBool::new(false), |_| {}).unwrap();
+        let before = cache.lock().unwrap().coarse_hits;
+        let second = read_plot(&query, &AtomicBool::new(false), |_| {}).unwrap();
+        let after = cache.lock().unwrap().coarse_hits;
+        assert!(after >= before + 8, "revisit should read eight coarse buckets");
+        let points = |data: &PlotData| data.series["value"].iter()
+            .map(|point| (point.index, point.value)).collect::<Vec<_>>();
+        assert_eq!(points(&first), points(&second));
+        assert!(points(&second).contains(&(12_345, 100_000.0)));
+    }
+    #[test]
     fn reader_budgets_trim_raw_tiles_and_summaries() {
         let mut caches = [GroupTileCache::default(), GroupTileCache::default()];
         for cache in &mut caches {
             cache.set_budget(64 * 1024);
             for tile in 0..8 {
                 cache.insert(Arc::new(GroupTile::from_values(tile * 1024,
-                    vec![vec![tile as f64; 1024]])));
+                    vec![vec![tile as f64; 1024]])), 1024);
             }
             assert!(cache.bytes + cache.summary_bytes <= 64 * 1024);
         }
