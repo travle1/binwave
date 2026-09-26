@@ -45,6 +45,10 @@ mod loaders;
 #[cfg(not(target_arch = "wasm32"))]
 mod plot_index;
 mod plot_trace;
+#[cfg(not(target_arch = "wasm32"))]
+mod plot_raster;
+#[cfg(not(target_arch = "wasm32"))]
+mod plot_gpu;
 mod plot_presentation;
 #[cfg(not(target_arch = "wasm32"))]
 mod plotting;
@@ -72,7 +76,7 @@ mod workspace_layout;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("binwave=info")).init();
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -89,6 +93,7 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| {
             if let Some(render_state) = &cc.wgpu_render_state {
+                plot_gpu::configure(render_state.target_format);
                 let adapter = render_state.adapter.get_info();
                 log::info!("Graphics adapter: {} ({:?}, {:?})", adapter.name, adapter.backend, adapter.device_type);
             }

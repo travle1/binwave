@@ -704,6 +704,41 @@ pub(crate) struct NumericPlan {
     pub fields: Vec<NumericField>,
 }
 impl NumericPlan {
+    /// Combine projections that address different fields of the same fixed
+    /// record sequence. The layout comes from decoded array metadata, not from
+    /// a file-format name or a sampled record.
+    pub(crate) fn combine(plans: &[NumericPlan]) -> Option<Self> {
+        let first = plans.first()?;
+        let reference = first.segmented.as_ref()?;
+        if plans.iter().any(|plan| {
+            let Some(segment) = plan.segmented.as_ref() else { return true; };
+            plan.revision != first.revision
+                || segment.outer_start != reference.outer_start
+                || segment.outer_stride != reference.outer_stride
+                || segment.inner_count != reference.inner_count
+                || segment.inner_stride != reference.inner_stride
+        }) { return None; }
+        let base = plans.iter().filter_map(|plan| plan.segmented.as_ref().map(|s| s.inner_offset)).min()?;
+        let mut combined = first.clone();
+        combined.segmented.as_mut()?.inner_offset = base;
+        combined.start = reference.outer_start.checked_add(base)?;
+        combined.fields.clear();
+        let mut end = 0;
+        for plan in plans {
+            let shift = plan.segmented.as_ref()?.inner_offset.checked_sub(base)?;
+            for field in &plan.fields {
+                let mut field = field.clone();
+                field.offset = field.offset.checked_add(shift)?;
+                end = end.max(field.offset.checked_add(field.width)?);
+                field.name = format!("{} / {}", plan.path, field.name);
+                field.source_path = Some(plan.path.clone());
+                combined.fields.push(field);
+            }
+        }
+        if end == 0 || end > reference.inner_stride || end > crate::byte_store::READ_LIMIT { return None; }
+        combined.stride = end;
+        Some(combined)
+    }
     pub(crate) fn physical_stride(&self) -> Address {
         self.segmented.as_ref().map_or(self.stride, |segment| segment.inner_stride)
     }
@@ -730,6 +765,7 @@ pub(crate) struct NumericField {
     pub offset: Address,
     pub width: Address,
     pub span: Address,
+    pub source_path: Option<String>,
     kind: String,
     endian: Endian,
 }
@@ -822,6 +858,7 @@ fn project_numeric(
                 offset,
                 width,
                 span: length.unwrap_or(width),
+                source_path: None,
                 kind: kind.clone(),
                 endian: inherited,
             });

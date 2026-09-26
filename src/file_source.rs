@@ -2,7 +2,10 @@
 use crate::cache::SourceStamp;
 use anyhow::{ensure, Context, Result};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+#[cfg(not(any(unix, windows)))]
+use std::io::Read;
+#[cfg(any(test, not(any(unix, windows))))]
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -10,6 +13,7 @@ pub struct FileSource {
     pub path: PathBuf,
     pub len: usize,
     stamp: SourceStamp,
+    file: File,
 }
 
 impl FileSource {
@@ -21,6 +25,7 @@ impl FileSource {
             path: path.to_owned(),
             len,
             stamp,
+            file,
         })
     }
 
@@ -42,18 +47,40 @@ impl FileSource {
     }
 
     pub fn read_range(&self, start: usize, length: usize) -> Result<Vec<u8>> {
+        let bytes = self.read_validated_range(start, length)?;
+        self.validate()?;
+        Ok(bytes)
+    }
+
+    /// The caller validates before and after a batch of reads. A retained file
+    /// handle and positional reads keep parallel plot workers independent.
+    pub(crate) fn read_validated_range(&self, start: usize, length: usize) -> Result<Vec<u8>> {
         let length = crate::file_range::bounded_length(start as u64, length, self.len as u64)
             .map_err(anyhow::Error::msg)?;
-        self.validate()?;
-        let mut file = File::open(&self.path)?;
-        ensure!(
-            self.stamp == SourceStamp::read(&self.path, &file.metadata()?)?,
-            "Source file changed; reopen it."
-        );
-        file.seek(SeekFrom::Start(start as u64))?;
         let mut bytes = vec![0; length.min(self.len - start)];
-        file.read_exact(&mut bytes)?;
-        self.validate()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(&mut bytes, start as u64)?;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            let mut offset = start as u64;
+            let mut remaining = bytes.as_mut_slice();
+            while !remaining.is_empty() {
+                let count = self.file.seek_read(remaining, offset)?;
+                ensure!(count > 0, "source ended during plot read");
+                offset += count as u64;
+                remaining = &mut remaining[count..];
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let mut file = File::open(&self.path)?;
+            file.seek(SeekFrom::Start(start as u64))?;
+            file.read_exact(&mut bytes)?;
+        }
         Ok(bytes)
     }
 }
@@ -106,5 +133,27 @@ mod tests {
         let source = FileSource::open(&path).unwrap();
         std::fs::write(&path, b"after").unwrap();
         assert!(source.read(0, 256).is_err());
+    }
+
+    #[test]
+    fn parallel_positional_reads_share_one_open_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interleaved.bin");
+        let bytes: Vec<u8> = (0..8192).map(|index| (index % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let source = FileSource::open(&path).unwrap();
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let source = &source;
+                let bytes = &bytes;
+                scope.spawn(move || {
+                    for index in 0..128 {
+                        let start = (worker * 997 + index * 53) % (bytes.len() - 257);
+                        assert_eq!(source.read_validated_range(start, 257).unwrap(), bytes[start..start + 257]);
+                    }
+                });
+            }
+        });
+        source.validate().unwrap();
     }
 }

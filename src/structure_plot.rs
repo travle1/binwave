@@ -26,6 +26,14 @@ const PREVIEW_WINDOW_SIZE: Address = PREVIEW_LIMIT / PREVIEW_WINDOWS;
 const MAX_BUCKETS: Address = 4096;
 const MAX_TOTAL_NUMERIC_POINTS: Address = 100_000;
 const CACHE_ENTRIES: Address = 3;
+#[cfg(not(target_arch = "wasm32"))]
+const GROUP_TILE_SAMPLES: Address = 4096;
+#[cfg(not(target_arch = "wasm32"))]
+const GROUP_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const GROUP_SUMMARY_BYTES: usize = 1024 * 1024 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const GROUP_SUMMARY_SAMPLES: Address = 1024;
 
 #[derive(Clone, Debug)]
 pub struct PlotSample {
@@ -84,6 +92,9 @@ struct Request {
     key: Key,
     source: ByteView,
     node: Node,
+    numeric_plan: Option<NumericPlan>,
+    #[cfg(not(target_arch = "wasm32"))]
+    group_tiles: Option<Arc<Mutex<GroupTileCache>>>,
     partial_updates: bool,
 }
 #[cfg(not(target_arch = "wasm32"))]
@@ -103,6 +114,94 @@ struct Running {
     finished: Arc<AtomicBool>,
 }
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, PartialEq, Eq)]
+struct GroupSignature {
+    revision: u64,
+    definition: u64,
+    path: String,
+    fields: Vec<String>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+struct GroupTile {
+    start: Address,
+    end: Address,
+    values: Vec<Vec<f64>>,
+    summary: Arc<GroupTileSummary>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+struct GroupTileSummary {
+    start: Address,
+    end: Address,
+    bins: Vec<(Range<Address>, Vec<Option<NumericBucket>>)>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl GroupTileSummary {
+    fn bytes(&self) -> usize {
+        self.bins.len().saturating_mul(self.bins.first().map_or(0, |(_, fields)| fields.len()))
+            .saturating_mul(std::mem::size_of::<NumericBucket>())
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl GroupTile {
+    fn bytes(&self) -> usize {
+        (self.end - self.start).saturating_mul(self.values.len()).saturating_mul(std::mem::size_of::<f64>())
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct GroupTileCache {
+    signature: Option<GroupSignature>,
+    tiles: VecDeque<(Address, Arc<GroupTile>)>,
+    bytes: usize,
+    summaries: VecDeque<(Address, Arc<GroupTileSummary>)>,
+    summary_bytes: usize,
+    #[cfg(test)]
+    loads: usize,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl GroupTileCache {
+    fn prepare(&mut self, signature: &GroupSignature) {
+        if self.signature.as_ref() != Some(signature) {
+            self.signature = Some(signature.clone());
+            self.tiles.clear();
+            self.bytes = 0;
+            self.summaries.clear();
+            self.summary_bytes = 0;
+        }
+    }
+    fn get(&mut self, start: Address) -> Option<Arc<GroupTile>> {
+        let index = self.tiles.iter().position(|(key, _)| *key == start)?;
+        let entry = self.tiles.remove(index)?;
+        let tile = entry.1.clone();
+        self.tiles.push_front(entry);
+        Some(tile)
+    }
+    fn insert(&mut self, tile: Arc<GroupTile>) {
+        if self.tiles.iter().any(|(start, _)| *start == tile.start) { return; }
+        self.bytes = self.bytes.saturating_add(tile.bytes());
+        #[cfg(test)] { self.loads += 1; }
+        self.tiles.push_front((tile.start, tile));
+        let summary = self.tiles.front().unwrap().1.summary.clone();
+        if !self.summaries.iter().any(|(start, _)| *start == summary.start) {
+            self.summary_bytes += summary.bytes();
+            self.summaries.push_front((summary.start, summary));
+        }
+        while self.bytes > GROUP_BUFFER_BYTES && self.tiles.len() > 1 {
+            if let Some((_, old)) = self.tiles.pop_back() { self.bytes -= old.bytes(); }
+        }
+        while self.summary_bytes > GROUP_SUMMARY_BYTES && self.summaries.len() > 1 {
+            if let Some((_, old)) = self.summaries.pop_back() { self.summary_bytes -= old.bytes(); }
+        }
+    }
+    fn summary(&mut self, start: Address) -> Option<Arc<GroupTileSummary>> {
+        let index = self.summaries.iter().position(|(key, _)| *key == start)?;
+        let entry = self.summaries.remove(index)?;
+        let summary = entry.1.clone();
+        self.summaries.push_front(entry);
+        Some(summary)
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 pub struct PlotReader {
     desired: Option<Request>,
@@ -110,6 +209,7 @@ pub struct PlotReader {
     data: Option<Arc<PlotData>>,
     error: Option<String>,
     cache: VecDeque<Cached>,
+    group_tiles: Arc<Mutex<GroupTileCache>>,
     data_generation: u64,
 }
 #[cfg(not(target_arch = "wasm32"))]
@@ -146,7 +246,7 @@ impl PlotReader {
         refine: bool,
         fields: Option<Vec<String>>,
     ) {
-        self.request_with_updates(ctx, source, node, range, pixel_width, refine, fields, true);
+        self.request_with_updates(ctx, source, node, range, pixel_width, refine, fields, None, true);
     }
 
     pub fn request_background(
@@ -158,7 +258,57 @@ impl PlotReader {
         pixel_width: Address,
         refine: bool,
     ) {
-        self.request_with_updates(ctx, source, node, range, pixel_width, refine, None, false);
+        self.request_with_updates(ctx, source, node, range, pixel_width, refine, None, None, false);
+    }
+
+    pub fn request_group(
+        &mut self, ctx: &egui::Context, source: ByteView, node: Node,
+        plan: NumericPlan, range: Range<Address>, pixel_width: Address, refine: bool,
+    ) {
+        let fields = Some(plan.fields.iter().map(|field| field.name.clone()).collect());
+        let partial_updates = range.len() > AUTO_SCAN_LIMIT;
+        self.request_with_updates(ctx, source, node, range, pixel_width, refine, fields, Some(plan), partial_updates);
+    }
+
+    pub fn matches_group_request(&self, revision: u64, node: &Node, plan: &NumericPlan,
+        range: Range<Address>, pixel_width: Address, refine: bool) -> bool {
+        let count = node.lazy.as_ref().map_or(node.children.len(), |array| array.count);
+        let start = range.start.min(count);
+        let range = start..range.end.max(start).min(count);
+        self.desired.as_ref().is_some_and(|request| {
+            let key = &request.key;
+            key.revision == revision && key.definition == identity(node)
+                && key.path == node.path && key.range == range
+                && key.buckets == display_buckets(pixel_width)
+                && key.exact_limit == exact_limit(pixel_width)
+                && key.refine == refine
+                && key.fields.as_ref().is_some_and(|fields| fields.len() == plan.fields.len()
+                    && fields.iter().zip(&plan.fields).all(|(name, field)| name == &field.name))
+        })
+    }
+
+    pub fn matches_background_request(
+        &self,
+        revision: u64,
+        node: &Node,
+        range: Range<Address>,
+        pixel_width: Address,
+        refine: bool,
+    ) -> bool {
+        let count = node.lazy.as_ref().map_or(node.children.len(), |array| array.count);
+        let start = range.start.min(count);
+        let range = start..range.end.max(start).min(count);
+        self.desired.as_ref().is_some_and(|request| {
+            let key = &request.key;
+            key.revision == revision
+                && key.definition == identity(node)
+                && key.path == node.path
+                && key.range == range
+                && key.buckets == display_buckets(pixel_width)
+                && key.exact_limit == exact_limit(pixel_width)
+                && key.refine == refine
+                && key.fields.is_none()
+        })
     }
 
     fn request_with_updates(
@@ -170,6 +320,7 @@ impl PlotReader {
         pixel_width: Address,
         refine: bool,
         fields: Option<Vec<String>>,
+        numeric_plan: Option<NumericPlan>,
         partial_updates: bool,
     ) {
         let count = node
@@ -224,7 +375,8 @@ impl PlotReader {
                 }
             }
         }
-        self.desired = Some(Request { key, source, node, partial_updates });
+        let group_tiles = numeric_plan.as_ref().map(|_| self.group_tiles.clone());
+        self.desired = Some(Request { key, source, node, numeric_plan, group_tiles, partial_updates });
         self.tick(ctx);
     }
     pub fn tick(&mut self, ctx: &egui::Context) {
@@ -279,6 +431,15 @@ impl PlotReader {
                 });
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
+                    let started = Instant::now();
+                    let report = request.key.range.len() > AUTO_SCAN_LIMIT;
+                    if report {
+                        log::info!("Plot load started: {} samples {}..{}, {} fields, path {}",
+                            request.key.range.len(), request.key.range.start, request.key.range.end,
+                            request.numeric_plan.as_ref().map_or_else(
+                                || request.key.fields.as_ref().map_or(0, Vec::len),
+                                |plan| plan.fields.len()), request.key.path);
+                    }
                     let publish = |data| {
                         *latest.lock().unwrap() = Some(Outcome {
                             key: request.key.clone(),
@@ -286,14 +447,32 @@ impl PlotReader {
                         });
                     };
                     let result = read_plot(&request, &cancel, publish);
+                    if report {
+                        match &result {
+                            Ok(data) => log::info!("Plot load finished: {} in {:.1}s, {:?}, {} of {} samples read",
+                                request.key.path, started.elapsed().as_secs_f32(), data.quality,
+                                data.scanned, data.total),
+                            Err(error) if cancel.load(Ordering::Relaxed) => log::info!(
+                                "Plot load cancelled: {} after {:.1}s ({error})",
+                                request.key.path, started.elapsed().as_secs_f32()),
+                            Err(error) => log::error!("Plot load failed: {} after {:.1}s: {error}",
+                                request.key.path, started.elapsed().as_secs_f32()),
+                        }
+                    }
+                    let succeeded = result.is_ok();
                     if !cancel.load(Ordering::Relaxed) {
                         *latest.lock().unwrap() = Some(Outcome {
-                            key: request.key,
+                            key: request.key.clone(),
                             result: result.map_err(|error| format!("{error:#}")),
                         });
                     }
                     finished.store(true, Ordering::Release);
                     ctx.request_repaint();
+                    if succeeded && !cancel.load(Ordering::Relaxed) {
+                        if let (Some(plan), Some(tiles)) = (&request.numeric_plan, &request.group_tiles) {
+                            prefetch_group_neighbors(&request, plan, tiles, &cancel);
+                        }
+                    }
                 });
             }
         }
@@ -310,6 +489,7 @@ impl PlotReader {
         self.data_generation = self.data_generation.wrapping_add(1);
         self.error = None;
         self.cache.clear();
+        *self.group_tiles.lock().unwrap() = GroupTileCache::default();
     }
     pub fn stop(&mut self) {
         if let Some(running) = &self.running {
@@ -322,6 +502,11 @@ impl PlotReader {
     }
     pub fn data_generation(&self) -> u64 {
         self.data_generation
+    }
+    #[cfg(test)]
+    pub(crate) fn group_buffer_stats(&self) -> (usize, usize) {
+        let cache = self.group_tiles.lock().unwrap();
+        (cache.tiles.len(), cache.loads)
     }
     #[cfg(test)]
     pub(crate) fn requested_fields(&self) -> Option<&[String]> {
@@ -594,11 +779,20 @@ fn read_plot(
     } else {
         PlotQuality::SampledPreview
     };
-    if let Some(mut plan) = request
+    #[cfg(not(target_arch = "wasm32"))]
+    if let (Some(plan), Some(tiles)) = (&request.numeric_plan, &request.group_tiles) {
+        // An overview is deliberately sampled. Building complete group tiles
+        // here turns every selected collection into a full-file scan.
+        if quality == PlotQuality::SampledPreview {
+            return read_numeric(request, plan.clone(), quality, cancel, publish);
+        }
+        return read_group_buffered(request, plan.clone(), quality, tiles, cancel, publish);
+    }
+    if let Some(mut plan) = request.numeric_plan.clone().or_else(|| request
         .node
         .lazy
         .as_ref()
-        .and_then(|array| array.numeric_plan())
+        .and_then(|array| array.numeric_plan()))
         .filter(|plan| plan.stride > 0 && plan.stride <= READ_LIMIT)
     {
         if let Some(selected) = &request.key.fields {
@@ -721,31 +915,32 @@ impl NumericReduction {
         }
     }
     fn record(&mut self, record: &[u8], index: Address) -> Result<()> {
-        let bucket = ((index - self.range.start) as u128 * self.buckets as u128
-            / (self.range.end - self.range.start).max(1) as u128) as Address;
-        for (field_index, field) in self.plan.fields.iter().enumerate() {
-            let value = field.decode(record)?;
-            if !value.is_finite() {
-                continue;
-            }
-            let point = NumericPoint { index, value };
-            if self.quality != PlotQuality::Exact {
-                match &mut self.reduced[field_index][bucket.min(self.buckets - 1) as usize] {
-                    Some(bucket) => bucket.push(point),
-                    slot => {
-                        *slot = Some(NumericBucket {
-                            first: point,
-                            min: point,
-                            max: point,
-                            last: point,
-                        })
-                    }
-                }
-            } else {
-                self.exact[field_index].push(point);
-            }
+        for field_index in 0..self.plan.fields.len() {
+            let value = self.plan.fields[field_index].decode(record)?;
+            self.record_value(field_index, value, index);
         }
         Ok(())
+    }
+    fn record_value(&mut self, field_index: usize, value: f64, index: Address) {
+        if !value.is_finite() { return; }
+        let bucket = ((index - self.range.start) as u128 * self.buckets as u128
+            / (self.range.end - self.range.start).max(1) as u128) as Address;
+        let point = NumericPoint { index, value };
+        if self.quality != PlotQuality::Exact {
+            match &mut self.reduced[field_index][bucket.min(self.buckets - 1) as usize] {
+                Some(bucket) => bucket.push(point),
+                slot => {
+                    *slot = Some(NumericBucket {
+                        first: point,
+                        min: point,
+                        max: point,
+                        last: point,
+                    })
+                }
+            }
+        } else {
+            self.exact[field_index].push(point);
+        }
     }
     fn data(&self, scanned: Address, complete: bool) -> PlotData {
         let mut series: BTreeMap<String, Vec<PlotSample>> = BTreeMap::new();
@@ -757,7 +952,7 @@ impl NumericReduction {
                     index: point.index,
                     value: point.value,
                     bytes: start..start + field.span,
-                    path: format!("{}[{}]{}", self.plan.path, point.index, field.suffix),
+                    path: format!("{}[{}]{}", field.source_path.as_deref().unwrap_or(&self.plan.path), point.index, field.suffix),
                 }
             };
             let points = if self.quality != PlotQuality::Exact {
@@ -807,6 +1002,202 @@ impl NumericReduction {
         }
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
+fn group_tile_size(plan: &NumericPlan) -> Address {
+    let stride = plan.physical_stride().max(1);
+    GROUP_TILE_SAMPLES.min(((READ_LIMIT.saturating_sub(plan.stride)) / stride).saturating_add(1).max(1))
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn group_signature(request: &Request) -> GroupSignature {
+    GroupSignature {
+        revision: request.key.revision,
+        definition: request.key.definition,
+        path: request.key.path.clone(),
+        fields: request.key.fields.clone().unwrap_or_default(),
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn load_group_tile(request: &Request, plan: &NumericPlan, start: Address, size: Address,
+    cancel: &AtomicBool) -> Result<GroupTile> {
+    let count = request.node.lazy.as_ref().map_or(0, |array| array.count);
+    let end = start.saturating_add(size).min(count);
+    let mut chunks = Vec::new();
+    let mut index = start;
+    while index < end {
+        ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
+        let next = index.saturating_add(plan.contiguous_count(index)).min(end);
+        let offset = plan.offset(index).ok_or_else(|| anyhow::anyhow!("plot offset overflow"))?;
+        let length = (next - index - 1).checked_mul(plan.physical_stride())
+            .and_then(|bytes| bytes.checked_add(plan.stride))
+            .ok_or_else(|| anyhow::anyhow!("plot length overflow"))?;
+        let bytes = request.source.read_validated(offset, length)?;
+        chunks.push((index, next, bytes));
+        index = next;
+    }
+    let decode_field = |field: &crate::structure::NumericField| -> Result<Vec<f64>> {
+        let mut values = Vec::with_capacity(end - start);
+        for (first_index, last_index, bytes) in &chunks {
+            for sample in *first_index..*last_index {
+                if (sample - *first_index) % 256 == 0 {
+                    ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
+                }
+                let offset = (sample - *first_index) * plan.physical_stride();
+                values.push(field.decode(&bytes[offset..offset + plan.stride])?);
+            }
+        }
+        Ok(values)
+    };
+    let values: Vec<Vec<f64>> = if plan.fields.len() > 8 && end - start >= 1024 {
+        use rayon::prelude::*;
+        plan.fields.par_iter().map(decode_field).collect::<Result<Vec<_>>>()?
+    } else {
+        plan.fields.iter().map(decode_field).collect::<Result<Vec<_>>>()?
+    };
+    let mut bins = Vec::new();
+    for bin_start in (start..end).step_by(GROUP_SUMMARY_SAMPLES) {
+        let bin_end = bin_start.saturating_add(GROUP_SUMMARY_SAMPLES).min(end);
+        let mut fields = Vec::with_capacity(values.len());
+        for field_values in &values {
+            let mut summary: Option<NumericBucket> = None;
+            for index in bin_start..bin_end {
+                let value = field_values[index - start];
+                if !value.is_finite() { continue; }
+                let point = NumericPoint { index, value };
+                match &mut summary {
+                    Some(bucket) => bucket.push(point),
+                    slot => *slot = Some(NumericBucket { first: point, min: point, max: point, last: point }),
+                }
+            }
+            fields.push(summary);
+        }
+        bins.push((bin_start..bin_end, fields));
+    }
+    let summary = Arc::new(GroupTileSummary { start, end, bins });
+    Ok(GroupTile { start, end, values, summary })
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn cached_group_tile(request: &Request, plan: &NumericPlan,
+    cache: &Arc<Mutex<GroupTileCache>>, signature: &GroupSignature,
+    start: Address, cancel: &AtomicBool) -> Result<Arc<GroupTile>> {
+    {
+        let mut cache = cache.lock().unwrap();
+        cache.prepare(signature);
+        if let Some(tile) = cache.get(start) { return Ok(tile); }
+    }
+    let tile = Arc::new(load_group_tile(request, plan, start, group_tile_size(plan), cancel)?);
+    if !cancel.load(Ordering::Relaxed) {
+        let mut cache = cache.lock().unwrap();
+        if cache.signature.as_ref() == Some(signature) { cache.insert(tile.clone()); }
+    }
+    Ok(tile)
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn cached_group_summary(request: &Request, plan: &NumericPlan,
+    cache: &Arc<Mutex<GroupTileCache>>, signature: &GroupSignature,
+    start: Address, cancel: &AtomicBool) -> Result<Arc<GroupTileSummary>> {
+    {
+        let mut cache = cache.lock().unwrap();
+        cache.prepare(signature);
+        if let Some(summary) = cache.summary(start) { return Ok(summary); }
+    }
+    Ok(cached_group_tile(request, plan, cache, signature, start, cancel)?.summary.clone())
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn read_group_buffered(request: &Request, plan: NumericPlan, quality: PlotQuality,
+    cache: &Arc<Mutex<GroupTileCache>>, cancel: &AtomicBool,
+    mut publish: impl FnMut(PlotData)) -> Result<PlotData> {
+    let field_count = plan.fields.len().max(1);
+    let quality = if quality == PlotQuality::Exact
+        && request.key.range.len().saturating_mul(field_count) > MAX_TOTAL_NUMERIC_POINTS {
+        PlotQuality::MinMax
+    } else { quality };
+    let buckets = reduction_buckets(quality, request.key.buckets)
+        .min((MAX_TOTAL_NUMERIC_POINTS / field_count).max(1));
+    let mut reduction = NumericReduction::new(plan.clone(), request.key.range.clone(), quality, buckets);
+    let tile_size = group_tile_size(&plan);
+    let mut index = request.key.range.start;
+    let mut scanned = 0;
+    let mut last_publish = Instant::now();
+    let mut last_progress = Instant::now();
+    let mut published = false;
+    let signature = group_signature(request);
+    while index < request.key.range.end {
+        ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
+        let tile_start = index / tile_size * tile_size;
+        let summary = cached_group_summary(request, &plan, cache, &signature, tile_start, cancel)?;
+        let end = summary.end.min(request.key.range.end);
+        let mut raw: Option<Arc<GroupTile>> = None;
+        for (bin_range, fields) in &summary.bins {
+            let first = bin_range.start.max(index);
+            let last = bin_range.end.min(end);
+            if first >= last { continue; }
+            let first_bucket = ((first - request.key.range.start) as u128 * buckets as u128
+                / request.key.range.len().max(1) as u128) as Address;
+            let last_bucket = ((last - 1 - request.key.range.start) as u128 * buckets as u128
+                / request.key.range.len().max(1) as u128) as Address;
+            if quality != PlotQuality::Exact && first == bin_range.start
+                && last == bin_range.end && first_bucket == last_bucket {
+                for (field_index, bucket) in fields.iter().enumerate() {
+                    if let Some(bucket) = bucket {
+                        let mut points = [bucket.first, bucket.min, bucket.max, bucket.last];
+                        points.sort_unstable_by_key(|point| point.index);
+                        let mut previous = None;
+                        for point in points {
+                            if previous == Some(point.index) { continue; }
+                            previous = Some(point.index);
+                            reduction.record_value(field_index, point.value, point.index);
+                        }
+                    }
+                }
+            } else {
+                if raw.is_none() { raw = Some(cached_group_tile(request, &plan, cache, &signature, tile_start, cancel)?); }
+                let tile = raw.as_ref().unwrap();
+                for sample in first..last {
+                    let position = sample - tile.start;
+                    for field_index in 0..tile.values.len() {
+                        reduction.record_value(field_index, tile.values[field_index][position], sample);
+                    }
+                }
+            }
+            scanned += last - first;
+        }
+        index = end;
+        if last_progress.elapsed() >= Duration::from_secs(5) {
+            log::info!("Plot load progress: {} — {} of {} samples scanned",
+                request.key.path, scanned, request.key.range.len());
+            last_progress = Instant::now();
+        }
+        if request.partial_updates && (!published || last_publish.elapsed() >= Duration::from_secs(1)) {
+            request.source.validate()?;
+            publish(reduction.data(scanned, false));
+            last_publish = Instant::now();
+            published = true;
+        }
+    }
+    request.source.validate()?;
+    ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
+    Ok(reduction.data(scanned, true))
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn prefetch_group_neighbors(request: &Request, plan: &NumericPlan,
+    cache: &Arc<Mutex<GroupTileCache>>, cancel: &AtomicBool) {
+    if request.key.range.len() > AUTO_SCAN_LIMIT { return; }
+    let size = group_tile_size(plan);
+    let count = request.node.lazy.as_ref().map_or(0, |array| array.count);
+    let tiles = (request.key.range.len().div_ceil(size)).clamp(1, 8);
+    let signature = group_signature(request);
+    let before = request.key.range.start / size;
+    let after = request.key.range.end.div_ceil(size);
+    for step in 0..tiles {
+        if cancel.load(Ordering::Relaxed) { break; }
+        if let Some(start) = before.checked_sub(step + 1).and_then(|tile| tile.checked_mul(size)) {
+            let _ = cached_group_tile(request, plan, cache, &signature, start, cancel);
+        }
+        if let Some(start) = after.checked_add(step).and_then(|tile| tile.checked_mul(size)) {
+            if start < count { let _ = cached_group_tile(request, plan, cache, &signature, start, cancel); }
+        }
+    }
+}
 fn read_numeric(
     request: &Request,
     plan: NumericPlan,
@@ -836,6 +1227,7 @@ fn read_numeric(
     );
     let mut scanned = 0;
     let mut last_publish = Instant::now();
+    let mut last_progress = Instant::now();
     let range = request.key.range.clone();
     let stride = reduction.plan.stride;
     let physical_stride = reduction.plan.physical_stride();
@@ -862,7 +1254,7 @@ fn read_numeric(
                 .checked_mul(physical_stride)
                 .and_then(|length| length.checked_add(stride))
                 .ok_or_else(|| anyhow::anyhow!("plot length overflow"))?;
-            let bytes = request.source.read(start, length)?;
+            let bytes = request.source.read_validated(start, length)?;
             ensure!(
                 bytes.len() as Address == length,
                 "source ended during plot read"
@@ -881,6 +1273,11 @@ fn read_numeric(
                 request.source.validate()?;
                 publish(reduction.data(scanned, false));
                 last_publish = Instant::now();
+            }
+            if last_progress.elapsed() >= Duration::from_secs(5) {
+                log::info!("Plot load progress: {} — {} of {} samples scanned",
+                    request.key.path, scanned, request.key.range.end - request.key.range.start);
+                last_progress = Instant::now();
             }
             index = span.end;
         }
@@ -917,6 +1314,9 @@ pub(crate) fn read_for_viewport(
         },
         source,
         node,
+        numeric_plan: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        group_tiles: None,
         partial_updates: true,
     };
     read_plot(&request, &AtomicBool::new(false), |_| {})
@@ -1041,6 +1441,8 @@ actions:
             },
             source,
             node,
+            numeric_plan: None,
+            group_tiles: None,
             partial_updates: true,
         }
     }
@@ -1527,6 +1929,18 @@ actions:
             data.series["value"].last().unwrap().bytes,
             4_190_208..4_190_212
         );
+    }
+    #[test]
+    fn grouped_overview_uses_bounded_preview_instead_of_scanning_every_record() {
+        let (store, node) = fixture(100_000, 50_000);
+        let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
+        let mut query = request(store.view(), node, 0..100_000, false);
+        query.numeric_plan = Some(plan);
+        query.group_tiles = Some(Arc::new(Mutex::new(GroupTileCache::default())));
+        let data = read_plot(&query, &AtomicBool::new(false), |_| {}).unwrap();
+        assert_eq!(data.quality, PlotQuality::SampledPreview);
+        assert!(data.scanned <= PREVIEW_LIMIT);
+        assert_eq!(data.total, 100_000);
     }
     #[test]
     fn explicit_refinement_scans_every_sample_and_finds_unsampled_spikes() {

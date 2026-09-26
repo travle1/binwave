@@ -4,18 +4,21 @@ use crate::egui_compat::ContextRun as _;
 use crate::structure_selection::{covering, sample_indices_for_bytes, sample_bytes};
 use crate::byte_store::ByteView;
 use crate::hex_editor::HexHighlight;
-use crate::plot_trace::decoded_channel;
-use crate::structure::{LazyArray, Node, ParseOutput, Value};
+use crate::plot_trace::{decoded_channel_borrowed, TraceMeshCache};
+use crate::plot_raster::PlotRaster;
+use crate::plot_gpu::GpuPlot;
+use crate::structure::{LazyArray, Node, NumericPlan, ParseOutput, Value};
 use crate::structure_plot::{PlotData, PlotQuality, PlotReader};
 use egui::{Color32, Ui};
 use egui_plot::{Plot, PlotBounds, PlotPoint, PlotTransform, Points};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, OnceLock,
 };
+use std::time::{Duration, Instant};
 
 const PAGE_SIZE: usize = 128;
 const INITIAL_PLOT_SAMPLES: usize = 1024;
@@ -23,10 +26,20 @@ const MAX_HIGHLIGHTS: usize = 256;
 fn plot_worker_count() -> usize {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     *WORKERS.get_or_init(|| {
-        std::thread::available_parallelism()
+        let workers = std::thread::available_parallelism()
             .map(|count| count.get().saturating_sub(2).max(1))
-            .unwrap_or(4)
+            .unwrap_or(4);
+        log::info!("Plot worker limit: {workers}");
+        workers
     })
+}
+
+fn log_slow_plot_phase(clock: &mut Instant, phase: &str) {
+    let elapsed = clock.elapsed();
+    if elapsed >= Duration::from_millis(200) {
+        log::warn!("Slow plot UI phase: {phase} took {:.2}s", elapsed.as_secs_f64());
+    }
+    *clock = Instant::now();
 }
 
 
@@ -113,8 +126,17 @@ pub struct StructureViews {
     plot_target: String,
     plot_sources: std::collections::BTreeSet<String>,
     plot_sources_initialized: bool,
+    plot_collections_open: bool,
+    plot_collection_filter: String,
     extra_plot_readers: std::collections::BTreeMap<String, PlotReader>,
+    group_plot_readers: BTreeMap<String, PlotReader>,
+    group_plan_cache: Option<(u64, Arc<BTreeMap<String, (Node, NumericPlan, Vec<String>)>>)>,
     plot_overlay: Option<(u64, PlotData)>,
+    plot_overlay_generations: BTreeMap<String, u64>,
+    plot_overlay_points: BTreeMap<String, Vec<PlotPoint>>,
+    plot_mesh_cache: Arc<TraceMeshCache>,
+    plot_raster: PlotRaster,
+    plot_gpu: GpuPlot,
     #[cfg(test)]
     plot_overlay_builds: usize,
     plot_view: Option<Range<usize>>,
@@ -122,6 +144,8 @@ pub struct StructureViews {
     plot_force_view: Option<Range<usize>>,
     plot_fit_y: bool,
     plot_free_y: bool,
+    plot_dot_radius: Option<f32>,
+    plot_range_fill_percent: Option<u32>,
     plot_range_zoom: Option<RangeZoom>,
     plot_zoom_y: Option<(f64, f64)>,
     plot_follow_selection: bool,
@@ -149,9 +173,16 @@ impl StructureViews {
     pub fn invalidate(&mut self) {
         self.plot_reader.invalidate();
         self.plot_overlay = None;
+        self.plot_overlay_generations.clear();
+        self.plot_overlay_points.clear();
+        self.plot_mesh_cache.clear();
+        self.plot_raster.invalidate();
+        self.plot_gpu.invalidate();
         self.plot_catalog_target.clear();
         self.plot_catalog.clear();
         for reader in self.extra_plot_readers.values_mut() { reader.invalidate(); }
+        for reader in self.group_plot_readers.values_mut() { reader.invalidate(); }
+        self.group_plan_cache = None;
         self.plot_action = None;
         self.plot_range_zoom = None;
         self.plot_zoom_y = None;
@@ -434,13 +465,9 @@ impl StructureViews {
                 self.table_target = preferred.clone();
                 self.target_initialized = true;
             }
-            self.plot_sources.clear();
-            self.plot_sources.insert(preferred.clone());
-            self.plot_sources_initialized = true;
-            self.plot_target = preferred;
-            self.plot_reader.invalidate();
-            self.extra_plot_readers.clear();
-            self.plot_view = None;
+            if self.plot_target.is_empty() && self.plot_sources.is_empty() {
+                self.plot_target = preferred;
+            }
         }
     }
     fn start_nested_discovery(&mut self, output: &ParseOutput, source: ByteView, ctx: &egui::Context) {
@@ -457,6 +484,8 @@ impl StructureViews {
         let revision = output.revision;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            let started = Instant::now();
+            log::info!("Nested collection discovery started: {}", parent.path);
             let result = (|| -> anyhow::Result<Vec<Node>> {
                 let array = parent.lazy.as_ref().unwrap();
                 let first = array.page(&source, &AtomicBool::new(false), 0, 1)?;
@@ -466,6 +495,12 @@ impl StructureViews {
                 }
                 Ok(found)
             })().map_err(|error| format!("{}: {error:#}", parent.path));
+            match &result {
+                Ok(found) => log::info!("Nested collection discovery finished: {} yielded {} collections in {:.2}s",
+                    parent.path, found.len(), started.elapsed().as_secs_f64()),
+                Err(error) => log::warn!("Nested collection discovery failed: {} after {:.2}s: {error}",
+                    parent.path, started.elapsed().as_secs_f64()),
+            }
             let _ = tx.send((revision, result));
             ctx.request_repaint();
         });
@@ -1177,6 +1212,8 @@ impl StructureViews {
                     self.plot_fit_y = true;
                     self.plot_reader.invalidate();
                     self.extra_plot_readers.clear();
+                    self.group_plot_readers.clear();
+                    self.group_plan_cache = None;
                 }
             }
             self.table_anchor = None;
@@ -1301,6 +1338,7 @@ impl StructureViews {
         output: &ParseOutput,
         source: ByteView,
     ) -> Option<Range<usize>> {
+        let mut phase_clock = Instant::now();
         self.tick(ui.ctx(), source.clone());
         self.discover_flattened_collections(output);
         if self.stale(output) {
@@ -1317,10 +1355,15 @@ impl StructureViews {
         let mut collections = Vec::new();
         collect_collections(&output.nodes, &mut collections);
         collections.extend(self.flattened_collections.iter());
-        self.plot_sources.retain(|path| collections.iter().any(|node| &node.path == path));
+        let collection_by_path: HashMap<&str, &Node> = collections.iter()
+            .map(|node| (node.path.as_str(), *node)).collect();
         if !self.plot_sources_initialized {
             self.plot_sources_initialized = true;
-            let eligible: Vec<_> = collections.iter().filter(|n| collection_score(n, output).0).collect();
+            // Nested virtual collections arrive in batches. Never let a batch's
+            // first item become an implicit plot selection.
+            let eligible: Vec<_> = collections.iter().filter(|n|
+                !self.flattened_collections.iter().any(|flat| flat.path == n.path)
+                    && collection_score(n, output).0).collect();
             if eligible.len() > 8 {
                 if let Some(best) = eligible.into_iter().max_by_key(|n| collection_score(n, output)) {
                     self.plot_sources.insert(best.path.clone());
@@ -1330,7 +1373,25 @@ impl StructureViews {
             }
         }
         let mut changed = false;
-        if self.plot_sources.is_empty() {
+        if self.plot_collections_open {
+            let mut open = self.plot_collections_open;
+            let ctx = ui.ctx().clone();
+            egui::Window::new("Plot collections")
+                .id(egui::Id::new("plot_collections_window"))
+                .open(&mut open)
+                .default_size([420.0, 560.0])
+                .resizable(true)
+                .show(&ctx, |ui| {
+                    changed |= plot_collection_choices(ui, &collections, &mut self.plot_sources,
+                        &mut self.plot_collection_filter);
+                });
+            self.plot_collections_open = open;
+        }
+        if changed {
+            self.plot_sources.retain(|path| collection_by_path.contains_key(path.as_str()));
+            self.plot_fit_y = true;
+        }
+        if !self.plot_sources.iter().any(|path| collection_by_path.contains_key(path.as_str())) {
             if collections.is_empty() {
                 crate::decoder_ui::empty_state(
                     ui,
@@ -1340,14 +1401,18 @@ impl StructureViews {
                 return None;
             }
             self.extra_plot_readers.clear();
-            egui::containers::menu::MenuButton::new("Series")
-                .config(egui::containers::menu::MenuConfig::new()
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
-                .ui(ui, |ui| {plot_collection_choices(ui,&collections,&mut self.plot_sources);});
-            ui.label("Choose a collection in Series. Toggle individual fields in the legend.");
+            self.group_plot_readers.clear();
+            self.group_plan_cache = None;
+            if ui.button("Collections…").clicked() { self.plot_collections_open = true; }
+            ui.label(if self.discovery_rx.is_some() {
+                "Finding collections… Choose one to plot when it appears."
+            } else {
+                "Choose a collection to plot."
+            });
             return None;
         }
-        let primary = if self.plot_sources.contains(&self.plot_target) {
+        let primary = if self.plot_sources.contains(&self.plot_target)
+            && collection_by_path.contains_key(self.plot_target.as_str()) {
             self.plot_target.clone()
         } else {
             collections.iter().filter(|node| self.plot_sources.contains(&node.path))
@@ -1359,7 +1424,6 @@ impl StructureViews {
             changed = true;
         }
         if changed { self.plot_fit_y = true; }
-        self.extra_plot_readers.retain(|path, _| self.plot_sources.contains(path) && path != &self.plot_target);
         let Some(node) = self.collection_node(output, &self.plot_target).cloned() else {
             ui.label("No sample collection. Repeat a numeric field or structure in the definition to plot it.");
             return None;
@@ -1369,10 +1433,33 @@ impl StructureViews {
             ui.label("This collection contains no samples.");
             return None;
         }
+        let mut group_hash = std::collections::hash_map::DefaultHasher::new();
+        output.revision.hash(&mut group_hash);
+        self.plot_target.hash(&mut group_hash);
+        for path in &self.plot_sources { path.hash(&mut group_hash); }
+        let group_key = group_hash.finish();
+        if self.group_plan_cache.as_ref().map(|(key, _)| *key) != Some(group_key) {
+            self.group_plan_cache = Some((group_key, Arc::new(grouped_numeric_plans(
+                &self.plot_sources, &collection_by_path, &self.plot_target))));
+        }
+        let grouped_plans = self.group_plan_cache.as_ref().unwrap().1.clone();
+        log_slow_plot_phase(&mut phase_clock, "prepare collections and group plans");
+        let grouped_paths: HashSet<_> = grouped_plans.values().flat_map(|(_, _, paths)| paths.iter().cloned()).collect();
+        self.group_plot_readers.retain(|key, _| grouped_plans.contains_key(key));
+        self.extra_plot_readers.retain(|path, _| self.plot_sources.contains(path)
+            && path != &self.plot_target && !grouped_paths.contains(path));
         if self.plot_catalog_target != self.plot_target {
             self.plot_catalog_target = self.plot_target.clone();
             self.plot_catalog = node.lazy.as_ref().and_then(|array| array.numeric_plan())
                 .map_or_else(Vec::new, |plan| plan.fields.into_iter().map(|field| field.name).collect());
+            // Hidden names can outlive a decode or collection change. Never
+            // reopen a numeric collection with every field silently hidden.
+            if !self.plot_catalog.is_empty() && self.plot_catalog.iter().all(|name|
+                self.plot_hidden.contains(&format!("{} / {name}", self.plot_target))) {
+                for name in self.plot_catalog.iter().take(16) {
+                    self.plot_hidden.remove(&format!("{} / {name}", self.plot_target));
+                }
+            }
             if self.plot_catalog.len() > 32 {
                 let prefix = format!("{} / ", self.plot_target);
                 if !self.plot_hidden.iter().any(|name| name.starts_with(&prefix)) {
@@ -1397,10 +1484,15 @@ impl StructureViews {
             .plot_view
             .clone()
             .unwrap_or(0..count.min(INITIAL_PLOT_SAMPLES));
-        let ranges: Vec<_> = std::iter::once((&self.plot_target, &self.plot_reader)).chain(self.extra_plot_readers.iter())
+        let mut ranges: Vec<_> = std::iter::once((&self.plot_target, &self.plot_reader)).chain(self.extra_plot_readers.iter())
             .flat_map(|(path,reader)| reader.data().into_iter().flat_map(move |d| d.bounds.iter().map(move |(name,(min,max))| {
                 (format!("{path} / {name}"),*min,*max)
             }))).collect();
+        for reader in self.group_plot_readers.values() {
+            if let Some(data) = reader.data() {
+                ranges.extend(data.bounds.iter().map(|(name, (min, max))| (name.clone(), *min, *max)));
+            }
+        }
         let mut names: Vec<String> = self.plot_catalog.iter()
             .map(|name| format!("{} / {name}", self.plot_target)).collect();
         let mut known: HashSet<String> = names.iter().cloned().collect();
@@ -1440,8 +1532,21 @@ impl StructureViews {
                     if matching.is_empty() { ui.weak("No matching fields"); }
                     let mut tree = SeriesTree::default();
                     for name in matching {
-                        let field = name.rsplit_once(" / ").map_or(name.as_str(), |(_, field)| field);
-                        tree.insert(field, name);
+                        let (collection_path, field) = name.rsplit_once(" / ")
+                            .unwrap_or(("", name.as_str()));
+                        let label = if field == "value" {
+                            collection_by_path.get(collection_path).map(|node| {
+                                if let Some((_, index)) = sensor_group_key(node) {
+                                    let group = node.name.split_once('[').map_or(node.name.as_str(), |(group, _)| group);
+                                    format!("{group}.Item {index}")
+                                } else {
+                                    node.name.clone()
+                                }
+                            }).unwrap_or_else(|| field.to_owned())
+                        } else {
+                            field.to_owned()
+                        };
+                        tree.insert(&label, name);
                     }
                     egui::ScrollArea::vertical().id_salt("plot-visible-fields").max_height(220.).show(ui, |ui| {
                         if tree.show(ui, &mut self.plot_hidden, "", !filter.is_empty()) {
@@ -1450,9 +1555,9 @@ impl StructureViews {
                     });
                 }
                 ui.separator();
-                changed |= plot_collection_choices(ui,&collections,&mut self.plot_sources);
                 if self.presentation.menu(ui,&ranges) { self.plot_fit_y=true; }
             });
+            if ui.button("Collections…").clicked() { self.plot_collections_open = true; }
             if ui.button("Fit").on_hover_text("Show the full sample range and fit the visible fields").clicked() { force_view=Some(0..count); self.plot_fit_y=true; }
             ui.menu_button("Go to sample…", |ui| {
                 ui.label("Sample index (starts at 0)");
@@ -1467,6 +1572,24 @@ impl StructureViews {
             ui.menu_button("Plot options", |ui| {
             let mut lock_y=!self.plot_free_y;
             if ui.checkbox(&mut lock_y,"Lock vertical zoom").changed() {self.plot_free_y=!lock_y;}
+            let mut show_dots = self.plot_dot_radius.unwrap_or(2.5) > 0.0;
+            if ui.checkbox(&mut show_dots, "Show sample dots").changed() {
+                self.plot_dot_radius = Some(if show_dots { 2.5 } else { 0.0 });
+            }
+            if show_dots {
+                let mut radius = self.plot_dot_radius.unwrap_or(2.5);
+                if ui.add(egui::Slider::new(&mut radius, 0.5..=5.0).text("Dot radius")).changed() {
+                    self.plot_dot_radius = Some(radius);
+                }
+            }
+            let mut range_fill = self.plot_range_fill_percent.unwrap_or(20);
+            if ui.add(egui::Slider::new(&mut range_fill, 0..=100)
+                .text("Range highlight fill").suffix("%"))
+                .on_hover_text("0% hides the fill; the range edges remain visible")
+                .changed()
+            {
+                self.plot_range_fill_percent = Some(range_fill);
+            }
             if ui.button("Fit Y").clicked() {self.plot_fit_y=true;ui.close();}
             if ui.add_enabled(selected_samples.is_some(),egui::Button::new("Fit selection")).clicked() {
                 if let Some(samples)=&selected_samples {force_view=Some(padded_selection(samples,count));self.plot_fit_y=true;}
@@ -1539,31 +1662,76 @@ impl StructureViews {
         // width immediately. Reduction follows physical pixels, including DPI.
         let canvas_width = (ui.available_width() - self.plot_axis_width).max(1.);
         let pixel_width = (canvas_width * ui.ctx().pixels_per_point()).ceil() as usize;
+        if !names.is_empty() && visible_series == 0 {
+            ui.horizontal(|ui| {
+                ui.label("All plot series are hidden.");
+                if ui.button("Show all series").clicked() {
+                    for name in &names { self.plot_hidden.remove(name); }
+                    self.plot_fit_y = true;
+                    self.plot_paused = false;
+                }
+            });
+        }
         let selected_fields = (!self.plot_catalog.is_empty()).then(|| self.plot_catalog.iter()
             .filter(|name| !self.plot_hidden.contains(&format!("{} / {name}", self.plot_target)))
             .cloned().collect::<Vec<_>>());
         if selected_fields.as_ref().is_some_and(Vec::is_empty) {
             self.plot_reader.stop();
         } else if !self.plot_paused {
-            self.plot_reader.request_filtered(
-                ui.ctx(), source.clone(), node.clone(), requested.clone(),
-                pixel_width, self.plot_refine, selected_fields.clone(),
-            );
+            let buffered_plan = sensor_group_key(&node)
+                .and_then(|_| node.lazy.as_ref()?.numeric_plan())
+                .filter(|plan| selected_fields.as_ref().is_none_or(|selected|
+                    selected.len() == plan.fields.len()));
+            if let Some(plan) = buffered_plan {
+                if !self.plot_reader.matches_group_request(source.revision, &node, &plan,
+                    requested.clone(), pixel_width, self.plot_refine) {
+                    self.plot_reader.request_group(ui.ctx(), source.clone(), node.clone(), plan,
+                        requested.clone(), pixel_width, self.plot_refine);
+                }
+            } else {
+                self.plot_reader.request_filtered(
+                    ui.ctx(), source.clone(), node.clone(), requested.clone(),
+                    pixel_width, self.plot_refine, selected_fields.clone(),
+                );
+            }
         }
         self.plot_reader.tick(ui.ctx());
         let mut extra_loading = 0;
         let mut queued_collections = 0;
         let mut active_readers = usize::from(self.plot_reader.is_loading())
-            + self.extra_plot_readers.values().filter(|reader| reader.is_loading()).count();
+            + self.extra_plot_readers.values().filter(|reader| reader.is_loading()).count()
+            + self.group_plot_readers.values().filter(|reader| reader.is_loading()).count();
+        for (key, (group_node, plan, paths)) in grouped_plans.iter() {
+            let reader = self.group_plot_readers.entry(key.clone()).or_default();
+            let was_loading = reader.is_loading();
+            if !self.plot_paused && (was_loading || active_readers < plot_worker_count()) {
+                let count = collection_count(group_node);
+                let range = requested.start.min(count)..requested.end.min(count);
+                if !reader.matches_group_request(source.revision, group_node, plan,
+                    range.clone(), pixel_width, self.plot_refine) {
+                    reader.request_group(ui.ctx(), source.clone(), group_node.clone(), plan.clone(),
+                        range, pixel_width, self.plot_refine);
+                }
+            } else if !was_loading && !self.plot_paused {
+                queued_collections += paths.len();
+            }
+            reader.tick(ui.ctx());
+            if !was_loading && reader.is_loading() { active_readers += 1; }
+            if let Some(error) = reader.error() { ui.colored_label(Color32::LIGHT_RED, format!("{key}: {error}")); }
+            if reader.is_loading() { extra_loading += 1; }
+        }
         for path in &self.plot_sources {
             if path == &self.plot_target { continue; }
-            if let Some(extra) = self.collection_node(output, path).cloned() {
+            if grouped_paths.contains(path) { continue; }
+            if let Some(&extra) = collection_by_path.get(path.as_str()) {
                 let count = collection_count(&extra);
                 let reader = self.extra_plot_readers.entry(path.clone()).or_default();
                 let was_loading = reader.is_loading();
                 if !self.plot_paused && (was_loading || active_readers < plot_worker_count()) {
-                    reader.request_background(ui.ctx(), source.clone(), extra,
-                        requested.start.min(count)..requested.end.min(count), pixel_width, self.plot_refine);
+                    let range = requested.start.min(count)..requested.end.min(count);
+                    if !reader.matches_background_request(source.revision, extra, range.clone(), pixel_width, self.plot_refine) {
+                        reader.request_background(ui.ctx(), source.clone(), extra.clone(), range, pixel_width, self.plot_refine);
+                    }
                 } else if !was_loading && !self.plot_paused {
                     queued_collections += 1;
                 }
@@ -1573,6 +1741,7 @@ impl StructureViews {
                 if reader.is_loading() { extra_loading += 1; }
             }
         }
+        log_slow_plot_phase(&mut phase_clock, "schedule plot readers");
         ui.horizontal_wrapped(|ui| {
             ui.label(format!(
                 "Samples {}–{} of {}",
@@ -1617,6 +1786,7 @@ impl StructureViews {
                 && ui.button("Stop loading").clicked() {
                 self.plot_reader.stop();
                 for reader in self.extra_plot_readers.values_mut() { reader.stop(); }
+                for reader in self.group_plot_readers.values_mut() { reader.stop(); }
                 self.plot_paused = true;
                 self.plot_refine = false;
             }
@@ -1633,11 +1803,6 @@ impl StructureViews {
         self.plot_target.hash(&mut overlay_hash);
         requested.start.hash(&mut overlay_hash);
         requested.end.hash(&mut overlay_hash);
-        self.plot_reader.data_generation().hash(&mut overlay_hash);
-        for (path, reader) in &self.extra_plot_readers {
-            path.hash(&mut overlay_hash);
-            reader.data_generation().hash(&mut overlay_hash);
-        }
         for path in &self.plot_sources { path.hash(&mut overlay_hash); }
         let mut hidden_fields: Vec<_> = self.plot_hidden.iter().collect();
         hidden_fields.sort_unstable();
@@ -1649,51 +1814,93 @@ impl StructureViews {
         }
         let overlay_key = overlay_hash.finish();
         if self.plot_overlay.as_ref().map(|(key, _)| *key) != Some(overlay_key) {
-        #[cfg(test)]
-        { self.plot_overlay_builds += 1; }
-        let mut combined = self.plot_reader.data().map(|raw| PlotData {
-            range: raw.range.clone(),
-            series: raw.series.iter().filter_map(|(name, points)| {
-                let full = format!("{} / {name}", self.plot_target);
-                (!self.plot_hidden.contains(&full)).then(|| (full, points.clone()))
-            }).collect(),
-            envelopes: raw.envelopes.iter().filter_map(|(name, bands)| {
-                let full = format!("{} / {name}", self.plot_target);
-                (!self.plot_hidden.contains(&full)).then(|| (full, bands.clone()))
-            }).collect(),
-            bounds: BTreeMap::new(),
-            quality: raw.quality,
-            scanned: raw.scanned,
-            total: raw.total,
-            complete: raw.complete,
-        });
-        {
-            if let Some(data) = &mut combined {
-                for (path, reader) in &self.extra_plot_readers {
-                    if let Some(extra) = reader.data() {
-                        let Some(collection) = self.collection_node(output, path) else { continue; };
-                        let count = collection_count(collection);
-                        if extra.range != (requested.start.min(count)..requested.end.min(count)) { continue; }
-                        for (name, points) in &extra.series {
-                            let full = format!("{path} / {name}");
-                            if !self.plot_hidden.contains(&full) { data.series.insert(full, points.clone()); }
-                        }
-                        for (name, bands) in &extra.envelopes {
-                            let full = format!("{path} / {name}");
-                            if !self.plot_hidden.contains(&full) { data.envelopes.insert(full, bands.clone()); }
-                        }
-                        if extra.quality == PlotQuality::SampledPreview { data.quality = PlotQuality::SampledPreview; }
-                        data.complete &= extra.complete;
-                    }
+            self.plot_overlay = None;
+            self.plot_overlay_generations.clear();
+            self.plot_overlay_points.clear();
+            self.plot_mesh_cache.clear();
+            self.plot_raster.invalidate();
+            self.plot_gpu.invalidate();
+        }
+        if let Some(raw) = self.plot_reader.data() {
+            if self.plot_overlay.is_none() {
+                self.plot_overlay = Some((overlay_key, PlotData {
+                    range: raw.range.clone(),
+                    series: BTreeMap::new(),
+                    envelopes: BTreeMap::new(),
+                    bounds: BTreeMap::new(),
+                    quality: raw.quality,
+                    scanned: raw.scanned,
+                    total: raw.total,
+                    complete: raw.complete,
+                }));
+            }
+            let (_, combined) = self.plot_overlay.as_mut().unwrap();
+            let primary_generation = self.plot_reader.data_generation();
+            if self.plot_overlay_generations.get(&self.plot_target) != Some(&primary_generation) {
+                update_overlay_source(combined, &mut self.plot_overlay_points, &self.plot_target, Some(raw), &self.plot_hidden, &self.presentation);
+                self.plot_mesh_cache.clear();
+                self.plot_raster.invalidate();
+                self.plot_gpu.invalidate();
+                self.plot_overlay_generations.insert(self.plot_target.clone(), primary_generation);
+                #[cfg(test)] { self.plot_overlay_builds += 1; }
+            }
+            combined.range = raw.range.clone();
+            combined.scanned = raw.scanned;
+            combined.total = raw.total;
+            combined.quality = raw.quality;
+            combined.complete = raw.complete;
+            for (path, reader) in &self.extra_plot_readers {
+                let extra = reader.data().filter(|extra| {
+                    collection_by_path.get(path.as_str()).copied()
+                        .is_some_and(|collection| {
+                            let count = collection_count(collection);
+                            extra.range == (requested.start.min(count)..requested.end.min(count))
+                        })
+                });
+                let generation = reader.data_generation();
+                if self.plot_overlay_generations.get(path) != Some(&generation) {
+                    update_overlay_source(combined, &mut self.plot_overlay_points, path, extra, &self.plot_hidden, &self.presentation);
+                    self.plot_mesh_cache.clear();
+                    self.plot_raster.invalidate();
+                    self.plot_gpu.invalidate();
+                    self.plot_overlay_generations.insert(path.clone(), generation);
+                    #[cfg(test)] { self.plot_overlay_builds += 1; }
+                }
+                if let Some(extra) = extra {
+                    if extra.quality == PlotQuality::SampledPreview { combined.quality = PlotQuality::SampledPreview; }
+                    combined.complete &= extra.complete;
                 }
             }
+            for (key, (group_node, _, paths)) in grouped_plans.iter() {
+                let Some(reader) = self.group_plot_readers.get(key) else { continue; };
+                let count = collection_count(group_node);
+                let extra = reader.data().filter(|data| data.range ==
+                    (requested.start.min(count)..requested.end.min(count)));
+                let generation_key = format!("@group:{key}");
+                let generation = reader.data_generation();
+                if self.plot_overlay_generations.get(&generation_key) != Some(&generation) {
+                    update_group_overlay(combined, &mut self.plot_overlay_points, paths, extra,
+                        &self.plot_hidden, &self.presentation);
+                    self.plot_mesh_cache.clear();
+                    self.plot_raster.invalidate();
+                    self.plot_gpu.invalidate();
+                    self.plot_overlay_generations.insert(generation_key, generation);
+                    #[cfg(test)] { self.plot_overlay_builds += 1; }
+                }
+                if let Some(extra) = extra {
+                    if extra.quality == PlotQuality::SampledPreview { combined.quality = PlotQuality::SampledPreview; }
+                    combined.complete &= extra.complete;
+                }
+            }
+        } else {
+            self.plot_overlay = None;
+            self.plot_overlay_generations.clear();
+            self.plot_overlay_points.clear();
+            self.plot_mesh_cache.clear();
+            self.plot_raster.invalidate();
+            self.plot_gpu.invalidate();
         }
-        if let Some(data)=&mut combined {
-            for (name,points) in &mut data.series { let p=self.presentation.placement(name); for point in points {point.value=p.display(point.value);} }
-            for (name,bands) in &mut data.envelopes {let p=self.presentation.placement(name);for band in bands {band.min.value=p.display(band.min.value);band.max.value=p.display(band.max.value);}}
-        }
-        self.plot_overlay = combined.map(|data| (overlay_key, data));
-        }
+        log_slow_plot_phase(&mut phase_clock, "assemble plot overlay");
         let placements=self.presentation.series.clone();
         let data = self.plot_overlay.as_ref().map(|(_, data)| data);
         let plot_id = egui::Id::new(("decoded_structure_plot", "overlay", output.revision));
@@ -1720,7 +1927,9 @@ impl StructureViews {
         let plot_outer = ui.available_rect_before_wrap();
         let plot_clip = ui.clip_rect();
         let plot_layer = ui.layer_id();
+        let dot_radius = self.plot_dot_radius.unwrap_or(2.5);
         let mut axis_hover = None;
+        let mut gpu_mode = false;
         let response = Plot::new(plot_id)
             .id(plot_id)
             .auto_bounds(egui::Vec2b::new(false, false))
@@ -1754,15 +1963,26 @@ impl StructureViews {
                     ));
                 }
                 if let Some(data) = data {
+                    gpu_mode = data.quality != PlotQuality::SampledPreview
+                        && data.series.len() >= 64
+                        && self.plot_gpu.update(&self.plot_overlay_points, &hidden, overlay_key);
+                    let raster_mode = !gpu_mode && data.quality != PlotQuality::SampledPreview
+                        && data.series.len() >= 64;
+                    if raster_mode {
+                        self.plot_raster.show(&plot_ctx, plot_ui, &self.plot_overlay_points,
+                            &hidden, overlay_key);
+                    }
+                    let dense_group = data.series.len() > 16
+                        && requested.len() > pixel_width.saturating_mul(4);
+                    let opacity = if dense_group { 1.0 / data.series.len() as f32 } else { 1.0 };
+                    let visible_trace_count = data.series.keys().filter(|name| !hidden.contains(*name)).count();
                     for (name, values) in data.series.iter() {
+                        if raster_mode || gpu_mode { break; }
                         if hidden.contains(name) {
                             continue;
                         }
-                        let points: Vec<[f64; 2]> = values
-                            .iter()
-                            .map(|point| [point.index as f64, point.value])
-                            .collect();
-                        let color = field_color(name);
+                        let Some(points) = self.plot_overlay_points.get(name).map(Vec::as_slice) else { continue; };
+                        let color = plot_series_color(name).gamma_multiply(opacity);
                         let bands = (data.quality == PlotQuality::SampledPreview).then(|| {
                             data.envelopes.get(name).into_iter().flatten().map(|band| [
                                 band.range.start as f64 - 0.5, band.range.end as f64 - 0.5,
@@ -1770,10 +1990,12 @@ impl StructureViews {
                             ]).collect::<Vec<_>>()
                         });
                         if data.quality == PlotQuality::Exact && values.len() <= canvas_width as usize / 5 {
-                            decoded_channel(plot_ui, name, color, points.clone(), bands.as_deref());
-                            plot_ui.points(Points::new(name, points).color(color).radius(2.5_f32));
+                            decoded_channel_borrowed(plot_ui, name, color, points, bands.as_deref(), visible_trace_count, self.plot_mesh_cache.clone());
+                            if dot_radius > 0.0 {
+                                plot_ui.points(Points::new(name, points).color(color).radius(dot_radius));
+                            }
                         } else {
-                            decoded_channel(plot_ui, name, color, points, bands.as_deref());
+                            decoded_channel_borrowed(plot_ui, name, color, points, bands.as_deref(), visible_trace_count, self.plot_mesh_cache.clone());
                         }
                     }
                 }
@@ -1879,6 +2101,8 @@ impl StructureViews {
                     }
                 }
             });
+        if gpu_mode { self.plot_gpu.paint(ui.painter(), &response.transform); }
+        log_slow_plot_phase(&mut phase_clock, "draw plot");
         self.plot_axis_width = (plot_outer.width() - response.transform.frame().width()).max(0.);
         if let Some((axis, rect)) = axis_hover {
             ui.interact(
@@ -1997,14 +2221,24 @@ impl StructureViews {
                 .transform
                 .position_from_point(&PlotPoint::new(samples.end as f64 - 0.5, 0.))
                 .x;
+            let selection_color = ui.visuals().selection.stroke.color;
+            let [red, green, blue, _] = selection_color.to_array();
+            let right = right.max(left + 2.);
+            let fill_alpha = (self.plot_range_fill_percent.unwrap_or(20) as f32 * 2.55).round() as u8;
             painter.rect_filled(
                 egui::Rect::from_min_max(
                     egui::pos2(left, frame.top()),
-                    egui::pos2(right.max(left + 2.), frame.bottom()),
+                    egui::pos2(right, frame.bottom()),
                 ),
                 0.,
-                ui.visuals().selection.bg_fill.gamma_multiply(0.18),
+                Color32::from_rgba_unmultiplied(red, green, blue, fill_alpha),
             );
+            for x in [left, right] {
+                painter.line_segment(
+                    [egui::pos2(x, frame.top()), egui::pos2(x, frame.bottom())],
+                    egui::Stroke::new(1.5, selection_color),
+                );
+            }
             let cursor = response
                 .transform
                 .position_from_point(&PlotPoint::new(samples.start as f64, 0.))
@@ -2039,7 +2273,9 @@ impl StructureViews {
             painter.text(
                 frame.center(),
                 egui::Align2::CENTER_CENTER,
-                if self.plot_reader.is_loading() {
+                if visible_series == 0 {
+                    "All plot series are hidden; use Show all series above"
+                } else if self.plot_reader.is_loading() {
                     "Reading samples for this view…"
                 } else {
                     "No numeric samples in this range"
@@ -2116,6 +2352,7 @@ impl StructureViews {
                 self.plot_refine, selected_fields,
             );
         }
+        log_slow_plot_phase(&mut phase_clock, "handle plot interaction");
         if let Some((bytes, path)) = picked {
             if let Some(samples) = sample_indices_for_bytes(&node, &bytes) {
                 self.plot_range_first = samples.start;
@@ -2203,24 +2440,32 @@ impl SeriesTree {
     }
 }
 
-fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut std::collections::BTreeSet<String>) -> bool {
+fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut std::collections::BTreeSet<String>, filter: &mut String) -> bool {
     let mut changed=false;
     let (single, groups) = grouped_collection_choices(collections);
     let grouped_containers: HashSet<_> = groups.values().filter_map(|sensors|
         sensors.first().and_then(|(_, node)| node.path.rsplit_once('[').map(|(path, _)| path.to_owned()))).collect();
-    egui::CollapsingHeader::new("Collections")
-        .id_salt("plot_collections")
-        .default_open(false)
+    ui.horizontal(|ui| {
+        ui.label(format!("{} selected", selected.len()));
+        if ui.add_enabled(!selected.is_empty(), egui::Button::new("Clear selection")).clicked() {
+            selected.clear();
+            changed = true;
+        }
+    });
+    ui.add(egui::TextEdit::singleline(filter).hint_text("Find collections or items…"));
+    let query = filter.trim().to_lowercase();
+    egui::ScrollArea::vertical()
+        .id_salt("plot_collection_choices")
+        .max_height(ui.available_height().max(100.0))
         .show(ui, |ui| {
-        egui::ScrollArea::vertical()
-            .id_salt("plot_collection_choices")
-            .max_height(ui.ctx().content_rect().height().min(420.0))
-            .show(ui, |ui| {
                 for node in single {
                     if grouped_containers.contains(&node.path) { continue; }
+                    if !query.is_empty() && !node.name.to_lowercase().contains(&query)
+                        && !node.path.to_lowercase().contains(&query) { continue; }
                     ui.push_id(&node.path, |ui| {
                         let mut enabled=selected.contains(&node.path);
-                        if ui.checkbox(&mut enabled,collection_label(node)).changed() {
+                        if ui.checkbox(&mut enabled,collection_label(node))
+                            .on_hover_text(&node.path).changed() {
                             if enabled {selected.insert(node.path.clone());} else {selected.remove(&node.path);}
                             changed=true;
                         }
@@ -2228,28 +2473,49 @@ fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut st
                 }
                 for (key, sensors) in groups {
                     let label = key.rsplit('.').nth(1).unwrap_or(&key);
-                    let enabled = sensors.iter().filter(|(_, node)| selected.contains(&node.path)).count();
-                    egui::CollapsingHeader::new(format!("{label} · {enabled}/{} items", sensors.len()))
+                    let matches_group = query.is_empty() || label.to_lowercase().contains(&query)
+                        || key.to_lowercase().contains(&query);
+                    let matching: Vec<_> = sensors.into_iter().filter(|(index, node)| matches_group
+                        || index.to_string().contains(&query)
+                        || node.name.to_lowercase().contains(&query)
+                        || node.path.to_lowercase().contains(&query)).collect();
+                    if matching.is_empty() { continue; }
+                    if matching.len() == 1 {
+                        let (index, node) = matching[0];
+                        ui.push_id(&node.path, |ui| {
+                            let mut shown = selected.contains(&node.path);
+                            if ui.checkbox(&mut shown, format!("{label} · Item {index}"))
+                                .on_hover_text(&node.path).changed() {
+                                if shown { selected.insert(node.path.clone()); }
+                                else { selected.remove(&node.path); }
+                                changed = true;
+                            }
+                        });
+                        continue;
+                    }
+                    let enabled = matching.iter().filter(|(_, node)| selected.contains(&node.path)).count();
+                    egui::CollapsingHeader::new(format!("{label} · {enabled}/{} items", matching.len()))
                         .id_salt(&key)
+                        .default_open(!query.is_empty())
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 if ui.small_button("Show group").clicked() {
-                                    for (_, node) in &sensors { changed |= selected.insert(node.path.clone()); }
+                                    for (_, node) in &matching { changed |= selected.insert(node.path.clone()); }
                                 }
                                 if ui.small_button("Only group").clicked() {
                                     selected.clear();
-                                    selected.extend(sensors.iter().map(|(_, node)| node.path.clone()));
+                                    selected.extend(matching.iter().map(|(_, node)| node.path.clone()));
                                     changed = true;
                                 }
                                 if ui.small_button("Hide group").clicked() {
-                                    for (_, node) in &sensors { changed |= selected.remove(&node.path); }
+                                    for (_, node) in &matching { changed |= selected.remove(&node.path); }
                                 }
                             });
                             egui::ScrollArea::vertical().id_salt(("plot_sensor_group", &key))
                                 .max_height(260.)
-                                .show_rows(ui, ui.spacing().interact_size.y, sensors.len(), |ui, range| {
+                                .show_rows(ui, ui.spacing().interact_size.y, matching.len(), |ui, range| {
                                     for row in range {
-                                        let (index, node) = sensors[row];
+                                        let (index, node) = matching[row];
                                         ui.push_id(&node.path, |ui| {
                                             ui.horizontal(|ui| {
                                                 let mut shown = selected.contains(&node.path);
@@ -2271,7 +2537,6 @@ fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut st
                         });
                 }
             });
-        });
     changed
 }
 
@@ -2285,6 +2550,28 @@ fn sensor_group_key(node: &Node) -> Option<(String, usize)> {
     let index = index.parse::<usize>().ok()?;
     if index != named_index || !prefix.ends_with(name) { return None; }
     Some((format!("{prefix}{suffix}"), index))
+}
+
+fn grouped_numeric_plans(
+    selected: &std::collections::BTreeSet<String>,
+    collections: &HashMap<&str, &Node>,
+    primary: &str,
+) -> BTreeMap<String, (Node, NumericPlan, Vec<String>)> {
+    let mut candidates: BTreeMap<String, Vec<(&Node, NumericPlan)>> = BTreeMap::new();
+    for path in selected {
+        if path == primary { continue; }
+        let Some(&node) = collections.get(path.as_str()) else { continue; };
+        let (Some((key, _)), Some(plan)) = (sensor_group_key(node), node.lazy.as_ref().and_then(|array| array.numeric_plan())) else { continue; };
+        candidates.entry(key).or_default().push((node, plan));
+    }
+    candidates.into_iter().filter_map(|(key, members)| {
+        if members.len() < 2 { return None; }
+        let count = collection_count(members[0].0);
+        if members.iter().any(|(node, _)| collection_count(node) != count) { return None; }
+        let plan = NumericPlan::combine(&members.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>())?;
+        let paths = members.iter().map(|(node, _)| node.path.clone()).collect();
+        Some((key, (members[0].0.clone(), plan, paths)))
+    }).collect()
 }
 fn grouped_collection_choices<'a>(collections: &[&'a Node]) -> (Vec<&'a Node>, BTreeMap<String, Vec<(usize, &'a Node)>>) {
     let mut single = Vec::new();
@@ -2307,6 +2594,75 @@ fn field_color(path: &str) -> Color32 {
         .map_or(path, |(_, suffix)| suffix)
         .trim_start_matches('.');
     crate::plot_trace::series_color(relative)
+}
+fn update_overlay_source(
+    overlay: &mut PlotData,
+    prepared: &mut BTreeMap<String, Vec<PlotPoint>>,
+    path: &str,
+    source: Option<&PlotData>,
+    hidden: &HashSet<String>,
+    presentation: &crate::plot_presentation::Presentation,
+) {
+    let prefix = format!("{path} / ");
+    overlay.series.retain(|name, _| !name.starts_with(&prefix));
+    overlay.envelopes.retain(|name, _| !name.starts_with(&prefix));
+    prepared.retain(|name, _| !name.starts_with(&prefix));
+    let Some(source) = source else { return; };
+    for (name, points) in &source.series {
+        let full = format!("{prefix}{name}");
+        if hidden.contains(&full) { continue; }
+        let placement = presentation.placement(&full);
+        let mut points = points.clone();
+        for point in &mut points { point.value = placement.display(point.value); }
+        prepared.insert(full.clone(), points.iter().map(|point| PlotPoint::new(point.index as f64, point.value)).collect());
+        overlay.series.insert(full, points);
+    }
+    for (name, bands) in &source.envelopes {
+        let full = format!("{prefix}{name}");
+        if hidden.contains(&full) { continue; }
+        let placement = presentation.placement(&full);
+        let mut bands = bands.clone();
+        for band in &mut bands {
+            band.min.value = placement.display(band.min.value);
+            band.max.value = placement.display(band.max.value);
+        }
+        overlay.envelopes.insert(full, bands);
+    }
+}
+fn update_group_overlay(
+    overlay: &mut PlotData,
+    prepared: &mut BTreeMap<String, Vec<PlotPoint>>,
+    paths: &[String],
+    source: Option<&PlotData>,
+    hidden: &HashSet<String>,
+    presentation: &crate::plot_presentation::Presentation,
+) {
+    let belongs = |name: &str| paths.iter().any(|path| name.starts_with(&format!("{path} / ")));
+    overlay.series.retain(|name, _| !belongs(name));
+    overlay.envelopes.retain(|name, _| !belongs(name));
+    prepared.retain(|name, _| !belongs(name));
+    let Some(source) = source else { return; };
+    for (name, points) in &source.series {
+        if hidden.contains(name) { continue; }
+        let placement = presentation.placement(name);
+        let mut points = points.clone();
+        for point in &mut points { point.value = placement.display(point.value); }
+        prepared.insert(name.clone(), points.iter().map(|point| PlotPoint::new(point.index as f64, point.value)).collect());
+        overlay.series.insert(name.clone(), points);
+    }
+    for (name, bands) in &source.envelopes {
+        if hidden.contains(name) { continue; }
+        let placement = presentation.placement(name);
+        let mut bands = bands.clone();
+        for band in &mut bands {
+            band.min.value = placement.display(band.min.value);
+            band.max.value = placement.display(band.max.value);
+        }
+        overlay.envelopes.insert(name.clone(), bands);
+    }
+}
+fn plot_series_color(name: &str) -> Color32 {
+    crate::plot_trace::series_color(name)
 }
 fn find_node<'a>(nodes: &'a [Node], path: &str) -> Option<&'a Node> {
     nodes.iter().find_map(|node| {
@@ -2716,6 +3072,12 @@ mod tests {
         assert_eq!(views.plot_reader.requested_fields().unwrap().len(), 16);
         settle_plot(&ctx, &mut views, &output, &store);
         assert_eq!(views.plot_reader.data().unwrap().series.len(), 16);
+        for name in &views.plot_catalog {
+            views.plot_hidden.insert(format!("{} / {name}", views.plot_target));
+        }
+        views.plot_catalog_target.clear();
+        render_plot(&ctx, &mut views, &output, &store, vec![], Default::default());
+        assert_eq!(views.plot_reader.requested_fields().unwrap().len(), 16);
     }
     #[test]
     fn positioned_series_clicks_keep_original_values_and_bytes() {
@@ -2767,6 +3129,39 @@ mod tests {
     use crate::byte_store::ByteStore;
     use crate::structure::Program;
 
+    #[test]
+    fn updating_one_plot_collection_keeps_other_prepared_series() {
+        fn source(value: f64) -> PlotData {
+            PlotData {
+                range: 0..1,
+                series: BTreeMap::from([("value".into(), vec![crate::structure_plot::PlotSample {
+                    index: 0, value, bytes: 0..2, path: "value[0]".into(),
+                }])]),
+                envelopes: BTreeMap::new(),
+                bounds: BTreeMap::new(),
+                quality: PlotQuality::Exact,
+                scanned: 1,
+                total: 1,
+                complete: true,
+            }
+        }
+        let mut overlay = source(0.0);
+        overlay.series.clear();
+        let mut prepared = BTreeMap::new();
+        let hidden = HashSet::new();
+        let presentation = crate::plot_presentation::Presentation::default();
+        update_overlay_source(&mut overlay, &mut prepared, "a", Some(&source(1.0)), &hidden, &presentation);
+        let point_ptr = overlay.series["a / value"].as_ptr();
+        let geometry_ptr = prepared["a / value"].as_ptr();
+        update_overlay_source(&mut overlay, &mut prepared, "b", Some(&source(2.0)), &hidden, &presentation);
+        assert_eq!(overlay.series["a / value"].as_ptr(), point_ptr);
+        assert_eq!(prepared["a / value"].as_ptr(), geometry_ptr);
+        assert_eq!(overlay.series["b / value"][0].value, 2.0);
+        update_overlay_source(&mut overlay, &mut prepared, "b", None, &hidden, &presentation);
+        assert!(!overlay.series.contains_key("b / value"));
+        assert!(!prepared.contains_key("b / value"));
+    }
+
     fn array() -> (ByteStore, ParseOutput) {
         let bytes: Vec<_> = (0_u16..1024).flat_map(u16::to_le_bytes).collect();
         let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
@@ -2805,8 +3200,19 @@ mod tests {
             views.discover_flattened_collections(&output);
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+        assert!(views.plot_sources.is_empty());
         assert_eq!(views.plot_target, "groups.items");
         assert_eq!(views.table_target, "groups.items");
+        views.plot_sources.insert("groups.items".into());
+        views.plot_target = "groups.items".into();
+        views.invalidate();
+        views.start_nested_discovery(&output, store.view(), &ctx);
+        while views.flattened_collections.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "rediscovery timed out: {:?}", views.discovery_error);
+            views.discover_flattened_collections(&output);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(views.plot_sources.contains("groups.items"));
     }
     #[test]
     fn nested_channel_arrays_form_virtual_series_across_records() {
@@ -2888,6 +3294,40 @@ actions:
         let sensors = &groups["blocks.payload.field_0.values"];
         assert_eq!(sensors.len(), 48);
         assert_eq!(sensors[2].0, 2);
+        let selected: std::collections::BTreeSet<String> = sensors.iter().take(3)
+            .map(|(_, node)| node.path.clone()).collect();
+        let by_path: HashMap<&str, &Node> = references.iter()
+            .map(|node| (node.path.as_str(), *node)).collect();
+        let grouped = grouped_numeric_plans(&selected, &by_path, &sensors[0].1.path);
+        let (group_node, group_plan, group_paths) = &grouped["blocks.payload.field_0.values"];
+        assert_eq!(group_paths.len(), 2);
+        let mut group_reader = crate::structure_plot::PlotReader::default();
+        group_reader.request_group(&ctx, store.view(), group_node.clone(), group_plan.clone(),
+            129..131, 800, false);
+        while !group_reader.data().is_some_and(|data| data.complete) {
+            assert!(std::time::Instant::now() < deadline, "grouped plot timed out: {:?}", group_reader.error());
+            group_reader.tick(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        for sensor_index in 1..3 {
+            let name = format!("blocks.payload.field_0[{sensor_index}].values / value");
+            let values = &group_reader.data().unwrap().series[&name];
+            assert_eq!(values.iter().map(|point| point.value).collect::<Vec<_>>(),
+                [((129 * 48) + sensor_index) as f64, (100 + sensor_index) as f64]);
+        }
+        while group_reader.group_buffer_stats().0 < 2 {
+            assert!(std::time::Instant::now() < deadline, "neighbor tile was not prefetched");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let loads = group_reader.group_buffer_stats().1;
+        group_reader.request_group(&ctx, store.view(), group_node.clone(), group_plan.clone(),
+            130..132, 800, false);
+        while !group_reader.data().is_some_and(|data| data.complete && data.range == (130..132)) {
+            assert!(std::time::Instant::now() < deadline, "buffered pan timed out: {:?}", group_reader.error());
+            group_reader.tick(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(group_reader.group_buffer_stats().1, loads, "nearby pan must reuse RAM tiles");
         let mut ordinary = sensors[0].1.clone();
         ordinary.name = "entries across records".into();
         ordinary.path = "records[4].payload.entries".into();
@@ -2933,6 +3373,21 @@ actions:
         assert_eq!(views.desired.as_ref().unwrap().key.path, sensor_path);
         assert_eq!(views.table_jump, 130);
         assert_eq!(views.selected.as_deref(), Some("blocks.payload.field_0[2].values[130]"));
+        views.plot_sources = selected;
+        views.plot_sources_initialized = true;
+        views.plot_target = "blocks.payload.field_0[0].values".into();
+        views.plot_view = Some(129..131);
+        views.plot_force_view = None;
+        views.plot_follow_selection = false;
+        while !views.group_plot_readers.values().any(|reader| reader.data().is_some_and(|data| data.complete)) {
+            render_plot(&ctx, &mut views, &output, &store, vec![], Default::default());
+            assert!(std::time::Instant::now() < deadline, "grouped plot UI timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        render_plot(&ctx, &mut views, &output, &store, vec![], Default::default());
+        assert!(views.plot_overlay.as_ref().is_some_and(|(_, data)|
+            data.series.contains_key("blocks.payload.field_0[2].values / value")));
+        assert!(!views.extra_plot_readers.contains_key("blocks.payload.field_0[2].values"));
     }
     #[test]
     fn indexed_virtual_series_supports_lazy_group_values() {
@@ -3420,6 +3875,11 @@ actions:
         assert_eq!(views.highlights(&output)[0].color, color);
         assert_eq!(field_color("samples[4].pair.a"), color);
     }
+
+    #[test]
+    fn plot_colors_distinguish_indexed_series_with_the_same_leaf_name() {
+        assert_ne!(plot_series_color("records[0].values"), plot_series_color("records[1].values"));
+    }
     #[test]
     fn sample_table_retains_more_than_thirty_two_fields() {
         let fields = (0..40)
@@ -3856,7 +4316,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 assert!(values.windows(2).all(|pair| pair[0].index < pair[1].index));
                 let mut traces = Vec::new();
                 for shape in &rendered.shapes {
-                    paths(&shape.shape, field_color(&format!("{} / {name}", views.plot_target)), &mut traces);
+                    paths(&shape.shape, plot_series_color(&format!("{} / {name}", views.plot_target)), &mut traces);
                 }
                 if count <= 10_000 {
                     assert_eq!(traces.len(), 1,
@@ -3873,7 +4333,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                     assert!(rendered.shapes.iter().any(|shape| matches!(
                         &shape.shape, egui::Shape::Mesh(mesh)
                         if mesh.vertices.len() > 100
-                            && mesh.vertices.iter().any(|v| v.color == field_color(&format!("{} / {name}", views.plot_target)).gamma_multiply(0.45))
+                            && mesh.vertices.iter().any(|v| v.color == plot_series_color(&format!("{} / {name}", views.plot_target)).gamma_multiply(0.45))
                     )), "{name} must render a continuous amplitude mesh");
                 }
                 for sample in values {
@@ -4083,6 +4543,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 {
                     *bands += 1
                 }
+                egui::Shape::Mesh(mesh) => *bands += mesh.indices.len() / 6,
                 egui::Shape::Circle(circle) if (circle.radius - 2.5).abs() < 0.01 => *dots += 1,
                 _ => (),
             }
@@ -4102,6 +4563,9 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 egui::Shape::Path(path) => {
                     path.stroke.color == egui::epaint::ColorMode::Solid(color) || path.fill == color.gamma_multiply(0.23)
                 }
+                egui::Shape::Mesh(mesh) => mesh.vertices.iter().any(|vertex| {
+                    vertex.color == color || vertex.color == color.gamma_multiply(0.23)
+                }),
                 _ => false,
             }
         }
@@ -4109,7 +4573,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             rendered
                 .shapes
                 .iter()
-                .any(|shape| series_color(&shape.shape, field_color("samples / value"))),
+                .any(|shape| series_color(&shape.shape, plot_series_color("samples / value"))),
             "band fill and outline must use the stable series color, rather than neutral gray"
         );
     }

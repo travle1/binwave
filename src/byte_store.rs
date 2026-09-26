@@ -39,6 +39,15 @@ impl Base {
             Self::Snapshot(source) => Ok(source.bytes()[offset..end].to_vec()),
         }
     }
+    fn read_validated(&self, offset: usize, length: usize) -> Result<Vec<u8>> {
+        ensure!(length <= READ_LIMIT, "read exceeds the 1 MiB chunk limit");
+        ensure!(offset <= self.len(), "byte offset is outside the file");
+        let end = offset + length.min(self.len() - offset);
+        match self {
+            Self::File(source) => source.read_validated_range(offset, end - offset),
+            Self::Snapshot(source) => Ok(source.bytes()[offset..end].to_vec()),
+        }
+    }
     fn validate(&self) -> Result<()> {
         match self {
             Self::File(source) => source.validate(),
@@ -113,10 +122,20 @@ impl ByteView {
     }
     pub fn read(&self, offset: usize, length: usize) -> Result<Vec<u8>> {
         let mut bytes = self.read_original(offset, length)?;
+        self.apply_patches(offset, &mut bytes);
+        Ok(bytes)
+    }
+    /// Use within a plot scan bracketed by `validate` calls. The final
+    /// validation discards results if the source changed during the scan.
+    pub(crate) fn read_validated(&self, offset: usize, length: usize) -> Result<Vec<u8>> {
+        let mut bytes = self.base.read_validated(offset, length)?;
+        self.apply_patches(offset, &mut bytes);
+        Ok(bytes)
+    }
+    fn apply_patches(&self, offset: usize, bytes: &mut [u8]) {
         for (&position, &value) in self.patches.range(offset..offset + bytes.len()) {
             bytes[position - offset] = value;
         }
-        Ok(bytes)
     }
     pub fn validate(&self) -> Result<()> {
         self.base.validate()

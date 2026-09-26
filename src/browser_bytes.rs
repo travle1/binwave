@@ -31,4 +31,7 @@ impl ByteView {
         );
         Ok(bytes.to_vec())
     }
+    pub fn read_validated(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
+        self.read(offset, length)
+    }
 }

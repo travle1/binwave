@@ -2,6 +2,11 @@
 use egui::{Color32, Id, Rect, Shape, Ui};
 use egui_plot::{Line, PlotBounds, PlotGeometry, PlotItem, PlotItemBase, PlotPoint, PlotTransform};
 use std::ops::RangeInclusive;
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Mutex;
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::HashMap;
 
 /// Stable series colors do not depend on selection order or the number of traces.
 pub fn series_color(name: &str) -> Color32 {
@@ -11,6 +16,7 @@ pub fn series_color(name: &str) -> Color32 {
 
 /// Render a decoded channel consistently across platform shells. Estimated
 /// bands describe observed ranges, never a continuous path across unread data.
+#[cfg(target_arch = "wasm32")]
 pub fn decoded_channel(
     plot: &mut egui_plot::PlotUi,
     name: &str,
@@ -19,6 +25,100 @@ pub fn decoded_channel(
     estimated_bands: Option<&[[f64; 4]]>,
 ) {
     if let Some(bands) = estimated_bands {
+        draw_bands(plot, name, color, bands);
+    } else {
+        plot.add(AdaptiveTrace::new(points, name, color));
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn decoded_channel_borrowed<'a>(
+    plot: &mut egui_plot::PlotUi<'a>,
+    name: &str,
+    color: Color32,
+    points: &'a [PlotPoint],
+    estimated_bands: Option<&[[f64; 4]]>,
+    visible_series: usize,
+    mesh_cache: Arc<TraceMeshCache>,
+) {
+    if let Some(bands) = estimated_bands {
+        plot.add(AmplitudeBands::new(name, color, points, bands));
+    } else {
+        plot.add(AdaptiveTrace::borrowed_with_series_count(points, name, color, visible_series)
+            .with_mesh_cache(mesh_cache));
+    }
+}
+
+/// A preview's windows share one plot item and one mesh per trace. Creating a
+/// polygon and two lines for every window overwhelms the UI with many traces.
+#[cfg(not(target_arch = "wasm32"))]
+struct AmplitudeBands<'a> {
+    base: PlotItemBase,
+    color: Color32,
+    points: &'a [PlotPoint],
+    bands: Vec<[f64; 4]>,
+    bounds: PlotBounds,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<'a> AmplitudeBands<'a> {
+    fn new(name: &str, color: Color32, points: &'a [PlotPoint], bands: &[[f64; 4]]) -> Self {
+        let mut bounds = PlotBounds::NOTHING;
+        for &[left, right, low, high] in bands {
+            if [left, right, low, high].iter().all(|v| v.is_finite()) && left < right && low <= high {
+                bounds.extend_with(&PlotPoint::new(left, low));
+                bounds.extend_with(&PlotPoint::new(right, high));
+            }
+        }
+        Self { base: PlotItemBase::new(name.to_owned()), color, points, bands: bands.to_vec(), bounds }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PlotItem for AmplitudeBands<'_> {
+    fn shapes(&self, _ui: &Ui, transform: &PlotTransform, shapes: &mut Vec<Shape>) {
+        let frame = *transform.frame();
+        let mut mesh = egui::epaint::Mesh::default();
+        for &[left, right, low, high] in &self.bands {
+            if ![left, right, low, high].iter().all(|v| v.is_finite()) || left >= right || low > high {
+                continue;
+            }
+            let x0 = transform.position_from_point_x(left).max(frame.left());
+            let x1 = transform.position_from_point_x(right).min(frame.right());
+            let y0 = transform.position_from_point_y(high).max(frame.top());
+            let y1 = transform.position_from_point_y(low).min(frame.bottom());
+            if x0.is_finite() && x1.is_finite() && y0.is_finite() && y1.is_finite() && x1 > x0 && y1 >= y0 {
+                if y1 > y0 {
+                    mesh.add_colored_rect(
+                        Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
+                        self.color.gamma_multiply(0.23),
+                    );
+                }
+                for y in [y0, y1] {
+                    let bottom = (y + 0.8).min(frame.bottom());
+                    if bottom > y {
+                        mesh.add_colored_rect(
+                            Rect::from_min_max(egui::pos2(x0, y), egui::pos2(x1, bottom)),
+                            self.color,
+                        );
+                    }
+                }
+            }
+        }
+        if !mesh.is_empty() {
+            shapes.push(Shape::Mesh(mesh.into()));
+        }
+    }
+    fn initialize(&mut self, _x_range: RangeInclusive<f64>) {}
+    fn color(&self) -> Color32 { self.color }
+    fn geometry(&self) -> PlotGeometry<'_> { PlotGeometry::Points(self.points) }
+    fn bounds(&self) -> PlotBounds { self.bounds }
+    fn base(&self) -> &PlotItemBase { &self.base }
+    fn base_mut(&mut self) -> &mut PlotItemBase { &mut self.base }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn draw_bands(plot: &mut egui_plot::PlotUi, name: &str, color: Color32, bands: &[[f64; 4]]) {
         for &[left, right, low, high] in bands {
             if ![left, right, low, high].iter().all(|x| x.is_finite()) || left >= right || low > high {
                 continue;
@@ -36,45 +136,131 @@ pub fn decoded_channel(
                     .name(name).color(color).width(0.8_f32));
             }
         }
-    } else {
-        plot.add(AdaptiveTrace::new(points, name, color));
-    }
 }
 
 const MIN_CYCLE_PIXELS: f64 = 4.0;
 const MAX_COLUMNS: usize = 16_384;
+// egui-wgpu allocates one vertex/index buffer for the entire frame. Budget
+// across traces, not per trace, to stay below the device's buffer-size limit.
+const MAX_LINE_POINTS_TOTAL: usize = 200_000;
+const MAX_MESH_COLUMNS_TOTAL: usize = 1_000_000;
 const ENVELOPE_RADIUS: usize = 2;
 
-/// Retains the line's original point geometry for legends, hover and selection.
-/// Only its painted representation changes when cycles cannot be resolved.
-pub struct AdaptiveTrace {
-    line: Line<'static>,
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MeshKey {
+    bounds: [u64; 4],
+    frame: [u32; 4],
+    pixels_per_point: u32,
+    color: [u8; 4],
+    line_limit: usize,
+    column_limit: usize,
+    highlighted: bool,
 }
 
-impl AdaptiveTrace {
-    pub fn new(points: Vec<[f64; 2]>, name: impl Into<String>, color: Color32) -> Self {
+#[cfg(not(target_arch = "wasm32"))]
+impl MeshKey {
+    fn new(transform: &PlotTransform, pixels_per_point: f32, color: Color32,
+        line_limit: usize, column_limit: usize, highlighted: bool) -> Self {
+        let bounds = transform.bounds();
+        let frame = transform.frame();
         Self {
-            line: Line::new(name.into(), points).color(color),
+            bounds: [bounds.min()[0].to_bits(), bounds.min()[1].to_bits(),
+                bounds.max()[0].to_bits(), bounds.max()[1].to_bits()],
+            frame: [frame.left().to_bits(), frame.top().to_bits(),
+                frame.right().to_bits(), frame.bottom().to_bits()],
+            pixels_per_point: pixels_per_point.to_bits(),
+            color: color.to_array(), line_limit, column_limit, highlighted,
         }
     }
 }
 
-impl PlotItem for AdaptiveTrace {
+/// Screen-space meshes are reused while the data and plot transform are unchanged.
+/// The owner clears this cache whenever decoded plot data changes.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+pub struct TraceMeshCache(Mutex<HashMap<String, (MeshKey, Arc<egui::epaint::Mesh>)>>);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TraceMeshCache {
+    pub fn clear(&self) { self.0.lock().unwrap().clear(); }
+    fn get(&self, name: &str, key: MeshKey) -> Option<Arc<egui::epaint::Mesh>> {
+        self.0.lock().unwrap().get(name).and_then(|(old, mesh)| (*old == key).then(|| mesh.clone()))
+    }
+    fn insert(&self, name: &str, key: MeshKey, mesh: Arc<egui::epaint::Mesh>) {
+        self.0.lock().unwrap().insert(name.to_owned(), (key, mesh));
+    }
+}
+
+/// Retains the line's original point geometry for legends, hover and selection.
+/// Only its painted representation changes when cycles cannot be resolved.
+pub struct AdaptiveTrace<'a> {
+    line: Line<'a>,
+    line_point_limit: usize,
+    mesh_column_limit: usize,
+    #[cfg(not(target_arch = "wasm32"))]
+    mesh_cache: Option<Arc<TraceMeshCache>>,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+impl AdaptiveTrace<'static> {
+    pub fn new(points: Vec<[f64; 2]>, name: impl Into<String>, color: Color32) -> Self {
+        Self {
+            line: Line::new(name.into(), points).color(color),
+            line_point_limit: MAX_LINE_POINTS_TOTAL,
+            mesh_column_limit: MAX_COLUMNS,
+            #[cfg(not(target_arch = "wasm32"))]
+            mesh_cache: None,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<'a> AdaptiveTrace<'a> {
+    pub fn borrowed_with_series_count(points: &'a [PlotPoint], name: impl Into<String>, color: Color32, visible_series: usize) -> Self {
+        let count = visible_series.max(1);
+        Self {
+            line: Line::new(name.into(), points).color(color),
+            line_point_limit: (MAX_LINE_POINTS_TOTAL / count).max(1),
+            mesh_column_limit: (MAX_MESH_COLUMNS_TOTAL / count).clamp(1, MAX_COLUMNS),
+            mesh_cache: None,
+        }
+    }
+    fn with_mesh_cache(mut self, cache: Arc<TraceMeshCache>) -> Self {
+        self.mesh_cache = Some(cache);
+        self
+    }
+}
+
+impl PlotItem for AdaptiveTrace<'_> {
     fn shapes(&self, ui: &Ui, transform: &PlotTransform, shapes: &mut Vec<Shape>) {
         let PlotGeometry::Points(points) = self.line.geometry() else {
             return;
         };
         let pixels_per_point = ui.ctx().pixels_per_point();
-        if has_dense_cycles(points, transform, pixels_per_point) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let key = MeshKey::new(transform, pixels_per_point, self.color(),
+            self.line_point_limit, self.mesh_column_limit, self.highlighted());
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(mesh) = self.mesh_cache.as_ref().and_then(|cache| cache.get(self.name(), key)) {
+            shapes.push(Shape::Mesh(mesh));
+            return;
+        }
+        let too_many_points = exceeds_visible_point_limit(points, transform, self.line_point_limit);
+        if too_many_points || has_dense_cycles(points, transform, pixels_per_point) {
             let alpha = if self.highlighted() { 0.72 } else { 0.45 };
             let mesh = amplitude_mesh(
                 points,
                 transform,
                 pixels_per_point,
                 self.color().gamma_multiply(alpha),
+                self.mesh_column_limit,
             );
             if !mesh.is_empty() {
-                shapes.push(Shape::Mesh(mesh.into()));
+                let mesh: Arc<egui::epaint::Mesh> = mesh.into();
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(cache) = &self.mesh_cache { cache.insert(self.name(), key, mesh.clone()); }
+                shapes.push(Shape::Mesh(mesh));
             }
         } else {
             self.line.shapes(ui, transform, shapes);
@@ -115,6 +301,13 @@ impl PlotItem for AdaptiveTrace {
 
 fn finite(point: &PlotPoint) -> bool {
     point.x.is_finite() && point.y.is_finite()
+}
+
+fn exceeds_visible_point_limit(points: &[PlotPoint], transform: &PlotTransform, limit: usize) -> bool {
+    let bounds = transform.bounds();
+    points.iter().filter(|point| {
+        finite(point) && point.x >= bounds.min()[0] && point.x <= bounds.max()[0]
+    }).take(limit + 1).count() > limit
 }
 
 fn has_dense_cycles(
@@ -233,6 +426,7 @@ fn amplitude_mesh(
     transform: &PlotTransform,
     pixels_per_point: f32,
     color: Color32,
+    max_columns: usize,
 ) -> egui::epaint::Mesh {
     let mut mesh = egui::epaint::Mesh::default();
     let frame = *transform.frame();
@@ -242,7 +436,7 @@ fn amplitude_mesh(
     let ppp = pixels_per_point.max(0.01);
     let left = (frame.left() * ppp).floor() / ppp;
     let right = (frame.right() * ppp).ceil() / ppp;
-    let count = (((right - left) * ppp).round() as usize).clamp(1, MAX_COLUMNS);
+    let count = (((right - left) * ppp).round() as usize).clamp(1, max_columns.clamp(1, MAX_COLUMNS));
     let step = (right - left) / count as f32;
     let column_at = |x: f32| (((x - left) / step).floor() as usize).min(count - 1);
     let mut columns = vec![Column::default(); count];
@@ -377,11 +571,28 @@ mod tests {
     }
 
     #[test]
+    fn many_visible_traces_have_a_bounded_geometry_budget() {
+        let traces = 528;
+        let points = wave(12_496, 64);
+        let transform = transform(4_000.0, points.len());
+        let trace = AdaptiveTrace::borrowed_with_series_count(&points, "signal", Color32::RED, traces);
+        assert!(exceeds_visible_point_limit(&points, &transform, trace.line_point_limit));
+        let mesh = amplitude_mesh(&points, &transform, 1.0, Color32::RED, trace.mesh_column_limit);
+        assert!(!mesh.is_empty());
+        assert!(mesh.vertices.len() <= trace.mesh_column_limit * 4);
+        assert!(mesh.indices.len() <= trace.mesh_column_limit * 6);
+        let total_index_bytes = traces * trace.mesh_column_limit * 6 * std::mem::size_of::<u32>();
+        let total_vertex_bytes = traces * trace.mesh_column_limit * 4 * std::mem::size_of::<egui::epaint::Vertex>();
+        assert!(total_index_bytes < 268_435_456);
+        assert!(total_vertex_bytes < 268_435_456);
+    }
+
+    #[test]
     fn envelope_has_shared_edges_stable_amplitude_and_retains_a_single_sample_peak() {
         let mut points = wave(12_496, 16);
         points[3_333].y = 3.5;
         let transform = transform(1_250.0, points.len());
-        let mesh = amplitude_mesh(&points, &transform, 1.0, Color32::RED);
+        let mesh = amplitude_mesh(&points, &transform, 1.0, Color32::RED, MAX_COLUMNS);
         assert!(mesh.is_valid());
         assert!(mesh.vertices.len() <= 1_252 * 4);
         let rects: Vec<_> = mesh
@@ -415,7 +626,7 @@ mod tests {
         let points = wave(12_496, 38);
         let transform = transform(1_250.0, points.len());
         assert!(has_dense_cycles(&points, &transform, 1.0));
-        let mesh = amplitude_mesh(&points, &transform, 1.0, Color32::RED);
+        let mesh = amplitude_mesh(&points, &transform, 1.0, Color32::RED, MAX_COLUMNS);
         assert!(mesh.is_valid());
         assert!(mesh.vertices.len() <= 1_252 * 4);
         let amplitude = points
@@ -447,7 +658,7 @@ mod tests {
         ];
         for ppp in [1.0, 1.5, 2.0, 100.0] {
             let transform = transform(1_250.0, 201);
-            let mesh = amplitude_mesh(&points, &transform, ppp, Color32::RED);
+            let mesh = amplitude_mesh(&points, &transform, ppp, Color32::RED, MAX_COLUMNS);
             assert!(mesh.is_valid());
             assert!(mesh.vertices.len() <= MAX_COLUMNS * 4);
             assert!(!mesh.vertices.is_empty());

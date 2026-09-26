@@ -182,7 +182,12 @@ impl StructureWorkspace {
         self.partial_output = None;
         self.invalidate_changed_revision(source.revision);
         self.last_run_language = Some(DecoderLanguage::Yaml);
-        match Program::parse(yaml) {
+        let parse_started = Instant::now();
+        log::info!("Decoder definition parse started ({} bytes)", yaml.len());
+        let parsed = Program::parse(yaml);
+        log::info!("Decoder definition parse finished in {:.2}s: {}",
+            parse_started.elapsed().as_secs_f64(), if parsed.is_ok() { "ok" } else { "error" });
+        match parsed {
             Ok(program) => {
                 self.start_run(RunSource::Yaml(program), source, ctx, true);
                 true
@@ -258,6 +263,9 @@ impl StructureWorkspace {
         let ctx = ctx.clone();
         let interpretation_check = self.interpretation_check.take();
         std::thread::spawn(move || {
+            let started = Instant::now();
+            let language = decoder.language();
+            log::info!("Decoder run started: {:?}, {} source bytes", language, source.len());
             let result = source
                 .validate()
                 .and_then(|_| {
@@ -294,6 +302,10 @@ impl StructureWorkspace {
                     Ok(decoded)
                 })
                 .map_err(|error| bounded_console(&format!("{error:#}")));
+            log::info!("Decoder run finished: {:?} in {:.2}s ({})", language,
+                started.elapsed().as_secs_f64(),
+                if cancel.load(Ordering::Relaxed) { "cancelled" }
+                else if result.is_ok() { "ok" } else { "error" });
             if !cancel.load(Ordering::Relaxed) {
                 let _ = sender.send((source.revision, result));
                 ctx.request_repaint();
