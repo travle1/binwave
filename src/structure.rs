@@ -704,6 +704,21 @@ pub(crate) struct NumericPlan {
     pub fields: Vec<NumericField>,
 }
 impl NumericPlan {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn cache_layout_key(&self) -> String {
+        let segment = self.segmented.as_ref().map(|part| [
+            part.outer_start, part.outer_stride, part.inner_offset,
+            part.inner_count, part.inner_stride,
+        ]);
+        let fields: Vec<_> = self.fields.iter().map(|field| serde_json::json!([
+            field.name, field.suffix, field.offset, field.width, field.span,
+            field.source_path, field.kind, field.endian,
+        ])).collect();
+        serde_json::json!({
+            "version": 1, "start": self.start, "stride": self.stride,
+            "segment": segment, "path": self.path, "fields": fields,
+        }).to_string()
+    }
     /// Combine projections that address different fields of the same fixed
     /// record sequence. The layout comes from decoded array metadata, not from
     /// a file-format name or a sampled record.

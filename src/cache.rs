@@ -242,18 +242,57 @@ pub fn copy_snapshot(source: &mut File, target: &mut File, progress: &LoadProgre
 }
 
 pub fn clear() -> Result<()> {
-    let root = root();
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::structure_plot::cancel_pending_cache_writes();
+    clear_root(&root())
+}
+
+fn clear_root(root: &Path) -> Result<()> {
     if !root.exists() {
         return Ok(());
     }
-    // Only this dedicated application directory is removed, never the user's
-    // PLOTTERMAX_CACHE_DIR / XDG_CACHE_HOME parent. Existing mappings remain valid.
-    fs::remove_dir_all(&root).with_context(|| {
-        format!(
-            "clear cache {} (close files if your OS keeps them locked)",
-            root.display()
-        )
-    })
+    // Decoded plot chunks explicitly retained by the user survive an ordinary
+    // cache clear. Everything else under this dedicated application root is
+    // disposable; never touch its parent cache directory.
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_name() == "decoded-plot-v2" && path.is_dir() {
+            for file_dir in fs::read_dir(&path)? {
+                let file_dir = file_dir?;
+                let file_path = file_dir.path();
+                if file_path.is_dir() && file_path.join("keep").exists() { continue; }
+                if file_path.is_dir() { fs::remove_dir_all(file_path)?; }
+                else { fs::remove_file(file_path)?; }
+            }
+        } else if path.is_dir() {
+            fs::remove_dir_all(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn ordinary_clear_preserves_only_kept_decoded_chunks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let decoded = root.join("decoded-plot-v2");
+    let kept = decoded.join("kept");
+    let default = decoded.join("default");
+    fs::create_dir_all(&kept).unwrap();
+    fs::create_dir_all(&default).unwrap();
+    fs::create_dir_all(root.join("ordinary")).unwrap();
+    fs::write(kept.join("keep"), b"file identity").unwrap();
+    fs::write(kept.join("data.chunk"), b"decoded").unwrap();
+    fs::write(default.join("data.chunk"), b"disposable").unwrap();
+    fs::write(root.join("ordinary").join("entry"), b"disposable").unwrap();
+    clear_root(root).unwrap();
+    assert!(kept.join("data.chunk").exists());
+    assert!(!default.exists());
+    assert!(!root.join("ordinary").exists());
 }
 
 /// Bounds generated metadata before a write can exceed the configured budget.

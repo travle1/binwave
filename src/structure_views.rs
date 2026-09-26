@@ -150,6 +150,7 @@ pub struct StructureViews {
     plot_zoom_y: Option<(f64, f64)>,
     plot_follow_selection: bool,
     plot_sampled_preview: bool,
+    plot_cache_error: Option<String>,
     plot_paused: bool,
     plot_anchor: Option<usize>,
     plot_jump: usize,
@@ -1564,6 +1565,38 @@ impl StructureViews {
                 }
             });
             ui.menu_button("Plot options", |ui| {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let mut keep = crate::structure_plot::keep_decoded_data(&source);
+                if ui.checkbox(&mut keep, "Keep decoded data for this file")
+                    .on_hover_text("Retain decoded plot values as you explore. Storage grows with covered ranges; this does not decode the whole file.")
+                    .changed() {
+                    match crate::structure_plot::set_keep_decoded_data(&source, keep) {
+                        Ok(()) => {
+                            self.plot_cache_error = None;
+                            if keep {
+                                self.plot_reader.persist_available_tiles();
+                                for reader in self.extra_plot_readers.values() { reader.persist_available_tiles(); }
+                                for reader in self.group_plot_readers.values() { reader.persist_available_tiles(); }
+                            }
+                        }
+                        Err(error) => self.plot_cache_error = Some(format!("{error:#}")),
+                    }
+                }
+                let (bytes, pending, error) = crate::structure_plot::decoded_data_status(&source);
+                ui.weak(format!("Decoded data on disk: {:.1} MiB · {pending} pending",
+                    bytes as f64 / (1024. * 1024.)));
+                if let Some(error) = error.or_else(|| self.plot_cache_error.clone()) {
+                    ui.colored_label(egui::Color32::LIGHT_RED, format!("New decoded data was not retained: {error}"));
+                }
+                if ui.button("Remove decoded data for this file").clicked() {
+                    match crate::structure_plot::remove_decoded_data(&source) {
+                        Ok(()) => self.plot_cache_error = None,
+                        Err(error) => self.plot_cache_error = Some(format!("{error:#}")),
+                    }
+                }
+                ui.separator();
+            }
             if ui.checkbox(&mut self.plot_sampled_preview, "Fast sampled preview")
                 .on_hover_text("May miss peaks. Off by default; full scans run in the background and can be stopped.")
                 .changed() {
@@ -1750,7 +1783,7 @@ impl StructureViews {
                 requested.end.saturating_sub(1),
                 count
             ));
-            if let Some(data) = self.plot_reader.data() {
+            if let Some(data) = self.plot_reader.display_data() {
                 ui.weak(data.quality.label()).on_hover_text(format!(
                     "Data covers sample indices {}–{}. Dense cycles are shown as amplitude bands; zoom in to see individual samples.",
                     data.range.start,
@@ -1801,8 +1834,6 @@ impl StructureViews {
         let mut overlay_hash = std::collections::hash_map::DefaultHasher::new();
         output.revision.hash(&mut overlay_hash);
         self.plot_target.hash(&mut overlay_hash);
-        requested.start.hash(&mut overlay_hash);
-        requested.end.hash(&mut overlay_hash);
         for path in &self.plot_sources { path.hash(&mut overlay_hash); }
         let mut hidden_fields: Vec<_> = self.plot_hidden.iter().collect();
         hidden_fields.sort_unstable();
@@ -1821,7 +1852,7 @@ impl StructureViews {
             self.plot_raster.invalidate();
             self.plot_gpu.invalidate();
         }
-        if let Some(raw) = self.plot_reader.data() {
+        if let Some(raw) = self.plot_reader.display_data() {
             if self.plot_overlay.is_none() {
                 self.plot_overlay = Some((overlay_key, PlotData {
                     range: raw.range.clone(),
@@ -1856,13 +1887,7 @@ impl StructureViews {
             combined.quality = raw.quality;
             combined.complete = raw.complete;
             for (path, reader) in &self.extra_plot_readers {
-                let extra = reader.data().filter(|extra| {
-                    collection_by_path.get(path.as_str()).copied()
-                        .is_some_and(|collection| {
-                            let count = collection_count(collection);
-                            extra.range == (requested.start.min(count)..requested.end.min(count))
-                        })
-                });
+                let extra = reader.display_data().filter(|_| collection_by_path.contains_key(path.as_str()));
                 let generation = reader.data_generation();
                 if self.plot_overlay_generations.get(path) != Some(&generation) {
                     update_overlay_source(combined, &mut self.plot_overlay_points, path, extra, &self.plot_hidden, &self.presentation);
@@ -1877,12 +1902,10 @@ impl StructureViews {
                     combined.complete &= extra.complete;
                 }
             }
-            for (key, (group_node, _, paths)) in grouped_plans.iter() {
+            for (key, (_group_node, _, paths)) in grouped_plans.iter() {
                 if paths.iter().any(|path| path == &self.plot_target) { continue; }
                 let Some(reader) = self.group_plot_readers.get(key) else { continue; };
-                let count = collection_count(group_node);
-                let extra = reader.data().filter(|data| data.range ==
-                    (requested.start.min(count)..requested.end.min(count)));
+                let extra = reader.display_data();
                 let generation_key = format!("@group:{key}");
                 let generation = reader.data_generation();
                 if self.plot_overlay_generations.get(&generation_key) != Some(&generation) {

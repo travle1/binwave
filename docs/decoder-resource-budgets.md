@@ -29,6 +29,24 @@ The RAM tile cache budget is chosen from available memory on Linux and Windows
 (capped at 1 GiB per grouped reader), with a 256 MiB fallback elsewhere. Set
 `BINWAVE_PLOT_CACHE_MB` to choose 64–4096 MiB per grouped reader. Rayon uses
 the available CPU threads; `RAYON_NUM_THREADS` can override its thread count.
+Native numeric tiles now use direct hash lookups and an LRU order, and eligible
+ordinary collections use the same tiled path as grouped fields. Compatible
+prior plot data stays visible while a new viewport request loads. The RAM
+allowance remains **per reader**, so several selected collections can exceed
+one `BINWAVE_PLOT_CACHE_MB` allowance; a global memory scheduler is still
+needed.
+
+For unchanged local files without byte edits, close-range numeric tiles can
+also be stored as versioned decoded chunks under the app cache directory.
+`BINWAVE_PLOT_DISK_CACHE_MB` sets the evictable disk quota in MiB (default
+4096, clamped to 512–65536). The Plot options menu has **Keep decoded data for
+this file**. It protects already stored chunks and persists newly decoded
+selected numeric values as the file is explored. Pending writes and retained
+disk usage are displayed there; a failed write is reported and plot reads
+continue from the source. Ordinary cache clearing preserves kept chunks; the
+same menu provides explicit per-file removal. Current chunks are keyed by the
+selected field set, so a different selection can still require decoding.
+The disk quota and Keep storage do not limit the source file itself.
 
 ## Follow-up work
 

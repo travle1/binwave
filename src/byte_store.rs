@@ -117,6 +117,21 @@ impl ByteView {
     pub fn len(&self) -> usize {
         self.base.len()
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn plot_cache_key(&self, options: &impl serde::Serialize) -> Option<String> {
+        if !self.patches.is_empty() { return None; }
+        match &self.base {
+            Base::File(source) => source.cache_key("decoded-plot-v1", options).ok(),
+            Base::Snapshot(_) => None,
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn plot_source_path(&self) -> Option<PathBuf> {
+        match &self.base {
+            Base::File(source) => source.path.canonicalize().ok(),
+            Base::Snapshot(_) => None,
+        }
+    }
     pub fn read_original(&self, offset: usize, length: usize) -> Result<Vec<u8>> {
         self.base.read(offset, length)
     }

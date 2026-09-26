@@ -39,6 +39,17 @@ native subprocess. Browser scripts can make network requests and are not a
 security sandbox. The browser needs a separate file/worker adapter, not another
 decoder implementation.
 
+Native numeric plotting now routes eligible ordinary and grouped projections
+through one tiled reader. Its decoded RAM tiles and extrema summaries use
+hash lookups with LRU eviction; concurrent requests for one tile share the
+in-flight load. A separate native-only decoded-chunk cache can restore covered
+tiles after RAM eviction or restart. Chunks carry source/plan identity and a
+payload checksum; invalid chunks fall back to the source. The optional Keep
+setting protects a file's chunks from ordinary eviction and cache clearing.
+The browser continues to use the shared decoder/reducer without native
+filesystem persistence. A persistent multilevel summary index and a global
+native resource scheduler remain planned work.
+
 Validation combines native engine tests with the actual built WASM API against
 a synthetic 40 GiB file (`tests/browser_decoder.mjs`). The synthetic file forbids
 whole-file reads and validates bounded plots, offsets, edits, and failed applies.

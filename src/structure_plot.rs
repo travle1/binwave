@@ -6,12 +6,14 @@ use crate::structure::{Address, Node, NumericPlan};
 use anyhow::{ensure, Result};
 use std::collections::BTreeMap;
 #[cfg(not(target_arch = "wasm32"))]
-use std::collections::VecDeque;
+use std::collections::BTreeSet;
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -144,7 +146,7 @@ struct Running {
     finished: Arc<AtomicBool>,
 }
 #[cfg(not(target_arch = "wasm32"))]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 struct GroupSignature {
     revision: u64,
     definition: u64,
@@ -176,15 +178,122 @@ impl GroupTile {
     fn bytes(&self) -> usize {
         (self.end - self.start).saturating_mul(self.values.len()).saturating_mul(std::mem::size_of::<f64>())
     }
+    fn from_values(start: Address, values: Vec<Vec<f64>>) -> Self {
+        let end = start + values.first().map_or(0, Vec::len);
+        let mut bins = Vec::new();
+        for bin_start in (start..end).step_by(GROUP_SUMMARY_SAMPLES) {
+            let bin_end = bin_start.saturating_add(GROUP_SUMMARY_SAMPLES).min(end);
+            let mut fields = Vec::with_capacity(values.len());
+            for field_values in &values {
+                let mut summary: Option<NumericBucket> = None;
+                for index in bin_start..bin_end {
+                    let value = field_values[index - start];
+                    if !value.is_finite() { continue; }
+                    let point = NumericPoint { index, value };
+                    match &mut summary {
+                        Some(bucket) => bucket.push(point),
+                        slot => *slot = Some(NumericBucket { first: point, min: point, max: point, last: point }),
+                    }
+                }
+                fields.push(summary);
+            }
+            bins.push((bin_start..bin_end, fields));
+        }
+        let summary = Arc::new(GroupTileSummary { start, end, bins });
+        Self { start, end, values, summary }
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+struct LruEntry<T> {
+    value: T,
+    older: Option<Address>,
+    newer: Option<Address>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+struct LruMap<T> {
+    entries: HashMap<Address, LruEntry<T>>,
+    newest: Option<Address>,
+    oldest: Option<Address>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T> Default for LruMap<T> {
+    fn default() -> Self {
+        Self { entries: HashMap::new(), newest: None, oldest: None }
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Clone> LruMap<T> {
+    fn len(&self) -> usize { self.entries.len() }
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.newest = None;
+        self.oldest = None;
+    }
+    fn get(&mut self, key: Address) -> Option<T> {
+        let value = self.entries.get(&key)?.value.clone();
+        self.touch(key);
+        Some(value)
+    }
+    fn insert(&mut self, key: Address, value: T) -> bool {
+        if self.entries.contains_key(&key) { self.touch(key); return false; }
+        if let Some(newest) = self.newest {
+            self.entries.get_mut(&newest).unwrap().newer = Some(key);
+        } else {
+            self.oldest = Some(key);
+        }
+        self.entries.insert(key, LruEntry { value, older: self.newest, newer: None });
+        self.newest = Some(key);
+        true
+    }
+    fn pop_oldest(&mut self) -> Option<T> {
+        let key = self.oldest?;
+        let entry = self.entries.remove(&key).unwrap();
+        self.oldest = entry.newer;
+        if let Some(next) = self.oldest {
+            self.entries.get_mut(&next).unwrap().older = None;
+        } else {
+            self.newest = None;
+        }
+        Some(entry.value)
+    }
+    fn touch(&mut self, key: Address) {
+        if self.newest == Some(key) { return; }
+        let (older, newer) = {
+            let entry = self.entries.get(&key).unwrap();
+            (entry.older, entry.newer)
+        };
+        if let Some(older) = older {
+            self.entries.get_mut(&older).unwrap().newer = newer;
+        } else {
+            self.oldest = newer;
+        }
+        if let Some(newer) = newer {
+            self.entries.get_mut(&newer).unwrap().older = older;
+        }
+        if let Some(previous) = self.newest {
+            self.entries.get_mut(&previous).unwrap().newer = Some(key);
+        }
+        let entry = self.entries.get_mut(&key).unwrap();
+        entry.older = self.newest;
+        entry.newer = None;
+        self.newest = Some(key);
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct TileFlight {
+    result: Mutex<Option<std::result::Result<Arc<GroupTile>, String>>>,
+    ready: Condvar,
 }
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 struct GroupTileCache {
     signature: Option<GroupSignature>,
-    tiles: VecDeque<(Address, Arc<GroupTile>)>,
+    tiles: LruMap<Arc<GroupTile>>,
     bytes: usize,
-    summaries: VecDeque<(Address, Arc<GroupTileSummary>)>,
+    summaries: LruMap<Arc<GroupTileSummary>>,
     summary_bytes: usize,
+    in_flight: HashMap<(GroupSignature, Address), Arc<TileFlight>>,
     #[cfg(test)]
     loads: usize,
 }
@@ -197,38 +306,29 @@ impl GroupTileCache {
             self.bytes = 0;
             self.summaries.clear();
             self.summary_bytes = 0;
+            self.in_flight.clear();
         }
     }
     fn get(&mut self, start: Address) -> Option<Arc<GroupTile>> {
-        let index = self.tiles.iter().position(|(key, _)| *key == start)?;
-        let entry = self.tiles.remove(index)?;
-        let tile = entry.1.clone();
-        self.tiles.push_front(entry);
-        Some(tile)
+        self.tiles.get(start)
     }
     fn insert(&mut self, tile: Arc<GroupTile>) {
-        if self.tiles.iter().any(|(start, _)| *start == tile.start) { return; }
+        if !self.tiles.insert(tile.start, tile.clone()) { return; }
         self.bytes = self.bytes.saturating_add(tile.bytes());
         #[cfg(test)] { self.loads += 1; }
-        self.tiles.push_front((tile.start, tile));
-        let summary = self.tiles.front().unwrap().1.summary.clone();
-        if !self.summaries.iter().any(|(start, _)| *start == summary.start) {
+        let summary = tile.summary.clone();
+        if self.summaries.insert(summary.start, summary.clone()) {
             self.summary_bytes += summary.bytes();
-            self.summaries.push_front((summary.start, summary));
         }
         while self.bytes > group_buffer_bytes() && self.tiles.len() > 1 {
-            if let Some((_, old)) = self.tiles.pop_back() { self.bytes -= old.bytes(); }
+            if let Some(old) = self.tiles.pop_oldest() { self.bytes -= old.bytes(); }
         }
         while self.summary_bytes > group_buffer_bytes().saturating_mul(4) && self.summaries.len() > 1 {
-            if let Some((_, old)) = self.summaries.pop_back() { self.summary_bytes -= old.bytes(); }
+            if let Some(old) = self.summaries.pop_oldest() { self.summary_bytes -= old.bytes(); }
         }
     }
     fn summary(&mut self, start: Address) -> Option<Arc<GroupTileSummary>> {
-        let index = self.summaries.iter().position(|(key, _)| *key == start)?;
-        let entry = self.summaries.remove(index)?;
-        let summary = entry.1.clone();
-        self.summaries.push_front(entry);
-        Some(summary)
+        self.summaries.get(start)
     }
 }
 #[cfg(not(target_arch = "wasm32"))]
@@ -237,6 +337,8 @@ pub struct PlotReader {
     desired: Option<Request>,
     running: Option<Running>,
     data: Option<Arc<PlotData>>,
+    data_key: Option<Key>,
+    start_after: Option<Instant>,
     error: Option<String>,
     cache: VecDeque<Cached>,
     group_tiles: Arc<Mutex<GroupTileCache>>,
@@ -276,7 +378,8 @@ impl PlotReader {
         refine: bool,
         fields: Option<Vec<String>>,
     ) {
-        self.request_with_updates(ctx, source, node, range, pixel_width, refine, fields, None, true);
+        let plan = eligible_numeric_plan(&node, fields.as_deref());
+        self.request_with_updates(ctx, source, node, range, pixel_width, refine, fields, plan, true);
     }
 
     pub fn request_background(
@@ -288,7 +391,8 @@ impl PlotReader {
         pixel_width: Address,
         refine: bool,
     ) {
-        self.request_with_updates(ctx, source, node, range, pixel_width, refine, None, None, false);
+        let plan = eligible_numeric_plan(&node, None);
+        self.request_with_updates(ctx, source, node, range, pixel_width, refine, None, plan, false);
     }
 
     pub fn request_group(
@@ -329,7 +433,9 @@ impl PlotReader {
         let count = node.lazy.as_ref().map_or(node.children.len(), |array| array.count);
         let start = range.start.min(count);
         let range = start..range.end.max(start).min(count);
-        let (buckets, exact_limit) = request_resolution(&range, pixel_width, None);
+        let plan = eligible_numeric_plan(node, None);
+        let (buckets, exact_limit) = request_resolution(&range, pixel_width,
+            plan.as_ref().map(|plan| plan.fields.len()));
         self.desired.as_ref().is_some_and(|request| {
             let key = &request.key;
             key.revision == revision
@@ -383,8 +489,16 @@ impl PlotReader {
         if let Some(running) = &self.running {
             running.cancel.store(true, Ordering::Relaxed);
         }
-        self.data = None;
-        self.data_generation = self.data_generation.wrapping_add(1);
+        let compatible = self.data_key.as_ref().is_some_and(|old|
+            old.revision == key.revision && old.definition == key.definition
+                && old.path == key.path && old.fields == key.fields);
+        if !compatible {
+            self.data = None;
+            self.data_key = None;
+            self.data_generation = self.data_generation.wrapping_add(1);
+        }
+        self.start_after = (compatible && self.data.is_some())
+            .then(|| Instant::now() + Duration::from_millis(16));
         self.error = None;
         // Retaining the request also retains its decode plan, so pointer identity
         // cannot be recycled while a cached interpretation is still present.
@@ -398,6 +512,8 @@ impl PlotReader {
             match source.validate() {
                 Ok(()) => {
                     self.data = Some(cached.data.clone());
+                    self.data_key = Some(key.clone());
+                    self.start_after = None;
                     self.data_generation = self.data_generation.wrapping_add(1);
                     self.cache.push_front(cached);
                 }
@@ -431,10 +547,12 @@ impl PlotReader {
                                 self.cache.truncate(CACHE_ENTRIES);
                             }
                             self.data = Some(data);
+                            self.data_key = Some(outcome.key.clone());
                             self.data_generation = self.data_generation.wrapping_add(1);
                         }
                         Err(error) => {
                             self.data = None;
+                            self.data_key = None;
                             self.data_generation = self.data_generation.wrapping_add(1);
                             self.error = Some(error);
                         }
@@ -450,8 +568,16 @@ impl PlotReader {
         }
         if self.running.is_none()
             && self.error.is_none()
-            && !self.data.as_ref().is_some_and(|data| data.complete)
+            && !self.data.as_ref().is_some_and(|data| data.complete
+                && self.data_key.as_ref() == self.desired.as_ref().map(|request| &request.key))
         {
+            if let Some(start) = self.start_after {
+                if let Some(wait) = start.checked_duration_since(Instant::now()) {
+                    ctx.request_repaint_after(wait);
+                    return;
+                }
+                self.start_after = None;
+            }
             if let Some(request) = self.desired.clone() {
                 let cancel = Arc::new(AtomicBool::new(false));
                 let latest = Arc::new(Mutex::new(None));
@@ -498,13 +624,13 @@ impl PlotReader {
                             result: result.map_err(|error| format!("{error:#}")),
                         });
                     }
-                    finished.store(true, Ordering::Release);
-                    ctx.request_repaint();
                     if succeeded && !cancel.load(Ordering::Relaxed) {
                         if let (Some(plan), Some(tiles)) = (&request.numeric_plan, &request.group_tiles) {
                             prefetch_group_neighbors(&request, plan, tiles, &cancel);
                         }
                     }
+                    finished.store(true, Ordering::Release);
+                    ctx.request_repaint();
                 });
             }
         }
@@ -518,6 +644,8 @@ impl PlotReader {
         }
         self.desired = None;
         self.data = None;
+        self.data_key = None;
+        self.start_after = None;
         self.data_generation = self.data_generation.wrapping_add(1);
         self.error = None;
         self.cache.clear();
@@ -530,10 +658,38 @@ impl PlotReader {
         self.desired = None;
     }
     pub fn data(&self) -> Option<&PlotData> {
+        (self.data_key.as_ref() == self.desired.as_ref().map(|request| &request.key))
+            .then(|| self.data.as_deref()).flatten()
+    }
+    /// A prior result remains paintable while the next compatible viewport loads.
+    pub fn display_data(&self) -> Option<&PlotData> {
         self.data.as_deref()
     }
     pub fn data_generation(&self) -> u64 {
         self.data_generation
+    }
+    pub(crate) fn persist_available_tiles(&self) {
+        let Some(request) = self.desired.clone() else { return; };
+        let Some(plan) = request.numeric_plan.clone() else { return; };
+        if !keep_decoded_data(&request.source) { return; }
+        let signature = group_signature(&request);
+        let tiles: Vec<_> = {
+            let cache = self.group_tiles.lock().unwrap();
+            if cache.signature.as_ref() != Some(&signature) { return; }
+            cache.tiles.entries.values().map(|entry| entry.value.clone()).collect()
+        };
+        std::thread::spawn(move || {
+            let size = group_tile_size(&plan);
+            for tile in tiles {
+                if !keep_decoded_data(&request.source) { break; }
+                if let Some((path, key)) = decoded_chunk_key(&request, &plan, tile.start, size) {
+                    if !path.exists() {
+                        queue_decoded_chunk(ChunkWrite { path, key, tile, generation: 0,
+                            file_generation: 0, keep: false }, true);
+                    }
+                }
+            }
+        });
     }
     #[cfg(test)]
     pub(crate) fn group_buffer_stats(&self) -> (usize, usize) {
@@ -550,7 +706,8 @@ impl PlotReader {
     pub fn is_loading(&self) -> bool {
         self.desired.is_some()
             && self.error.is_none()
-            && !self.data.as_ref().is_some_and(|data| data.complete)
+            && (self.running.is_some() || !self.data.as_ref().is_some_and(|data| data.complete
+                && self.data_key.as_ref() == self.desired.as_ref().map(|request| &request.key)))
     }
 }
 fn identity(node: &Node) -> u64 {
@@ -1058,6 +1215,16 @@ fn group_tile_size(plan: &NumericPlan) -> Address {
     GROUP_TILE_SAMPLES.min(((READ_LIMIT.saturating_sub(plan.stride)) / stride).saturating_add(1).max(1))
 }
 #[cfg(not(target_arch = "wasm32"))]
+fn eligible_numeric_plan(node: &Node, selected: Option<&[String]>) -> Option<NumericPlan> {
+    let mut plan = node.lazy.as_ref()?.numeric_plan()?;
+    if plan.stride == 0 || plan.stride > READ_LIMIT { return None; }
+    if let Some(selected) = selected {
+        let names: std::collections::HashSet<_> = selected.iter().collect();
+        plan.fields.retain(|field| names.contains(&field.name));
+    }
+    (!plan.fields.is_empty()).then_some(plan)
+}
+#[cfg(not(target_arch = "wasm32"))]
 fn group_signature(request: &Request) -> GroupSignature {
     GroupSignature {
         revision: request.key.revision,
@@ -1065,6 +1232,330 @@ fn group_signature(request: &Request) -> GroupSignature {
         path: request.key.path.clone(),
         fields: request.key.fields.clone().unwrap_or_default(),
     }
+}
+#[cfg(not(target_arch = "wasm32"))]
+const DECODED_CHUNK_MAGIC: &[u8; 8] = b"BWCHNK02";
+#[cfg(not(target_arch = "wasm32"))]
+fn chunk_hash(bytes: &[u8], mut hash: u64) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn decoded_file_dir(source: &ByteView) -> Option<std::path::PathBuf> {
+    let path = source.plot_source_path()?;
+    let hash = chunk_hash(path.as_os_str().as_encoded_bytes(), 0xcbf29ce484222325);
+    Some(crate::cache::root().join("decoded-plot-v2").join(format!("{hash:016x}")))
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn keep_state() -> &'static Mutex<HashMap<std::path::PathBuf, bool>> {
+    static STATE: std::sync::OnceLock<Mutex<HashMap<std::path::PathBuf, bool>>> = std::sync::OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn keep_decoded_data(source: &ByteView) -> bool {
+    let Some(path) = source.plot_source_path() else { return false; };
+    let Some(dir) = decoded_file_dir(source) else { return false; };
+    let mut state = keep_state().lock().unwrap();
+    *state.entry(dir.clone()).or_insert_with(||
+        std::fs::read(dir.join("keep")).ok().as_deref() == Some(path.as_os_str().as_encoded_bytes()))
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn set_keep_decoded_data(source: &ByteView, keep: bool) -> Result<()> {
+    use std::io::Write;
+    let path = source.plot_source_path().ok_or_else(|| anyhow::anyhow!("Plot source is not a local file"))?;
+    let dir = decoded_file_dir(source).ok_or_else(|| anyhow::anyhow!("Plot source is not a local file"))?;
+    let marker = dir.join("keep");
+    if keep {
+        std::fs::create_dir_all(&dir)?;
+        let mut file = tempfile::NamedTempFile::new_in(&dir)?;
+        file.write_all(path.as_os_str().as_encoded_bytes())?;
+        file.as_file().sync_all()?;
+        file.persist(marker).map_err(|error| error.error)?;
+    } else if marker.exists() {
+        std::fs::remove_file(marker)?;
+    }
+    keep_state().lock().unwrap().insert(dir, keep);
+    invalidate_chunk_catalog();
+    Ok(())
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn remove_decoded_data(source: &ByteView) -> Result<()> {
+    if let Some(dir) = decoded_file_dir(source) {
+        let mut generations = chunk_file_generations().lock().unwrap();
+        *generations.entry(dir.clone()).or_default() += 1;
+        drop(generations);
+        if dir.exists() { std::fs::remove_dir_all(&dir)?; }
+        keep_state().lock().unwrap().remove(&dir);
+        chunk_errors().lock().unwrap().remove(&dir);
+    }
+    invalidate_chunk_catalog();
+    Ok(())
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn decoded_data_usage(source: &ByteView) -> u64 {
+    let Some(dir) = decoded_file_dir(source) else { return 0; };
+    static USAGE: std::sync::OnceLock<Mutex<HashMap<std::path::PathBuf, (Instant, u64)>>> = std::sync::OnceLock::new();
+    let usage = USAGE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some((at, bytes)) = usage.lock().unwrap().get(&dir) {
+        if at.elapsed() < Duration::from_secs(1) { return *bytes; }
+    }
+    let bytes = std::fs::read_dir(&dir).ok().into_iter().flatten().flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.is_file()).map(|metadata| metadata.len()).sum();
+    usage.lock().unwrap().insert(dir, (Instant::now(), bytes));
+    bytes
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn decoded_chunk_key(request: &Request, plan: &NumericPlan, start: Address, size: Address)
+    -> Option<(std::path::PathBuf, String)> {
+    let key = request.source.plot_cache_key(&(plan.cache_layout_key(), start, size))?;
+    let hash = chunk_hash(key.as_bytes(), 0xcbf29ce484222325);
+    let path = decoded_file_dir(&request.source)?
+        .join(format!("{hash:016x}.chunk"));
+    Some((path, key))
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn read_decoded_chunk(path: &std::path::Path, key: &str, start: Address,
+    count: Address, fields: Address) -> Option<GroupTile> {
+    use std::io::Read;
+    let source = std::fs::File::open(path).ok()?;
+    let mut file = std::io::BufReader::with_capacity(256 * 1024, source);
+    let mut header = [0u8; 40];
+    file.read_exact(&mut header).ok()?;
+    if &header[..8] != DECODED_CHUNK_MAGIC { return None; }
+    let key_len = u64::from_le_bytes(header[8..16].try_into().ok()?) as usize;
+    let stored_start = u64::from_le_bytes(header[16..24].try_into().ok()?) as usize;
+    let stored_count = u32::from_le_bytes(header[24..28].try_into().ok()?) as usize;
+    let stored_fields = u32::from_le_bytes(header[28..32].try_into().ok()?) as usize;
+    let expected_hash = u64::from_le_bytes(header[32..40].try_into().ok()?);
+    if key_len != key.len() || key_len > 1_000_000 || stored_start != start
+        || stored_count != count || stored_fields != fields { return None; }
+    let payload_bytes = count.checked_mul(fields)?.checked_mul(8)?;
+    if file.get_ref().metadata().ok()?.len() != (40usize.checked_add(key_len)?.checked_add(payload_bytes)?) as u64 {
+        return None;
+    }
+    let mut saved_key = vec![0; key_len];
+    file.read_exact(&mut saved_key).ok()?;
+    if saved_key != key.as_bytes() { return None; }
+    let mut hash = chunk_hash(&saved_key, 0xcbf29ce484222325);
+    let mut values = Vec::with_capacity(fields);
+    for _ in 0..fields {
+        let mut field = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut bytes = [0; 8];
+            file.read_exact(&mut bytes).ok()?;
+            hash = chunk_hash(&bytes, hash);
+            field.push(f64::from_le_bytes(bytes));
+        }
+        values.push(field);
+    }
+    (hash == expected_hash).then(|| GroupTile::from_values(start, values))
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn write_decoded_chunk(path: &std::path::Path, key: &str, tile: &GroupTile) -> Result<()> {
+    use std::io::Write;
+    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("chunk path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    let mut hash = chunk_hash(key.as_bytes(), 0xcbf29ce484222325);
+    for field in &tile.values {
+        for &value in field { hash = chunk_hash(&value.to_le_bytes(), hash); }
+    }
+    {
+        let mut writer = std::io::BufWriter::with_capacity(256 * 1024, &mut file);
+        writer.write_all(DECODED_CHUNK_MAGIC)?;
+        writer.write_all(&(key.len() as u64).to_le_bytes())?;
+        writer.write_all(&(tile.start as u64).to_le_bytes())?;
+        writer.write_all(&u32::try_from(tile.end - tile.start)?.to_le_bytes())?;
+        writer.write_all(&u32::try_from(tile.values.len())?.to_le_bytes())?;
+        writer.write_all(&hash.to_le_bytes())?;
+        writer.write_all(key.as_bytes())?;
+        for field in &tile.values {
+            for &value in field { writer.write_all(&value.to_le_bytes())?; }
+        }
+        writer.flush()?;
+    }
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn decoded_chunk_quota() -> u64 {
+    static QUOTA: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *QUOTA.get_or_init(|| std::env::var("BINWAVE_PLOT_DISK_CACHE_MB").ok()
+        .and_then(|value| value.parse::<u64>().ok()).unwrap_or(4096)
+        .clamp(512, 65_536) * 1024 * 1024)
+}
+#[cfg(not(target_arch = "wasm32"))]
+struct ChunkCatalog {
+    root: std::path::PathBuf,
+    generation: u64,
+    total: u64,
+    files: HashMap<std::path::PathBuf, (std::time::SystemTime, u64)>,
+    oldest: BTreeSet<(std::time::SystemTime, std::path::PathBuf)>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl ChunkCatalog {
+    fn scan(root: &std::path::Path, generation: u64) -> Self {
+        let mut catalog = Self {
+            root: root.to_owned(), generation, total: 0,
+            files: HashMap::new(), oldest: BTreeSet::new(),
+        };
+        if let Ok(directories) = std::fs::read_dir(root) {
+            for directory in directories.flatten() {
+                if directory.path().join("keep").exists() { continue; }
+                if let Ok(entries) = std::fs::read_dir(directory.path()) {
+                    for entry in entries.flatten() { catalog.record(&entry.path()); }
+                }
+            }
+        }
+        catalog
+    }
+    fn record(&mut self, path: &std::path::Path) {
+        if path.extension().is_none_or(|ext| ext != "chunk")
+            || path.parent().is_some_and(|dir| dir.join("keep").exists()) { return; }
+        let Ok(metadata) = std::fs::metadata(path) else { return; };
+        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        let bytes = metadata.len();
+        if let Some((old_time, old_bytes)) = self.files.insert(path.to_owned(), (modified, bytes)) {
+            self.oldest.remove(&(old_time, path.to_owned()));
+            self.total = self.total.saturating_sub(old_bytes);
+        }
+        self.oldest.insert((modified, path.to_owned()));
+        self.total = self.total.saturating_add(bytes);
+    }
+    fn prune(&mut self) { self.prune_to(decoded_chunk_quota()); }
+    fn prune_to(&mut self, limit: u64) {
+        while self.total > limit {
+            let Some((modified, path)) = self.oldest.pop_first() else { break; };
+            let Some((_, bytes)) = self.files.remove(&path) else { continue; };
+            if path.parent().is_some_and(|dir| dir.join("keep").exists()) {
+                self.total = self.total.saturating_sub(bytes);
+                continue;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                self.total = self.total.saturating_sub(bytes);
+            } else {
+                self.files.insert(path.clone(), (modified, bytes));
+                self.oldest.insert((modified, path));
+                break;
+            }
+        }
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+static CHUNK_CATALOG_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(not(target_arch = "wasm32"))]
+fn invalidate_chunk_catalog() { CHUNK_CATALOG_GENERATION.fetch_add(1, Ordering::AcqRel); }
+#[cfg(not(target_arch = "wasm32"))]
+struct ChunkWrite {
+    path: std::path::PathBuf,
+    key: String,
+    tile: Arc<GroupTile>,
+    generation: u64,
+    file_generation: u64,
+    keep: bool,
+}
+#[cfg(not(target_arch = "wasm32"))]
+static CHUNK_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn cancel_pending_cache_writes() {
+    CHUNK_GENERATION.fetch_add(1, Ordering::AcqRel);
+    invalidate_chunk_catalog();
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn chunk_file_generations() -> &'static Mutex<HashMap<std::path::PathBuf, u64>> {
+    static GENERATIONS: std::sync::OnceLock<Mutex<HashMap<std::path::PathBuf, u64>>> = std::sync::OnceLock::new();
+    GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn pending_chunks() -> &'static Mutex<HashSet<std::path::PathBuf>> {
+    static PENDING: std::sync::OnceLock<Mutex<HashSet<std::path::PathBuf>>> = std::sync::OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn chunk_errors() -> &'static Mutex<HashMap<std::path::PathBuf, String>> {
+    static ERRORS: std::sync::OnceLock<Mutex<HashMap<std::path::PathBuf, String>>> = std::sync::OnceLock::new();
+    ERRORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn decoded_data_status(source: &ByteView) -> (u64, usize, Option<String>) {
+    let Some(dir) = decoded_file_dir(source) else { return (0, 0, None); };
+    let pending = pending_chunks().lock().unwrap().iter()
+        .filter(|path| path.starts_with(&dir)).count();
+    let error = chunk_errors().lock().unwrap().get(&dir).cloned();
+    (decoded_data_usage(source), pending, error)
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn queue_decoded_chunk(mut job: ChunkWrite, keep: bool) {
+    job.generation = CHUNK_GENERATION.load(Ordering::Acquire);
+    job.file_generation = job.path.parent().and_then(|dir|
+        chunk_file_generations().lock().unwrap().get(dir).copied()).unwrap_or(0);
+    job.keep = keep;
+    static WRITER: std::sync::OnceLock<std::sync::mpsc::SyncSender<ChunkWrite>> = std::sync::OnceLock::new();
+    let sender = WRITER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<ChunkWrite>(4);
+        std::thread::spawn(move || {
+            let mut catalog: Option<ChunkCatalog> = None;
+            while let Ok(job) = receiver.recv() {
+                let dir = job.path.parent().unwrap();
+                let file_generation = chunk_file_generations().lock().unwrap().get(dir).copied().unwrap_or(0);
+                if (!job.keep && job.generation != CHUNK_GENERATION.load(Ordering::Acquire))
+                    || job.file_generation != file_generation {
+                    pending_chunks().lock().unwrap().remove(&job.path);
+                    continue;
+                }
+                let root = job.path.parent().unwrap().parent().unwrap();
+                if let Err(error) = write_decoded_chunk(&job.path, &job.key, &job.tile) {
+                    log::warn!("Decoded plot cache write failed: {error:#}");
+                    chunk_errors().lock().unwrap().insert(dir.to_path_buf(), format!("{error:#}"));
+                } else {
+                    chunk_errors().lock().unwrap().remove(dir);
+                    let generation = CHUNK_CATALOG_GENERATION.load(Ordering::Acquire);
+                    if catalog.as_ref().is_none_or(|known|
+                        known.generation != generation || known.root != root) {
+                        catalog = Some(ChunkCatalog::scan(root, generation));
+                    } else if let Some(catalog) = &mut catalog {
+                        catalog.record(&job.path);
+                    }
+                    if let Some(catalog) = &mut catalog { catalog.prune(); }
+                }
+                let file_generation = chunk_file_generations().lock().unwrap().get(dir).copied().unwrap_or(0);
+                if (!job.keep && job.generation != CHUNK_GENERATION.load(Ordering::Acquire))
+                    || job.file_generation != file_generation {
+                    let _ = std::fs::remove_file(&job.path);
+                }
+                pending_chunks().lock().unwrap().remove(&job.path);
+            }
+        });
+        sender
+    });
+    let path = job.path.clone();
+    if !pending_chunks().lock().unwrap().insert(path.clone()) { return; }
+    let sent = if keep { sender.send(job).is_ok() } else { sender.try_send(job).is_ok() };
+    if !sent {
+        pending_chunks().lock().unwrap().remove(&path);
+        if keep {
+            if let Some(dir) = path.parent() {
+                chunk_errors().lock().unwrap().insert(dir.to_path_buf(),
+                    "Decoded cache writer is unavailable".into());
+            }
+        }
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn persist_visible_tile(request: &Request, plan: &NumericPlan,
+    start: Address, tile: &Arc<GroupTile>) {
+    let keep = keep_decoded_data(&request.source);
+    if !keep && request.key.range.len() > AUTO_SCAN_LIMIT { return; }
+    let Some((path, key)) = decoded_chunk_key(request, plan, start, group_tile_size(plan)) else { return; };
+    if !path.exists() { queue_decoded_chunk(ChunkWrite { path, key, tile: tile.clone(),
+        generation: 0, file_generation: 0, keep: false }, keep); }
 }
 #[cfg(not(target_arch = "wasm32"))]
 fn load_group_tile(request: &Request, plan: &NumericPlan, start: Address, size: Address,
@@ -1106,43 +1597,72 @@ fn load_group_tile(request: &Request, plan: &NumericPlan, start: Address, size: 
     } else {
         plan.fields.iter().map(decode_field).collect::<Result<Vec<_>>>()?
     };
-    let mut bins = Vec::new();
-    for bin_start in (start..end).step_by(GROUP_SUMMARY_SAMPLES) {
-        let bin_end = bin_start.saturating_add(GROUP_SUMMARY_SAMPLES).min(end);
-        let mut fields = Vec::with_capacity(values.len());
-        for field_values in &values {
-            let mut summary: Option<NumericBucket> = None;
-            for index in bin_start..bin_end {
-                let value = field_values[index - start];
-                if !value.is_finite() { continue; }
-                let point = NumericPoint { index, value };
-                match &mut summary {
-                    Some(bucket) => bucket.push(point),
-                    slot => *slot = Some(NumericBucket { first: point, min: point, max: point, last: point }),
-                }
-            }
-            fields.push(summary);
-        }
-        bins.push((bin_start..bin_end, fields));
-    }
-    let summary = Arc::new(GroupTileSummary { start, end, bins });
-    Ok(GroupTile { start, end, values, summary })
+    Ok(GroupTile::from_values(start, values))
 }
 #[cfg(not(target_arch = "wasm32"))]
 fn cached_group_tile(request: &Request, plan: &NumericPlan,
     cache: &Arc<Mutex<GroupTileCache>>, signature: &GroupSignature,
     start: Address, cancel: &AtomicBool) -> Result<Arc<GroupTile>> {
-    {
+    let (flight, owner) = {
         let mut cache = cache.lock().unwrap();
         cache.prepare(signature);
-        if let Some(tile) = cache.get(start) { return Ok(tile); }
+        if let Some(tile) = cache.get(start) {
+            drop(cache);
+            persist_visible_tile(request, plan, start, &tile);
+            return Ok(tile);
+        }
+        let key = (signature.clone(), start);
+        if let Some(flight) = cache.in_flight.get(&key) {
+            (flight.clone(), false)
+        } else {
+            let flight = Arc::new(TileFlight::default());
+            cache.in_flight.insert(key, flight.clone());
+            (flight, true)
+        }
+    };
+    if !owner {
+        let mut result = flight.result.lock().unwrap();
+        loop {
+            ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
+            if let Some(result) = result.as_ref() {
+                return result.clone().map_err(anyhow::Error::msg);
+            }
+            result = flight.ready.wait_timeout(result, Duration::from_millis(25)).unwrap().0;
+        }
     }
-    let tile = Arc::new(load_group_tile(request, plan, start, group_tile_size(plan), cancel)?);
-    if !cancel.load(Ordering::Relaxed) {
+    let size = group_tile_size(plan);
+    let count = request.node.lazy.as_ref().map_or(0, |array| array.count);
+    let expected = start.saturating_add(size).min(count).saturating_sub(start);
+    let disk = decoded_chunk_key(request, plan, start, size);
+    let from_disk = disk.as_ref().and_then(|(path, key)|
+        read_decoded_chunk(path, key, start, expected, plan.fields.len()));
+    let disk_hit = from_disk.is_some();
+    let result = match from_disk {
+        Some(tile) => Ok(Arc::new(tile)),
+        None => load_group_tile(request, plan, start, size, cancel).map(Arc::new),
+    };
+    if let (Ok(tile), Some((path, key))) = (&result, disk) {
+        let keep = keep_decoded_data(&request.source);
+        if (keep || request.key.range.len() <= AUTO_SCAN_LIMIT) && !disk_hit
+            && !cancel.load(Ordering::Relaxed) {
+            queue_decoded_chunk(ChunkWrite { path, key, tile: tile.clone(),
+                generation: 0, file_generation: 0, keep: false }, keep);
+        }
+    }
+    {
         let mut cache = cache.lock().unwrap();
-        if cache.signature.as_ref() == Some(signature) { cache.insert(tile.clone()); }
+        let key = (signature.clone(), start);
+        if cache.in_flight.get(&key).is_some_and(|current| Arc::ptr_eq(current, &flight)) {
+            cache.in_flight.remove(&key);
+        }
+        if !cancel.load(Ordering::Relaxed) && cache.signature.as_ref() == Some(signature) {
+            if let Ok(tile) = &result { cache.insert(tile.clone()); }
+        }
     }
-    Ok(tile)
+    *flight.result.lock().unwrap() = Some(result.as_ref().map(Arc::clone)
+        .map_err(|error| format!("{error:#}")));
+    flight.ready.notify_all();
+    result
 }
 #[cfg(not(target_arch = "wasm32"))]
 fn cached_group_summary(request: &Request, plan: &NumericPlan,
@@ -1528,6 +2048,256 @@ actions:
             assert!(Instant::now() < deadline, "plot worker did not settle");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+    /// Run with `cargo test --release benchmark_numeric_plot_navigation -- --ignored --nocapture`.
+    /// The allocated file and decoder layout are generic; no user data is needed.
+    #[test]
+    #[ignore = "manual performance measurement"]
+    fn benchmark_numeric_plot_navigation() {
+        let count = std::env::var("BINWAVE_BENCH_SAMPLES").ok()
+            .and_then(|value| value.parse::<usize>().ok()).unwrap_or(1_000_000);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut bytes = Vec::with_capacity(count * 4);
+        for index in 0..count {
+            bytes.extend_from_slice(&((index % 1024) as i32).to_le_bytes());
+        }
+        std::fs::write(file.path(), &bytes).unwrap();
+        drop(bytes);
+        let file_source = Arc::new(crate::file_source::FileSource::open(file.path()).unwrap());
+        let store = ByteStore::from_file(file_source.clone());
+        let node = parse(&store.view(),
+            "actions:\n  - read: {name: samples, type: i32, repeat: until end}\n");
+        let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
+        let mut query = request(store.view(), node, 0..count, true);
+        query.key.buckets = display_buckets(1920);
+        query.numeric_plan = Some(plan);
+        let tiles = Arc::new(Mutex::new(GroupTileCache::default()));
+        query.group_tiles = Some(tiles.clone());
+        for (name, range) in [
+            ("overview", 0..count),
+            ("zoom", count / 2..(count / 2 + 8192).min(count)),
+            ("adjacent", count / 2 + 4096..(count / 2 + 12_288).min(count)),
+            ("return", count / 2..(count / 2 + 8192).min(count)),
+        ] {
+            query.key.range = range;
+            let start = Instant::now();
+            let before = file_source.io_stats();
+            let data = read_plot(&query, &AtomicBool::new(false), |_| {}).unwrap();
+            let after = file_source.io_stats();
+            println!("plot_bench phase={name} elapsed_ms={:.3} scanned={} source_calls={} source_bytes={} tile_loads={}",
+                start.elapsed().as_secs_f64() * 1000., data.scanned,
+                after.0 - before.0, after.1 - before.1, tiles.lock().unwrap().loads);
+        }
+    }
+    #[test]
+    fn tile_lookup_keeps_constant_time_eviction_order() {
+        let mut cache = LruMap::default();
+        for key in 0..10_000 { assert!(cache.insert(key, key)); }
+        assert_eq!(cache.get(0), Some(0));
+        assert_eq!(cache.pop_oldest(), Some(1));
+        assert_eq!(cache.get(0), Some(0));
+        assert!(!cache.insert(0, 999));
+        assert_eq!(cache.get(0), Some(0));
+        for expected in 2..10_000 { assert_eq!(cache.pop_oldest(), Some(expected)); }
+        assert_eq!(cache.pop_oldest(), Some(0));
+        assert_eq!(cache.pop_oldest(), None);
+        assert_eq!(cache.len(), 0);
+    }
+    #[test]
+    fn concurrent_group_tile_requests_share_one_decode() {
+        let (store, node) = fixture(8192, usize::MAX);
+        let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
+        let query = request(store.view(), node, 0..8192, true);
+        let signature = group_signature(&query);
+        let cache = Arc::new(Mutex::new(GroupTileCache::default()));
+        let cancel = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0..8).map(|_| {
+                let cache = cache.clone();
+                let query = &query;
+                let plan = &plan;
+                let signature = &signature;
+                let cancel = &cancel;
+                scope.spawn(move || cached_group_tile(query, plan, &cache, signature, 0, cancel).unwrap())
+            }).collect();
+            for job in jobs { assert_eq!(job.join().unwrap().start, 0); }
+        });
+        assert_eq!(cache.lock().unwrap().loads, 1);
+    }
+    #[test]
+    fn decoded_chunk_round_trip_checks_identity_and_integrity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.chunk");
+        let tile = GroupTile::from_values(4096, vec![vec![1., f64::NAN, 3.], vec![4., 5., 6.]]);
+        write_decoded_chunk(&path, "generic-layout", &tile).unwrap();
+        let loaded = read_decoded_chunk(&path, "generic-layout", 4096, 3, 2).unwrap();
+        assert_eq!(loaded.values[0][0], 1.);
+        assert!(loaded.values[0][1].is_nan());
+        assert_eq!(loaded.values[1], [4., 5., 6.]);
+        assert!(read_decoded_chunk(&path, "different-layout", 4096, 3, 2).is_none());
+        assert!(read_decoded_chunk(&path, "generic-layout", 4097, 3, 2).is_none());
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(read_decoded_chunk(&path, "generic-layout", 4096, 3, 2).is_none());
+        std::fs::write(&path, b"truncated").unwrap();
+        assert!(read_decoded_chunk(&path, "generic-layout", 4096, 3, 2).is_none());
+    }
+    #[test]
+    fn persisted_numeric_tile_reopens_without_source_payload_reads() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut bytes = Vec::with_capacity(4096 * 4);
+        for index in 0..4096i32 { bytes.extend_from_slice(&index.to_le_bytes()); }
+        std::fs::write(file.path(), bytes).unwrap();
+        let source = Arc::new(crate::file_source::FileSource::open(file.path()).unwrap());
+        let store = ByteStore::from_file(source.clone());
+        let node = parse(&store.view(),
+            "actions:\n  - read: {name: samples, type: i32, repeat: until end}\n");
+        let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
+        let query = request(store.view(), node, 0..4096, true);
+        let (path, key) = decoded_chunk_key(&query, &plan, 0, group_tile_size(&plan)).unwrap();
+        let values = (0..4096).map(|index| index as f64).collect();
+        write_decoded_chunk(&path, &key, &GroupTile::from_values(0, vec![values])).unwrap();
+        let before = source.io_stats();
+        let cache = Arc::new(Mutex::new(GroupTileCache::default()));
+        let tile = cached_group_tile(&query, &plan, &cache, &group_signature(&query), 0,
+            &AtomicBool::new(false)).unwrap();
+        let after = source.io_stats();
+        assert_eq!(after, before);
+        assert_eq!(tile.values[0][4095], 4095.);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn keep_setting_survives_reopen_and_explicit_removal() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"generic numeric fixture").unwrap();
+        let first = ByteStore::from_file(Arc::new(crate::file_source::FileSource::open(file.path()).unwrap()));
+        let first_view = first.view();
+        let dir = decoded_file_dir(&first_view).unwrap();
+        set_keep_decoded_data(&first_view, true).unwrap();
+        assert!(keep_decoded_data(&first_view));
+        keep_state().lock().unwrap().remove(&dir);
+        let reopened = ByteStore::from_file(Arc::new(crate::file_source::FileSource::open(file.path()).unwrap()));
+        assert!(keep_decoded_data(&reopened.view()));
+        set_keep_decoded_data(&reopened.view(), false).unwrap();
+        keep_state().lock().unwrap().remove(&dir);
+        assert!(!keep_decoded_data(&reopened.view()));
+        set_keep_decoded_data(&reopened.view(), true).unwrap();
+        remove_decoded_data(&reopened.view()).unwrap();
+        assert!(!keep_decoded_data(&reopened.view()));
+        assert!(!dir.exists());
+    }
+    #[test]
+    fn kept_query_reuses_its_values_after_reopen() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut bytes = Vec::with_capacity(8192 * 4);
+        for index in 0..8192i32 { bytes.extend_from_slice(&(index % 101).to_le_bytes()); }
+        std::fs::write(file.path(), bytes).unwrap();
+        let source = Arc::new(crate::file_source::FileSource::open(file.path()).unwrap());
+        let store = ByteStore::from_file(source);
+        let view = store.view();
+        let node = parse(&view, "actions:\n  - read: {name: samples, type: i32, repeat: until end}\n");
+        let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
+        let query = request(view.clone(), node, 1024..4096, true);
+        set_keep_decoded_data(&view, true).unwrap();
+        let cache = Arc::new(Mutex::new(GroupTileCache::default()));
+        cached_group_tile(&query, &plan, &cache, &group_signature(&query), 0,
+            &AtomicBool::new(false)).unwrap();
+        let (path, _) = decoded_chunk_key(&query, &plan, 0, group_tile_size(&plan)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while decoded_data_status(&view).1 > 0 {
+            assert!(Instant::now() < deadline, "kept chunk did not persist");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(path.exists());
+        let reopened_source = Arc::new(crate::file_source::FileSource::open(file.path()).unwrap());
+        let reopened = ByteStore::from_file(reopened_source.clone());
+        let reopened_node = parse(&reopened.view(),
+            "actions:\n  - read: {name: samples, type: i32, repeat: until end}\n");
+        let reopened_plan = reopened_node.lazy.as_ref().unwrap().numeric_plan().unwrap();
+        let reopened_query = request(reopened.view(), reopened_node, 1024..4096, true);
+        let before = reopened_source.io_stats();
+        let fresh_cache = Arc::new(Mutex::new(GroupTileCache::default()));
+        let tile = cached_group_tile(&reopened_query, &reopened_plan, &fresh_cache,
+            &group_signature(&reopened_query), 0, &AtomicBool::new(false)).unwrap();
+        assert_eq!(reopened_source.io_stats(), before);
+        assert_eq!(tile.values[0][101], 0.);
+        remove_decoded_data(&reopened_query.source).unwrap();
+    }
+    #[test]
+    fn default_chunk_quota_never_evicts_kept_file() {
+        let root = tempfile::tempdir().unwrap();
+        let disposable = root.path().join("disposable");
+        let kept = root.path().join("kept");
+        std::fs::create_dir_all(&disposable).unwrap();
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("keep"), b"file identity").unwrap();
+        std::fs::write(kept.join("one.chunk"), [1u8; 20]).unwrap();
+        std::fs::write(disposable.join("one.chunk"), [2u8; 20]).unwrap();
+        std::fs::write(disposable.join("two.chunk"), [3u8; 20]).unwrap();
+        let mut catalog = ChunkCatalog::scan(root.path(), 0);
+        assert_eq!(catalog.total, 40);
+        catalog.prune_to(20);
+        assert!(kept.join("one.chunk").exists());
+        assert_eq!(catalog.total, 20);
+        assert_eq!(std::fs::read_dir(disposable).unwrap().count(), 1);
+    }
+    #[test]
+    fn decoded_chunk_identity_survives_reopen_but_not_source_change() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), vec![1u8; 4096]).unwrap();
+        let first = ByteStore::from_file(Arc::new(crate::file_source::FileSource::open(file.path()).unwrap()));
+        let first_node = parse(&first.view(),
+            "actions:\n  - read: {name: samples, type: u8, repeat: until end}\n");
+        let first_plan = first_node.lazy.as_ref().unwrap().numeric_plan().unwrap();
+        let first_key = decoded_chunk_key(&request(first.view(), first_node, 0..4096, true),
+            &first_plan, 0, group_tile_size(&first_plan)).unwrap().1;
+        let second = ByteStore::from_file(Arc::new(crate::file_source::FileSource::open(file.path()).unwrap()));
+        let second_node = parse(&second.view(),
+            "actions:\n  - read: {name: samples, type: u8, repeat: until end}\n");
+        let second_plan = second_node.lazy.as_ref().unwrap().numeric_plan().unwrap();
+        let second_key = decoded_chunk_key(&request(second.view(), second_node, 0..4096, true),
+            &second_plan, 0, group_tile_size(&second_plan)).unwrap().1;
+        assert_eq!(first_key, second_key);
+        std::fs::write(file.path(), vec![2u8; 4096]).unwrap();
+        let changed = ByteStore::from_file(Arc::new(crate::file_source::FileSource::open(file.path()).unwrap()));
+        assert_ne!(changed.view().plot_cache_key(&second_plan.cache_layout_key()).unwrap(),
+            second.view().plot_cache_key(&second_plan.cache_layout_key()).unwrap());
+    }
+    #[test]
+    fn grouped_pan_reuses_prefetched_numeric_tiles() {
+        let (store, node) = fixture(100_000, usize::MAX);
+        let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
+        let ctx = egui::Context::default();
+        let mut reader = PlotReader::default();
+        reader.request_group(&ctx, store.view(), node.clone(), plan.clone(),
+            20_000..30_000, 1280, true);
+        settle(&mut reader, &ctx);
+        let loads = reader.group_buffer_stats().1;
+        assert!(!reader.matches_group_request(store.view().revision, &node, &plan,
+            25_000..35_000, 1280, true));
+        reader.request_group(&ctx, store.view(), node, plan,
+            25_000..35_000, 1280, true);
+        settle(&mut reader, &ctx);
+        assert_eq!(reader.data().unwrap().range, 25_000..35_000);
+        assert!(reader.group_buffer_stats().1 <= loads + 2);
+    }
+    #[test]
+    fn ordinary_numeric_collection_uses_the_tile_cache() {
+        let (store, node) = fixture(100_000, usize::MAX);
+        let ctx = egui::Context::default();
+        let mut reader = PlotReader::default();
+        reader.request_filtered(&ctx, store.view(), node.clone(),
+            20_000..30_000, 1280, true, None);
+        settle(&mut reader, &ctx);
+        assert!(reader.group_buffer_stats().0 > 0);
+        assert_eq!(reader.data().unwrap().quality, PlotQuality::MinMax);
+        assert!(reader.data().unwrap().range.start <= 20_000);
+        let loads = reader.group_buffer_stats().1;
+        reader.request_filtered(&ctx, store.view(), node, 25_000..35_000, 1280, true, None);
+        settle(&mut reader, &ctx);
+        assert!(reader.group_buffer_stats().1 <= loads + 2,
+            "nearby pan may extend prefetch but must reuse visible tiles");
     }
     #[test]
     fn exact_plot_is_independent_of_128_row_pages_and_preserves_byte_provenance() {

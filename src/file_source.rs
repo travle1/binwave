@@ -7,6 +7,7 @@ use std::io::Read;
 #[cfg(any(test, not(any(unix, windows))))]
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
 pub struct FileSource {
@@ -14,6 +15,8 @@ pub struct FileSource {
     pub len: usize,
     stamp: SourceStamp,
     file: File,
+    read_calls: AtomicU64,
+    bytes_read: AtomicU64,
 }
 
 impl FileSource {
@@ -26,7 +29,17 @@ impl FileSource {
             len,
             stamp,
             file,
+            read_calls: AtomicU64::new(0),
+            bytes_read: AtomicU64::new(0),
         })
+    }
+
+    pub(crate) fn io_stats(&self) -> (u64, u64) {
+        (self.read_calls.load(Ordering::Relaxed), self.bytes_read.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn cache_key(&self, kind: &str, options: &impl serde::Serialize) -> Result<String> {
+        self.stamp.key(kind, options)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -81,6 +94,8 @@ impl FileSource {
             file.seek(SeekFrom::Start(start as u64))?;
             file.read_exact(&mut bytes)?;
         }
+        self.read_calls.fetch_add(1, Ordering::Relaxed);
+        self.bytes_read.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok(bytes)
     }
 }
