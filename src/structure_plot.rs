@@ -24,6 +24,7 @@ const PREVIEW_LIMIT: Address = 65_536;
 const PREVIEW_WINDOWS: Address = 128;
 const PREVIEW_WINDOW_SIZE: Address = PREVIEW_LIMIT / PREVIEW_WINDOWS;
 const MAX_BUCKETS: Address = 4096;
+const MAX_TOTAL_NUMERIC_POINTS: Address = 100_000;
 const CACHE_ENTRIES: Address = 3;
 
 #[derive(Clone, Debug)]
@@ -76,6 +77,7 @@ struct Key {
     buckets: Address,
     exact_limit: Address,
     refine: bool,
+    fields: Option<Vec<String>>,
 }
 #[derive(Clone)]
 struct Request {
@@ -128,6 +130,19 @@ impl PlotReader {
         pixel_width: Address,
         refine: bool,
     ) {
+        self.request_filtered(ctx, source, node, range, pixel_width, refine, None);
+    }
+
+    pub fn request_filtered(
+        &mut self,
+        ctx: &egui::Context,
+        source: ByteView,
+        node: Node,
+        range: Range<Address>,
+        pixel_width: Address,
+        refine: bool,
+        fields: Option<Vec<String>>,
+    ) {
         let count = node
             .lazy
             .as_ref()
@@ -144,6 +159,7 @@ impl PlotReader {
             buckets,
             exact_limit: exact_limit(pixel_width),
             refine,
+            fields,
         };
         if self
             .desired
@@ -270,6 +286,10 @@ impl PlotReader {
     }
     pub fn data(&self) -> Option<&PlotData> {
         self.data.as_deref()
+    }
+    #[cfg(test)]
+    pub(crate) fn requested_fields(&self) -> Option<&[String]> {
+        self.desired.as_ref()?.key.fields.as_deref()
     }
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
@@ -538,13 +558,17 @@ fn read_plot(
     } else {
         PlotQuality::SampledPreview
     };
-    if let Some(plan) = request
+    if let Some(mut plan) = request
         .node
         .lazy
         .as_ref()
         .and_then(|array| array.numeric_plan())
         .filter(|plan| plan.stride > 0 && plan.stride <= READ_LIMIT)
     {
+        if let Some(selected) = &request.key.fields {
+            let selected: std::collections::HashSet<_> = selected.iter().collect();
+            plan.fields.retain(|field| selected.contains(&field.name));
+        }
         return read_numeric(request, plan, quality, cancel, publish);
     }
     let mut reduction = Reduction::new(
@@ -758,11 +782,21 @@ fn read_numeric(
         request.source.revision == plan.revision,
         "Bytes changed; apply the definition again before plotting this collection."
     );
+    let field_count = plan.fields.len().max(1) as Address;
+    let quality = if quality == PlotQuality::Exact
+        && (request.key.range.end - request.key.range.start).saturating_mul(field_count) > MAX_TOTAL_NUMERIC_POINTS
+    {
+        PlotQuality::MinMax
+    } else {
+        quality
+    };
+    let buckets = reduction_buckets(quality, request.key.buckets)
+        .min((MAX_TOTAL_NUMERIC_POINTS / field_count).max(1));
     let mut reduction = NumericReduction::new(
         plan,
         request.key.range.clone(),
         quality,
-        reduction_buckets(quality, request.key.buckets),
+        buckets,
     );
     let mut scanned = 0;
     let mut last_publish = Instant::now();
@@ -838,6 +872,7 @@ pub(crate) fn read_for_viewport(
             buckets: display_buckets(pixel_width),
             exact_limit: exact_limit(pixel_width),
             refine: false,
+            fields: None,
         },
         source,
         node,
@@ -846,6 +881,21 @@ pub(crate) fn read_for_viewport(
 }
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    #[test]
+    fn filtered_numeric_plot_reads_only_selected_fields() {
+        let yaml = "structures:\n  - name: Record\n    fields:\n      - {name: a, type: u16}\n      - {name: b, type: u16}\n      - {name: c, type: u16}\nactions:\n  - read: {name: records, type: {structure: Record}, repeat: 512}\n";
+        let bytes: Vec<u8> = (0..512_u16).flat_map(|i| [i, i + 1, i + 2].into_iter().flat_map(u16::to_le_bytes)).collect();
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let output = Program::parse(yaml).unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let ctx = egui::Context::default();
+        let mut reader = PlotReader::default();
+        reader.request_filtered(&ctx, store.view(), output.nodes[0].clone(), 0..512, 800, false, Some(vec!["b".into()]));
+        settle(&mut reader, &ctx);
+        let data = reader.data().unwrap();
+        assert_eq!(data.series.keys().map(String::as_str).collect::<Vec<_>>(), ["b"]);
+        assert_eq!(data.series["b"].len(), 512);
+        assert_eq!(data.series["b"][0].bytes, 2..4);
+    }
     #[test]
     fn reductions_keep_fields_beyond_thirty_two() {
         for quality in [PlotQuality::Exact, PlotQuality::MinMax, PlotQuality::SampledPreview] {
@@ -945,6 +995,7 @@ actions:
                 buckets: 128,
                 exact_limit: exact_limit(512),
                 refine,
+                fields: None,
             },
             source,
             node,

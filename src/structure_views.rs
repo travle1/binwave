@@ -87,6 +87,8 @@ pub struct StructureViews {
     presentation: crate::plot_presentation::Presentation,
     plot_hidden: HashSet<String>,
     plot_field_filter: String,
+    plot_catalog_target: String,
+    plot_catalog: Vec<String>,
     plot_target: String,
     plot_sources: std::collections::BTreeSet<String>,
     plot_sources_initialized: bool,
@@ -122,6 +124,8 @@ impl StructureViews {
     }
     pub fn invalidate(&mut self) {
         self.plot_reader.invalidate();
+        self.plot_catalog_target.clear();
+        self.plot_catalog.clear();
         for reader in self.extra_plot_readers.values_mut() { reader.invalidate(); }
         self.plot_action = None;
         self.plot_range_zoom = None;
@@ -1168,7 +1172,14 @@ impl StructureViews {
         self.plot_sources.retain(|path| collections.iter().any(|node| &node.path == path));
         if !self.plot_sources_initialized {
             self.plot_sources_initialized = true;
-            self.plot_sources.extend(collections.iter().filter(|n| collection_score(n, output).0).map(|n| n.path.clone()));
+            let eligible: Vec<_> = collections.iter().filter(|n| collection_score(n, output).0).collect();
+            if eligible.len() > 8 {
+                if let Some(best) = eligible.into_iter().max_by_key(|n| collection_score(n, output)) {
+                    self.plot_sources.insert(best.path.clone());
+                }
+            } else {
+                self.plot_sources.extend(eligible.into_iter().map(|n| n.path.clone()));
+            }
         }
         let mut changed = false;
         if self.plot_sources.is_empty() {
@@ -1206,6 +1217,19 @@ impl StructureViews {
             ui.label("This collection contains no samples.");
             return None;
         }
+        if self.plot_catalog_target != self.plot_target {
+            self.plot_catalog_target = self.plot_target.clone();
+            self.plot_catalog = node.lazy.as_ref().and_then(|array| array.numeric_plan())
+                .map_or_else(Vec::new, |plan| plan.fields.into_iter().map(|field| field.name).collect());
+            if self.plot_catalog.len() > 32 {
+                let prefix = format!("{} / ", self.plot_target);
+                if !self.plot_hidden.iter().any(|name| name.starts_with(&prefix)) {
+                    for name in self.plot_catalog.iter().skip(16) {
+                        self.plot_hidden.insert(format!("{prefix}{name}"));
+                    }
+                }
+            }
+        }
         let selected_samples = self
             .last_hex_selection
             .as_ref()
@@ -1225,14 +1249,17 @@ impl StructureViews {
             .flat_map(|(path,reader)| reader.data().into_iter().flat_map(move |d| d.bounds.iter().map(move |(name,(min,max))| {
                 (format!("{path} / {name}"),*min,*max)
             }))).collect();
-        let visible_series = ranges
-            .iter()
-            .filter(|(name, _, _)| !self.plot_hidden.contains(name))
-            .count();
-        let series_label = if ranges.is_empty() {
+        let mut names: Vec<String> = self.plot_catalog.iter()
+            .map(|name| format!("{} / {name}", self.plot_target)).collect();
+        let mut known: HashSet<String> = names.iter().cloned().collect();
+        for (name, _, _) in &ranges {
+            if known.insert(name.clone()) { names.push(name.clone()); }
+        }
+        let visible_series = names.iter().filter(|name| !self.plot_hidden.contains(*name)).count();
+        let series_label = if names.is_empty() {
             "Series".to_owned()
         } else {
-            format!("Series {visible_series}/{}", ranges.len())
+            format!("Series {visible_series}/{}", names.len())
         };
         ui.horizontal_wrapped(|ui| {
             egui::containers::menu::MenuButton::new(series_label)
@@ -1241,29 +1268,29 @@ impl StructureViews {
                 .ui(ui, |ui| {
                 ui.strong("Collections");
                 changed |= plot_collection_choices(ui,&collections,&mut self.plot_sources);
-                if !ranges.is_empty() {
+                if !names.is_empty() {
                     ui.separator();
                     ui.strong("Fields shown");
                     ui.add(egui::TextEdit::singleline(&mut self.plot_field_filter)
                         .hint_text("Find fields…"));
                     let filter = self.plot_field_filter.trim().to_lowercase();
-                    let matching: Vec<_> = ranges.iter()
-                        .filter(|(name, _, _)| filter.is_empty() || name.to_lowercase().contains(&filter))
+                    let matching: Vec<_> = names.iter()
+                        .filter(|name| filter.is_empty() || name.to_lowercase().contains(&filter))
                         .collect();
                     ui.horizontal(|ui| {
                         let scope = if filter.is_empty() { "all" } else { "matching" };
                         if ui.add_enabled(!matching.is_empty(), egui::Button::new(format!("Show {scope}"))).clicked() {
-                            for (name, _, _) in &matching { self.plot_hidden.remove(name); }
+                            for name in &matching { self.plot_hidden.remove(*name); }
                             self.plot_fit_y = true;
                         }
                         if ui.add_enabled(!matching.is_empty(), egui::Button::new(format!("Hide {scope}"))).clicked() {
-                            for (name, _, _) in &matching { self.plot_hidden.insert(name.clone()); }
+                            for name in &matching { self.plot_hidden.insert((*name).clone()); }
                             self.plot_fit_y = true;
                         }
                     });
                     if matching.is_empty() { ui.weak("No matching fields"); }
                     let mut tree = SeriesTree::default();
-                    for (name, _, _) in matching {
+                    for name in matching {
                         let field = name.rsplit_once(" / ").map_or(name.as_str(), |(_, field)| field);
                         tree.insert(field, name);
                     }
@@ -1361,13 +1388,19 @@ impl StructureViews {
         // width immediately. Reduction follows physical pixels, including DPI.
         let canvas_width = (ui.available_width() - self.plot_axis_width).max(1.);
         let pixel_width = (canvas_width * ui.ctx().pixels_per_point()).ceil() as usize;
-        if !self.plot_paused {
-            self.plot_reader.request(
+        let selected_fields = (!self.plot_catalog.is_empty()).then(|| self.plot_catalog.iter()
+            .filter(|name| !self.plot_hidden.contains(&format!("{} / {name}", self.plot_target)))
+            .cloned().collect::<Vec<_>>());
+        if selected_fields.as_ref().is_some_and(Vec::is_empty) {
+            self.plot_reader.stop();
+        } else if !self.plot_paused {
+            self.plot_reader.request_filtered(
                 ui.ctx(), source.clone(), node.clone(), requested.clone(),
-                pixel_width, self.plot_refine,
+                pixel_width, self.plot_refine, selected_fields.clone(),
             );
         }
         self.plot_reader.tick(ui.ctx());
+        let mut extra_loading = 0;
         for path in &self.plot_sources {
             if path == &self.plot_target { continue; }
             if let Some(extra) = self.collection_node(output, path).cloned() {
@@ -1379,7 +1412,7 @@ impl StructureViews {
                 }
                 reader.tick(ui.ctx());
                 if let Some(error) = reader.error() { ui.colored_label(Color32::LIGHT_RED, format!("{path}: {error}")); }
-                if reader.is_loading() { ui.spinner(); }
+                if reader.is_loading() { extra_loading += 1; }
             }
         }
         ui.horizontal_wrapped(|ui| {
@@ -1422,6 +1455,13 @@ impl StructureViews {
                     self.plot_paused = true;
                     self.plot_refine = false;
                 }
+            }
+            if extra_loading > 0 {
+                ui.spinner();
+                ui.weak(format!("{extra_loading} other collections loading"));
+            }
+            if self.plot_catalog.len() > 32 {
+                ui.weak(format!("{} available fields; select fields in Series", self.plot_catalog.len()));
             }
             if self.plot_paused { ui.weak("Stopped · zoom or Fit to read again"); }
         });
@@ -1878,14 +1918,13 @@ impl StructureViews {
             }
         });
         // The plot owns its range request. Paging the table never changes this range.
-        self.plot_reader.request(
-            ui.ctx(),
-            source,
-            node.clone(),
-            actual,
-            (response.transform.frame().width() * ui.ctx().pixels_per_point()).ceil() as usize,
-            self.plot_refine,
-        );
+        if !self.plot_paused && !selected_fields.as_ref().is_some_and(Vec::is_empty) {
+            self.plot_reader.request_filtered(
+                ui.ctx(), source, node.clone(), actual,
+                (response.transform.frame().width() * ui.ctx().pixels_per_point()).ceil() as usize,
+                self.plot_refine, selected_fields,
+            );
+        }
         if let Some((bytes, path)) = picked {
             if let Some(samples) = sample_indices_for_bytes(&node, &bytes) {
                 self.plot_range_first = samples.start;
@@ -2339,6 +2378,29 @@ fn tree_display(node: &Node, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wide_numeric_collection_starts_with_bounded_visible_fields() {
+        let mut yaml = String::from("structures:\n  - name: Record\n    fields:\n");
+        for index in 0..128 {
+            yaml.push_str(&format!("      - {{name: sensor_{index}, type: u16}}\n"));
+        }
+        yaml.push_str("actions:\n  - read: {name: records, type: {structure: Record}, repeat: 512}\n");
+        let store = ByteStore::from_snapshot(Original::from_bytes(&vec![0; 512 * 128 * 2]).unwrap());
+        let output = Program::parse(&yaml).unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while views.plot_catalog.is_empty() {
+            render_plot(&ctx, &mut views, &output, &store, vec![], Default::default());
+            assert!(std::time::Instant::now() < deadline, "plot catalog timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(views.plot_catalog.len(), 128);
+        assert_eq!(views.plot_hidden.len(), 112);
+        assert_eq!(views.plot_reader.requested_fields().unwrap().len(), 16);
+        settle_plot(&ctx, &mut views, &output, &store);
+        assert_eq!(views.plot_reader.data().unwrap().series.len(), 16);
+    }
     #[test]
     fn positioned_series_clicks_keep_original_values_and_bytes() {
         let ctx=egui::Context::default();
