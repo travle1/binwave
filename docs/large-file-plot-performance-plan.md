@@ -350,6 +350,10 @@ not UI responsiveness or storage-bound 100 GB behavior. Eight readers provide
 parallel throughput without running one independent scan per logical core;
 the default still requires frame-time and interaction benchmarking. Repeat with
 `BINWAVE_BENCH_SAMPLES=2000000 cargo test --release --bin binwave benchmark_parallel_plot_readers -- --ignored --nocapture`.
+The UI also now scans each resident decoded page for nested collection names
+once, instead of repeating that traversal on every frame; discovered-path
+deduplication uses a hash set. A focused page-reuse test passes. The effect on
+live frame time with hundreds of nested collections is not yet measured.
 
 ### Limited synthetic measurement
 

@@ -54,7 +54,7 @@ fn log_slow_plot_phase(clock: &mut Instant, phase: &str) {
 }
 
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct PageKey {
     path: String,
     start: usize,
@@ -120,6 +120,9 @@ pub struct StructureViews {
     page: Option<Page>,
     cached_pages: Vec<Page>,
     flattened_collections: Vec<Node>,
+    discovered_pages: HashSet<PageKey>,
+    #[cfg(test)]
+    discovery_page_scans: usize,
     discovery_rx: Option<mpsc::Receiver<(u64, Result<Vec<Node>, String>)>>,
     discovery_attempted: HashSet<String>,
     discovery_error: Option<String>,
@@ -212,6 +215,7 @@ impl StructureViews {
         self.page = None;
         self.cached_pages.clear();
         self.flattened_collections.clear();
+        self.discovered_pages.clear();
         self.discovery_rx = None;
         self.discovery_attempted.clear();
         self.discovery_error = None;
@@ -451,15 +455,20 @@ impl StructureViews {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        let resident: HashSet<_> = self.page.as_ref().into_iter().chain(self.cached_pages.iter())
+            .map(|page| page.key.clone()).collect();
+        self.discovered_pages.retain(|key| resident.contains(key));
         for page in self.page.as_ref().into_iter().chain(self.cached_pages.iter()) {
             if page.key.revision != output.revision { continue; }
             let Some(parent) = find_node(&output.nodes, &page.key.path) else { continue; };
             let Some(first) = page.result.as_ref().ok().and_then(|rows| rows.first()) else { continue; };
+            if !self.discovered_pages.insert(page.key.clone()) { continue; }
+            #[cfg(test)] { self.discovery_page_scans += 1; }
             collect_flattened_descendants(parent, first, None, &mut found);
         }
         if !found.is_empty() {
-            found.retain(|node| !self.flattened_collections.iter().any(|existing| existing.path == node.path));
-            let mut names = HashSet::new();
+            let mut names: HashSet<_> = self.flattened_collections.iter()
+                .map(|node| node.path.clone()).collect();
             found.retain(|node| names.insert(node.path.clone()));
         }
         if !found.is_empty() {
@@ -3262,6 +3271,24 @@ mod tests {
             Program::parse("actions:\n  - read: {name: items, type: u16, repeat: 1024}\n").unwrap();
         let output = program.run(&store.view(), &AtomicBool::new(false)).unwrap();
         (store, output)
+    }
+    #[test]
+    fn nested_collection_discovery_scans_a_resident_page_once() {
+        let (store, output) = array();
+        let parent = &output.nodes[0];
+        let mut views = StructureViews::default();
+        for start in [0, 128] {
+            let rows = parent.lazy.as_ref().unwrap().page(
+                &store.view(), &AtomicBool::new(false), start, 1).unwrap();
+            views.page = Some(Page {
+                key: PageKey { path: parent.path.clone(), start, revision: output.revision },
+                result: Ok(rows),
+            });
+            views.discover_flattened_collections(&output);
+            views.discover_flattened_collections(&output);
+            assert_eq!(views.discovery_page_scans, 1 + usize::from(start != 0));
+            assert!(views.discovered_pages.len() <= 1);
+        }
     }
     fn settle(views: &mut StructureViews, source: ByteView) {
         let ctx = egui::Context::default();
