@@ -1792,14 +1792,16 @@ impl StructureViews {
                     && self.plot_range_zoom.is_none()
                     && (axis_hover.is_some() || plot_ui.response().hovered())
                 {
-                    let (scroll, shift, pinch, pointer) = plot_ctx.input(|input| {
+                    let (scroll, pan_scroll, shift, pinch, pointer) = plot_ctx.input(|input| {
                         let scroll = input.raw.events.iter().filter_map(|event| match event {
                             egui::Event::MouseWheel { delta, .. } => Some(*delta),
                             _ => None,
                         }).fold(egui::Vec2::ZERO, |sum, delta| sum + delta);
+                        let pan_scroll = wheel_pan_points(&input.raw.events);
                         let shift = input.modifiers.shift;
                         (
                             scroll,
+                            pan_scroll,
                             shift,
                             if shift && scroll != egui::Vec2::ZERO {
                                 egui::Vec2::splat(1.)
@@ -1830,7 +1832,7 @@ impl StructureViews {
                         } else if pinch == egui::Vec2::splat(1.) {
                             // egui-winit remaps Shift+wheel into horizontal scroll.
                             let delta = if shift {
-                                scroll.x + scroll.y
+                                pan_scroll.x + pan_scroll.y
                             } else if scroll.y != 0. {
                                 scroll.y
                             } else {
@@ -1841,12 +1843,11 @@ impl StructureViews {
                                     let axis = axis_hover.map_or(0, |(axis, _)| axis);
                                     let mut min = old.min();
                                     let mut max = old.max();
+                                    let fraction = (f64::from(delta) / 240.).clamp(-1., 1.);
                                     let distance = if axis == 0 {
-                                        -f64::from(delta) * old.width()
-                                            / f64::from(inner.width().max(1.))
+                                        -fraction * old.width()
                                     } else {
-                                        f64::from(delta) * old.height()
-                                            / f64::from(inner.height().max(1.))
+                                        fraction * old.height()
                                     };
                                     min[axis] += distance;
                                     max[axis] += distance;
@@ -2554,6 +2555,21 @@ fn centered_view(center: usize, width: usize, count: usize) -> Range<usize> {
         .saturating_sub(width / 2)
         .min(count.saturating_sub(width));
     start..start + width
+}
+
+fn wheel_pan_points(events: &[egui::Event]) -> egui::Vec2 {
+    events.iter().filter_map(|event| {
+        if let egui::Event::MouseWheel { unit, delta, .. } = event {
+            let scale = match unit {
+                egui::MouseWheelUnit::Point => 1.,
+                egui::MouseWheelUnit::Line => 48.,
+                egui::MouseWheelUnit::Page => 240.,
+            };
+            Some(*delta * scale)
+        } else {
+            None
+        }
+    }).fold(egui::Vec2::ZERO, |sum, delta| sum + delta)
 }
 
 fn padded_selection(samples: &Range<usize>, count: usize) -> Range<usize> {
@@ -4502,13 +4518,13 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             if y_axis {
                 axis_navigation_assert_x(before, immediately_after);
                 assert!(
-                    immediately_after.min()[1] > before.min()[1],
+                    immediately_after.min()[1] - before.min()[1] > before.height() * 0.15,
                     "positive Y scroll pans to higher values"
                 );
             } else {
                 navigation_assert_y(before, immediately_after);
                 assert!(
-                    immediately_after.min()[0] < before.min()[0],
+                    before.min()[0] - immediately_after.min()[0] > before.width() * 0.15,
                     "positive X scroll pans to earlier samples"
                 );
             }
@@ -4531,6 +4547,17 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             assert_eq!(views.last_hex_selection, selected);
             assert_eq!(views.desired.as_ref().unwrap().key, page);
         }
+    }
+
+    #[test]
+    fn line_wheel_pan_has_a_useful_step() {
+        let points = wheel_pan_points(&[egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(1., 0.),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert_eq!(points.x, 48.);
     }
 
     #[test]
