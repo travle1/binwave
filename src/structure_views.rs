@@ -2150,11 +2150,15 @@ fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut st
 }
 
 fn sensor_group_key(node: &Node) -> Option<(String, usize)> {
-    if !node.name.contains(" across ") { return None; }
+    let (group_name, _) = node.name.split_once(" across ")?;
+    let (name, named_index) = group_name.rsplit_once('[')?;
+    let named_index = named_index.strip_suffix(']')?.parse::<usize>().ok()?;
     let (prefix, rest) = node.path.rsplit_once('[')?;
     let (index, suffix) = rest.split_once(']')?;
     if !suffix.starts_with('.') { return None; }
-    Some((format!("{prefix}{suffix}"), index.parse().ok()?))
+    let index = index.parse::<usize>().ok()?;
+    if index != named_index || !prefix.ends_with(name) { return None; }
+    Some((format!("{prefix}{suffix}"), index))
 }
 fn grouped_collection_choices<'a>(collections: &[&'a Node]) -> (Vec<&'a Node>, BTreeMap<String, Vec<(usize, &'a Node)>>) {
     let mut single = Vec::new();
@@ -2742,6 +2746,10 @@ actions:
         let sensors = &groups["blocks.payload.field_0.values"];
         assert_eq!(sensors.len(), 48);
         assert_eq!(sensors[2].0, 2);
+        let mut ordinary = sensors[0].1.clone();
+        ordinary.name = "entries across records".into();
+        ordinary.path = "records[4].payload.entries".into();
+        assert!(sensor_group_key(&ordinary).is_none());
         for sensor in 0..3 {
             let path = format!("blocks.payload.field_0[{sensor}].values");
             let node = views.flattened_collections.iter().find(|node| node.path == path).unwrap();
