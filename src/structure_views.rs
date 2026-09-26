@@ -754,12 +754,18 @@ impl StructureViews {
         };
         ui.horizontal_wrapped(|ui| {
             ui.label("Data");
-            let references: Vec<_> = collections.iter().collect();
-            let (single, groups) = grouped_collection_choices(&references);
-            egui::ComboBox::from_id_salt("structure_collection")
-                .width(ui.available_width().min(420.).max(120.))
-                .selected_text(selected_text)
-                .show_ui(ui, |ui| {
+            ui.strong(selected_text);
+        });
+        let references: Vec<_> = collections.iter().collect();
+        let (single, groups) = grouped_collection_choices(&references);
+        egui::CollapsingHeader::new("Browse collections")
+            .id_salt("sample_collections")
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("sample_collection_list")
+                    .max_height(220.)
+                    .show(ui, |ui| {
                     for node in single {
                         ui.selectable_value(
                             &mut self.table_target,
@@ -790,7 +796,7 @@ impl StructureViews {
                     }
                     ui.selectable_value(&mut self.table_target, String::new(), "File elements");
                 });
-        });
+            });
         if previous != self.table_target {
             self.table_anchor = None;
             self.reveal_selected_row = false;
