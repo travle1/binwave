@@ -49,6 +49,9 @@ setting protects a file's chunks from ordinary eviction and cache clearing.
 The browser continues to use the shared decoder/reducer without native
 filesystem persistence. A persistent multilevel summary index and a global
 native resource scheduler remain planned work.
+Medium-density CPU raster preparation runs on one cancellable background job.
+The UI retains the last texture at its original plot coordinates while a
+compatible viewport redraw is pending; obsolete results are discarded.
 
 Validation combines native engine tests with the actual built WASM API against
 a synthetic 40 GiB file (`tests/browser_decoder.mjs`). The synthetic file forbids

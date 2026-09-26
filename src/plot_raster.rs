@@ -6,15 +6,34 @@ use egui_plot::{PlotImage, PlotPoint, PlotUi};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+
+struct PendingRaster {
+    key: u64,
+    receiver: Receiver<ColorImage>,
+    cancel: Arc<AtomicBool>,
+}
 
 #[derive(Default)]
 pub struct PlotRaster {
     texture: Option<TextureHandle>,
     key: Option<u64>,
+    texture_bounds: Option<[f64; 4]>,
+    texture_generation: Option<u64>,
+    pending: Option<PendingRaster>,
+    epoch: u64,
 }
 
 impl PlotRaster {
-    pub fn invalidate(&mut self) { self.key = None; }
+    pub fn invalidate(&mut self) {
+        if let Some(pending) = &self.pending { pending.cancel.store(true, Ordering::Relaxed); }
+        self.key = None;
+        self.texture = None;
+        self.texture_bounds = None;
+        self.texture_generation = None;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
 
     pub fn show(&mut self, ctx: &Context, plot: &mut PlotUi<'_>,
         series: &BTreeMap<String, Vec<PlotPoint>>, hidden: &HashSet<String>,
@@ -32,40 +51,78 @@ impl PlotRaster {
         if width == 0 || height == 0
             || !bounds.min().iter().chain(bounds.max().iter()).all(|v| v.is_finite())
             || bounds.width() <= 0. || bounds.height() <= 0. { return; }
+        if self.texture_generation.is_some_and(|generation| generation != data_generation) {
+            self.invalidate();
+        }
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.epoch.hash(&mut hasher);
         data_generation.hash(&mut hasher);
         width.hash(&mut hasher);
         height.hash(&mut hasher);
         ppp.to_bits().hash(&mut hasher);
         for value in bounds.min().into_iter().chain(bounds.max()) { value.to_bits().hash(&mut hasher); }
         let key = hasher.finish();
-        if self.key != Some(key) || self.texture.is_none() {
-            let visible: Vec<_> = series.iter().filter(|(name, _)| !hidden.contains(*name))
-                .map(|(name, points)| (name.as_str(), points.as_slice())).collect();
-            let image = rasterize(&visible, width, height,
-                [bounds.min()[0], bounds.min()[1], bounds.max()[0], bounds.max()[1]]);
-            if let Some(texture) = &mut self.texture {
-                texture.set(image, TextureOptions::NEAREST);
-            } else {
-                self.texture = Some(ctx.load_texture("decoded-plot-traces", image, TextureOptions::NEAREST));
-            }
-            self.key = Some(key);
+        let requested_bounds = [bounds.min()[0], bounds.min()[1], bounds.max()[0], bounds.max()[1]];
+        if let Some(pending) = &self.pending {
+            if pending.key != key { pending.cancel.store(true, Ordering::Relaxed); }
         }
-        if let Some(texture) = &self.texture {
-            let center = PlotPoint::new((bounds.min()[0] + bounds.max()[0]) * 0.5,
-                (bounds.min()[1] + bounds.max()[1]) * 0.5);
+        if let Some(pending) = self.pending.take() {
+            match pending.receiver.try_recv() {
+                Ok(image) if pending.key == key => {
+                    if let Some(texture) = &mut self.texture {
+                        texture.set(image, TextureOptions::NEAREST);
+                    } else {
+                        self.texture = Some(ctx.load_texture("decoded-plot-traces", image, TextureOptions::NEAREST));
+                    }
+                    self.key = Some(key);
+                    self.texture_bounds = Some(requested_bounds);
+                    self.texture_generation = Some(data_generation);
+                }
+                Ok(_) | Err(TryRecvError::Disconnected) => {}
+                Err(TryRecvError::Empty) => self.pending = Some(pending),
+            }
+        }
+        if self.key != Some(key) && self.pending.is_none() {
+            let visible: Vec<_> = series.iter().filter(|(name, _)| !hidden.contains(*name))
+                .map(|(name, points)| (name.clone(), points.clone())).collect();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let repaint = ctx.clone();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let worker_cancel = cancel.clone();
+            std::thread::spawn(move || {
+                let borrowed: Vec<_> = visible.iter()
+                    .map(|(name, points)| (name.as_str(), points.as_slice())).collect();
+                if let Some(image) = rasterize_with_cancel(&borrowed, width, height,
+                    requested_bounds, Some(&worker_cancel)) {
+                    let _ = sender.send(image);
+                }
+                repaint.request_repaint();
+            });
+            self.pending = Some(PendingRaster { key, receiver, cancel });
+        }
+        if let (Some(texture), Some(image_bounds)) = (&self.texture, self.texture_bounds) {
+            let center = PlotPoint::new((image_bounds[0] + image_bounds[2]) * 0.5,
+                (image_bounds[1] + image_bounds[3]) * 0.5);
             plot.image(PlotImage::new("Rasterized traces", texture.id(), center,
-                egui::vec2(bounds.width() as f32, bounds.height() as f32)).allow_hover(false));
+                egui::vec2((image_bounds[2] - image_bounds[0]) as f32,
+                    (image_bounds[3] - image_bounds[1]) as f32)).allow_hover(false));
         }
     }
 }
 
+#[cfg(test)]
 fn rasterize(series: &[(&str, &[PlotPoint])], width: usize, height: usize, bounds: [f64; 4]) -> ColorImage {
+    rasterize_with_cancel(series, width, height, bounds, None).unwrap()
+}
+
+fn rasterize_with_cancel(series: &[(&str, &[PlotPoint])], width: usize, height: usize,
+    bounds: [f64; 4], cancel: Option<&AtomicBool>) -> Option<ColorImage> {
     let mut pixels = vec![[0u8; 4]; width * height];
     // Work on a few series at a time so parallel coverage masks stay bounded.
     // Each series contributes at most once per pixel; dense oscillations cannot
     // brighten themselves into a solid min/max rectangle.
     for batch in series.chunks(8) {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) { return None; }
         let prepared: Vec<_> = batch.par_iter().map(|(name, points)| {
             let mut covered = vec![false; width * height];
             let mut touched = Vec::new();
@@ -107,8 +164,9 @@ fn rasterize(series: &[(&str, &[PlotPoint])], width: usize, height: usize, bound
             }
         }
     }
-    ColorImage::new([width, height], pixels.into_iter().map(|p|
-        Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])).collect())
+    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) { return None; }
+    Some(ColorImage::new([width, height], pixels.into_iter().map(|p|
+        Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])).collect()))
 }
 
 fn clip_line(x0: f64, y0: f64, x1: f64, y1: f64, width: usize, height: usize)
@@ -168,6 +226,7 @@ fn blend(pixel: &mut [u8; 4], color: [u8; 3]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egui_compat::ContextRun as _;
     #[test]
     fn raster_keeps_a_single_sample_spike() {
         let points = [PlotPoint::new(0., 0.), PlotPoint::new(1., 10.), PlotPoint::new(2., 0.)];
@@ -207,5 +266,42 @@ mod tests {
         let once = rasterize(&[("trace", &straight)], 11, 11, [0., 0., 10., 10.]);
         let repeated = rasterize(&[("trace", &retraced)], 11, 11, [0., 0., 10., 10.]);
         assert_eq!(once.pixels, repeated.pixels);
+    }
+    #[test]
+    fn cancelled_raster_does_not_publish_a_partial_image() {
+        let points = [PlotPoint::new(0., 0.), PlotPoint::new(10., 10.)];
+        let cancelled = AtomicBool::new(true);
+        assert!(rasterize_with_cancel(&[("trace", &points)], 11, 11,
+            [0., 0., 10., 10.], Some(&cancelled)).is_none());
+    }
+    #[test]
+    fn raster_worker_publishes_on_a_later_ui_frame() {
+        let ctx = egui::Context::default();
+        let mut raster = PlotRaster::default();
+        let series = BTreeMap::from([("trace".to_owned(), vec![
+            PlotPoint::new(0., 0.), PlotPoint::new(10., 10.),
+        ])]);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                egui::vec2(400., 300.))),
+            ..Default::default()
+        };
+        for _ in 0..100 {
+            ctx.run(input.clone(), |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui_plot::Plot::new("raster-worker-test").show(ui, |plot| {
+                        plot.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                            [0., 0.], [10., 10.]));
+                        raster.show(&ctx, plot, &series, &HashSet::new(), 1);
+                    });
+                });
+            });
+            if raster.key.is_some() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(raster.texture.is_some(), "background raster did not publish");
+        assert_eq!(raster.texture_bounds, Some([0., 0., 10., 10.]));
+        raster.invalidate();
+        assert!(raster.texture.is_none());
     }
 }

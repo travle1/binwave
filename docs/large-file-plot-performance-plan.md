@@ -304,7 +304,9 @@ or persistent. Decoded chunks now share
 columns across compatible field selections, but partial field hits still
 decode the entire requested group before merging new columns. Variable-record
 checkpoints and render-pipeline
-work remain. The Keep control reports pending writes and disk usage, but not
+work remain. Medium-density raster preparation now runs in one cancellable
+background job, but frame-time and GPU-upload targets remain unmeasured. The
+Keep control reports pending writes and disk usage, but not
 field/range coverage. No 100 GB performance result or p95 interaction/frame
 measurement has been collected. Do not treat a successful close-range tile
 test as validation of the 100 GB acceptance gates.
