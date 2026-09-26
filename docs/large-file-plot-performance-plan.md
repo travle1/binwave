@@ -311,6 +311,15 @@ field/range coverage. No 100 GB performance result or p95 interaction/frame
 measurement has been collected. Do not treat a successful close-range tile
 test as validation of the 100 GB acceptance gates.
 
+A subsequent crowded-plot regression showed 0.4–9.46 second UI draw phases in
+the application log as traces arrived. The GPU renderer abandoned its entire
+upload when it reached the segment cap and fell back to per-trace UI meshes.
+Commit `576d63b` keeps a bounded, extrema-retaining GPU representation and
+prepares it off the UI thread; plot buffers are shared with raster workers.
+Synthetic over-cap and invalid-gap tests pass, but live frame-time and GPU
+upload measurements remain required before the rendering acceptance gate can
+be marked complete.
+
 ### Limited synthetic measurement
 
 Command: `BINWAVE_BENCH_SAMPLES=20000000 cargo test --release --bin binwave
