@@ -84,6 +84,7 @@ struct Request {
     key: Key,
     source: ByteView,
     node: Node,
+    partial_updates: bool,
 }
 #[cfg(not(target_arch = "wasm32"))]
 struct Cached {
@@ -122,6 +123,7 @@ impl Drop for PlotReader {
 #[cfg(not(target_arch = "wasm32"))]
 impl PlotReader {
     /// `pixel_width` is the plot canvas width in physical display pixels.
+    #[cfg(test)]
     pub fn request(
         &mut self,
         ctx: &egui::Context,
@@ -143,6 +145,32 @@ impl PlotReader {
         pixel_width: Address,
         refine: bool,
         fields: Option<Vec<String>>,
+    ) {
+        self.request_with_updates(ctx, source, node, range, pixel_width, refine, fields, true);
+    }
+
+    pub fn request_background(
+        &mut self,
+        ctx: &egui::Context,
+        source: ByteView,
+        node: Node,
+        range: Range<Address>,
+        pixel_width: Address,
+        refine: bool,
+    ) {
+        self.request_with_updates(ctx, source, node, range, pixel_width, refine, None, false);
+    }
+
+    fn request_with_updates(
+        &mut self,
+        ctx: &egui::Context,
+        source: ByteView,
+        node: Node,
+        range: Range<Address>,
+        pixel_width: Address,
+        refine: bool,
+        fields: Option<Vec<String>>,
+        partial_updates: bool,
     ) {
         let count = node
             .lazy
@@ -196,7 +224,7 @@ impl PlotReader {
                 }
             }
         }
-        self.desired = Some(Request { key, source, node });
+        self.desired = Some(Request { key, source, node, partial_updates });
         self.tick(ctx);
     }
     pub fn tick(&mut self, ctx: &egui::Context) {
@@ -589,7 +617,7 @@ fn read_plot(
     let mut add = |node: &Node, index: Address, reduction: &mut Reduction| {
         reduction.node(node, "", index);
         scanned += 1;
-        if last_publish.elapsed() >= Duration::from_millis(250) {
+        if request.partial_updates && last_publish.elapsed() >= Duration::from_millis(250) {
             publish(reduction.data(scanned, false));
             last_publish = Instant::now();
         }
@@ -849,7 +877,7 @@ fn read_numeric(
                 reduction.record(record, span.start + offset as Address)?;
                 scanned += 1;
             }
-            if last_publish.elapsed() >= Duration::from_millis(250) {
+            if request.partial_updates && last_publish.elapsed() >= Duration::from_millis(250) {
                 request.source.validate()?;
                 publish(reduction.data(scanned, false));
                 last_publish = Instant::now();
@@ -889,6 +917,7 @@ pub(crate) fn read_for_viewport(
         },
         source,
         node,
+        partial_updates: true,
     };
     read_plot(&request, &AtomicBool::new(false), |_| {})
 }
@@ -1012,6 +1041,7 @@ actions:
             },
             source,
             node,
+            partial_updates: true,
         }
     }
     fn settle(reader: &mut PlotReader, ctx: &egui::Context) {

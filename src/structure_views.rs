@@ -14,13 +14,20 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc,
+    mpsc, Arc, OnceLock,
 };
 
 const PAGE_SIZE: usize = 128;
 const INITIAL_PLOT_SAMPLES: usize = 1024;
 const MAX_HIGHLIGHTS: usize = 256;
-const MAX_CONCURRENT_PLOT_COLLECTIONS: usize = 4;
+fn plot_worker_count() -> usize {
+    static WORKERS: OnceLock<usize> = OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|count| count.get().saturating_sub(2).max(1))
+            .unwrap_or(4)
+    })
+}
 
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1554,8 +1561,8 @@ impl StructureViews {
                 let count = collection_count(&extra);
                 let reader = self.extra_plot_readers.entry(path.clone()).or_default();
                 let was_loading = reader.is_loading();
-                if !self.plot_paused && (was_loading || active_readers < MAX_CONCURRENT_PLOT_COLLECTIONS) {
-                    reader.request(ui.ctx(), source.clone(), extra,
+                if !self.plot_paused && (was_loading || active_readers < plot_worker_count()) {
+                    reader.request_background(ui.ctx(), source.clone(), extra,
                         requested.start.min(count)..requested.end.min(count), pixel_width, self.plot_refine);
                 } else if !was_loading && !self.plot_paused {
                     queued_collections += 1;
