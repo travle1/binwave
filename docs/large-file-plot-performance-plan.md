@@ -324,6 +324,13 @@ reopen, broad field group, or storage-bound load. The benchmark needs the
 additional layouts/navigation trace specified in Phase 0 before performance
 gates can be set.
 
+A summary-only broad-scan prototype was measured on the same 20 million sample
+workload. It took 348 ms and read 143 MB because many display-bucket boundaries
+caused a second raw-tile read, versus 74–78 ms and 80 MB on the retained
+materializing path. The prototype was removed from the active path. Phase 5
+needs a single-pass treatment of partial buckets before summary-only scanning
+can be enabled without this regression.
+
 ## Deliverable from the implementing agent
 
 Provide the completed code and focused tests, benchmark commands/fixtures, a before/after results table, updated resource/architecture documentation, the implemented default-cache and per-file retention behavior, an explicit decision for variable-record checkpoints, and a concise explanation of remaining bottlenecks. Distinguish warm reuse, post-eviction/restart reuse in both retention modes, and first accurate scan results. If the full 100 GB dataset or required hardware is unavailable, report the largest measured workload and leave those performance gates explicitly unverified.
