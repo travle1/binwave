@@ -251,7 +251,6 @@ impl PlotReader {
                             key: request.key.clone(),
                             result: Ok(data),
                         });
-                        ctx.request_repaint();
                     };
                     let result = read_plot(&request, &cancel, publish);
                     if !cancel.load(Ordering::Relaxed) {
@@ -266,7 +265,7 @@ impl PlotReader {
             }
         }
         if self.running.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(50));
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
     pub fn invalidate(&mut self) {

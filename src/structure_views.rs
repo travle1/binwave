@@ -1595,18 +1595,19 @@ impl StructureViews {
             if self.plot_reader.is_loading() {
                 ui.spinner();
                 ui.weak("Reading visible range…");
-                if ui.button("Stop").clicked() {
-                    self.plot_reader.stop();
-                    for reader in self.extra_plot_readers.values_mut() { reader.stop(); }
-                    self.plot_paused = true;
-                    self.plot_refine = false;
-                }
             }
             if extra_loading > 0 {
                 ui.spinner();
                 ui.weak(format!("{extra_loading} other collections loading"));
             }
             if queued_collections > 0 { ui.weak(format!("{queued_collections} collections queued")); }
+            if !self.plot_paused && (self.plot_reader.is_loading() || extra_loading > 0 || queued_collections > 0)
+                && ui.button("Stop loading").clicked() {
+                self.plot_reader.stop();
+                for reader in self.extra_plot_readers.values_mut() { reader.stop(); }
+                self.plot_paused = true;
+                self.plot_refine = false;
+            }
             if self.plot_catalog.len() > 32 {
                 ui.weak(format!("{} available fields; select fields in Series", self.plot_catalog.len()));
             }

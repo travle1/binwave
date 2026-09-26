@@ -87,7 +87,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Binwave",
         native_options,
-        Box::new(|cc| Ok(Box::new(app::BinwaveApp::new(cc)))),
+        Box::new(|cc| {
+            if let Some(render_state) = &cc.wgpu_render_state {
+                let adapter = render_state.adapter.get_info();
+                log::info!("Graphics adapter: {} ({:?}, {:?})", adapter.name, adapter.backend, adapter.device_type);
+            }
+            Ok(Box::new(app::BinwaveApp::new(cc)))
+        }),
     )?;
     Ok(())
 }
