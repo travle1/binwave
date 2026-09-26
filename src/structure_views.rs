@@ -889,7 +889,7 @@ impl StructureViews {
             let open = self.table_open_groups.contains(&key);
             let label = key.rsplit('.').nth(1).unwrap_or(&key);
             navigation.push(TableNavigation {
-                label: format!("{} {label} · {} sensors", if open { "▾" } else { "▸" }, sensors.len()),
+                label: format!("{} {label} · {} items", if open { "▾" } else { "▸" }, sensors.len()),
                 path: key,
                 group: true,
                 depth: 0,
@@ -899,7 +899,7 @@ impl StructureViews {
                 sensors.sort_by_key(|(_, node)| node.path != self.table_target);
                 for (index, node) in sensors {
                     navigation.push(TableNavigation {
-                        label: format!("{} Sensor {index}", if node.path == self.table_target { "▾" } else { "▸" }),
+                        label: format!("{} Item {index}", if node.path == self.table_target { "▾" } else { "▸" }),
                         path: node.path.clone(),
                         group: false,
                         depth: 1,
@@ -2188,7 +2188,7 @@ fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut st
                 for (key, sensors) in groups {
                     let label = key.rsplit('.').nth(1).unwrap_or(&key);
                     let enabled = sensors.iter().filter(|(_, node)| selected.contains(&node.path)).count();
-                    egui::CollapsingHeader::new(format!("{label} · {enabled}/{} sensors", sensors.len()))
+                    egui::CollapsingHeader::new(format!("{label} · {enabled}/{} items", sensors.len()))
                         .id_salt(&key)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
@@ -2212,7 +2212,7 @@ fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut st
                                         ui.push_id(&node.path, |ui| {
                                             ui.horizontal(|ui| {
                                                 let mut shown = selected.contains(&node.path);
-                                                if ui.checkbox(&mut shown, format!("Sensor {index}"))
+                                                if ui.checkbox(&mut shown, format!("Item {index}"))
                                                     .on_hover_text(&node.path).changed() {
                                                     if shown { selected.insert(node.path.clone()); }
                                                     else { selected.remove(&node.path); }
