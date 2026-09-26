@@ -44,8 +44,9 @@ this file**. It protects already stored chunks and persists newly decoded
 selected numeric values as the file is explored. Pending writes and retained
 disk usage are displayed there; a failed write is reported and plot reads
 continue from the source. Ordinary cache clearing preserves kept chunks; the
-same menu provides explicit per-file removal. Current chunks are keyed by the
-selected field set, so a different selection can still require decoding.
+same menu provides explicit per-file removal. Compatible field subsets reuse
+stored columns. A request combining retained and new fields currently decodes
+the whole requested group, then merges new columns into the chunk.
 The disk quota and Keep storage do not limit the source file itself.
 
 ## Follow-up work

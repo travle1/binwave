@@ -472,6 +472,15 @@ pub struct Define {
     pub fields: FieldMapping,
 }
 
+/// How grouped values become individual sensor series.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupLayout {
+    #[default]
+    Interleaved,
+    Contiguous,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FieldMapping {
@@ -483,6 +492,8 @@ pub struct FieldMapping {
     pub repeat: Option<Expr>,
     #[serde(default)]
     pub items_per_group: Option<Expr>,
+    #[serde(default)]
+    pub layout: GroupLayout,
     #[serde(default)]
     pub length: Option<Expr>,
     #[serde(default)]
@@ -704,6 +715,24 @@ pub(crate) struct NumericPlan {
     pub fields: Vec<NumericField>,
 }
 impl NumericPlan {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn cache_record_key(&self) -> String {
+        let segment = self.segmented.as_ref().map(|part| [
+            part.outer_start, part.outer_stride, part.inner_offset,
+            part.inner_count, part.inner_stride,
+        ]);
+        serde_json::json!({
+            "version": 2, "start": self.start, "stride": self.stride,
+            "segment": segment,
+        }).to_string()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn cache_field_keys(&self) -> Vec<String> {
+        self.fields.iter().map(|field| serde_json::json!([
+            field.name, field.suffix, field.offset, field.width, field.span,
+            field.source_path, field.kind, field.endian,
+        ]).to_string()).collect()
+    }
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn cache_layout_key(&self) -> String {
         let segment = self.segmented.as_ref().map(|part| [
@@ -2646,6 +2675,8 @@ impl<'a> Engine<'a> {
                     ))
                 })
                 .transpose()?;
+            ensure!(definition.fields.layout == GroupLayout::Interleaved
+                || definition.fields.items_per_group.is_some(), "contiguous layout requires items_per_group");
             if let Some(items_per_group) = &definition.fields.items_per_group {
                 ensure!(field.repeat.is_some(), "items_per_group requires repeat for the group count");
                 let count = resolve(items_per_group)?;
@@ -2654,6 +2685,29 @@ impl<'a> Engine<'a> {
                     TypeSpec::Name(kind) => kind.clone(),
                     TypeSpec::Select { .. } => unreachable!(),
                 };
+                if definition.fields.layout == GroupLayout::Contiguous {
+                    let Some(Repeat::Count(groups)) = &field.repeat else { unreachable!() };
+                    let groups = constant_size(groups).context("group count must be constant")?;
+                    ensure!(groups > 0 && groups <= 4096, "contiguous layout requires 1 to 4096 sensors");
+                    let item_kind = format!("{}__sensors_{index}", definition.name);
+                    ensure!(!self.structures.contains_key(&item_kind), "structure {item_kind:?} is already defined");
+                    ensure!(self.structures.len() < 512, "at most 512 static and discovered structures are allowed");
+                    let mut fields = Vec::new();
+                    for sensor in 0..groups {
+                        let mut samples = Field::scalar(format!("sensor_{sensor}"), value_kind.clone());
+                        samples.repeat = Some(Repeat::Count(count.clone()));
+                        samples.length = field.length.clone();
+                        valid_field(&samples)?;
+                        fields.push(samples);
+                    }
+                    self.structures.insert(item_kind.clone(), Structure { fields, ..Structure::default() });
+                    field.repeat = None;
+                    field.length = None;
+                    field.kind = TypeSpec::Name(item_kind);
+                    valid_field(&field)?;
+                    structure.fields.push(field);
+                    continue;
+                }
                 let key = (value_kind.clone(), constant_size(&count).unwrap(), field.length.as_ref().and_then(constant_size));
                 let item_kind = if let Some(existing) = group_item_types.get(&key) {
                     existing.clone()

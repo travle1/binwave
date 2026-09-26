@@ -298,9 +298,10 @@ newly decoded selected numeric fields; it does not initiate a full scan.
 
 These changes do **not** yet satisfy the full plan. Loaded coverage is not
 independent of viewport resolution, RAM ownership is still per reader, the
-summary index is not multilevel or persistent, and decoded chunks are keyed
-by the selected field set. Changing to a subset of already retained fields
-can therefore decode again. Variable-record checkpoints and render-pipeline
+summary index is not multilevel or persistent. Decoded chunks now share
+columns across compatible field selections, but partial field hits still
+decode the entire requested group before merging new columns. Variable-record
+checkpoints and render-pipeline
 work remain. The Keep control reports pending writes and disk usage, but not
 field/range coverage. No 100 GB performance result or p95 interaction/frame
 measurement has been collected. Do not treat a successful close-range tile

@@ -683,10 +683,9 @@ impl PlotReader {
             for tile in tiles {
                 if !keep_decoded_data(&request.source) { break; }
                 if let Some((path, key)) = decoded_chunk_key(&request, &plan, tile.start, size) {
-                    if !path.exists() {
-                        queue_decoded_chunk(ChunkWrite { path, key, tile, generation: 0,
-                            file_generation: 0, keep: false }, true);
-                    }
+                    queue_decoded_chunk(ChunkWrite { path, key, tile,
+                        fields: plan.cache_field_keys(), generation: 0,
+                        file_generation: 0, keep: false }, true);
                 }
             }
         });
@@ -1234,7 +1233,7 @@ fn group_signature(request: &Request) -> GroupSignature {
     }
 }
 #[cfg(not(target_arch = "wasm32"))]
-const DECODED_CHUNK_MAGIC: &[u8; 8] = b"BWCHNK02";
+const DECODED_CHUNK_MAGIC: &[u8; 8] = b"BWCHNK03";
 #[cfg(not(target_arch = "wasm32"))]
 fn chunk_hash(bytes: &[u8], mut hash: u64) -> u64 {
     for byte in bytes {
@@ -1311,15 +1310,15 @@ pub(crate) fn decoded_data_usage(source: &ByteView) -> u64 {
 #[cfg(not(target_arch = "wasm32"))]
 fn decoded_chunk_key(request: &Request, plan: &NumericPlan, start: Address, size: Address)
     -> Option<(std::path::PathBuf, String)> {
-    let key = request.source.plot_cache_key(&(plan.cache_layout_key(), start, size))?;
+    let key = request.source.plot_cache_key(&(plan.cache_record_key(), start, size))?;
     let hash = chunk_hash(key.as_bytes(), 0xcbf29ce484222325);
     let path = decoded_file_dir(&request.source)?
         .join(format!("{hash:016x}.chunk"));
     Some((path, key))
 }
 #[cfg(not(target_arch = "wasm32"))]
-fn read_decoded_chunk(path: &std::path::Path, key: &str, start: Address,
-    count: Address, fields: Address) -> Option<GroupTile> {
+fn read_chunk_columns(path: &std::path::Path, key: &str, start: Address,
+    count: Address) -> Option<Vec<(String, Vec<f64>)>> {
     use std::io::Read;
     let source = std::fs::File::open(path).ok()?;
     let mut file = std::io::BufReader::with_capacity(256 * 1024, source);
@@ -1332,17 +1331,28 @@ fn read_decoded_chunk(path: &std::path::Path, key: &str, start: Address,
     let stored_fields = u32::from_le_bytes(header[28..32].try_into().ok()?) as usize;
     let expected_hash = u64::from_le_bytes(header[32..40].try_into().ok()?);
     if key_len != key.len() || key_len > 1_000_000 || stored_start != start
-        || stored_count != count || stored_fields != fields { return None; }
-    let payload_bytes = count.checked_mul(fields)?.checked_mul(8)?;
-    if file.get_ref().metadata().ok()?.len() != (40usize.checked_add(key_len)?.checked_add(payload_bytes)?) as u64 {
-        return None;
-    }
+        || stored_count != count || stored_fields > 4096
+        || file.get_ref().metadata().ok()?.len() > 256 * 1024 * 1024 { return None; }
     let mut saved_key = vec![0; key_len];
     file.read_exact(&mut saved_key).ok()?;
     if saved_key != key.as_bytes() { return None; }
     let mut hash = chunk_hash(&saved_key, 0xcbf29ce484222325);
-    let mut values = Vec::with_capacity(fields);
-    for _ in 0..fields {
+    let mut columns = Vec::with_capacity(stored_fields);
+    let mut seen = HashSet::new();
+    let mut expected_bytes = 40usize.checked_add(key_len)?;
+    for _ in 0..stored_fields {
+        let mut length = [0u8; 4];
+        file.read_exact(&mut length).ok()?;
+        let name_len = u32::from_le_bytes(length) as usize;
+        if name_len > 100_000 { return None; }
+        let mut name = vec![0; name_len];
+        file.read_exact(&mut name).ok()?;
+        let name = String::from_utf8(name).ok()?;
+        if !seen.insert(name.clone()) { return None; }
+        hash = chunk_hash(&length, hash);
+        hash = chunk_hash(name.as_bytes(), hash);
+        expected_bytes = expected_bytes.checked_add(4)?.checked_add(name_len)?
+            .checked_add(count.checked_mul(8)?)?;
         let mut field = Vec::with_capacity(count);
         for _ in 0..count {
             let mut bytes = [0; 8];
@@ -1350,19 +1360,46 @@ fn read_decoded_chunk(path: &std::path::Path, key: &str, start: Address,
             hash = chunk_hash(&bytes, hash);
             field.push(f64::from_le_bytes(bytes));
         }
-        values.push(field);
+        columns.push((name, field));
     }
-    (hash == expected_hash).then(|| GroupTile::from_values(start, values))
+    (hash == expected_hash && file.get_ref().metadata().ok()?.len() == expected_bytes as u64)
+        .then_some(columns)
 }
 #[cfg(not(target_arch = "wasm32"))]
-fn write_decoded_chunk(path: &std::path::Path, key: &str, tile: &GroupTile) -> Result<()> {
+fn read_decoded_chunk(path: &std::path::Path, key: &str, start: Address,
+    count: Address, fields: &[String]) -> Option<GroupTile> {
+    let columns = read_chunk_columns(path, key, start, count)?;
+    let mut columns: HashMap<_, _> = columns.into_iter().collect();
+    let values = fields.iter().map(|field| columns.remove(field)).collect::<Option<Vec<_>>>()?;
+    Some(GroupTile::from_values(start, values))
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn write_decoded_chunk(path: &std::path::Path, key: &str, tile: &GroupTile,
+    fields: &[String]) -> Result<()> {
     use std::io::Write;
+    ensure!(fields.len() == tile.values.len(), "decoded chunk field count changed");
+    let count = tile.end - tile.start;
+    ensure!(tile.values.iter().all(|values| values.len() == count),
+        "decoded chunk has unequal field lengths");
+    let mut columns: BTreeMap<String, Vec<f64>> = read_chunk_columns(path, key, tile.start, count)
+        .unwrap_or_default().into_iter().collect();
+    if fields.iter().all(|field| columns.contains_key(field)) { return Ok(()); }
+    for (field, values) in fields.iter().zip(&tile.values) {
+        columns.insert(field.clone(), values.clone());
+    }
+    ensure!(columns.len() <= 4096, "too many decoded fields in one tile");
+    let payload_bytes = columns.len().checked_mul(count).and_then(|size| size.checked_mul(8))
+        .ok_or_else(|| anyhow::anyhow!("decoded chunk size overflow"))?;
+    ensure!(payload_bytes <= 256 * 1024 * 1024, "decoded chunk exceeds 256 MiB");
     let parent = path.parent().ok_or_else(|| anyhow::anyhow!("chunk path has no parent"))?;
     std::fs::create_dir_all(parent)?;
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     let mut hash = chunk_hash(key.as_bytes(), 0xcbf29ce484222325);
-    for field in &tile.values {
-        for &value in field { hash = chunk_hash(&value.to_le_bytes(), hash); }
+    for (field, values) in &columns {
+        let length = u32::try_from(field.len())?.to_le_bytes();
+        hash = chunk_hash(&length, hash);
+        hash = chunk_hash(field.as_bytes(), hash);
+        for &value in values { hash = chunk_hash(&value.to_le_bytes(), hash); }
     }
     {
         let mut writer = std::io::BufWriter::with_capacity(256 * 1024, &mut file);
@@ -1370,11 +1407,13 @@ fn write_decoded_chunk(path: &std::path::Path, key: &str, tile: &GroupTile) -> R
         writer.write_all(&(key.len() as u64).to_le_bytes())?;
         writer.write_all(&(tile.start as u64).to_le_bytes())?;
         writer.write_all(&u32::try_from(tile.end - tile.start)?.to_le_bytes())?;
-        writer.write_all(&u32::try_from(tile.values.len())?.to_le_bytes())?;
+        writer.write_all(&u32::try_from(columns.len())?.to_le_bytes())?;
         writer.write_all(&hash.to_le_bytes())?;
         writer.write_all(key.as_bytes())?;
-        for field in &tile.values {
-            for &value in field { writer.write_all(&value.to_le_bytes())?; }
+        for (field, values) in &columns {
+            writer.write_all(&u32::try_from(field.len())?.to_le_bytes())?;
+            writer.write_all(field.as_bytes())?;
+            for &value in values { writer.write_all(&value.to_le_bytes())?; }
         }
         writer.flush()?;
     }
@@ -1457,6 +1496,7 @@ struct ChunkWrite {
     path: std::path::PathBuf,
     key: String,
     tile: Arc<GroupTile>,
+    fields: Vec<String>,
     generation: u64,
     file_generation: u64,
     keep: bool,
@@ -1474,9 +1514,17 @@ fn chunk_file_generations() -> &'static Mutex<HashMap<std::path::PathBuf, u64>> 
     GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 #[cfg(not(target_arch = "wasm32"))]
-fn pending_chunks() -> &'static Mutex<HashSet<std::path::PathBuf>> {
-    static PENDING: std::sync::OnceLock<Mutex<HashSet<std::path::PathBuf>>> = std::sync::OnceLock::new();
-    PENDING.get_or_init(|| Mutex::new(HashSet::new()))
+fn pending_chunks() -> &'static Mutex<HashMap<std::path::PathBuf, usize>> {
+    static PENDING: std::sync::OnceLock<Mutex<HashMap<std::path::PathBuf, usize>>> = std::sync::OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn finish_pending_chunk(path: &std::path::Path) {
+    let mut pending = pending_chunks().lock().unwrap();
+    if let Some(count) = pending.get_mut(path) {
+        *count -= 1;
+        if *count == 0 { pending.remove(path); }
+    }
 }
 #[cfg(not(target_arch = "wasm32"))]
 fn chunk_errors() -> &'static Mutex<HashMap<std::path::PathBuf, String>> {
@@ -1487,7 +1535,7 @@ fn chunk_errors() -> &'static Mutex<HashMap<std::path::PathBuf, String>> {
 pub(crate) fn decoded_data_status(source: &ByteView) -> (u64, usize, Option<String>) {
     let Some(dir) = decoded_file_dir(source) else { return (0, 0, None); };
     let pending = pending_chunks().lock().unwrap().iter()
-        .filter(|path| path.starts_with(&dir)).count();
+        .filter(|(path, _)| path.starts_with(&dir)).map(|(_, count)| *count).sum();
     let error = chunk_errors().lock().unwrap().get(&dir).cloned();
     (decoded_data_usage(source), pending, error)
 }
@@ -1507,11 +1555,11 @@ fn queue_decoded_chunk(mut job: ChunkWrite, keep: bool) {
                 let file_generation = chunk_file_generations().lock().unwrap().get(dir).copied().unwrap_or(0);
                 if (!job.keep && job.generation != CHUNK_GENERATION.load(Ordering::Acquire))
                     || job.file_generation != file_generation {
-                    pending_chunks().lock().unwrap().remove(&job.path);
+                    finish_pending_chunk(&job.path);
                     continue;
                 }
                 let root = job.path.parent().unwrap().parent().unwrap();
-                if let Err(error) = write_decoded_chunk(&job.path, &job.key, &job.tile) {
+                if let Err(error) = write_decoded_chunk(&job.path, &job.key, &job.tile, &job.fields) {
                     log::warn!("Decoded plot cache write failed: {error:#}");
                     chunk_errors().lock().unwrap().insert(dir.to_path_buf(), format!("{error:#}"));
                 } else {
@@ -1530,16 +1578,16 @@ fn queue_decoded_chunk(mut job: ChunkWrite, keep: bool) {
                     || job.file_generation != file_generation {
                     let _ = std::fs::remove_file(&job.path);
                 }
-                pending_chunks().lock().unwrap().remove(&job.path);
+                finish_pending_chunk(&job.path);
             }
         });
         sender
     });
     let path = job.path.clone();
-    if !pending_chunks().lock().unwrap().insert(path.clone()) { return; }
+    *pending_chunks().lock().unwrap().entry(path.clone()).or_default() += 1;
     let sent = if keep { sender.send(job).is_ok() } else { sender.try_send(job).is_ok() };
     if !sent {
-        pending_chunks().lock().unwrap().remove(&path);
+        finish_pending_chunk(&path);
         if keep {
             if let Some(dir) = path.parent() {
                 chunk_errors().lock().unwrap().insert(dir.to_path_buf(),
@@ -1555,7 +1603,7 @@ fn persist_visible_tile(request: &Request, plan: &NumericPlan,
     if !keep && request.key.range.len() > AUTO_SCAN_LIMIT { return; }
     let Some((path, key)) = decoded_chunk_key(request, plan, start, group_tile_size(plan)) else { return; };
     if !path.exists() { queue_decoded_chunk(ChunkWrite { path, key, tile: tile.clone(),
-        generation: 0, file_generation: 0, keep: false }, keep); }
+        fields: plan.cache_field_keys(), generation: 0, file_generation: 0, keep: false }, keep); }
 }
 #[cfg(not(target_arch = "wasm32"))]
 fn load_group_tile(request: &Request, plan: &NumericPlan, start: Address, size: Address,
@@ -1635,7 +1683,7 @@ fn cached_group_tile(request: &Request, plan: &NumericPlan,
     let expected = start.saturating_add(size).min(count).saturating_sub(start);
     let disk = decoded_chunk_key(request, plan, start, size);
     let from_disk = disk.as_ref().and_then(|(path, key)|
-        read_decoded_chunk(path, key, start, expected, plan.fields.len()));
+        read_decoded_chunk(path, key, start, expected, &plan.cache_field_keys()));
     let disk_hit = from_disk.is_some();
     let result = match from_disk {
         Some(tile) => Ok(Arc::new(tile)),
@@ -1646,7 +1694,7 @@ fn cached_group_tile(request: &Request, plan: &NumericPlan,
         if (keep || request.key.range.len() <= AUTO_SCAN_LIMIT) && !disk_hit
             && !cancel.load(Ordering::Relaxed) {
             queue_decoded_chunk(ChunkWrite { path, key, tile: tile.clone(),
-                generation: 0, file_generation: 0, keep: false }, keep);
+                fields: plan.cache_field_keys(), generation: 0, file_generation: 0, keep: false }, keep);
         }
     }
     {
@@ -2129,19 +2177,34 @@ actions:
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("test.chunk");
         let tile = GroupTile::from_values(4096, vec![vec![1., f64::NAN, 3.], vec![4., 5., 6.]]);
-        write_decoded_chunk(&path, "generic-layout", &tile).unwrap();
-        let loaded = read_decoded_chunk(&path, "generic-layout", 4096, 3, 2).unwrap();
+        let fields = ["first".to_owned(), "second".to_owned()];
+        write_decoded_chunk(&path, "generic-layout", &tile, &fields).unwrap();
+        let loaded = read_decoded_chunk(&path, "generic-layout", 4096, 3, &fields).unwrap();
         assert_eq!(loaded.values[0][0], 1.);
         assert!(loaded.values[0][1].is_nan());
         assert_eq!(loaded.values[1], [4., 5., 6.]);
-        assert!(read_decoded_chunk(&path, "different-layout", 4096, 3, 2).is_none());
-        assert!(read_decoded_chunk(&path, "generic-layout", 4097, 3, 2).is_none());
+        assert!(read_decoded_chunk(&path, "different-layout", 4096, 3, &fields).is_none());
+        assert!(read_decoded_chunk(&path, "generic-layout", 4097, 3, &fields).is_none());
         let mut bytes = std::fs::read(&path).unwrap();
         *bytes.last_mut().unwrap() ^= 1;
         std::fs::write(&path, bytes).unwrap();
-        assert!(read_decoded_chunk(&path, "generic-layout", 4096, 3, 2).is_none());
+        assert!(read_decoded_chunk(&path, "generic-layout", 4096, 3, &fields).is_none());
         std::fs::write(&path, b"truncated").unwrap();
-        assert!(read_decoded_chunk(&path, "generic-layout", 4096, 3, 2).is_none());
+        assert!(read_decoded_chunk(&path, "generic-layout", 4096, 3, &fields).is_none());
+    }
+    #[test]
+    fn decoded_chunk_merges_fields_and_reuses_subsets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared.chunk");
+        write_decoded_chunk(&path, "record-layout", &GroupTile::from_values(0,
+            vec![vec![1., 2.], vec![3., 4.]]), &["a".into(), "b".into()]).unwrap();
+        let subset = read_decoded_chunk(&path, "record-layout", 0, 2, &["b".into()]).unwrap();
+        assert_eq!(subset.values, [vec![3., 4.]]);
+        write_decoded_chunk(&path, "record-layout", &GroupTile::from_values(0,
+            vec![vec![5., 6.]]), &["c".into()]).unwrap();
+        let all = read_decoded_chunk(&path, "record-layout", 0, 2,
+            &["a".into(), "b".into(), "c".into()]).unwrap();
+        assert_eq!(all.values, [vec![1., 2.], vec![3., 4.], vec![5., 6.]]);
     }
     #[test]
     fn persisted_numeric_tile_reopens_without_source_payload_reads() {
@@ -2157,7 +2220,8 @@ actions:
         let query = request(store.view(), node, 0..4096, true);
         let (path, key) = decoded_chunk_key(&query, &plan, 0, group_tile_size(&plan)).unwrap();
         let values = (0..4096).map(|index| index as f64).collect();
-        write_decoded_chunk(&path, &key, &GroupTile::from_values(0, vec![values])).unwrap();
+        write_decoded_chunk(&path, &key, &GroupTile::from_values(0, vec![values]),
+            &plan.cache_field_keys()).unwrap();
         let before = source.io_stats();
         let cache = Arc::new(Mutex::new(GroupTileCache::default()));
         let tile = cached_group_tile(&query, &plan, &cache, &group_signature(&query), 0,
@@ -2223,6 +2287,42 @@ actions:
         assert_eq!(reopened_source.io_stats(), before);
         assert_eq!(tile.values[0][101], 0.);
         remove_decoded_data(&reopened_query.source).unwrap();
+    }
+    #[test]
+    fn persisted_full_record_serves_a_field_subset_after_reopen() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut bytes = Vec::new();
+        for index in 0..4096i32 {
+            bytes.extend_from_slice(&index.to_le_bytes());
+            bytes.extend_from_slice(&(index + 7).to_le_bytes());
+        }
+        std::fs::write(file.path(), bytes).unwrap();
+        let yaml = "structures:\n  - name: Sample\n    fields:\n      - {name: first, type: i32}\n      - {name: second, type: i32}\nactions:\n  - read: {name: samples, type: {structure: Sample}, repeat: until end}\n";
+        let source = Arc::new(crate::file_source::FileSource::open(file.path()).unwrap());
+        let store = ByteStore::from_file(source);
+        let node = parse(&store.view(), yaml);
+        let full = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
+        let query = request(store.view(), node, 0..4096, true);
+        let (path, key) = decoded_chunk_key(&query, &full, 0, group_tile_size(&full)).unwrap();
+        let values = vec![(0..4096).map(|index| index as f64).collect(),
+            (0..4096).map(|index| (index + 7) as f64).collect()];
+        write_decoded_chunk(&path, &key, &GroupTile::from_values(0, values),
+            &full.cache_field_keys()).unwrap();
+        let reopened_source = Arc::new(crate::file_source::FileSource::open(file.path()).unwrap());
+        let reopened = ByteStore::from_file(reopened_source.clone());
+        let reopened_node = parse(&reopened.view(), yaml);
+        let subset = eligible_numeric_plan(&reopened_node, Some(&["second".into()])).unwrap();
+        let reopened_query = request(reopened.view(), reopened_node, 0..4096, true);
+        assert_eq!(decoded_chunk_key(&reopened_query, &subset, 0, group_tile_size(&subset)).unwrap().0,
+            path);
+        let before = reopened_source.io_stats();
+        let cache = Arc::new(Mutex::new(GroupTileCache::default()));
+        let tile = cached_group_tile(&reopened_query, &subset, &cache,
+            &group_signature(&reopened_query), 0, &AtomicBool::new(false)).unwrap();
+        assert_eq!(reopened_source.io_stats(), before);
+        assert_eq!(tile.values.len(), 1);
+        assert_eq!(tile.values[0][100], 107.);
+        std::fs::remove_file(path).unwrap();
     }
     #[test]
     fn default_chunk_quota_never_evicts_kept_file() {
