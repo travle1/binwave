@@ -1129,9 +1129,6 @@ impl StructureViews {
                         self.plot_jump = samples.start;
                         self.plot_range_first = samples.start;
                         self.plot_range_last = samples.end.saturating_sub(1);
-                        if self.plot_view.is_none() {
-                            self.plot_fit_y = true;
-                        }
                         let view = selection_view(
                             self.plot_view.as_ref(),
                             &samples,
@@ -1140,6 +1137,7 @@ impl StructureViews {
                         if self.plot_view.as_ref() != Some(&view) {
                             self.plot_force_view = Some(view.clone());
                             self.plot_view = Some(view);
+                            self.plot_fit_y = true;
                             self.plot_refine = false;
                         }
                     }
@@ -2454,7 +2452,8 @@ fn selection_view(
     count: usize,
 ) -> Range<usize> {
     if let Some(current) =
-        current.filter(|current| current.start <= samples.start && current.end >= samples.end)
+        current.filter(|current| current.len() <= PAGE_SIZE
+            && current.start <= samples.start && current.end >= samples.end)
     {
         return current.clone();
     }
@@ -2462,10 +2461,10 @@ fn selection_view(
         return padded_selection(samples, count);
     }
     let width = current
-        .map_or(INITIAL_PLOT_SAMPLES, |current| current.len())
+        .map_or(PAGE_SIZE, |current| current.len())
         .clamp(
             samples.len().saturating_add(16),
-            INITIAL_PLOT_SAMPLES.max(samples.len().saturating_add(16)),
+            PAGE_SIZE.max(samples.len().saturating_add(16)),
         );
     centered_view(
         samples.start.saturating_add(samples.len() / 2),
@@ -3577,6 +3576,9 @@ actions:
             selection_view(Some(&(100..220)), &(150..151), 256),
             100..220
         );
+        let focused = selection_view(Some(&(0..100_000)), &(50_000..50_001), 100_000);
+        assert_eq!(focused.len(), PAGE_SIZE);
+        assert!(focused.contains(&50_000));
         let shifted = selection_view(Some(&(0..64)), &(255..256), 256);
         assert_eq!(shifted.end, 256);
         assert!(shifted.contains(&255));
