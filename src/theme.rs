@@ -85,6 +85,8 @@ pub struct Radii {
     pub pill: u16,
 }
 pub struct Sizes {
+    pub frame_border: f32,
+    pub frame_resize_grab: f32,
     pub sidebar_width: f32,
     pub header_height: f32,
     pub card_header_height: f32,
@@ -199,6 +201,8 @@ pub const DARK: Theme = Theme {
         pill: 999,
     },
     size: Sizes {
+        frame_border: 1.,
+        frame_resize_grab: 6.,
         sidebar_width: 240.,
         header_height: 48.,
         card_header_height: 40.,

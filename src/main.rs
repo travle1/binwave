@@ -60,6 +60,8 @@ mod structure_plot;
 mod structure_selection;
 mod theme;
 #[cfg(not(target_arch = "wasm32"))]
+mod window_frame;
+#[cfg(not(target_arch = "wasm32"))]
 mod structure_ui;
 #[cfg(not(target_arch = "wasm32"))]
 mod structure_views;
@@ -77,7 +79,9 @@ fn main() -> eframe::Result<()> {
             // Keep the existing settings location through the product rename.
             .with_app_id("Plotter Max")
             .with_inner_size([1280., 850.])
-            .with_min_inner_size([1000., 650.]),
+            .with_min_inner_size([1000., 650.])
+            .with_decorations(false)
+            .with_transparent(true),
         ..Default::default()
     };
     eframe::run_native(

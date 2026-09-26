@@ -1758,7 +1758,13 @@ impl eframe::App for BinwaveApp {
         self.dialog_template = rfd::AsyncFileDialog::new().set_parent(frame);
         self.binary
             .set_dialog_template(self.dialog_template.clone());
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::window_frame::show(ui, |ui| self.ui_workspace(ui));
+        #[cfg(target_arch = "wasm32")]
         self.ui_workspace(ui);
+    }
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.workspace.save(storage);
