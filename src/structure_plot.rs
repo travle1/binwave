@@ -61,6 +61,7 @@ pub struct PlotData {
     pub range: Range<Address>,
     pub series: BTreeMap<String, Vec<PlotSample>>,
     pub envelopes: BTreeMap<String, Vec<PlotEnvelope>>,
+    pub bounds: BTreeMap<String, (f64, f64)>,
     pub quality: PlotQuality,
     pub scanned: Address,
     pub total: Address,
@@ -261,6 +262,12 @@ impl PlotReader {
         self.error = None;
         self.cache.clear();
     }
+    pub fn stop(&mut self) {
+        if let Some(running) = &self.running {
+            running.cancel.store(true, Ordering::Relaxed);
+        }
+        self.desired = None;
+    }
     pub fn data(&self) -> Option<&PlotData> {
         self.data.as_deref()
     }
@@ -421,10 +428,16 @@ impl Reduction {
         } else {
             self.exact.clone()
         };
+        let bounds = series.iter().filter_map(|(name, points)| {
+            let mut values = points.iter().map(|point| point.value).filter(|value| value.is_finite());
+            let first = values.next()?;
+            Some((name.clone(), values.fold((first, first), |(lo, hi), value| (lo.min(value), hi.max(value)))))
+        }).collect();
         PlotData {
             range: self.range.clone(),
             series,
             envelopes,
+            bounds,
             quality: self.quality,
             scanned,
             total: (self.range.end - self.range.start),
@@ -479,6 +492,9 @@ fn reduction_buckets(quality: PlotQuality, requested: Address) -> Address {
 // phases. Starts vary within evenly distributed strata; exact endpoints are
 // included without claiming that any unread interval has been scanned.
 fn preview_windows(range: Range<Address>, buckets: Address) -> Vec<Range<Address>> {
+    preview_windows_with_budget(range, buckets, PREVIEW_LIMIT)
+}
+fn preview_windows_with_budget(range: Range<Address>, buckets: Address, sample_budget: Address) -> Vec<Range<Address>> {
     if range.is_empty() {
         return Vec::new();
     }
@@ -487,7 +503,9 @@ fn preview_windows(range: Range<Address>, buckets: Address) -> Vec<Range<Address
     (0..count)
         .map(|bucket| {
             let stratum = bucket_range(&range, count, bucket);
-            let width = (stratum.end - stratum.start).min(PREVIEW_WINDOW_SIZE);
+            let width = (stratum.end - stratum.start)
+                .min(PREVIEW_WINDOW_SIZE)
+                .min((sample_budget / count).max(1));
             let start = if bucket == 0 {
                 stratum.start
             } else if bucket + 1 == count {
@@ -670,11 +688,11 @@ impl NumericReduction {
         Ok(())
     }
     fn data(&self, scanned: Address, complete: bool) -> PlotData {
-        let mut series = BTreeMap::new();
+        let mut series: BTreeMap<String, Vec<PlotSample>> = BTreeMap::new();
         let mut envelopes = BTreeMap::new();
         for (field_index, field) in self.plan.fields.iter().enumerate() {
             let sample = |point: NumericPoint| {
-                let start = self.plan.start + point.index * self.plan.stride + field.offset;
+                let start = self.plan.offset(point.index).unwrap_or(self.plan.start) + field.offset;
                 PlotSample {
                     index: point.index,
                     value: point.value,
@@ -712,10 +730,16 @@ impl NumericReduction {
             };
             series.insert(field.name.clone(), points.into_iter().map(sample).collect());
         }
+        let bounds = series.iter().filter_map(|(name, points)| {
+            let mut values = points.iter().map(|point| point.value).filter(|value| value.is_finite());
+            let first = values.next()?;
+            Some((name.clone(), values.fold((first, first), |(lo, hi), value| (lo.min(value), hi.max(value)))))
+        }).collect();
         PlotData {
             range: self.range.clone(),
             series,
             envelopes,
+            bounds,
             quality: self.quality,
             scanned,
             total: (self.range.end - self.range.start),
@@ -747,23 +771,21 @@ fn read_numeric(
     // Window size and physical read size are independent: even very wide
     // records are read in chunks no larger than the ByteView's 1 MiB limit.
     let windows = if quality == PlotQuality::SampledPreview {
-        preview_windows(range, request.key.buckets)
+        let budget = (1_000_000 / reduction.plan.fields.len().max(1) as Address)
+            .clamp(2_048, PREVIEW_LIMIT);
+        preview_windows_with_budget(range, request.key.buckets, budget)
     } else {
         vec![range]
     };
     let batch = (READ_LIMIT / stride.max(1)).max(1);
     for window in windows {
-        for index in window.clone().step_by(batch as usize) {
-            let span = index..index.saturating_add(batch).min(window.end);
+        let mut index = window.start;
+        while index < window.end {
+            let span = index..index.saturating_add(batch)
+                .min(index.saturating_add(reduction.plan.contiguous_count(index)))
+                .min(window.end);
             ensure!(!cancel.load(Ordering::Relaxed), "plot request cancelled");
-            let start = reduction
-                .plan
-                .start
-                .checked_add(
-                    span.start
-                        .checked_mul(stride)
-                        .ok_or_else(|| anyhow::anyhow!("plot offset overflow"))?,
-                )
+            let start = reduction.plan.offset(span.start)
                 .ok_or_else(|| anyhow::anyhow!("plot offset overflow"))?;
             let length = (span.end - span.start)
                 .checked_mul(stride)
@@ -785,6 +807,7 @@ fn read_numeric(
                 publish(reduction.data(scanned, false));
                 last_publish = Instant::now();
             }
+            index = span.end;
         }
     }
     request.source.validate()?;
@@ -953,6 +976,29 @@ actions:
         assert_eq!(points[1023].index, 1274);
         assert_eq!(points[1023].bytes, 5096..5100);
         assert_eq!(points[1023].path, "samples[1274]");
+    }
+    #[test]
+    fn repeated_numeric_fields_use_segmented_fast_plan_across_groups() {
+        let yaml = "structures:\n  - name: Item\n    fields:\n      - {name: marker, type: u8}\n      - {name: sensors, type: u16, repeat: 3}\n  - name: Group\n    fields:\n      - {name: header, type: bytes, length: 2}\n      - {name: items, type: {structure: Item}, repeat: 256}\nactions:\n  - read: {name: groups, type: {structure: Group}, repeat: 130}\n";
+        let stride = 2 + 256 * 7;
+        let mut bytes = vec![0; 130 * stride];
+        let first = 2 + 255 * 7 + 5;
+        let second = stride + 2 + 5;
+        bytes[first..first + 2].copy_from_slice(&11_u16.to_le_bytes());
+        bytes[second..second + 2].copy_from_slice(&22_u16.to_le_bytes());
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let output = Program::parse(yaml).unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let groups = &output.nodes[0];
+        let first_group = groups.lazy.as_ref().unwrap().page(&store.view(), &AtomicBool::new(false), 0, 1).unwrap();
+        let flat = crate::structure::LazyArray::flattened_child(groups, &first_group[0].children[1]).unwrap();
+        let plan = flat.lazy.as_ref().unwrap().numeric_plan().unwrap();
+        assert_eq!(plan.fields.len(), 4);
+        assert_eq!(plan.fields[3].name, "sensors.[2]");
+        let data = read_for_viewport(store.view(), flat, 255..257, 800).unwrap();
+        let points = &data.series["sensors.[2]"];
+        assert_eq!(points.iter().map(|point| point.value).collect::<Vec<_>>(), [11., 22.]);
+        assert_eq!(points[0].bytes, first..first + 2);
+        assert_eq!(points[1].bytes, second..second + 2);
     }
     #[test]
     fn exact_point_budget_scales_with_plot_width_and_remains_bounded() {

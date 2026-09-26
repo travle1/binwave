@@ -33,6 +33,27 @@ not a YAML type reference. It still resolves through the same type catalog.
 Inline nested `fields` without a `type` is not supported: declare a named
 structure and reference it explicitly.
 
+## Reusable enums
+
+Declare a named lookup table once and apply it to an earlier decoded value.
+Enum declarations read no bytes. Quote numeric keys so they remain strings.
+
+```yaml
+enums:
+  - name: Labels
+    cases: {'7': First, '9': Second}
+  - name: Widths
+    cases: {'1': u8, '2': u16}
+```
+
+In a `define` action, `name: {ref: id, enum: Labels}` maps a numeric `id` to
+the generated field name. `type: {ref: width, enum: Widths}` reuses the width
+mapping for the generated field type. A field can also use
+`type: {choose: {ref: width, enum: Widths}}`. Enum output used as a field name
+must follow the normal field-name rules. An unmapped name falls back to its raw
+decoded value; an unmapped type reports an error unless an `otherwise` value
+is declared. Local `cases` override enum cases when both are present.
+
 ## Three different kinds of nesting
 
 | Layer | What it means | Does it read bytes? |
@@ -104,6 +125,23 @@ records
         ├── x = 30
         └── y = 40
 ```
+
+To choose what appears on a collapsed structure row, mark one of its fields
+with `preview: true`. A scalar previews its value; a nested field previews its
+decoded type. For example, a `payload` whose `choose` selects `Data` appears
+as `payload=Data` on the parent row. This changes only the display summary,
+not the decoded path or bytes. At most one field per structure may be marked.
+
+```yaml
+  - name: Record
+    fields:
+      - {name: kind, type: u8}
+      - name: payload
+        type: {choose: {ref: kind, cases: {'1': {structure: Data}}}}
+        preview: true
+```
+
+The tree no longer guesses a preview from field names such as `id` or `type`.
 
 `Position` is a reusable type name; `position` is the name of one field using
 that type. The field creates the nesting. `records` names the top-level read,

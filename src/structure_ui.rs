@@ -1264,9 +1264,11 @@ impl Operation {
                 fields: FieldMapping {
                     name: Some(Reference {
                         reference: "name".into(),
+                        enum_name: None,
                     }),
                     kind: TypeChoice {
                         reference: "code".into(),
+                        enum_name: None,
                         cases: BTreeMap::new(),
                         otherwise: None,
                     },
@@ -1288,6 +1290,7 @@ impl Operation {
 #[derive(Clone)]
 struct TypeChoiceDraft {
     reference: String,
+    enum_name: String,
     cases: Vec<(String, String)>,
     otherwise: String,
 }
@@ -1295,6 +1298,7 @@ impl TypeChoiceDraft {
     fn from_choice(choice: &TypeChoice) -> Self {
         Self {
             reference: choice.reference.clone(),
+            enum_name: choice.enum_name.clone().unwrap_or_default(),
             cases: choice
                 .cases
                 .iter()
@@ -1321,6 +1325,7 @@ impl TypeChoiceDraft {
         }
         Ok(TypeChoice {
             reference: self.reference.trim().into(),
+            enum_name: (!self.enum_name.trim().is_empty()).then(|| self.enum_name.trim().into()),
             cases,
             otherwise: (!self.otherwise.is_empty()).then(|| self.otherwise.clone()),
         })
@@ -1331,6 +1336,7 @@ impl TypeChoiceDraft {
             ui.text_edit_singleline(&mut self.reference);
             reference_menu(ui, &mut self.reference, references);
         });
+        labeled(ui, "Named enum (optional)", &mut self.enum_name);
         let mut remove = None;
         for (index, (value, kind)) in self.cases.iter_mut().enumerate() {
             ui.push_id(("type_case", index), |ui| {
@@ -1403,6 +1409,7 @@ impl ReadStep {
                 false,
                 TypeChoiceDraft {
                     reference: String::new(),
+                    enum_name: String::new(),
                     cases: Vec::new(),
                     otherwise: String::new(),
                 },
@@ -1468,6 +1475,7 @@ impl ReadStep {
         self.options_ui(ui, references);
     }
     fn options_ui(&mut self, ui: &mut Ui, references: &[String]) {
+        ui.checkbox(&mut self.original.preview, "Show value or decoded type on collapsed parent");
         ui.horizontal_wrapped(|ui| {
             ui.label("Read");
             egui::ComboBox::from_id_salt("read_repeat")
@@ -1606,6 +1614,7 @@ struct DefineStep {
     name: String,
     from: String,
     label: String,
+    label_enum: String,
     choice: TypeChoiceDraft,
     repeat: ValueInput,
     length: ValueInput,
@@ -1623,6 +1632,8 @@ impl DefineStep {
                 .as_ref()
                 .map(|r| r.reference.clone())
                 .unwrap_or_default(),
+            label_enum: value.fields.name.as_ref()
+                .and_then(|r| r.enum_name.clone()).unwrap_or_default(),
             choice: TypeChoiceDraft::from_choice(&value.fields.kind),
             repeat: ValueInput::from_expr(value.fields.repeat.clone()),
             length: ValueInput::from_expr(value.fields.length.clone()),
@@ -1643,6 +1654,7 @@ impl DefineStep {
             fields: FieldMapping {
                 name: (!self.label.trim().is_empty()).then(|| Reference {
                     reference: self.label.trim().into(),
+                    enum_name: (!self.label_enum.trim().is_empty()).then(|| self.label_enum.trim().into()),
                 }),
                 kind: self.choice.build()?,
                 repeat: self.repeat.optional()?,
@@ -1663,6 +1675,7 @@ impl DefineStep {
             "Each item describes one field. The property paths below are relative to that item.",
         );
         labeled(ui, "Field name property (optional)", &mut self.label);
+        labeled(ui, "Field name enum (optional)", &mut self.label_enum);
         self.choice.ui(ui, types, &[]);
         self.repeat
             .ui(ui, "Item count property (optional)", "e.g. count", &[]);
@@ -2049,6 +2062,7 @@ fn draft_program(yaml: &str) -> Result<Program> {
         Ok(Program {
             endian: Endian::Little,
             structures: BTreeMap::new(),
+            enums: Vec::new(),
             actions: Vec::new(),
         })
     } else if StructureWorkspace::is_generic(yaml) {
@@ -2816,6 +2830,7 @@ impl Builder {
             Program {
                 endian: self.endian,
                 structures: BTreeMap::new(),
+                enums: Vec::new(),
                 actions: Vec::new(),
             }
         } else if StructureWorkspace::is_generic(yaml) {
@@ -2878,9 +2893,11 @@ impl Builder {
                 fields: FieldMapping {
                     name: (!self.mapping.label.trim().is_empty()).then(|| Reference {
                         reference: self.mapping.label.trim().into(),
+                        enum_name: None,
                     }),
                     kind: TypeChoice {
                         reference: self.mapping.code.trim().into(),
+                        enum_name: None,
                         cases,
                         otherwise: None,
                     },

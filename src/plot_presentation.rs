@@ -49,44 +49,53 @@ impl Presentation {
         {
             self.stack(ranges);
             changed = true;
-            ui.close();
         }
         if ui.button("Reset positions").clicked() {
             self.series.clear();
             changed = true;
-            ui.close();
         }
-        ui.separator();
-        egui::ScrollArea::vertical()
-            .max_height(320.)
-            .show(ui, |ui| {
-                for (name, _, _) in ranges {
-                    ui.menu_button(name, |ui| {
-                        let p = self.series.entry(name.clone()).or_default();
-                        ui.horizontal(|ui| {
-                            ui.label("Vertical offset");
-                            changed |= ui
-                                .add(egui::DragValue::new(&mut p.offset).speed(0.1))
-                                .changed();
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Scale");
-                            changed |= ui
-                                .add(
-                                    egui::DragValue::new(&mut p.scale)
-                                        .speed(0.01)
-                                        .range(1e-12..=1e12),
-                                )
-                                .changed();
-                        });
-                        if ui.button("Reset this series").clicked() {
-                            *p = Placement::default();
-                            changed = true;
+        let mut groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for (name, _, _) in ranges {
+            let field = name.rsplit_once(" / ").map_or(name.as_str(), |(_, field)| field);
+            let (group, label) = field.split_once('.').unwrap_or(("", field));
+            groups.entry(group.to_owned()).or_default().push((label.to_owned(), name.clone()));
+        }
+        ui.menu_button("Series positions", |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("plot-series-positions")
+                .max_height(320.)
+                .show(ui, |ui| {
+                    for (group, entries) in groups {
+                        let mut show_entries = |ui: &mut egui::Ui| {
+                            for (label, name) in &entries {
+                                ui.push_id(name, |ui| {
+                                    ui.menu_button(label, |ui| {
+                                        let p = self.series.entry(name.clone()).or_default();
+                                        ui.horizontal(|ui| {
+                                            ui.label("Vertical offset");
+                                            changed |= ui.add(egui::DragValue::new(&mut p.offset).speed(0.1)).changed();
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label("Scale");
+                                            changed |= ui.add(egui::DragValue::new(&mut p.scale).speed(0.01).range(1e-12..=1e12)).changed();
+                                        });
+                                        if ui.button("Reset this series").clicked() {
+                                            *p = Placement::default();
+                                            changed = true;
+                                        }
+                                        ui.weak("Display only; original values and bytes are unchanged.");
+                                    }).response.on_hover_text(name);
+                                });
+                            }
+                        };
+                        if group.is_empty() {
+                            show_entries(ui);
+                        } else {
+                            ui.collapsing(format!("{group} ({})", entries.len()), |ui| show_entries(ui));
                         }
-                        ui.weak("Display only; original values and bytes are unchanged.");
-                    });
-                }
-            });
+                    }
+                });
+        });
         changed
     }
     pub fn stack(&mut self, ranges: &[(String, f64, f64)]) {

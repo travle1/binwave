@@ -314,6 +314,8 @@ impl YamlLayoutCache {
                     ui.code("structures:\n  - name: RecordType\n    fields:\n      - {name: value, type: u16}\nactions:\n  - read: {name: records, type: {structure: RecordType}, repeat: 2}");
                     ui.label("Declarations read no bytes. Actions start reads; fields consume bytes in order. A field using a structure creates nested values.");
                     ui.label("repeat counts items; length bounds each item in bytes. ref uses an earlier decoded value. Names are chosen by you.");
+                    ui.label("Reusable enums map decoded values to names or types: enums: [{name: Labels, cases: {'1': First}}], then name: {ref: code, enum: Labels} in define.");
+                    ui.label("Mark one field in a structure with preview: true to show its value or decoded type on the collapsed parent row.");
                     ui.label("Right-click in the editor → Insert template to add a field, structure, or read step at the cursor. Python has its own templates.");
                     ui.separator();
                     ui.label("Open Help → Decoder guide for every supported type, field option, action, expression, and a complete Python API reference.");

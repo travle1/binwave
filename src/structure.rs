@@ -41,7 +41,17 @@ pub struct Program {
     pub endian: Endian,
     #[serde(default, with = "named_structures")]
     pub structures: BTreeMap<String, Structure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enums: Vec<EnumDef>,
     pub actions: Vec<Action>,
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnumDef {
+    pub name: String,
+    pub cases: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otherwise: Option<String>,
 }
 
 // YAML declares named records; the execution engine retains an indexed catalog.
@@ -116,6 +126,8 @@ pub struct Field {
     pub name: String,
     #[serde(rename = "type")]
     pub kind: TypeSpec,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub preview: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<Repeat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -137,6 +149,7 @@ impl Field {
         Self {
             name: name.into(),
             kind: TypeSpec::Name(kind.into()),
+            preview: false,
             repeat: None,
             length: None,
             at: None,
@@ -147,6 +160,7 @@ impl Field {
         }
     }
 }
+fn is_false(value: &bool) -> bool { !*value }
 
 #[derive(Debug, Clone)]
 pub enum TypeSpec {
@@ -235,6 +249,8 @@ mod optional_type {
 pub struct TypeChoice {
     #[serde(rename = "ref")]
     pub reference: String,
+    #[serde(default, rename = "enum", skip_serializing_if = "Option::is_none")]
+    pub enum_name: Option<String>,
     #[serde(default, with = "type_cases")]
     pub cases: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "optional_type")]
@@ -478,6 +494,8 @@ pub struct FieldMapping {
 pub struct Reference {
     #[serde(rename = "ref")]
     pub reference: String,
+    #[serde(default, rename = "enum", skip_serializing_if = "Option::is_none")]
+    pub enum_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -542,6 +560,7 @@ pub struct Node {
     pub lazy: Option<LazyArray>,
     pub endian: Endian,
     pub references: Vec<String>,
+    pub preview: Option<String>,
 }
 impl Node {
     pub fn tree_label(&self) -> String {
@@ -560,19 +579,15 @@ impl Node {
             return format!("{} · {}", self.kind, self.display());
         }
         let bytes = self.range.end.saturating_sub(self.range.start);
-        let section_type = self.children.iter().take(4).find(|child| {
-            matches!(child.name.as_str(), "type" | "kind" | "tag" | "id")
-                || child.name.ends_with("_type")
-        }).and_then(|child| child.value.as_ref().map(|value| format!("{}={value}", child.name)));
-        let section_type = section_type.map_or_else(String::new, |value| format!(" · {value}"));
+        let preview = self.preview.as_ref().map_or_else(String::new, |value| format!(" · {value}"));
         if self.kind == "partial collection" {
             format!("{} items decoded · incomplete · starts 0x{:X}", self.children.len(), self.range.start)
         } else if self.kind == "partial" {
-            format!("{bytes} bytes decoded{section_type} · incomplete · starts 0x{:X}", self.range.start)
+            format!("{bytes} bytes decoded{preview} · incomplete · starts 0x{:X}", self.range.start)
         } else if self.kind.ends_with("[]") {
             format!("{} items · {bytes} bytes · starts 0x{:X}", self.children.len(), self.range.start)
         } else {
-            format!("{}{section_type} · {bytes} bytes · starts 0x{:X}", self.kind, self.range.start)
+            format!("{}{preview} · {bytes} bytes · starts 0x{:X}", self.kind, self.range.start)
         }
     }
     pub fn numeric_tooltip(&self) -> Option<String> {
@@ -602,7 +617,9 @@ impl Node {
     }
     pub fn display(&self) -> String {
         if let Some(array) = &self.lazy {
-            if array.offsets.is_some() {
+            if array.segmented.is_some() {
+                format!("{} items · across groups", array.count)
+            } else if array.offsets.is_some() {
                 format!("{} items · variable size", array.count)
             } else {
                 format!("{} items · {} bytes each", array.count, array.stride)
@@ -649,7 +666,16 @@ pub struct LazyArray {
     /// Boundaries for variable-size records, including the final end offset.
     /// Fixed-size arrays calculate boundaries from their stride instead.
     offsets: Option<Arc<Vec<Address>>>,
+    segmented: Option<SegmentedArray>,
     plan: Arc<LazyPlan>,
+}
+#[derive(Debug, Clone)]
+struct SegmentedArray {
+    outer_start: Address,
+    outer_stride: Address,
+    inner_offset: Address,
+    inner_count: Address,
+    inner_stride: Address,
 }
 #[derive(Debug, Clone)]
 struct LazyPlan {
@@ -660,6 +686,7 @@ struct LazyPlan {
     endian: Endian,
     values: HashMap<String, Value>,
     structures: BTreeMap<String, Structure>,
+    enums: Vec<EnumDef>,
     revision: u64,
 }
 /// A conservative numeric projection of a constant decoded structure. Unsupported
@@ -669,9 +696,27 @@ struct LazyPlan {
 pub(crate) struct NumericPlan {
     pub start: Address,
     pub stride: Address,
+    segmented: Option<SegmentedArray>,
     pub path: String,
     pub revision: u64,
     pub fields: Vec<NumericField>,
+}
+impl NumericPlan {
+    pub(crate) fn offset(&self, index: Address) -> Option<Address> {
+        if let Some(segment) = &self.segmented {
+            let group = index / segment.inner_count;
+            let within = index % segment.inner_count;
+            segment.outer_start.checked_add(group.checked_mul(segment.outer_stride)?)?
+                .checked_add(segment.inner_offset)?
+                .checked_add(within.checked_mul(segment.inner_stride)?)
+        } else {
+            self.start.checked_add(index.checked_mul(self.stride)?)
+        }
+    }
+    pub(crate) fn contiguous_count(&self, index: Address) -> Address {
+        self.segmented.as_ref().map_or(Address::MAX, |segment|
+            segment.inner_count - index % segment.inner_count)
+    }
 }
 #[derive(Clone)]
 pub(crate) struct NumericField {
@@ -724,11 +769,30 @@ fn project_numeric(
         || field.relative.is_some()
         || field.align.is_some()
         || field.expect.is_some()
-        || field.repeat.is_some()
     {
         return None;
     }
     *budget -= 1;
+    if let Some(repeat) = &field.repeat {
+        let Repeat::Count(count) = repeat else { return None; };
+        let count = constant_size(count)?;
+        if count > *budget { return None; }
+        let mut element = field.clone();
+        element.repeat = None;
+        let mut consumed = 0 as Address;
+        for index in 0..count {
+            let item_prefix = if prefix.is_empty() {
+                format!("[{index}]")
+            } else {
+                format!("{prefix}.[{index}]")
+            };
+            consumed = consumed.checked_add(project_numeric(
+                &element, structures, offset.checked_add(consumed)?, &item_prefix,
+                inherited, depth + 1, budget, fields,
+            )?)?;
+        }
+        return Some(consumed);
+    }
     let TypeSpec::Name(kind) = &field.kind else {
         return None;
     };
@@ -792,8 +856,73 @@ fn project_numeric(
     Some(length.unwrap_or(consumed))
 }
 impl LazyArray {
+    /// A view of the same fixed-size child collection in every fixed-size
+    /// parent record. No sample data or per-sample offsets are materialized.
+    pub(crate) fn flattened_child(parent: &Node, child: &Node) -> Option<Node> {
+        let outer = parent.lazy.as_ref()?;
+        let inner = child.lazy.as_ref()?;
+        if outer.count == 0 || inner.count == 0 || outer.stride == 0 || inner.stride == 0
+            || outer.offsets.is_some() || outer.segmented.is_some()
+            || inner.offsets.is_some() || inner.segmented.is_some() {
+            return None;
+        }
+        let outer_start = outer.bounds(0)?.start;
+        let inner_start = inner.bounds(0)?.start;
+        let inner_offset = inner_start.checked_sub(outer_start)?;
+        let inner_bytes = inner.count.checked_mul(inner.stride)?;
+        if inner_offset.checked_add(inner_bytes)? > outer.stride {
+            return None;
+        }
+        let count = outer.count.checked_mul(inner.count)?;
+        let path = format!("{}.{}", parent.path, child.name);
+        let mut plan = (*inner.plan).clone();
+        plan.start = inner_start;
+        plan.end = parent.range.end;
+        plan.path = path.clone();
+        let array = Self {
+            count,
+            stride: inner.stride,
+            offsets: None,
+            segmented: Some(SegmentedArray {
+                outer_start,
+                outer_stride: outer.stride,
+                inner_offset,
+                inner_count: inner.count,
+                inner_stride: inner.stride,
+            }),
+            plan: Arc::new(plan),
+        };
+        let end = array.bounds(count - 1)?.end;
+        Some(Node {
+            name: format!("{} across {}", child.name, parent.name),
+            path,
+            range: inner_start..end,
+            kind: child.kind.clone(),
+            value: None,
+            children: Vec::new(),
+            lazy: Some(array),
+            endian: child.endian,
+            references: child.references.clone(),
+            preview: None,
+        })
+    }
     pub(crate) fn indices_for_bytes(&self, bytes: &Range<Address>) -> Option<Range<Address>> {
         if self.count == 0 || bytes.is_empty() { return None; }
+        if self.segmented.is_some() {
+            let mut low = 0;
+            let mut high = self.count;
+            while low < high {
+                let mid = low + (high - low) / 2;
+                if self.bounds(mid)?.end <= bytes.start { low = mid + 1; } else { high = mid; }
+            }
+            let first = low;
+            high = self.count;
+            while low < high {
+                let mid = low + (high - low) / 2;
+                if self.bounds(mid)?.start < bytes.end { low = mid + 1; } else { high = mid; }
+            }
+            return (first < low).then_some(first..low);
+        }
         if let Some(offsets) = &self.offsets {
             let first = offsets.partition_point(|offset| *offset <= bytes.start).saturating_sub(1);
             let end = offsets.partition_point(|offset| *offset < bytes.end).min(offsets.len() - 1);
@@ -806,6 +935,15 @@ impl LazyArray {
     }
     pub(crate) fn bounds(&self, index: Address) -> Option<Range<Address>> {
         if index >= self.count { return None; }
+        if let Some(segment) = &self.segmented {
+            let group = index / segment.inner_count;
+            let within = index % segment.inner_count;
+            let start = segment.outer_start
+                .checked_add(group.checked_mul(segment.outer_stride)?)?
+                .checked_add(segment.inner_offset)?
+                .checked_add(within.checked_mul(segment.inner_stride)?)?;
+            return Some(start..start.checked_add(segment.inner_stride)?);
+        }
         if let Some(offsets) = &self.offsets {
             let index = usize::try_from(index).ok()?;
             return Some(*offsets.get(index)?..*offsets.get(index + 1)?);
@@ -833,6 +971,7 @@ impl LazyArray {
         Some(NumericPlan {
             start: self.plan.start,
             stride: self.stride,
+            segmented: self.segmented.clone(),
             path: self.plan.path.clone(),
             revision: self.plan.revision,
             fields,
@@ -901,6 +1040,7 @@ impl LazyArray {
             cancel,
             self.plan.endian,
             self.plan.structures.clone(),
+            self.plan.enums.clone(),
             self.plan.revision,
         );
         engine.values = self.plan.values.clone();
@@ -910,10 +1050,12 @@ impl LazyArray {
         for index in start..end {
             let bounds = self.bounds(index).context("array offset overflow")?;
             let mut cursor = bounds.start;
+            // Each lazy item has its own parsing budget. A page of individually
+            // valid records must not fail because their node counts add up.
+            engine.nodes = 0;
             if self.offsets.is_some() {
                 engine.values = self.plan.values.clone();
                 engine.collections.clear();
-                engine.nodes = 0;
             }
             let path = format!("{}[{index}]", self.plan.path);
             let mut node = engine.single(
@@ -924,7 +1066,7 @@ impl LazyArray {
                 self.plan.endian,
                 0,
             )?;
-            ensure!(self.offsets.is_none() || cursor == bounds.end, "{path}: record size changed since indexing");
+            ensure!((self.offsets.is_none() && self.segmented.is_none()) || cursor == bounds.end, "{path}: record size changed since indexing");
             node.name = format!("[{index}]");
             nodes.push(node);
         }
@@ -1013,6 +1155,14 @@ impl Program {
             program.structures.len() <= 256,
             "at most 256 structures are allowed"
         );
+        ensure!(program.enums.len() <= 256, "at most 256 enums are allowed");
+        let mut enum_names = HashSet::new();
+        for declared in &program.enums {
+            valid_name(&declared.name)?;
+            ensure!(enum_names.insert(&declared.name), "duplicate enum {:?}", declared.name);
+            ensure!(!declared.cases.is_empty(), "enum {:?} has no cases", declared.name);
+            ensure!(declared.cases.len() <= 4096, "enum {:?} has too many cases", declared.name);
+        }
         for (name, structure) in &program.structures {
             valid_name(name)?;
             ensure!(
@@ -1024,14 +1174,17 @@ impl Program {
                 "structure {name} has too many fields"
             );
             let mut seen = std::collections::HashSet::new();
+            let mut preview_count = 0;
             for field in &structure.fields {
                 valid_field(field)?;
+                if field.preview { preview_count += 1; }
                 ensure!(
                     seen.insert(&field.name),
                     "duplicate field {} in {name}",
                     field.name
                 );
             }
+            ensure!(preview_count <= 1, "structure {name} marks more than one preview field");
             validate_actions(&structure.actions, 0)?;
         }
         validate_actions(&program.actions, 0)?;
@@ -1073,6 +1226,7 @@ impl Program {
             cancel,
             self.endian,
             self.structures.clone(),
+            self.enums.clone(),
             revision,
         );
         for (name, structure) in &self.structures {
@@ -1275,7 +1429,7 @@ fn partial_tree(completed: &[Node], progress: &[Node]) -> Vec<Node> {
                 } else {
                     "partial"
                 }.into(), value: None, children: Vec::new(), lazy: None,
-                endian: leaf.endian, references: Vec::new(),
+                endian: leaf.endian, references: Vec::new(), preview: None,
             });
             nodes.len() - 1
         });
@@ -1336,6 +1490,7 @@ struct Engine<'a> {
     revision: u64,
     regions: Vec<Range<Address>>,
     structures: BTreeMap<String, Structure>,
+    enums: Vec<EnumDef>,
     values: HashMap<String, Value>,
     collections: HashMap<String, Node>,
     definitions: Vec<ResolvedDefinition>,
@@ -1348,6 +1503,7 @@ impl<'a> Engine<'a> {
         cancel: &'a AtomicBool,
         _endian: Endian,
         structures: BTreeMap<String, Structure>,
+        enums: Vec<EnumDef>,
         revision: u64,
     ) -> Self {
         Self {
@@ -1356,6 +1512,7 @@ impl<'a> Engine<'a> {
             revision,
             regions: vec![],
             structures,
+            enums,
             values: HashMap::new(),
             collections: HashMap::new(),
             definitions: Vec::new(),
@@ -1475,13 +1632,17 @@ impl<'a> Engine<'a> {
     }
     fn choice(&self, choice: &TypeChoice, scope: &str) -> Result<String> {
         let key = self.lookup(&choice.reference, scope)?.key();
-        if choice.cases.is_empty() && choice.otherwise.is_none() {
+        if choice.cases.is_empty() && choice.otherwise.is_none() && choice.enum_name.is_none() {
             return Ok(key);
         }
+        let declared = choice.enum_name.as_ref()
+            .map(|name| self.enum_by_name(name)).transpose()?;
         choice
             .cases
             .get(&key)
+            .or_else(|| declared.and_then(|e| e.cases.get(&key)))
             .or(choice.otherwise.as_ref())
+            .or_else(|| declared.and_then(|e| e.otherwise.as_ref()))
             .cloned()
             .with_context(|| {
                 format!(
@@ -1489,6 +1650,10 @@ impl<'a> Engine<'a> {
                     choice.reference
                 )
             })
+    }
+    fn enum_by_name(&self, name: &str) -> Result<&EnumDef> {
+        self.enums.iter().find(|declared| declared.name == name)
+            .with_context(|| format!("enum {name:?} is not defined"))
     }
     fn actions(
         &mut self,
@@ -1550,6 +1715,7 @@ impl<'a> Engine<'a> {
                         lazy: None,
                         endian,
                         references: expr_references(&calculation.value),
+                        preview: None,
                     });
                 }
                 Action::Choose(choice) => {
@@ -1732,7 +1898,7 @@ impl<'a> Engine<'a> {
         let Ok(kind) = self.selected_type(&element.kind, path) else { return Ok(None); };
         if self.has_actions(&kind, 0) { return Ok(None); }
         let source = ScanSource::new(self.source);
-        let mut scanner = Engine::new(&source, self.cancel, endian, self.structures.clone(), self.revision);
+        let mut scanner = Engine::new(&source, self.cancel, endian, self.structures.clone(), self.enums.clone(), self.revision);
         scanner.regions = self.regions.clone();
         let needed: HashSet<String> = self.structures.values()
             .flat_map(|structure| structure.fields.iter())
@@ -1848,6 +2014,7 @@ impl<'a> Engine<'a> {
                             count: indexed_count,
                             stride: 0,
                             offsets: Some(Arc::new(offsets)),
+                            segmented: None,
                             plan: Arc::new(LazyPlan {
                                 field: element,
                                 start,
@@ -1856,11 +2023,13 @@ impl<'a> Engine<'a> {
                                 endian: field.endian.unwrap_or(endian),
                                 values: self.values.clone(),
                                 structures: self.structures.clone(),
+                                enums: self.enums.clone(),
                                 revision: self.revision,
                             }),
                         }),
                         endian: field.endian.unwrap_or(endian),
                         references: field_references(field),
+                        preview: None,
                     };
                     self.collections.insert(path.into(), node.clone());
                     return Ok(node);
@@ -1908,6 +2077,7 @@ impl<'a> Engine<'a> {
             lazy: None,
             endian: field.endian.unwrap_or(endian),
             references: field_references(field),
+            preview: None,
         };
         self.collections.insert(path.into(), node.clone());
         Ok(node)
@@ -1928,16 +2098,19 @@ impl<'a> Engine<'a> {
                 count,
                 stride,
                 offsets: None,
+                segmented: None,
                 plan: Arc::new(LazyPlan {
                     field: element.clone(), start, end, path: path.into(),
                     endian: field.endian.unwrap_or(endian),
                     values: self.values.clone(),
                     structures: self.structures.clone(),
+                    enums: self.enums.clone(),
                     revision: self.revision,
                 }),
             }),
             endian: field.endian.unwrap_or(endian),
             references: field_references(field),
+            preview: None,
         })
     }
     fn single(
@@ -1964,6 +2137,7 @@ impl<'a> Engine<'a> {
         };
         let mut endian = field.endian.unwrap_or(inherited);
         let mut children = Vec::new();
+        let mut preview = None;
         let value;
         if let Some(width) = primitive_width(&kind) {
             let value_end = checked_end(start, width, end)?;
@@ -2052,6 +2226,13 @@ impl<'a> Engine<'a> {
                 &mut children,
                 depth + 1,
             )?;
+            preview = structure.fields.iter().find(|field| field.preview)
+                .and_then(|field| children.iter().find(|child| child.name == field.name))
+                .map(|child| {
+                    let content = child.value.as_ref().map_or_else(|| child.kind.clone(), ToString::to_string);
+                    let short: String = content.chars().take(80).collect();
+                    format!("{}={short}", child.name)
+                });
             if length.is_some() {
                 self.regions.pop();
             }
@@ -2076,6 +2257,7 @@ impl<'a> Engine<'a> {
                 lazy: None,
                 endian,
                 references: vec![],
+                preview: None,
             });
             *cursor = end;
         }
@@ -2101,6 +2283,7 @@ impl<'a> Engine<'a> {
             lazy: None,
             endian,
             references: field_references(field),
+            preview,
         };
         if let Some(value) = value {
             self.values.insert(path.into(), value);
@@ -2267,10 +2450,14 @@ impl<'a> Engine<'a> {
         let mut names = std::collections::HashSet::new();
         for (index, element) in children.iter().enumerate() {
             let name = if let Some(reference) = &definition.fields.name {
-                self.lookup(&reference.reference, &element.path)?
-                    .key()
-                    .trim_end_matches('\0')
-                    .to_string()
+                let key = self.lookup(&reference.reference, &element.path)?.key();
+                let mapped = reference.enum_name.as_ref()
+                    .map(|name| self.enum_by_name(name))
+                    .transpose()?
+                    .and_then(|declared| declared.cases.get(&key).or(declared.otherwise.as_ref()))
+                    .cloned()
+                    .unwrap_or(key);
+                mapped.trim_end_matches('\0').to_string()
             } else {
                 format!("field_{index}")
             };
@@ -2486,6 +2673,21 @@ mod tests {
     fn run(yaml: &str, bytes: Vec<u8>) -> Result<ParseOutput> {
         Program::parse(yaml)?.run_from(&Bytes(bytes), &AtomicBool::new(false), 1)
     }
+    #[test]
+    fn lazy_page_with_many_fields_uses_record_limit_per_item() {
+        let mut yaml = String::from("structures:\n  - name: Record\n    fields:\n");
+        for index in 0..200 {
+            yaml.push_str(&format!("      - {{name: value_{index}, type: u8}}\n"));
+        }
+        yaml.push_str("actions:\n  - read: {name: records, type: {structure: Record}, repeat: 256}\n");
+        let source = Bytes(vec![7; 256 * 200]);
+        let output = Program::parse(&yaml).unwrap().run_from(&source, &AtomicBool::new(false), 1).unwrap();
+        let array = output.nodes[0].lazy.as_ref().unwrap();
+        let rows = array.page_from(&source, &AtomicBool::new(false), 0, 128).unwrap();
+        assert_eq!(rows.len(), 128);
+        assert_eq!(rows[127].children.len(), 200);
+        assert_eq!(rows[127].children[199].numeric(), Some(7.));
+    }
     const DYNAMIC: &str = r#"
 endian: little
 structures:
@@ -2509,6 +2711,40 @@ actions:
         repeat: {ref: count}
   - read: {name: payload, type: {structure: Discovered}}
 "#;
+    #[test]
+    fn reusable_enums_name_discovered_fields_and_choose_types() {
+        let yaml = r#"
+enums:
+  - name: Labels
+    cases: {'7': First, '9': Second}
+  - name: Widths
+    cases: {'1': u8, '2': u16}
+structures:
+  - name: Entry
+    fields:
+      - {name: id, type: u8}
+      - {name: width, type: u8}
+actions:
+  - read: {name: entries, type: {structure: Entry}, repeat: 2}
+  - define:
+      name: Discovered
+      from: entries
+      fields:
+        name: {ref: id, enum: Labels}
+        type: {ref: width, enum: Widths}
+  - read: {name: payload, type: {structure: Discovered}}
+  - read: {name: width, type: u8}
+  - read: {name: selected, type: {choose: {ref: width, enum: Widths}}}
+"#;
+        let out = run(yaml, vec![7, 1, 9, 2, 3, 4, 5, 1, 6]).unwrap();
+        assert_eq!(out.nodes[1].children[0].name, "First");
+        assert_eq!(out.nodes[1].children[1].name, "Second");
+        assert_eq!(out.nodes[1].children[1].numeric(), Some(0x0504 as f64));
+        assert_eq!(out.nodes[3].numeric(), Some(6.));
+        let saved = serde_yaml_ng::to_string(&Program::parse(yaml).unwrap()).unwrap();
+        assert!(saved.contains("enum: Labels"));
+        assert!(saved.contains("enum: Widths"));
+    }
     #[test]
     fn explicit_names_references_and_nested_byte_paths_round_trip() {
         let yaml = include_str!("../samples/decoders/yaml/nested_records.yaml");
@@ -2543,7 +2779,7 @@ actions:
 
     #[test]
     fn tree_shows_array_indices_structure_discriminators_and_integer_formats() {
-        let yaml = "structures:\n  - name: Section\n    fields:\n      - {name: section_type, type: u32}\n      - {name: signed_value, type: i16}\nactions:\n  - read: {name: sections, type: {structure: Section}, repeat: 1}\n";
+        let yaml = "structures:\n  - name: Section\n    fields:\n      - {name: section_type, type: u32, preview: true}\n      - {name: signed_value, type: i16}\nactions:\n  - read: {name: sections, type: {structure: Section}, repeat: 1}\n";
         let output = run(yaml, vec![4, 0, 0, 0, 0xFE, 0xFF]).unwrap();
         let section = &output.nodes[0].children[0];
         assert_eq!(section.tree_label(), "sections[0]");
@@ -2552,6 +2788,20 @@ actions:
         assert_eq!(section.children[0].numeric_tooltip().as_deref(), Some("u32 · 32 bits\nDecimal: 4\nHex: 0x00000004\nBinary: 0b00000000000000000000000000000100"));
         assert_eq!(section.children[1].tree_summary(), "i16 · -2");
         assert_eq!(section.children[1].numeric_tooltip().as_deref(), Some("i16 · 16 bits\nDecimal: -2\nHex: 0xFFFE\nBinary: 0b1111111111111110"));
+    }
+    #[test]
+    fn collapsed_record_preview_uses_only_the_marked_field() {
+        let yaml = "structures:\n  - name: Data\n    fields:\n      - {name: value, type: u8}\n  - name: Record\n    fields:\n      - {name: kind, type: u8}\n      - {name: payload, type: {choose: {ref: kind, cases: {'1': {structure: Data}}}}, preview: true}\nactions:\n  - read: {name: records, type: {structure: Record}, repeat: 2}\n";
+        let out = run(yaml, vec![1, 7, 1, 8]).unwrap();
+        let rows = &out.nodes[0].children;
+        assert!(rows[0].tree_summary().contains("payload=Data"));
+        assert!(!rows[0].tree_summary().contains("kind=1"));
+        assert!(rows[1].tree_summary().contains("payload=Data"));
+        let unmarked = yaml.replace(", preview: true", "");
+        let out = run(&unmarked, vec![1, 7, 1, 8]).unwrap();
+        assert!(!out.nodes[0].children[0].tree_summary().contains("kind=1"));
+        let duplicate = yaml.replace("name: kind, type: u8", "name: kind, type: u8, preview: true");
+        assert!(Program::parse(&duplicate).unwrap_err().to_string().contains("more than one preview"));
     }
 
     #[test]

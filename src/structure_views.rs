@@ -6,10 +6,10 @@ use crate::byte_store::ByteView;
 use crate::hex_editor::HexHighlight;
 use crate::plot_trace::decoded_channel;
 use crate::structure::{LazyArray, Node, ParseOutput, Value};
-use crate::structure_plot::{PlotQuality, PlotReader};
+use crate::structure_plot::{PlotData, PlotQuality, PlotReader};
 use egui::{Color32, Ui};
 use egui_plot::{Plot, PlotBounds, PlotPoint, PlotTransform, Points};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -73,6 +73,11 @@ pub struct StructureViews {
     definition_index: usize,
     desired: Option<Request>,
     page: Option<Page>,
+    cached_pages: Vec<Page>,
+    flattened_collections: Vec<Node>,
+    discovery_rx: Option<mpsc::Receiver<(u64, Result<Vec<Node>, String>)>>,
+    discovery_attempted: HashSet<String>,
+    discovery_error: Option<String>,
     rx: Option<mpsc::Receiver<Page>>,
     running: Option<PageKey>,
     cancel: Arc<AtomicBool>,
@@ -81,6 +86,7 @@ pub struct StructureViews {
     plot_reader: PlotReader,
     presentation: crate::plot_presentation::Presentation,
     plot_hidden: HashSet<String>,
+    plot_field_filter: String,
     plot_target: String,
     plot_sources: std::collections::BTreeSet<String>,
     plot_sources_initialized: bool,
@@ -94,6 +100,7 @@ pub struct StructureViews {
     plot_zoom_y: Option<(f64, f64)>,
     plot_follow_selection: bool,
     plot_refine: bool,
+    plot_paused: bool,
     plot_anchor: Option<usize>,
     plot_jump: usize,
     plot_range_first: usize,
@@ -125,11 +132,17 @@ impl StructureViews {
         self.plot_force_view = self.plot_view.clone();
         self.plot_fit_y = true;
         self.plot_refine = false;
+        self.plot_paused = false;
         self.plot_anchor = None;
         self.table_anchor = None;
         self.cancel.store(true, Ordering::Relaxed);
         self.desired = None;
         self.page = None;
+        self.cached_pages.clear();
+        self.flattened_collections.clear();
+        self.discovery_rx = None;
+        self.discovery_attempted.clear();
+        self.discovery_error = None;
         self.source_revision = None;
         self.last_hex_selection = None;
         self.selected = None;
@@ -162,7 +175,9 @@ impl StructureViews {
                     .as_ref()
                     .is_some_and(|request| request.key == page.key)
             {
-                self.page = Some(page);
+                if let Some(previous) = self.page.replace(page) {
+                    self.remember_page(previous);
+                }
                 self.resolve_pending_selection();
             }
         }
@@ -171,10 +186,7 @@ impl StructureViews {
             .as_ref()
             .filter(|request| {
                 request.key.revision == source.revision
-                    && !self
-                        .page
-                        .as_ref()
-                        .is_some_and(|page| page.key == request.key)
+                    && self.page_for_key(&request.key).is_none()
             })
             .cloned();
         if let Some(request) = next {
@@ -230,6 +242,16 @@ impl StructureViews {
             start,
             revision,
         };
+        if self.page.as_ref().is_some_and(|page| page.key == key) {
+            return;
+        }
+        if let Some(index) = self.cached_pages.iter().position(|page| page.key == key) {
+            let cached = self.cached_pages.remove(index);
+            if let Some(previous) = self.page.replace(cached) {
+                self.remember_page(previous);
+            }
+            return;
+        }
         if self
             .desired
             .as_ref()
@@ -242,7 +264,6 @@ impl StructureViews {
             key,
             array: array.clone(),
         });
-        self.page = None;
         if let Some(ctx) = &self.repaint_context {
             ctx.request_repaint();
         }
@@ -270,7 +291,7 @@ impl StructureViews {
                 })
                 .map(|anchor| anchor.bytes.clone())
                 .or_else(|| {
-                    let collection = find_node(&output.nodes, &self.table_target)?;
+                    let collection = self.collection_node(output, &self.table_target)?;
                     let selected =
                         sample_indices_for_bytes(collection, self.last_hex_selection.as_ref()?)?;
                     sample_bytes(collection, selected.start..selected.start + 1)
@@ -285,7 +306,7 @@ impl StructureViews {
             field.range.clone()
         };
         self.select(if extend { row } else { field });
-        self.plot_anchor = find_node(&output.nodes, &self.table_target)
+        self.plot_anchor = self.collection_node(output, &self.table_target)
             .and_then(|collection| sample_indices_for_bytes(collection, &anchor))
             .map(|samples| samples.start);
         self.table_anchor = Some(TableAnchor {
@@ -304,11 +325,110 @@ impl StructureViews {
             .is_some_and(|revision| revision != output.revision)
     }
     fn page_nodes(&self, path: &str, revision: u64) -> Option<&[Node]> {
-        self.page
-            .as_ref()
-            .filter(|page| page.key.path == path && page.key.revision == revision)
+        self.page_for(path, revision)
             .and_then(|page| page.result.as_ref().ok())
             .map(Vec::as_slice)
+    }
+    fn page_for_key(&self, key: &PageKey) -> Option<&Page> {
+        self.page.as_ref().filter(|page| &page.key == key)
+            .or_else(|| self.cached_pages.iter().rev().find(|page| &page.key == key))
+    }
+    fn remember_page(&mut self, page: Page) {
+        self.cached_pages.retain(|cached| cached.key != page.key);
+        self.cached_pages.push(page);
+        if self.cached_pages.len() > 8 {
+            let index = self.cached_pages.iter()
+                .position(|cached| cached.key.path != self.table_target && !self.expanded.contains(&cached.key.path))
+                .unwrap_or(0);
+            self.cached_pages.remove(index);
+        }
+    }
+    fn page_for(&self, path: &str, revision: u64) -> Option<&Page> {
+        self.page.as_ref().filter(|page| page.key.path == path && page.key.revision == revision)
+            .or_else(|| self.cached_pages.iter().rev().find(|page| page.key.path == path && page.key.revision == revision))
+    }
+    fn collection_node<'a>(&'a self, output: &'a ParseOutput, path: &str) -> Option<&'a Node> {
+        find_node(&output.nodes, path)
+            .or_else(|| self.flattened_collections.iter().find(|node| node.path == path))
+    }
+    fn discover_flattened_collections(&mut self, output: &ParseOutput) {
+        let mut found = Vec::new();
+        if let Some(rx) = &self.discovery_rx {
+            match rx.try_recv() {
+                Ok((revision, result)) => {
+                    self.discovery_rx = None;
+                    if revision == output.revision {
+                        match result {
+                            Ok(nodes) => found.extend(nodes),
+                            Err(error) => self.discovery_error = Some(error),
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.discovery_rx = None;
+                    self.discovery_error = Some("Nested collection discovery stopped unexpectedly".into());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        for page in self.page.as_ref().into_iter().chain(self.cached_pages.iter()) {
+            if page.key.revision != output.revision { continue; }
+            let Some(parent) = find_node(&output.nodes, &page.key.path) else { continue; };
+            let Some(first) = page.result.as_ref().ok().and_then(|rows| rows.first()) else { continue; };
+            for child in &first.children {
+                if let Some(flat) = LazyArray::flattened_child(parent, child) {
+                    if !self.flattened_collections.iter().any(|node| node.path == flat.path)
+                        && !found.iter().any(|node: &Node| node.path == flat.path) {
+                        found.push(flat);
+                    }
+                }
+            }
+        }
+        if !found.is_empty() {
+            found.retain(|node| !self.flattened_collections.iter().any(|existing| existing.path == node.path));
+            let mut names = HashSet::new();
+            found.retain(|node| names.insert(node.path.clone()));
+        }
+        if !found.is_empty() {
+            self.discovery_error = None;
+            let preferred = found.iter().max_by_key(|node| node.lazy.as_ref().map_or(0, |a| a.count)).unwrap().path.clone();
+            self.flattened_collections.extend(found);
+            if self.table_target.is_empty() || self.collection_node(output, &self.table_target).is_some_and(|node| node.lazy.as_ref().is_some_and(|array| array.count < self.collection_node(output, &preferred).and_then(|node| node.lazy.as_ref()).map_or(0, |array| array.count))) {
+                self.table_target = preferred.clone();
+                self.target_initialized = true;
+            }
+            self.plot_sources.clear();
+            self.plot_sources.insert(preferred.clone());
+            self.plot_sources_initialized = true;
+            self.plot_target = preferred;
+            self.plot_reader.invalidate();
+            self.extra_plot_readers.clear();
+            self.plot_view = None;
+        }
+    }
+    fn start_nested_discovery(&mut self, output: &ParseOutput, source: ByteView, ctx: &egui::Context) {
+        if self.discovery_rx.is_some() || !self.flattened_collections.is_empty() { return; }
+        let mut candidates = Vec::new();
+        collect_collections(&output.nodes, &mut candidates);
+        candidates.retain(|node| node.lazy.is_some() && !numeric_kind(&node.kind)
+            && !self.discovery_attempted.contains(&node.path));
+        candidates.sort_by_key(|node| std::cmp::Reverse(collection_count(node)));
+        let Some(parent) = candidates.first().copied().cloned() else { return; };
+        self.discovery_attempted.insert(parent.path.clone());
+        let (tx, rx) = mpsc::channel();
+        self.discovery_rx = Some(rx);
+        let revision = output.revision;
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<Vec<Node>> {
+                let array = parent.lazy.as_ref().unwrap();
+                let first = array.page(&source, &AtomicBool::new(false), 0, 1)?;
+                Ok(first.first().into_iter().flat_map(|row| row.children.iter())
+                    .filter_map(|child| LazyArray::flattened_child(&parent, child)).collect())
+            })().map_err(|error| format!("{}: {error:#}", parent.path));
+            let _ = tx.send((revision, result));
+            ctx.request_repaint();
+        });
     }
     pub fn selected_node(&self, output: &ParseOutput) -> Option<Node> {
         if self.stale(output) {
@@ -317,11 +437,10 @@ impl StructureViews {
         let path = self.selected.as_ref()?;
         find_node(&output.nodes, path)
             .or_else(|| {
-                self.page
-                    .as_ref()
+                self.page.as_ref().into_iter().chain(self.cached_pages.iter())
                     .filter(|page| page.key.revision == output.revision)
-                    .and_then(|page| page.result.as_ref().ok())
-                    .and_then(|nodes| find_node(nodes, path))
+                    .filter_map(|page| page.result.as_ref().ok())
+                    .find_map(|nodes| find_node(nodes, path))
             })
             .cloned()
     }
@@ -432,9 +551,17 @@ impl StructureViews {
             0,
             &self.expanded,
             self.page.as_ref(),
+            &self.cached_pages,
             output.revision,
             &mut rows,
         );
+        if let Some(error) = self.page.as_ref().into_iter().chain(self.cached_pages.iter())
+            .filter(|page| page.key.revision == output.revision && self.expanded.contains(&page.key.path))
+            .filter_map(|page| page.result.as_ref().err())
+            .next()
+        {
+            ui.colored_label(ui.visuals().error_fg_color, format!("Could not load samples: {error}"));
+        }
         let row_height = ui.text_style_height(&egui::TextStyle::Body).max(18.) + 4.;
         let mut toggle = None;
         let mut node_click = None;
@@ -483,6 +610,12 @@ impl StructureViews {
                             let tooltip = node.numeric_tooltip().map_or(tooltip.clone(), |number| format!("{number}\n\n{tooltip}"));
                             let value_response = ui.selectable_label(self.selected.as_deref() == Some(&node.path), format!("· {}", tree_display(node, 90)))
                                 .on_hover_text(&tooltip);
+                            if let Some(error) = self.page_for(&node.path, output.revision)
+                                .and_then(|page| page.result.as_ref().err())
+                            {
+                                ui.colored_label(ui.visuals().error_fg_color, "Could not load samples")
+                                    .on_hover_text(error);
+                            }
                             response.clone().on_hover_text(&tooltip);
                             if response.clicked() || value_response.clicked() {
                                 node_click = Some(node.clone());
@@ -579,7 +712,7 @@ impl StructureViews {
     }
 
     fn initialize_target(&mut self, output: &ParseOutput) {
-        if !self.table_target.is_empty() && find_node(&output.nodes, &self.table_target).is_none() {
+        if !self.table_target.is_empty() && self.collection_node(output, &self.table_target).is_none() {
             self.target_initialized = false;
         }
         if self.target_initialized {
@@ -588,6 +721,7 @@ impl StructureViews {
         self.target_initialized = true;
         let mut collections = Vec::new();
         collect_collections(&output.nodes, &mut collections);
+        collections.extend(self.flattened_collections.iter());
         self.table_target = collections
             .into_iter()
             .max_by_key(|node| collection_score(node, output))
@@ -597,18 +731,21 @@ impl StructureViews {
         self.initialize_target(output);
         let mut collections = Vec::new();
         collect_collections(&output.nodes, &mut collections);
+        let mut collections: Vec<Node> = collections.into_iter().cloned().collect();
+        collections.extend(self.flattened_collections.iter().cloned());
         let previous = self.table_target.clone();
+        let selected_text = if self.table_target.is_empty() {
+            "File elements".to_owned()
+        } else if let Some(node) = collections.iter().find(|node| node.path == self.table_target) {
+            collection_label(node)
+        } else {
+            self.table_target.clone()
+        };
         ui.horizontal_wrapped(|ui| {
             ui.label("Data");
             egui::ComboBox::from_id_salt("structure_collection")
                 .width(ui.available_width().min(420.).max(120.))
-                .selected_text(if self.table_target.is_empty() {
-                    "File elements".to_owned()
-                } else if let Some(node) = find_node(&output.nodes, &self.table_target) {
-                    collection_label(node)
-                } else {
-                    self.table_target.clone()
-                })
+                .selected_text(selected_text)
                 .show_ui(ui, |ui| {
                     for node in &collections {
                         ui.selectable_value(
@@ -628,13 +765,13 @@ impl StructureViews {
             self.table_anchor = None;
             self.reveal_selected_row = false;
         }
-        if let Some(node) = find_node(&output.nodes, &self.table_target) {
+        if let Some(node) = self.collection_node(output, &self.table_target).cloned() {
             if node.lazy.is_some() {
-                self.page_controls(ui, node, output.revision);
+                self.page_controls(ui, &node, output.revision);
             } else {
                 ui.weak(format!(
                     "{} samples · 0x{:X}–0x{:X}",
-                    collection_count(node),
+                    collection_count(&node),
                     node.range.start,
                     node.range.end
                 ));
@@ -651,7 +788,9 @@ impl StructureViews {
             .desired
             .as_ref()
             .filter(|request| request.key.path == node.path && request.key.revision == revision)
-            .map_or(0, |request| request.key.start);
+            .map(|request| request.key.start)
+            .or_else(|| self.page_for(&node.path, revision).map(|page| page.key.start))
+            .unwrap_or(0);
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(start > 0, egui::Button::new("Previous"))
@@ -700,18 +839,16 @@ impl StructureViews {
             }
         });
         self.request(node, start, revision, ui.ctx());
-        if let Some(page) = &self.page {
-            if page.key.path == node.path {
-                if let Err(error) = &page.result {
-                    ui.colored_label(Color32::LIGHT_RED, error);
-                }
+        if let Some(page) = self.page_for(&node.path, revision) {
+            if let Err(error) = &page.result {
+                ui.colored_label(Color32::LIGHT_RED, error);
             }
         } else {
             ui.weak("Reading this page…");
         }
     }
     fn target_rows<'a>(&'a self, output: &'a ParseOutput) -> &'a [Node] {
-        match find_node(&output.nodes, &self.table_target) {
+        match self.collection_node(output, &self.table_target) {
             Some(node) if node.lazy.is_some() => {
                 self.page_nodes(&node.path, output.revision).unwrap_or(&[])
             }
@@ -726,11 +863,14 @@ impl StructureViews {
         output: &ParseOutput,
         source: ByteView,
     ) -> Option<Range<usize>> {
-        self.tick(ui.ctx(), source);
+        self.tick(ui.ctx(), source.clone());
+        self.discover_flattened_collections(output);
         if self.stale(output) {
             ui.label("Bytes changed. Press ▶ Run (F5) to refresh the table.");
             return None;
         }
+        self.start_nested_discovery(output, source, ui.ctx());
+        if let Some(error) = &self.discovery_error { ui.colored_label(Color32::LIGHT_RED, error); }
         self.target_controls(ui, output);
         ui.weak("Click a sample or value · Shift-click to select a range of whole samples.");
         let rows = self.target_rows(output);
@@ -748,12 +888,7 @@ impl StructureViews {
                 || selected.is_some_and(|path| contains_path(&node.path, path))
         });
         let reveal = self.reveal_selected_row && selected_row.is_some();
-        let first = self
-            .page
-            .as_ref()
-            .filter(|page| {
-                page.key.path == self.table_target && page.key.revision == output.revision
-            })
+        let first = self.page_for(&self.table_target, output.revision)
             .map_or(0, |page| page.key.start);
         let sample_collection = !self.table_target.is_empty();
         let mut chosen = None;
@@ -925,7 +1060,7 @@ impl StructureViews {
     }
 
     fn initialize_plot(&mut self, output: &ParseOutput) {
-        if self.plot_target.is_empty() || find_node(&output.nodes, &self.plot_target).is_none() {
+        if self.plot_target.is_empty() || self.collection_node(output, &self.plot_target).is_none() {
             self.plot_view = None;
             self.plot_force_view = None;
             self.initialize_target(output);
@@ -933,6 +1068,7 @@ impl StructureViews {
             if self.plot_target.is_empty() {
                 let mut collections = Vec::new();
                 collect_collections(&output.nodes, &mut collections);
+                collections.extend(self.flattened_collections.iter());
                 self.plot_target = collections
                     .into_iter()
                     .max_by_key(|node| collection_score(node, output))
@@ -942,7 +1078,9 @@ impl StructureViews {
         if self.plot_follow_selection {
             self.plot_follow_selection = false;
             if let Some(range) = &self.last_hex_selection {
-                if let Some(collection) = containing_collection(&output.nodes, range) {
+                if let Some(collection) = self.flattened_collections.iter()
+                    .find(|node| sample_indices_for_bytes(node, range).is_some())
+                    .or_else(|| containing_collection(&output.nodes, range)) {
                     if !self.plot_sources.contains(&collection.path) && self.plot_sources_initialized {
                         return;
                     }
@@ -967,7 +1105,7 @@ impl StructureViews {
                 }
             }
         }
-        if let Some(node) = find_node(&output.nodes, &self.plot_target) {
+        if let Some(node) = self.collection_node(output, &self.plot_target) {
             if let Some(view) = &self.plot_view {
                 let count = collection_count(node);
                 if view.end > count || view.is_empty() {
@@ -980,7 +1118,7 @@ impl StructureViews {
             }
         }
         if self.plot_view.is_none() {
-            if let Some(node) = find_node(&output.nodes, &self.plot_target) {
+            if let Some(node) = self.collection_node(output, &self.plot_target) {
                 let view = 0..collection_count(node).min(INITIAL_PLOT_SAMPLES);
                 self.plot_view = Some(view.clone());
                 self.plot_force_view = Some(view);
@@ -1012,13 +1150,21 @@ impl StructureViews {
         source: ByteView,
     ) -> Option<Range<usize>> {
         self.tick(ui.ctx(), source.clone());
+        self.discover_flattened_collections(output);
         if self.stale(output) {
             ui.label("Bytes changed. Press ▶ Run (F5) to refresh the plot.");
+            return None;
+        }
+        self.start_nested_discovery(output, source.clone(), ui.ctx());
+        if let Some(error) = &self.discovery_error { ui.colored_label(Color32::LIGHT_RED, error); }
+        if self.discovery_rx.is_some() && self.flattened_collections.is_empty() {
+            ui.horizontal(|ui| { ui.spinner(); ui.label("Finding nested sample collections…"); });
             return None;
         }
         self.initialize_plot(output);
         let mut collections = Vec::new();
         collect_collections(&output.nodes, &mut collections);
+        collections.extend(self.flattened_collections.iter());
         self.plot_sources.retain(|path| collections.iter().any(|node| &node.path == path));
         if !self.plot_sources_initialized {
             self.plot_sources_initialized = true;
@@ -1035,7 +1181,10 @@ impl StructureViews {
                 return None;
             }
             self.extra_plot_readers.clear();
-            ui.menu_button("Series", |ui| {plot_collection_choices(ui,&collections,&mut self.plot_sources);});
+            egui::containers::menu::MenuButton::new("Series")
+                .config(egui::containers::menu::MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
+                .ui(ui, |ui| {plot_collection_choices(ui,&collections,&mut self.plot_sources);});
             ui.label("Choose a collection in Series. Toggle individual fields in the legend.");
             return None;
         }
@@ -1048,11 +1197,11 @@ impl StructureViews {
         }
         if changed { self.plot_fit_y = true; }
         self.extra_plot_readers.retain(|path, _| self.plot_sources.contains(path) && path != &self.plot_target);
-        let Some(node) = find_node(&output.nodes, &self.plot_target) else {
+        let Some(node) = self.collection_node(output, &self.plot_target).cloned() else {
             ui.label("No sample collection. Repeat a numeric field or structure in the definition to plot it.");
             return None;
         };
-        let count = collection_count(node);
+        let count = collection_count(&node);
         if count == 0 {
             ui.label("This collection contains no samples.");
             return None;
@@ -1073,8 +1222,8 @@ impl StructureViews {
             .clone()
             .unwrap_or(0..count.min(INITIAL_PLOT_SAMPLES));
         let ranges: Vec<_> = std::iter::once((&self.plot_target, &self.plot_reader)).chain(self.extra_plot_readers.iter())
-            .flat_map(|(path,reader)| reader.data().into_iter().flat_map(move |d| d.series.iter().filter_map(move |(name,points)| {
-                numeric_bounds(points.iter().map(|p|p.value)).map(|(min,max)| (format!("{path} / {name}"),min,max))
+            .flat_map(|(path,reader)| reader.data().into_iter().flat_map(move |d| d.bounds.iter().map(move |(name,(min,max))| {
+                (format!("{path} / {name}"),*min,*max)
             }))).collect();
         let visible_series = ranges
             .iter()
@@ -1086,23 +1235,41 @@ impl StructureViews {
             format!("Series {visible_series}/{}", ranges.len())
         };
         ui.horizontal_wrapped(|ui| {
-            ui.menu_button(series_label, |ui| {
+            egui::containers::menu::MenuButton::new(series_label)
+                .config(egui::containers::menu::MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
+                .ui(ui, |ui| {
                 ui.strong("Collections");
                 changed |= plot_collection_choices(ui,&collections,&mut self.plot_sources);
                 if !ranges.is_empty() {
                     ui.separator();
                     ui.strong("Fields shown");
-                    egui::ScrollArea::vertical().max_height(220.).show(ui, |ui| {
-                        for (name, _, _) in &ranges {
-                            let mut shown = !self.plot_hidden.contains(name);
-                            if ui.checkbox(&mut shown, name).changed() {
-                                if shown {
-                                    self.plot_hidden.remove(name);
-                                } else {
-                                    self.plot_hidden.insert(name.clone());
-                                }
-                                self.plot_fit_y = true;
-                            }
+                    ui.add(egui::TextEdit::singleline(&mut self.plot_field_filter)
+                        .hint_text("Find fields…"));
+                    let filter = self.plot_field_filter.trim().to_lowercase();
+                    let matching: Vec<_> = ranges.iter()
+                        .filter(|(name, _, _)| filter.is_empty() || name.to_lowercase().contains(&filter))
+                        .collect();
+                    ui.horizontal(|ui| {
+                        let scope = if filter.is_empty() { "all" } else { "matching" };
+                        if ui.add_enabled(!matching.is_empty(), egui::Button::new(format!("Show {scope}"))).clicked() {
+                            for (name, _, _) in &matching { self.plot_hidden.remove(name); }
+                            self.plot_fit_y = true;
+                        }
+                        if ui.add_enabled(!matching.is_empty(), egui::Button::new(format!("Hide {scope}"))).clicked() {
+                            for (name, _, _) in &matching { self.plot_hidden.insert(name.clone()); }
+                            self.plot_fit_y = true;
+                        }
+                    });
+                    if matching.is_empty() { ui.weak("No matching fields"); }
+                    let mut tree = SeriesTree::default();
+                    for (name, _, _) in matching {
+                        let field = name.rsplit_once(" / ").map_or(name.as_str(), |(_, field)| field);
+                        tree.insert(field, name);
+                    }
+                    egui::ScrollArea::vertical().id_salt("plot-visible-fields").max_height(220.).show(ui, |ui| {
+                        if tree.show(ui, &mut self.plot_hidden, "", !filter.is_empty()) {
+                            self.plot_fit_y = true;
                         }
                     });
                 }
@@ -1115,7 +1282,7 @@ impl StructureViews {
                 ui.add(egui::DragValue::new(&mut self.plot_jump).range(0..=count-1));
                 if ui.button("Go").clicked() {
                     force_view=Some(centered_view(self.plot_jump,view.len().min(INITIAL_PLOT_SAMPLES).max(64),count));
-                    if let Some(bytes)=sample_bytes(node,self.plot_jump..self.plot_jump+1) {picked=Some((bytes,None));}
+                    if let Some(bytes)=sample_bytes(&node,self.plot_jump..self.plot_jump+1) {picked=Some((bytes,None));}
                     ui.close();
                 }
             });
@@ -1153,7 +1320,7 @@ impl StructureViews {
                 if ui.button("Select bytes").clicked() {
                     let first = self.plot_range_first.min(self.plot_range_last).min(count - 1);
                     let last = self.plot_range_first.max(self.plot_range_last).min(count - 1);
-                    if let Some(bytes) = sample_bytes(node, first..last + 1) {
+                    if let Some(bytes) = sample_bytes(&node, first..last + 1) {
                         self.plot_anchor = Some(first);
                         picked = Some((bytes, None));
                     }
@@ -1183,6 +1350,7 @@ impl StructureViews {
         }
         if changed { self.plot_fit_y=true; }
         if let Some(forced) = &force_view {
+            self.plot_paused = false;
             if self.plot_view.as_ref() != Some(forced) {
                 self.plot_refine = false;
             }
@@ -1193,22 +1361,22 @@ impl StructureViews {
         // width immediately. Reduction follows physical pixels, including DPI.
         let canvas_width = (ui.available_width() - self.plot_axis_width).max(1.);
         let pixel_width = (canvas_width * ui.ctx().pixels_per_point()).ceil() as usize;
-        self.plot_reader.request(
-            ui.ctx(),
-            source.clone(),
-            node.clone(),
-            requested.clone(),
-            pixel_width,
-            self.plot_refine,
-        );
+        if !self.plot_paused {
+            self.plot_reader.request(
+                ui.ctx(), source.clone(), node.clone(), requested.clone(),
+                pixel_width, self.plot_refine,
+            );
+        }
         self.plot_reader.tick(ui.ctx());
         for path in &self.plot_sources {
             if path == &self.plot_target { continue; }
-            if let Some(extra) = find_node(&output.nodes, path) {
-                let count = collection_count(extra);
+            if let Some(extra) = self.collection_node(output, path).cloned() {
+                let count = collection_count(&extra);
                 let reader = self.extra_plot_readers.entry(path.clone()).or_default();
-                reader.request(ui.ctx(), source.clone(), extra.clone(),
-                    requested.start.min(count)..requested.end.min(count), pixel_width, self.plot_refine);
+                if !self.plot_paused {
+                    reader.request(ui.ctx(), source.clone(), extra,
+                        requested.start.min(count)..requested.end.min(count), pixel_width, self.plot_refine);
+                }
                 reader.tick(ui.ctx());
                 if let Some(error) = reader.error() { ui.colored_label(Color32::LIGHT_RED, format!("{path}: {error}")); }
                 if reader.is_loading() { ui.spinner(); }
@@ -1231,6 +1399,7 @@ impl StructureViews {
                     ui.weak("Bands show observed ranges from sampled windows.");
                     if ui.button("Scan for all peaks").clicked() {
                         self.plot_refine = true;
+                        self.plot_paused = false;
                     }
                 }
                 if !data.complete && data.total > 0 {
@@ -1247,25 +1416,46 @@ impl StructureViews {
             if self.plot_reader.is_loading() {
                 ui.spinner();
                 ui.weak("Reading visible range…");
-                if self.plot_refine && ui.button("Stop scan").clicked() {
+                if ui.button("Stop").clicked() {
+                    self.plot_reader.stop();
+                    for reader in self.extra_plot_readers.values_mut() { reader.stop(); }
+                    self.plot_paused = true;
                     self.plot_refine = false;
                 }
             }
+            if self.plot_paused { ui.weak("Stopped · zoom or Fit to read again"); }
         });
         if let Some(error) = self.plot_reader.error() {
             ui.colored_label(Color32::LIGHT_RED, error);
         }
-        let mut combined = self.plot_reader.data().cloned();
+        let mut combined = self.plot_reader.data().map(|raw| PlotData {
+            range: raw.range.clone(),
+            series: raw.series.iter().filter_map(|(name, points)| {
+                let full = format!("{} / {name}", self.plot_target);
+                (!self.plot_hidden.contains(&full)).then(|| (full, points.clone()))
+            }).collect(),
+            envelopes: raw.envelopes.iter().filter_map(|(name, bands)| {
+                let full = format!("{} / {name}", self.plot_target);
+                (!self.plot_hidden.contains(&full)).then(|| (full, bands.clone()))
+            }).collect(),
+            bounds: BTreeMap::new(),
+            quality: raw.quality,
+            scanned: raw.scanned,
+            total: raw.total,
+            complete: raw.complete,
+        });
         {
             if let Some(data) = &mut combined {
-                data.series = std::mem::take(&mut data.series).into_iter()
-                    .map(|(name, points)| (format!("{} / {name}", self.plot_target), points)).collect();
-                data.envelopes = std::mem::take(&mut data.envelopes).into_iter()
-                    .map(|(name, bands)| (format!("{} / {name}", self.plot_target), bands)).collect();
                 for (path, reader) in &self.extra_plot_readers {
                     if let Some(extra) = reader.data() {
-                        for (name, points) in &extra.series { data.series.insert(format!("{path} / {name}"), points.clone()); }
-                        for (name, bands) in &extra.envelopes { data.envelopes.insert(format!("{path} / {name}"), bands.clone()); }
+                        for (name, points) in &extra.series {
+                            let full = format!("{path} / {name}");
+                            if !self.plot_hidden.contains(&full) { data.series.insert(full, points.clone()); }
+                        }
+                        for (name, bands) in &extra.envelopes {
+                            let full = format!("{path} / {name}");
+                            if !self.plot_hidden.contains(&full) { data.envelopes.insert(full, bands.clone()); }
+                        }
                         if extra.quality == PlotQuality::SampledPreview { data.quality = PlotQuality::SampledPreview; }
                         data.complete &= extra.complete;
                     }
@@ -1492,6 +1682,7 @@ impl StructureViews {
         if self.plot_view.as_ref() != Some(&actual) {
             self.plot_view = Some(actual.clone());
             self.plot_refine = false;
+            self.plot_paused = false;
             ui.ctx().request_repaint();
         }
         let frame = *response.transform.frame();
@@ -1643,7 +1834,7 @@ impl StructureViews {
                         .or_else(|| selected_samples.as_ref().map(|samples| samples.start))
                         .unwrap_or(index);
                     if let Some(bytes) =
-                        sample_bytes(node, anchor.min(index)..anchor.max(index) + 1)
+                        sample_bytes(&node, anchor.min(index)..anchor.max(index) + 1)
                     {
                         picked = Some((bytes, None));
                     }
@@ -1664,7 +1855,7 @@ impl StructureViews {
                     if let Some((_, point)) = nearest {
                         self.plot_anchor = Some(point.index);
                         picked = Some((point.bytes.clone(), Some(point.path.clone())));
-                    } else if let Some(bytes) = sample_bytes(node, index..index + 1) {
+                    } else if let Some(bytes) = sample_bytes(&node, index..index + 1) {
                         self.plot_anchor = Some(index);
                         picked = Some((bytes, None));
                     }
@@ -1696,7 +1887,7 @@ impl StructureViews {
             self.plot_refine,
         );
         if let Some((bytes, path)) = picked {
-            if let Some(samples) = sample_indices_for_bytes(node, &bytes) {
+            if let Some(samples) = sample_indices_for_bytes(&node, &bytes) {
                 self.plot_range_first = samples.start;
                 self.plot_range_last = samples.end.saturating_sub(1);
                 self.plot_jump = samples.start;
@@ -1726,6 +1917,59 @@ impl StructureViews {
                 color: field_color(&node.path),
             })
             .collect()
+    }
+}
+
+#[derive(Default)]
+struct SeriesTree {
+    leaves: Vec<(String, String)>,
+    children: BTreeMap<String, SeriesTree>,
+}
+impl SeriesTree {
+    fn insert(&mut self, field: &str, full_name: &str) {
+        if let Some((group, rest)) = field.split_once('.') {
+            self.children.entry(group.to_owned()).or_default().insert(rest, full_name);
+        } else {
+            self.leaves.push((field.to_owned(), full_name.to_owned()));
+        }
+    }
+    fn names(&self, out: &mut Vec<String>) {
+        out.extend(self.leaves.iter().map(|(_, name)| name.clone()));
+        for child in self.children.values() { child.names(out); }
+    }
+    fn show(&self, ui: &mut Ui, hidden: &mut HashSet<String>, path: &str, expand: bool) -> bool {
+        let mut changed = false;
+        for (label, name) in &self.leaves {
+            let mut shown = !hidden.contains(name);
+            ui.push_id(name, |ui| {
+                if ui.checkbox(&mut shown, label).on_hover_text(name).changed() {
+                    if shown { hidden.remove(name); } else { hidden.insert(name.clone()); }
+                    changed = true;
+                }
+            });
+        }
+        for (group, child) in &self.children {
+            let group_path = if path.is_empty() { group.clone() } else { format!("{path}.{group}") };
+            let mut names = Vec::new();
+            child.names(&mut names);
+            egui::CollapsingHeader::new(format!("{group} ({})", names.len()))
+                .id_salt(&group_path)
+                .default_open(expand)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Show group").clicked() {
+                            for name in &names { hidden.remove(name); }
+                            changed = true;
+                        }
+                        if ui.small_button("Hide group").clicked() {
+                            for name in &names { hidden.insert(name.clone()); }
+                            changed = true;
+                        }
+                    });
+                    changed |= child.show(ui, hidden, &group_path, expand);
+                });
+        }
+        changed
     }
 }
 
@@ -1938,20 +2182,21 @@ fn flatten_visible<'a>(
     depth: usize,
     expanded: &HashSet<String>,
     page: Option<&'a Page>,
+    cached_pages: &'a [Page],
     revision: u64,
     rows: &mut Vec<(&'a Node, usize)>,
 ) {
     for node in nodes {
         rows.push((node, depth));
         if expanded.contains(&node.path) {
-            flatten_visible(&node.children, depth + 1, expanded, page, revision, rows);
-            if let Some(nodes) = page
-                .filter(|page| page.key.path == node.path && page.key.revision == revision)
+            flatten_visible(&node.children, depth + 1, expanded, page, cached_pages, revision, rows);
+            if let Some(nodes) = page.into_iter().chain(cached_pages.iter().rev())
+                .find(|page| page.key.path == node.path && page.key.revision == revision)
                 .and_then(|page| page.result.as_ref().ok())
             {
                 for child in nodes {
                     if !node.children.iter().any(|preview| preview.path == child.path) {
-                        flatten_visible(std::slice::from_ref(child), depth + 1, expanded, None, revision, rows);
+                        flatten_visible(std::slice::from_ref(child), depth + 1, expanded, page, cached_pages, revision, rows);
                     }
                 }
             }
@@ -2166,6 +2411,86 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+    }
+    #[test]
+    fn nested_samples_are_discovered_without_expanding_the_tree() {
+        let yaml = "structures:\n  - name: Item\n    fields:\n      - {name: value, type: u8}\n  - name: Group\n    fields:\n      - {name: prefix, type: bytes, length: 2}\n      - {name: items, type: {structure: Item}, repeat: 256}\nactions:\n  - read: {name: groups, type: {structure: Group}, repeat: 130}\n";
+        let store = ByteStore::from_snapshot(Original::from_bytes(&vec![7; 130 * 258]).unwrap());
+        let output = Program::parse(yaml).unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let mut views = StructureViews::default();
+        assert!(views.expanded.is_empty());
+        let ctx = egui::Context::default();
+        views.start_nested_discovery(&output, store.view(), &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while views.flattened_collections.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "discovery timed out: {:?}", views.discovery_error);
+            views.discover_flattened_collections(&output);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(views.plot_target, "groups.items");
+        assert_eq!(views.table_target, "groups.items");
+    }
+    #[test]
+    fn expanded_nested_lazy_page_shows_record_fields() {
+        let mut yaml = String::from("structures:\n  - name: Item\n    fields:\n");
+        for index in 0..200 {
+            yaml.push_str(&format!("      - {{name: value_{index}, type: u8}}\n"));
+        }
+        yaml.push_str("  - name: Group\n    fields:\n      - {name: prefix, type: bytes, length: 2}\n      - {name: items, type: {structure: Item}, repeat: 256}\nactions:\n  - read: {name: groups, type: {structure: Group}, repeat: 130}\n");
+        let store = ByteStore::from_snapshot(Original::from_bytes(&vec![7; 130 * (2 + 256 * 200)]).unwrap());
+        let output = Program::parse(&yaml).unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let groups = &output.nodes[0];
+        assert!(groups.lazy.is_some());
+        let mut views = StructureViews::default();
+        views.request(groups, 0, output.revision, &egui::Context::default());
+        settle(&mut views, store.view());
+        let items = views.page_nodes("groups", output.revision).unwrap()[0].children[1].clone();
+        assert_eq!(items.lazy.as_ref().unwrap().count, 256);
+        views.expanded.extend(["groups", "groups[0]", "groups[0].items", "groups[0].items[0]"].map(str::to_owned));
+        views.request(&items, 0, output.revision, &egui::Context::default());
+        settle(&mut views, store.view());
+        assert!(views.page.as_ref().unwrap().result.is_ok());
+        assert!(views.page_nodes("groups", output.revision).is_some());
+        assert!(views.page_nodes("groups[0].items", output.revision).is_some());
+        views.request(groups, 0, output.revision, &egui::Context::default());
+        settle(&mut views, store.view());
+        assert!(views.page_nodes("groups[0].items", output.revision).is_some());
+        views.discover_flattened_collections(&output);
+        let flat = views.flattened_collections.iter().find(|node| node.path == "groups.items").unwrap().clone();
+        assert_eq!(flat.lazy.as_ref().unwrap().count, 130 * 256);
+        assert!(flat.lazy.as_ref().unwrap().numeric_plan().is_some());
+        assert_eq!(flat.lazy.as_ref().unwrap().bounds(255), Some((2 + 255 * 200)..(2 + 256 * 200)));
+        assert_eq!(flat.lazy.as_ref().unwrap().bounds(256), Some((2 + 256 * 200 + 2)..(2 + 257 * 200 + 2)));
+        let boundary = flat.lazy.as_ref().unwrap().page(&store.view(), &AtomicBool::new(false), 255, 2).unwrap();
+        assert_eq!(boundary[0].children[199].numeric(), Some(7.));
+        assert_eq!(boundary[1].children[199].numeric(), Some(7.));
+        assert_eq!(views.table_target, "groups.items");
+        assert_eq!(views.plot_target, "groups.items");
+        views.request(&flat, 255, output.revision, &egui::Context::default());
+        settle(&mut views, store.view());
+        let table_rows = views.target_rows(&output);
+        assert_eq!(table_rows.first().unwrap().path, "groups.items[128]");
+        assert_eq!(table_rows[127].path, "groups.items[255]");
+        views.request(&flat, 256, output.revision, &egui::Context::default());
+        settle(&mut views, store.view());
+        assert_eq!(views.target_rows(&output)[0].path, "groups.items[256]");
+        let mut reader = crate::structure_plot::PlotReader::default();
+        let ctx = egui::Context::default();
+        reader.request(&ctx, store.view(), flat, 255..257, 800, false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !reader.data().is_some_and(|data| data.complete) {
+            assert!(std::time::Instant::now() < deadline, "plot worker timed out");
+            reader.tick(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let points = &reader.data().unwrap().series["value_0"];
+        assert_eq!(points.iter().map(|point| point.index).collect::<Vec<_>>(), [255, 256]);
+        assert_eq!(points[0].bytes, (2 + 255 * 200)..(3 + 255 * 200));
+        assert_eq!(points[1].bytes, (2 + 256 * 200 + 2)..(3 + 256 * 200 + 2));
+        let mut rows = Vec::new();
+        flatten_visible(&output.nodes, 0, &views.expanded, views.page.as_ref(), &views.cached_pages, output.revision, &mut rows);
+        assert!(rows.iter().any(|(node, _)| node.path == "groups[0].items[0]"));
+        assert!(rows.iter().any(|(node, _)| node.path == "groups[0].items[0].value_199"));
     }
     #[test]
     fn lazy_pages_are_bounded_and_selectable_without_rendering_the_tree() {
