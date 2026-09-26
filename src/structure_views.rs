@@ -33,10 +33,14 @@ fn plot_query_pixel_width(physical_width: usize, visible_series: usize) -> usize
 fn plot_worker_count() -> usize {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     *WORKERS.get_or_init(|| {
-        let workers = std::thread::available_parallelism()
-            .map(|count| count.get().saturating_sub(2).max(1))
-            .unwrap_or(4);
-        log::info!("Plot worker limit: {workers}");
+        let available = std::thread::available_parallelism().map_or(4, |count| count.get());
+        let headroom = available.saturating_sub(2).max(1);
+        // Each reader may fan out to the shared Rayon pool. Running one reader
+        // per logical core oversubscribes scans and competes with the UI.
+        let workers = std::env::var("BINWAVE_PLOT_WORKERS").ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map_or(headroom.min(8), |configured| configured.clamp(1, headroom));
+        log::info!("Plot reader limit: {workers} concurrent readers ({available} logical cores)");
         workers
     })
 }
@@ -1346,6 +1350,15 @@ impl StructureViews {
         source: ByteView,
     ) -> Option<Range<usize>> {
         let mut phase_clock = Instant::now();
+        // A covered pan can reuse cached geometry without entering a reader.
+        // Check the file identity once here before any retained data is shown.
+        if let Err(error) = source.validate() {
+            self.plot_reader.stop();
+            for reader in self.group_plot_readers.values_mut() { reader.stop(); }
+            for reader in self.extra_plot_readers.values_mut() { reader.stop(); }
+            ui.colored_label(Color32::LIGHT_RED, format!("{error:#}"));
+            return None;
+        }
         self.tick(ui.ctx(), source.clone());
         self.discover_flattened_collections(output);
         if self.stale(output) {

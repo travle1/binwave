@@ -495,7 +495,13 @@ impl PlotReader {
                 && key.path == node.path && key.refine == refine
                 && key.fields.as_deref() == fields.as_deref()
                 && covers_view(key, &range, pixel_width, field_count)
-        }) { return; }
+        }) {
+            if let Err(error) = source.validate() {
+                self.invalidate();
+                self.error = Some(format!("{error:#}"));
+            }
+            return;
+        }
         let query_range = if numeric_plan.is_some() && refine {
             numeric_query_coverage(&range, count)
         } else { range.clone() };
@@ -2269,6 +2275,46 @@ actions:
         println!("plot_trace summary overview_ms={overview_ms:.3} nearby_p50_ms={p50:.3} nearby_p95_ms={p95:.3} query_changes={query_changes} source_calls={} source_bytes={} tile_loads={}",
             source.io_stats().0, source.io_stats().1, reader.group_buffer_stats().1);
     }
+    /// Compare independent overview readers under the same shared Rayon pool.
+    /// This is a warm-OS-cache throughput probe, not a UI frame benchmark.
+    #[test]
+    #[ignore = "manual reader-concurrency measurement"]
+    fn benchmark_parallel_plot_readers() {
+        use std::io::Write;
+        let count = std::env::var("BINWAVE_BENCH_SAMPLES").ok()
+            .and_then(|value| value.parse::<usize>().ok()).unwrap_or(2_000_000);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut output = std::io::BufWriter::new(std::fs::File::create(file.path()).unwrap());
+        for index in 0..count {
+            output.write_all(&((index % 1024) as i32).to_le_bytes()).unwrap();
+        }
+        output.flush().unwrap();
+        drop(output);
+        let source = Arc::new(crate::file_source::FileSource::open(file.path()).unwrap());
+        let store = ByteStore::from_file(source.clone());
+        let node = parse(&store.view(),
+            "actions:\n  - read: {name: samples, type: i32, repeat: until end}\n");
+        let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
+        for readers in [1, 4, 8, 16] {
+            let started = Instant::now();
+            let before = source.io_stats();
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..readers).map(|_| {
+                    let mut query = request(store.view(), node.clone(), 0..count, true);
+                    query.key.buckets = display_buckets(1920);
+                    query.numeric_plan = Some(plan.clone());
+                    query.group_tiles = Some(Arc::new(Mutex::new(GroupTileCache::default())));
+                    scope.spawn(move || read_plot(&query, &AtomicBool::new(false), |_| {}))
+                }).collect();
+                for handle in handles {
+                    assert!(handle.join().unwrap().unwrap().complete);
+                }
+            });
+            let after = source.io_stats();
+            println!("plot_concurrency readers={readers} samples_per_reader={count} elapsed_ms={:.3} source_calls={} source_bytes={}",
+                started.elapsed().as_secs_f64() * 1000., after.0 - before.0, after.1 - before.1);
+        }
+    }
     #[test]
     fn tile_lookup_keeps_constant_time_eviction_order() {
         let mut cache = LruMap::default();
@@ -2557,6 +2603,27 @@ actions:
         settle(&mut reader, &ctx);
         assert!(reader.data().unwrap().range.start <= 2000);
         assert!(reader.data().unwrap().range.end >= 3000);
+    }
+    #[test]
+    fn covered_pan_rejects_replaced_source() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), vec![7u8; 20_000]).unwrap();
+        let source = Arc::new(crate::file_source::FileSource::open(file.path()).unwrap());
+        let store = ByteStore::from_file(source);
+        let node = parse(&store.view(),
+            "actions:\n  - read: {name: samples, type: u8, repeat: until end}\n");
+        let ctx = egui::Context::default();
+        let mut reader = PlotReader::default();
+        reader.request(&ctx, store.view(), node.clone(), 1000..2000, 1280, true);
+        settle(&mut reader, &ctx);
+        assert!(reader.display_data().is_some());
+
+        // A changed length makes source replacement detectable even on a
+        // filesystem with coarse modification timestamps.
+        std::fs::write(file.path(), vec![9u8; 20_001]).unwrap();
+        reader.request(&ctx, store.view(), node, 1100..2100, 1280, true);
+        assert!(reader.display_data().is_none());
+        assert!(reader.error().unwrap().contains("Source file changed"));
     }
     #[test]
     fn ordinary_numeric_collection_uses_the_tile_cache() {

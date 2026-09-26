@@ -337,6 +337,20 @@ or gesture-to-paint measurement. Run
 to repeat it. Retained display output, in-flight memory, GPU uploads, and
 first-scan performance on a 100 GB file remain unverified.
 
+The next safety and scheduling increment validates source identity before a
+retained plot is painted, including pans that require no new query, and stops
+active reads if the source has changed. Concurrent collection readers now
+default to eight or the available logical cores minus two, whichever is
+smaller; `BINWAVE_PLOT_WORKERS` can override that count within the headroom
+limit. On the same Ryzen 9 7950X and tmpfs-backed `/tmp`, a generic allocated
+8 MB, two-million-sample `i32` file measured simultaneous independent overview
+reads at 16.3 ms for one reader, 24.4 ms for four, 32.1 ms for eight, and
+53.7 ms for sixteen (total batch latency). This probes warm-cache throughput,
+not UI responsiveness or storage-bound 100 GB behavior. Eight readers provide
+parallel throughput without running one independent scan per logical core;
+the default still requires frame-time and interaction benchmarking. Repeat with
+`BINWAVE_BENCH_SAMPLES=2000000 cargo test --release --bin binwave benchmark_parallel_plot_readers -- --ignored --nocapture`.
+
 ### Limited synthetic measurement
 
 Command: `BINWAVE_BENCH_SAMPLES=20000000 cargo test --release --bin binwave

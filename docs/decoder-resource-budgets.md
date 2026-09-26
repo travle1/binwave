@@ -33,7 +33,10 @@ raw decoded tiles and 25% for summaries. In-flight scan batches are bounded
 separately by half that share or one tile. Parallel scan batches cap their
 tile count below the reported logical CPU count when possible; the Rayon pool
 itself still uses the available threads. `RAYON_NUM_THREADS` can override the
-pool's thread count.
+pool's thread count. At most eight collection readers run concurrently by
+default, leaving two reported logical cores as headroom. Set
+`BINWAVE_PLOT_WORKERS` to choose 1 through that headroom limit. This bounds
+reader concurrency; each active reader can still submit tile work to Rayon.
 Native numeric tiles now use direct hash lookups and an LRU order, and eligible
 ordinary collections use the same tiled path as grouped fields. Compatible
 prior plot data stays visible while a new viewport request loads. The RAM
@@ -42,6 +45,8 @@ plot output, queued disk writes, and in-flight tiles are not included in this
 RAM cache allowance; a full global scheduler is still needed.
 Native numeric plots request aligned coverage around the visible viewport.
 Small pans inside that coverage reuse the same result without new source reads.
+The plot checks file identity before displaying retained coverage and stops
+active scans if the original file has changed.
 For many visible traces, the plot reduces per-series min/max resolution toward
 an approximately one-million-point display target; each bucket preserves its
 observed extrema. Exact views and the minimum bucket count can exceed this
