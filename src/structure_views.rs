@@ -351,6 +351,14 @@ impl StructureViews {
         self.page.as_ref().filter(|page| page.key.path == path && page.key.revision == revision)
             .or_else(|| self.cached_pages.iter().rev().find(|page| page.key.path == path && page.key.revision == revision))
     }
+    fn tree_page_control_node(&self, output: &ParseOutput, path: &str) -> Option<Node> {
+        find_node(&output.nodes, path)
+            .or_else(|| self.page.as_ref().into_iter().chain(self.cached_pages.iter())
+                .filter(|page| page.key.revision == output.revision)
+                .filter_map(|page| page.result.as_ref().ok())
+                .find_map(|nodes| find_node(nodes, path)))
+            .cloned()
+    }
     fn collection_node<'a>(&'a self, output: &'a ParseOutput, path: &str) -> Option<&'a Node> {
         find_node(&output.nodes, path)
             .or_else(|| self.flattened_collections.iter().find(|node| node.path == path))
@@ -534,15 +542,10 @@ impl StructureViews {
         ui.weak("Expand an item to inspect its fields. Click a row to highlight its bytes in Hex; hover a number for decimal, hex, and binary.");
         let mut clicked = None;
         self.definition_details(ui, output, &mut clicked);
-        if let Some(request) = self.desired.clone().filter(|request| {
-            self.expanded.contains(&request.key.path)
-                && self
-                    .selected
-                    .as_deref()
-                    .is_some_and(|path| contains_path(&request.key.path, path))
-        }) {
-            if let Some(node) = find_node(&output.nodes, &request.key.path) {
-                self.page_controls(ui, node, output.revision);
+        if let Some(request) = self.desired.clone().filter(|request| self.expanded.contains(&request.key.path)) {
+            let node = self.tree_page_control_node(output, &request.key.path);
+            if let Some(node) = node {
+                self.page_controls(ui, &node, output.revision);
             }
         }
         let mut rows = Vec::new();
@@ -2543,6 +2546,8 @@ mod tests {
         views.request(&items, 0, output.revision, &egui::Context::default());
         settle(&mut views, store.view());
         assert!(views.page.as_ref().unwrap().result.is_ok());
+        assert_eq!(views.tree_page_control_node(&output, "groups[0].items")
+            .and_then(|node| node.lazy.map(|array| array.count)), Some(256));
         assert!(views.page_nodes("groups", output.revision).is_some());
         assert!(views.page_nodes("groups[0].items", output.revision).is_some());
         views.request(groups, 0, output.revision, &egui::Context::default());
