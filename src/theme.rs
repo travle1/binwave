@@ -1,0 +1,368 @@
+//! Shared design tokens and egui theme setup.
+//!
+//! Values mirror `design/binwave-egui-v2-design/design-tokens.json`. Later
+//! phases should read these tokens instead of embedding presentation values.
+#![allow(dead_code)] // Later design phases consume the remaining tokens.
+
+use egui::{
+    vec2, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin,
+    Stroke, TextStyle,
+};
+
+pub struct Surface {
+    pub sidebar: Color32,
+    pub window: Color32,
+    pub card: Color32,
+    pub raised: Color32,
+    pub control: Color32,
+    pub control_alt: Color32,
+    pub active: Color32,
+    pub sidebar_selected: Color32,
+}
+pub struct Border {
+    pub card: Color32,
+    pub window: Color32,
+    pub control: Color32,
+}
+pub struct Text {
+    pub primary: Color32,
+    pub secondary: Color32,
+    pub secondary_alt: Color32,
+    pub muted: Color32,
+    pub faint: Color32,
+    pub faint_alt: Color32,
+    pub line_number: Color32,
+    pub zero_byte: Color32,
+    pub on_accent: Color32,
+}
+pub struct Accent {
+    pub base: Color32,
+    pub soft_alpha: f32,
+    pub selection_alpha: f32,
+}
+pub struct Status {
+    pub warning: Color32,
+    pub warning_text: Color32,
+    pub warning_soft_alpha: f32,
+    pub warning_badge_alpha: f32,
+    pub success: Color32,
+    pub danger: Color32,
+}
+pub struct Syntax {
+    pub key: Color32,
+    pub punctuation: Color32,
+    pub value: Color32,
+    pub builtin_type: Color32,
+    pub number: Color32,
+    pub comment: Color32,
+}
+pub struct HexRegions {
+    pub file_header: Color32,
+    pub section_header: Color32,
+    pub data_section: Color32,
+    pub entry_a: Color32,
+    pub entry_b: Color32,
+}
+pub struct Colors {
+    pub surface: Surface,
+    pub border: Border,
+    pub text: Text,
+    pub accent: Accent,
+    pub status: Status,
+    pub syntax: Syntax,
+    pub hex_regions: HexRegions,
+    pub scrollbar: Color32,
+}
+pub struct Radii {
+    pub window: u8,
+    pub card: u8,
+    pub inset: u8,
+    pub control: u8,
+    pub well: u8,
+    pub row: u8,
+    pub chip: u8,
+    pub selection: u8,
+    pub pill: u16,
+}
+pub struct Sizes {
+    pub sidebar_width: f32,
+    pub header_height: f32,
+    pub card_header_height: f32,
+    pub tab_height: f32,
+    pub control_height: f32,
+    pub sidebar_row_height: f32,
+    pub recent_file_row_height: f32,
+    pub table_row_height: f32,
+    pub hex_row_height: f32,
+    pub caption_button: [f32; 2],
+    pub toggle: [f32; 2],
+}
+pub struct Gaps {
+    pub card_gap: f32,
+    pub card_padding: f32,
+    pub tab_gap: f32,
+    pub sidebar_row_gap: f32,
+    pub sidebar_first_section_top: f32,
+    pub sidebar_section_top: f32,
+}
+pub struct FontSizes {
+    pub title: f32,
+    pub card_title: f32,
+    pub body: f32,
+    pub control: f32,
+    pub small: f32,
+    pub label: f32,
+    pub axis: f32,
+    pub hex: f32,
+    pub code: f32,
+    pub code_line_height: f32,
+}
+pub struct Theme {
+    pub color: Colors,
+    pub radius: Radii,
+    pub size: Sizes,
+    pub spacing: Gaps,
+    pub font: FontSizes,
+}
+
+const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
+    Color32::from_rgb(r, g, b)
+}
+
+pub const DARK: Theme = Theme {
+    color: Colors {
+        surface: Surface {
+            sidebar: rgb(0x0B, 0x0D, 0x10),
+            window: rgb(0x11, 0x13, 0x18),
+            card: rgb(0x17, 0x1A, 0x21),
+            raised: rgb(0x1B, 0x1E, 0x26),
+            control: rgb(0x1F, 0x23, 0x2B),
+            control_alt: rgb(0x20, 0x24, 0x2D),
+            active: rgb(0x24, 0x29, 0x35),
+            sidebar_selected: rgb(0x1C, 0x20, 0x29),
+        },
+        border: Border {
+            card: rgb(0x23, 0x27, 0x33),
+            window: rgb(0x26, 0x2A, 0x33),
+            control: rgb(0x2A, 0x2F, 0x3A),
+        },
+        text: Text {
+            primary: rgb(0xE4, 0xE7, 0xEC),
+            secondary: rgb(0xC9, 0xCE, 0xD8),
+            secondary_alt: rgb(0xA3, 0xAB, 0xBA),
+            muted: rgb(0x8A, 0x93, 0xA5),
+            faint: rgb(0x7F, 0x88, 0x99),
+            faint_alt: rgb(0x6F, 0x78, 0x88),
+            line_number: rgb(0x4F, 0x57, 0x66),
+            zero_byte: rgb(0x66, 0x70, 0x85),
+            on_accent: rgb(0x0B, 0x0D, 0x10),
+        },
+        accent: Accent {
+            base: rgb(0x8C, 0x9B, 0xFF),
+            soft_alpha: 0.12,
+            selection_alpha: 0.30,
+        },
+        status: Status {
+            warning: rgb(0xF0, 0xB4, 0x5E),
+            warning_text: rgb(0xF7, 0xD9, 0xAE),
+            warning_soft_alpha: 0.08,
+            warning_badge_alpha: 0.14,
+            success: rgb(0x5F, 0xD0, 0xBC),
+            danger: rgb(0xFF, 0x95, 0x85),
+        },
+        syntax: Syntax {
+            key: rgb(0x9A, 0xA7, 0xFF),
+            punctuation: rgb(0x7F, 0x88, 0x99),
+            value: rgb(0xE4, 0xE7, 0xEC),
+            builtin_type: rgb(0x5F, 0xD0, 0xBC),
+            number: rgb(0xF0, 0xB4, 0x5E),
+            comment: rgb(0x6F, 0x78, 0x88),
+        },
+        hex_regions: HexRegions {
+            file_header: rgb(0xF0, 0xB4, 0x5E),
+            section_header: rgb(0x9F, 0xB0, 0xFF),
+            data_section: rgb(0x5F, 0xD0, 0xBC),
+            entry_a: rgb(0xE4, 0xE7, 0xEC),
+            entry_b: rgb(0xB7, 0xBE, 0xCB),
+        },
+        scrollbar: rgb(0x3A, 0x40, 0x4C),
+    },
+    radius: Radii {
+        window: 14,
+        card: 12,
+        inset: 10,
+        control: 8,
+        well: 8,
+        row: 7,
+        chip: 6,
+        selection: 5,
+        pill: 999,
+    },
+    size: Sizes {
+        sidebar_width: 240.,
+        header_height: 48.,
+        card_header_height: 40.,
+        tab_height: 28.,
+        control_height: 28.,
+        sidebar_row_height: 36.,
+        recent_file_row_height: 34.,
+        table_row_height: 24.,
+        hex_row_height: 24.,
+        caption_button: [46., 36.],
+        toggle: [28., 16.],
+    },
+    spacing: Gaps {
+        card_gap: 8.,
+        card_padding: 10.,
+        tab_gap: 2.,
+        sidebar_row_gap: 2.,
+        sidebar_first_section_top: 22.,
+        sidebar_section_top: 16.,
+    },
+    font: FontSizes {
+        title: 14.5,
+        card_title: 13.,
+        body: 13.,
+        control: 12.5,
+        small: 12.,
+        label: 11.5,
+        axis: 10.5,
+        hex: 12.5,
+        code: 12.,
+        code_line_height: 18.,
+    },
+};
+
+pub fn install(ctx: &Context) {
+    let mut fonts = FontDefinitions::default();
+    for (name, bytes) in [
+        (
+            "geist-regular",
+            &include_bytes!("../assets/fonts/Geist-Regular.ttf")[..],
+        ),
+        (
+            "geist-medium",
+            &include_bytes!("../assets/fonts/Geist-Medium.ttf")[..],
+        ),
+        (
+            "geist-semibold",
+            &include_bytes!("../assets/fonts/Geist-SemiBold.ttf")[..],
+        ),
+        (
+            "geist-mono",
+            &include_bytes!("../assets/fonts/GeistMono-Regular.ttf")[..],
+        ),
+    ] {
+        fonts
+            .font_data
+            .insert(name.into(), FontData::from_static(bytes).into());
+    }
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "geist-regular".into());
+    fonts
+        .families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .insert(0, "geist-mono".into());
+    for (family, name) in [
+        ("Geist Medium", "geist-medium"),
+        ("Geist SemiBold", "geist-semibold"),
+        ("Geist Mono", "geist-mono"),
+    ] {
+        fonts
+            .families
+            .insert(FontFamily::Name(family.into()), vec![name.into()]);
+    }
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
+
+    let t = &DARK;
+    let c = &t.color;
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
+    let v = &mut style.visuals;
+    *v = egui::Visuals::dark();
+    v.override_text_color = Some(c.text.primary);
+    v.weak_text_color = Some(c.text.muted);
+    v.hyperlink_color = c.accent.base;
+    v.faint_bg_color = c.surface.raised;
+    v.extreme_bg_color = c.surface.window;
+    v.text_edit_bg_color = Some(c.surface.window);
+    v.code_bg_color = c.surface.window;
+    v.warn_fg_color = c.status.warning;
+    v.error_fg_color = c.status.danger;
+    v.window_corner_radius = CornerRadius::same(t.radius.window);
+    v.window_fill = c.surface.card;
+    v.window_stroke = Stroke::new(1., c.border.window);
+    v.menu_corner_radius = CornerRadius::same(t.radius.control);
+    v.panel_fill = c.surface.window;
+    v.selection.bg_fill = c.accent.base.gamma_multiply(c.accent.selection_alpha);
+    v.selection.stroke = Stroke::new(1., c.accent.base);
+    for (widget, fill, text) in [
+        (
+            &mut v.widgets.noninteractive,
+            c.surface.card,
+            c.text.primary,
+        ),
+        (&mut v.widgets.inactive, c.surface.control, c.text.secondary),
+        (
+            &mut v.widgets.hovered,
+            c.surface.control_alt,
+            c.text.primary,
+        ),
+        (&mut v.widgets.active, c.surface.active, c.text.primary),
+        (&mut v.widgets.open, c.surface.active, c.text.primary),
+    ] {
+        widget.bg_fill = fill;
+        widget.weak_bg_fill = fill;
+        widget.bg_stroke = Stroke::new(1., c.border.control);
+        widget.corner_radius = CornerRadius::same(t.radius.control);
+        widget.fg_stroke = Stroke::new(1., text);
+    }
+    style.spacing.item_spacing = vec2(t.spacing.card_gap, t.spacing.sidebar_row_gap);
+    style.spacing.button_padding = vec2(
+        t.spacing.card_padding,
+        (t.size.control_height - t.font.control) / 4.,
+    );
+    style.spacing.interact_size.y = t.size.control_height;
+    style.spacing.window_margin = Margin::same(t.spacing.card_padding as i8);
+    style.text_styles.insert(
+        TextStyle::Body,
+        FontId::new(t.font.body, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        TextStyle::Button,
+        FontId::new(t.font.control, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        TextStyle::Small,
+        FontId::new(t.font.small, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        TextStyle::Heading,
+        FontId::new(t.font.title, FontFamily::Name("Geist SemiBold".into())),
+    );
+    style.text_styles.insert(
+        TextStyle::Monospace,
+        FontId::new(t.font.code, FontFamily::Monospace),
+    );
+    ctx.set_style_of(egui::Theme::Dark, style);
+    ctx.set_theme(egui::ThemePreference::Dark);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installs_fonts_and_dark_visuals() {
+        let ctx = Context::default();
+        install(&ctx);
+        let style = ctx.style_of(egui::Theme::Dark);
+        assert_eq!(style.visuals.panel_fill, DARK.color.surface.window);
+        assert_eq!(style.visuals.selection.stroke.color, DARK.color.accent.base);
+        assert_eq!(style.spacing.interact_size.y, DARK.size.control_height);
+    }
+}

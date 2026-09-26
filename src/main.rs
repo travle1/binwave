@@ -58,6 +58,7 @@ mod demos;
 mod structure;
 mod structure_plot;
 mod structure_selection;
+mod theme;
 #[cfg(not(target_arch = "wasm32"))]
 mod structure_ui;
 #[cfg(not(target_arch = "wasm32"))]

@@ -287,6 +287,7 @@ impl Drop for BinwaveApp {
 
 impl BinwaveApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        crate::theme::install(&cc.egui_ctx);
         let mut app = Self::default();
         app.workspace = WorkspaceLayout::load(cc.storage);
         app.restore_file_locations(cc.storage);
