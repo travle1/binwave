@@ -1,7 +1,8 @@
 //! Shared design tokens and egui theme setup.
 //!
-//! Values mirror `design/binwave-egui-v2-design/design-tokens.json`. Later
-//! phases should read these tokens instead of embedding presentation values.
+//! Tokens started from `design/binwave-egui-v2-design/design-tokens.json`.
+//! Surface and border values were raised after review for clearer boundaries.
+//! Later phases should read these tokens instead of embedding presentation values.
 #![allow(dead_code)] // Later design phases consume the remaining tokens.
 
 use egui::{
@@ -134,27 +135,27 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
 pub const DARK: Theme = Theme {
     color: Colors {
         surface: Surface {
-            sidebar: rgb(0x0B, 0x0D, 0x10),
-            window: rgb(0x11, 0x13, 0x18),
-            card: rgb(0x17, 0x1A, 0x21),
-            raised: rgb(0x1B, 0x1E, 0x26),
-            control: rgb(0x1F, 0x23, 0x2B),
-            control_alt: rgb(0x20, 0x24, 0x2D),
-            active: rgb(0x24, 0x29, 0x35),
-            sidebar_selected: rgb(0x1C, 0x20, 0x29),
+            sidebar: rgb(0x15, 0x19, 0x20),
+            window: rgb(0x1B, 0x20, 0x2A),
+            card: rgb(0x27, 0x2E, 0x3A),
+            raised: rgb(0x30, 0x37, 0x44),
+            control: rgb(0x32, 0x3A, 0x47),
+            control_alt: rgb(0x39, 0x43, 0x52),
+            active: rgb(0x3A, 0x46, 0x58),
+            sidebar_selected: rgb(0x32, 0x3A, 0x49),
         },
         border: Border {
-            card: rgb(0x23, 0x27, 0x33),
-            window: rgb(0x26, 0x2A, 0x33),
-            control: rgb(0x2A, 0x2F, 0x3A),
+            card: rgb(0x46, 0x53, 0x67),
+            window: rgb(0x4B, 0x58, 0x6A),
+            control: rgb(0x52, 0x5E, 0x70),
         },
         text: Text {
             primary: rgb(0xE4, 0xE7, 0xEC),
             secondary: rgb(0xC9, 0xCE, 0xD8),
             secondary_alt: rgb(0xA3, 0xAB, 0xBA),
-            muted: rgb(0x8A, 0x93, 0xA5),
-            faint: rgb(0x7F, 0x88, 0x99),
-            faint_alt: rgb(0x6F, 0x78, 0x88),
+            muted: rgb(0xA4, 0xAD, 0xBD),
+            faint: rgb(0x93, 0x9D, 0xAE),
+            faint_alt: rgb(0x80, 0x8B, 0x9C),
             line_number: rgb(0x4F, 0x57, 0x66),
             zero_byte: rgb(0x66, 0x70, 0x85),
             on_accent: rgb(0x0B, 0x0D, 0x10),
@@ -187,7 +188,7 @@ pub const DARK: Theme = Theme {
             entry_a: rgb(0xE4, 0xE7, 0xEC),
             entry_b: rgb(0xB7, 0xBE, 0xCB),
         },
-        scrollbar: rgb(0x3A, 0x40, 0x4C),
+        scrollbar: rgb(0x60, 0x6B, 0x7B),
     },
     radius: Radii {
         window: 14,
@@ -236,6 +237,20 @@ pub const DARK: Theme = Theme {
         code_line_height: 18.,
     },
 };
+
+pub fn dock_style(egui_style: &egui::Style) -> egui_dock::Style {
+    let t = &DARK;
+    let mut style = egui_dock::Style::from_egui(egui_style);
+    style.separator.width = t.spacing.card_gap;
+    style.separator.color_idle = t.color.surface.window;
+    style.separator.color_hovered = t.color.border.window;
+    style.separator.color_dragged = t.color.accent.base;
+    style.tab_bar.bg_fill = t.color.surface.card;
+    style.tab_bar.hline_color = t.color.border.card;
+    style.tab.tab_body.bg_fill = t.color.surface.card;
+    style.tab.tab_body.stroke = Stroke::new(t.size.frame_border, t.color.border.card);
+    style
+}
 
 pub fn install(ctx: &Context) {
     let mut fonts = FontDefinitions::default();
@@ -368,5 +383,9 @@ mod tests {
         assert_eq!(style.visuals.panel_fill, DARK.color.surface.window);
         assert_eq!(style.visuals.selection.stroke.color, DARK.color.accent.base);
         assert_eq!(style.spacing.interact_size.y, DARK.size.control_height);
+        let dock = dock_style(&style);
+        assert_eq!(dock.separator.width, DARK.spacing.card_gap);
+        assert_eq!(dock.separator.color_idle, DARK.color.surface.window);
+        assert_eq!(dock.tab.tab_body.bg_fill, DARK.color.surface.card);
     }
 }

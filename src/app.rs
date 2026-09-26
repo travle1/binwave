@@ -1408,7 +1408,7 @@ impl BinwaveApp {
             }
             DockArea::new(&mut workspace.dock)
                 .id(egui::Id::new("workspace_dock"))
-                .style(egui_dock::Style::from_egui(ui.style().as_ref()))
+                .style(crate::theme::dock_style(ui.style().as_ref()))
                 .show_inside(ui, &mut WorkspaceViewer { app: self });
         });
         self.workspace = workspace;
