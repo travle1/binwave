@@ -22,6 +22,19 @@ Use a recent stable Rust toolchain (Rust 1.88 or newer) and a desktop session:
 cargo run --release
 ```
 
+Open a file and an optional decoder at launch:
+
+```sh
+cargo run --release -- path/to/data.bin --decoder path/to/decoder.yaml
+cargo run --release -- --file path/to/data.bin
+cargo run --release -- --decoder path/to/decoder.py
+```
+
+`--decoder` accepts YAML, Python, and Markdown CSV configuration files. A YAML or Python
+decoder opens in the editor without running; press F5 to apply it. A CSV
+configuration uses the supplied `--file` as its data source when both are given.
+Use `--help` to list the options.
+
 Linux needs working X11 or Wayland and graphics drivers; native file pickers use
 the desktop file portal. Open and save pickers keep the workspace responding while
 you browse. Compilation may download crates; file processing is local.

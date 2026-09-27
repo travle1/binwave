@@ -43,6 +43,8 @@ mod hex_editor;
 #[cfg(not(target_arch = "wasm32"))]
 mod loaders;
 #[cfg(not(target_arch = "wasm32"))]
+mod launch_args;
+#[cfg(not(target_arch = "wasm32"))]
 mod plot_index;
 mod plot_trace;
 #[cfg(not(target_arch = "wasm32"))]
@@ -81,6 +83,17 @@ mod workspace_layout;
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("binwave=info")).init();
+    let launch = match launch_args::parse(std::env::args_os().skip(1)) {
+        Ok(launch_args::Parsed::Help) => {
+            print!("{}", launch_args::USAGE);
+            return Ok(());
+        }
+        Ok(launch_args::Parsed::Launch(launch)) => launch,
+        Err(error) => {
+            eprintln!("{error}\n\n{}", launch_args::USAGE);
+            std::process::exit(2);
+        }
+    };
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -95,13 +108,15 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Binwave",
         native_options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             if let Some(render_state) = &cc.wgpu_render_state {
                 plot_gpu::configure(render_state.target_format);
                 let adapter = render_state.adapter.get_info();
                 log::info!("Graphics adapter: {} ({:?}, {:?})", adapter.name, adapter.backend, adapter.device_type);
             }
-            Ok(Box::new(app::BinwaveApp::new(cc)))
+            let mut app = app::BinwaveApp::new(cc);
+            app.open_launch_paths(launch.data, launch.decoder, &cc.egui_ctx);
+            Ok(Box::new(app))
         }),
     )?;
     Ok(())

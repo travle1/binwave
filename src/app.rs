@@ -330,6 +330,38 @@ impl BinwaveApp {
         app
     }
 
+    pub fn open_launch_paths(&mut self, data: Option<PathBuf>, decoder: Option<PathBuf>, ctx: &Context) {
+        match (data, decoder) {
+            (Some(data), Some(decoder)) if LibraryFormat::from_path(&decoder) == Some(LibraryFormat::Csv) => {
+                match AppConfig::load_from_file(&decoder) {
+                    Ok(mut cfg) => {
+                        cfg.data_path = Some(data.clone());
+                        self.pending_config = Some(cfg);
+                        self.decoder_library_open = false;
+                        self.binary.open(data, ctx);
+                    }
+                    Err(error) => self.cache_message = Some(format!("Config: {error:#}")),
+                }
+            }
+            (Some(data), Some(decoder)) => {
+                self.open_path(data.clone(), ctx);
+                self.pending_recent_decoder = Some((data, decoder));
+            }
+            (Some(data), None) => self.open_path(data, ctx),
+            (None, Some(decoder)) if LibraryFormat::from_path(&decoder) == Some(LibraryFormat::Csv) => {
+                self.load_csv_config_path(decoder, ctx);
+            }
+            (None, Some(decoder)) => {
+                self.decoder = Decoder::Layout;
+                self.decoder_library_open = false;
+                self.show_empty_workspace = true;
+                self.binary.load_yaml(decoder, ctx);
+                self.workspace.show_decoder();
+            }
+            (None, None) => {}
+        }
+    }
+
     fn restore_file_locations(&mut self, storage: Option<&dyn eframe::Storage>) {
         self.file_locations = FileLocations::load(storage);
         self.binary.set_file_locations(self.file_locations.clone());
@@ -1125,7 +1157,8 @@ impl BinwaveApp {
                     .pending_config
                     .take()
                     .filter(|cfg| cfg.data_path.as_ref() == Some(&path));
-                let is_csv = config.is_some() || file_kind(&path) == FileKind::Csv;
+                let is_csv = config.is_some()
+                    || (recent_decoder.is_none() && file_kind(&path) == FileKind::Csv);
                 let mut cfg = config.unwrap_or_else(|| self.cfg.clone());
                 cfg.data_path = Some(path);
                 self.cfg = cfg.clone();
@@ -2673,6 +2706,58 @@ mod tests {
             assert!(Instant::now() < deadline, "{}", app.binary.status().0);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn launch_paths_open_data_and_its_decoder_without_running_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("capture.csv");
+        let decoder = directory.path().join("definition.yaml");
+        std::fs::write(&data, [1u8, 0, 2, 0]).unwrap();
+        std::fs::write(&decoder, "endian: little\nstructures:\n  - name: Entry\n    fields:\n      - {name: reading, type: u16}\n").unwrap();
+        let ctx = Context::default();
+        let mut app = BinwaveApp::default();
+        app.open_launch_paths(Some(data.clone()), Some(decoder.clone()), &ctx);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while app.binary.decoder_path() != Some(decoder.as_path()) {
+            workspace_frame(&mut app, &ctx);
+            assert!(Instant::now() < deadline, "{}", app.binary.status().0);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(app.binary.source_path(), Some(data.as_path()));
+        assert!(app.decoder == Decoder::Layout);
+        assert!(!app.binary.is_decoding());
+        assert!(app.binary.can_apply_definition());
+    }
+
+    #[test]
+    fn decoder_only_launch_opens_editor_without_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let decoder = directory.path().join("definition.yaml");
+        std::fs::write(&decoder, "structures:\n  - name: Entry\n").unwrap();
+        let ctx = Context::default();
+        let mut app = BinwaveApp::default();
+        app.open_launch_paths(None, Some(decoder.clone()), &ctx);
+        assert_eq!(app.binary.decoder_path(), Some(decoder.as_path()));
+        assert!(app.show_empty_workspace);
+        assert!(app.binary.has_definition());
+    }
+
+    #[test]
+    fn launch_file_overrides_csv_config_data_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = csv_fixture(directory.path(), 8);
+        let config = directory.path().join("settings.md");
+        std::fs::write(&config,
+            "```json\n{\"data_path\":\"missing.csv\",\"csv\":{\"time_column\":\"time\"}}\n```\n")
+            .unwrap();
+        let ctx = Context::default();
+        let mut app = BinwaveApp::default();
+        app.open_launch_paths(Some(data.clone()), Some(config), &ctx);
+        assert_eq!(app.pending_config.as_ref().and_then(|cfg| cfg.data_path.as_ref()), Some(&data));
+        wait_csv(&mut app, &ctx);
+        assert_eq!(app.cfg.data_path.as_ref(), Some(&data));
+        assert!(app.decoder == Decoder::Csv);
     }
 
     fn text(output: egui::FullOutput) -> String {
