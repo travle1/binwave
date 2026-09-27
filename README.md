@@ -221,8 +221,8 @@ shared results engine reads lazily. YAML describes schemas and reading operation
 for that same engine. Sharing results does not translate Python source into YAML,
 or YAML source into Python. `file.read()`, `read_at()`, and `unpack()` support freeform
 inspection and calculations; they do not automatically create displayed results.
-The current output API describes fixed-size structures over source bytes. It does
-not register arbitrary computed arrays or Python callbacks for every plotted sample.
+The output API does not register arbitrary computed arrays or Python callbacks
+for every plotted sample.
 
 Output and tracebacks appear in the console when execution finishes. **Stop** can
 cancel a script, including a Python loop. Loaded scripts use their own directory
@@ -325,6 +325,23 @@ type. A later payload uses that discovered type. The definitions may be nested;
 there is no hardcoded header or descriptor format. The
 [generic definition reference](samples/generic_structures.md) includes complete
 synthetic bytes, supported actions, reference rules, and examples.
+
+Fields within a structure can use a zero-based `offset` from that structure's
+start. A counted `repeat` can use `step` to set the byte distance between item
+starts. Without `step`, items are packed:
+
+```yaml
+structures:
+  - name: Block
+    fields:
+      - {name: sensor_0, type: u16, offset: 3, repeat: 3, step: 4}
+      - {name: sensor_1, type: u16, endian: big, offset: 14, repeat: 3, step: 2}
+actions:
+  - read: {name: blocks, type: {structure: Block}, length: 20, repeat: until end}
+```
+
+Every value must fit inside its enclosing bounded structure. `define` can read
+offsets and steps from earlier metadata and use them in generated fields.
 
 The interpreter supports exact integer values, standard fixed-width numeric types,
 UTF-8 `string`, zero-terminated `cstring`, raw byte regions, and unsigned LEB128 `varuint`.

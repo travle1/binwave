@@ -982,13 +982,36 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
                     ui.label("otherwise is recommended for forward-compatible formats. Using otherwise: bytes preserves unknown payloads and their exact byte ranges instead of failing on an unfamiliar tag.");
                 });
 
-            egui::CollapsingHeader::new("References and integer expressions")
+            egui::CollapsingHeader::new("References to earlier values")
                 .show(ui, |ui| {
                     ui.label("An unqualified reference searches the current decoded element and then its enclosing scopes. A leading slash anchors the path at file level. References name decoded values, not structure declarations.");
                     ui.code("{ref: count}\n{ref: header.count}\n{ref: /header.entries[0].size}");
-                    ui.label("Expressions use checked integer arithmetic. add, subtract, multiply, and divide accept two operands, and either operand may be another expression or reference. Division must be exact.");
-                    ui.code("length: {subtract: [{ref: total_bytes}, 4]}\nrepeat: {divide: [{ref: payload_bytes}, 8]}\nrelative: {add: [{ref: gap}, 2]}");
-                    ui.label("Missing or forward references, negative sizes, overflow, division remainders, and out-of-region reads are reported as decoder errors.");
+                });
+
+            egui::CollapsingHeader::new("Arithmetic: add, subtract, multiply, divide")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.label("Use arithmetic to compute counts, byte lengths, and offsets. Each operator takes exactly two inputs in order: {operator: [left, right]}. Inputs can be integers, references to earlier values, or nested expressions.");
+                    egui::Grid::new("decoder-guide-arithmetic")
+                        .striped(true)
+                        .num_columns(3)
+                        .show(ui, |ui| {
+                            ui.strong("Operator"); ui.strong("Example"); ui.strong("Result"); ui.end_row();
+                            ui.code("add"); ui.code("{add: [4096, 16]}"); ui.label("4112"); ui.end_row();
+                            ui.code("subtract"); ui.code("{subtract: [4112, 16]}"); ui.label("4096"); ui.end_row();
+                            ui.code("multiply"); ui.code("{multiply: [4096, 2]}"); ui.label("8192"); ui.end_row();
+                            ui.code("divide"); ui.code("{divide: [8192, 2]}"); ui.label("4096"); ui.end_row();
+                        });
+                    ui.strong("Use expressions directly in fields");
+                    ui.code("length: {multiply: [{ref: SamplesPerBlock}, 2]}\nrepeat: {divide: [{ref: payload_bytes}, 2]}\nrelative: {add: [{ref: gap}, 2]}");
+                    ui.strong("Nest operations to remove a header before counting samples");
+                    ui.code("repeat: {divide: [{subtract: [{ref: block_bytes}, 16]}, 2]}");
+                    ui.label("This subtracts a 16-byte header, then divides the remaining payload size by two bytes per sample. Expressions also work in at, align, skip, and the repeat, items_per_group, length, at, and relative mappings under define.fields.");
+                    ui.strong("Name a calculation for reuse");
+                    ui.code("actions:\n  - read: {name: sample_count, type: u16}\n  - calculate:\n      name: payload_bytes\n      value: {multiply: [{ref: sample_count}, 2]}\n  - read: {name: payload, type: bytes, length: {ref: payload_bytes}}");
+                    ui.label("calculate publishes a named integer without consuming bytes. Later expressions use it with ref, just like an earlier decoded integer.");
+                    ui.label("These expressions use checked integer arithmetic. Division must be exact: dividing 7 by 2 is an error, not rounding. Division by zero, overflow, missing or forward references, and negative counts or lengths are errors. Negative relative offsets are allowed within the containing region.");
+                    ui.label("Use the YAML mappings shown above, not formulas such as sample_count * 2. Modulo, powers, and bitwise operators are not supported in YAML expressions. remaining is only a field-length keyword; it cannot be an arithmetic input.");
                 });
 
             egui::CollapsingHeader::new("YAML actions")
@@ -1014,8 +1037,15 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
                     ui.code("- define:\n    name: GeneratedRecord\n    from: description.fields\n    fields:\n      name: {ref: label}\n      type: {ref: format, cases: {'1': u16, '2': i16, '3': f32}}\n      repeat: {ref: count}");
                     ui.label("Optional mappings also include length, at, and relative. Generated names and formats come from decoded data, but the mapping from numeric format codes to Binwave types belongs to the decoder definition.");
                     ui.code("repeat: {ref: group_count}\nitems_per_group: {ref: values_per_group}");
-                    ui.label("For grouped values, repeat counts groups and items_per_group counts consecutive values in each group. A virtual series can follow one position through every group. Leave items_per_group out for a flat repeated field.");
+                    ui.label("For grouped values, repeat counts groups and items_per_group counts consecutive values in each group. With layout: interleaved, each position is a sensor followed across sample groups. With layout: contiguous (default), each group is a sensor with items_per_group consecutive samples; these appear as sensor_0, sensor_1, etc. Leave items_per_group out for a flat repeated field.");
                     ui.label("Because define executes during parsing, the description bytes and define action must occur before any read that references GeneratedRecord.");
+                });
+
+            egui::CollapsingHeader::new("Mapped sensor series")
+                .show(ui, |ui| {
+                    ui.label("A repeated field may use an offset from its containing structure and a byte step between items.");
+                    ui.code("- {name: samples, type: u16, offset: 3, repeat: 128, step: 6}");
+                    ui.label("offset is measured from the containing structure's start; step is the byte distance between successive values. Each value must fit inside its containing region. Offset, repeat, and step accept the same checked expressions as other YAML fields.");
                 });
 
             egui::CollapsingHeader::new("Checksums, trailers, and validation")

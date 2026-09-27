@@ -1,0 +1,309 @@
+{
+  "file": "t_int.rtlm",
+  "format": "RTLM",
+  "version": 1,
+  "layout": "interleaved",
+  "seed": 1,
+  "duration_s": 300,
+  "file_bytes": 13625580,
+  "total_records": 333050,
+  "data_offset": 1024,
+  "record_header": "sync u16 (0xA55A) | stream_id u8 | seq u8 | t_us u64 | payload | crc u16 (CRC-16/CCITT-FALSE over stream_id..payload)",
+  "streams": [
+    {
+      "id": 1,
+      "name": "imu",
+      "rate_hz": 1000,
+      "record_bytes": 42,
+      "record_count": 299750,
+      "section_records_offset": null,
+      "fields": [
+        {
+          "name": "ax",
+          "type": "f32"
+        },
+        {
+          "name": "ay",
+          "type": "f32"
+        },
+        {
+          "name": "az",
+          "type": "f32"
+        },
+        {
+          "name": "gx",
+          "type": "f32"
+        },
+        {
+          "name": "gy",
+          "type": "f32"
+        },
+        {
+          "name": "gz",
+          "type": "f32"
+        },
+        {
+          "name": "temp_c",
+          "type": "f32"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "motors",
+      "rate_hz": 100,
+      "record_bytes": 30,
+      "record_count": 30000,
+      "section_records_offset": null,
+      "fields": [
+        {
+          "name": "rpm_0",
+          "type": "f32"
+        },
+        {
+          "name": "rpm_1",
+          "type": "f32"
+        },
+        {
+          "name": "rpm_2",
+          "type": "f32"
+        },
+        {
+          "name": "rpm_3",
+          "type": "f32"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "gps",
+      "rate_hz": 10,
+      "record_bytes": 42,
+      "record_count": 3000,
+      "section_records_offset": null,
+      "fields": [
+        {
+          "name": "lat",
+          "type": "f64"
+        },
+        {
+          "name": "lon",
+          "type": "f64"
+        },
+        {
+          "name": "alt_m",
+          "type": "f32"
+        },
+        {
+          "name": "speed_mps",
+          "type": "f32"
+        },
+        {
+          "name": "sats",
+          "type": "u8"
+        },
+        {
+          "name": "fix",
+          "type": "u8"
+        },
+        {
+          "name": "reserved",
+          "type": "u16"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "battery",
+      "rate_hz": 1,
+      "record_bytes": 30,
+      "record_count": 300,
+      "section_records_offset": null,
+      "fields": [
+        {
+          "name": "voltage",
+          "type": "f32"
+        },
+        {
+          "name": "current_a",
+          "type": "f32"
+        },
+        {
+          "name": "soc_pct",
+          "type": "f32"
+        },
+        {
+          "name": "temp_c",
+          "type": "f32"
+        }
+      ]
+    }
+  ],
+  "anomalies": [
+    {
+      "name": "gps_dropout",
+      "stream": "gps",
+      "sample_index": 810,
+      "record_index": 810,
+      "t_us": 80999803,
+      "byte_offset": 3682504,
+      "description": "fix=0, sats 0-3, position frozen, speed 0",
+      "length_samples": 300,
+      "fields": [
+        "fix",
+        "sats",
+        "lat",
+        "lon",
+        "speed_mps"
+      ]
+    },
+    {
+      "name": "motor3_stall",
+      "stream": "motors",
+      "sample_index": 12299,
+      "record_index": 12299,
+      "t_us": 122990011,
+      "byte_offset": 5590966,
+      "description": "rpm_3 ramps to 0, holds, recovers over 1.5 s; rpm_0..2 rise 8% to compensate",
+      "length_samples": 150,
+      "fields": [
+        "rpm_0",
+        "rpm_1",
+        "rpm_2",
+        "rpm_3"
+      ]
+    },
+    {
+      "name": "bad_crc",
+      "stream": "imu",
+      "sample_index": 126445,
+      "record_index": 126445,
+      "t_us": 126444999,
+      "byte_offset": 5748004,
+      "description": "crc field XOR 0xBEEF; payload is intact"
+    },
+    {
+      "name": "bad_crc",
+      "stream": "imu",
+      "sample_index": 158226,
+      "record_index": 158226,
+      "t_us": 158225997,
+      "byte_offset": 7192462,
+      "description": "crc field XOR 0xBEEF; payload is intact"
+    },
+    {
+      "name": "garbage_burst",
+      "byte_offset": 7273024,
+      "length": 37,
+      "description": "37 random bytes between records; a decoder must resync on the sync word and a valid CRC"
+    },
+    {
+      "name": "gyro_stuck",
+      "stream": "imu",
+      "sample_index": 165000,
+      "record_index": 165000,
+      "t_us": 165000000,
+      "byte_offset": 7500383,
+      "description": "gx frozen at its last good value for 2000 samples",
+      "length_samples": 2000,
+      "fields": [
+        "gx"
+      ]
+    },
+    {
+      "name": "bad_crc",
+      "stream": "imu",
+      "sample_index": 169970,
+      "record_index": 169970,
+      "t_us": 169970003,
+      "byte_offset": 7726241,
+      "description": "crc field XOR 0xBEEF; payload is intact"
+    },
+    {
+      "name": "bad_crc",
+      "stream": "imu",
+      "sample_index": 175604,
+      "record_index": 175604,
+      "t_us": 175603999,
+      "byte_offset": 7982333,
+      "description": "crc field XOR 0xBEEF; payload is intact"
+    },
+    {
+      "name": "bad_crc",
+      "stream": "motors",
+      "sample_index": 18607,
+      "record_index": 18607,
+      "t_us": 186070036,
+      "byte_offset": 8458025,
+      "description": "crc field XOR 0xBEEF; payload is intact"
+    },
+    {
+      "name": "bad_crc",
+      "stream": "imu",
+      "sample_index": 197408,
+      "record_index": 197408,
+      "t_us": 197408001,
+      "byte_offset": 8973317,
+      "description": "crc field XOR 0xBEEF; payload is intact"
+    },
+    {
+      "name": "bad_crc",
+      "stream": "motors",
+      "sample_index": 20985,
+      "record_index": 20985,
+      "t_us": 209850017,
+      "byte_offset": 9538811,
+      "description": "crc field XOR 0xBEEF; payload is intact"
+    },
+    {
+      "name": "battery_sag",
+      "stream": "battery",
+      "sample_index": 216,
+      "record_index": 216,
+      "t_us": 215999460,
+      "byte_offset": 9818261,
+      "description": "voltage drops 2.8 V and current rises 22 A for 3 s",
+      "length_samples": 3,
+      "fields": [
+        "voltage",
+        "current_a"
+      ]
+    },
+    {
+      "name": "imu_impact",
+      "stream": "imu",
+      "sample_index": 249000,
+      "record_index": 249000,
+      "t_us": 249000003,
+      "byte_offset": 11318141,
+      "description": "single-sample shock (ax +147, ay -62, az +95 m/s^2) then 200-sample damped ring-down",
+      "fields": [
+        "ax",
+        "ay",
+        "az",
+        "gy"
+      ]
+    },
+    {
+      "name": "imu_logging_gap",
+      "stream": "imu",
+      "sample_index": 269999,
+      "record_index": 269999,
+      "t_us": 269999000,
+      "byte_offset": 12272519,
+      "description": "250 IMU samples never written; t_us jumps ~250 ms and seq jumps by 251 mod 256. byte_offset is the last record before the gap",
+      "resume_byte_offset": 12273497,
+      "dropped_samples": 250,
+      "fields": [
+        "t_us",
+        "seq"
+      ]
+    },
+    {
+      "name": "truncated_final_record",
+      "byte_offset": 13625561,
+      "length": 19,
+      "description": "first 19 of 42 bytes of an IMU record; logger lost power mid-write"
+    }
+  ]
+}

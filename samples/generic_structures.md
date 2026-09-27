@@ -332,6 +332,17 @@ To run a different sequence of actions, use:
 Calculations and choices are declarative data operations, not a general-purpose
 programming language.
 
+An `offset` places a field relative to the start of its containing structure.
+A counted `repeat` may use `step` for the byte distance between item starts:
+
+```yaml
+- read: {name: samples, type: u16, offset: 3, repeat: 128, step: 6}
+```
+
+Item `i` starts at `structure_start + offset + i * step`. Without `step`, items
+are packed. An enclosing `length` bounds the structure. In `define`, metadata
+references can supply `offset`, `step`, and `item_step` for nested groups.
+
 ## Definitions created from data
 
 `decoders/yaml/generic_sections.yaml` demonstrates sections that define the structure of a later

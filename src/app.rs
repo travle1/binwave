@@ -1301,6 +1301,7 @@ impl BinwaveApp {
                 Cancel => self.binary.stop_decoding(),
                 OpenDecoder => { self.decoder=Decoder::Layout; self.binary.choose_definition(&ctx); self.show_view(Pane::Layout); },
                 SaveDecoder => self.binary.save_definition(&ctx),
+                SaveDecoderAs => self.binary.save_definition_as(&ctx),
                 NewDecoder => { self.decoder=Decoder::Layout; self.binary.new_yaml(&ctx); self.show_view(Pane::Layout); },
                 Apply => self.run_active_decoder(&ctx),
                 Example => if let Some((_,yaml))=crate::source_editor::YAML_EXAMPLES.get(argument) { self.decoder=Decoder::Layout; self.binary.load_definition_text(yaml,&ctx); self.show_view(Pane::Layout); },
@@ -1341,6 +1342,7 @@ impl BinwaveApp {
             egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
             egui::Key::S,
         );
+        let save_decoder = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
         let jump = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::G);
         if ctx.input_mut(|i| i.consume_shortcut(&jump))
             && self.commands_available()
@@ -1357,6 +1359,12 @@ impl BinwaveApp {
             && self.binary.has_file()
         {
             self.binary.save_copy(&ctx);
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&save_decoder))
+            && self.commands_available()
+            && self.decoder == Decoder::Layout
+        {
+            self.binary.save_definition(&ctx);
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F5))
             && self.commands_available()

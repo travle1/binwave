@@ -1,4 +1,6 @@
 const MAX_BODY_BYTES = 4_096;
+const ADMIN_EMAIL = "hello@buildincharge.com";
+const SENDER = { email: ADMIN_EMAIL, name: "BinWave" };
 
 function json(body, status = 200) {
   return Response.json(body, {
@@ -9,6 +11,51 @@ function json(body, status = 200) {
 
 function text(value, maxLength) {
   return typeof value === "string" ? value.trim().slice(0, maxLength) : "";
+}
+
+async function notifyEarlyAccess(env, signup) {
+  if (!env.BREVO_API) {
+    console.error(JSON.stringify({ event: "binwave_notification_skipped", reason: "missing_brevo_api" }));
+    return;
+  }
+
+  try {
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "api-key": env.BREVO_API,
+      },
+      body: JSON.stringify({
+        sender: SENDER,
+        to: [{ email: ADMIN_EMAIL, name: "Binwave" }],
+        replyTo: { email: signup.email, name: "BinWave early-access request" },
+        subject: "New BinWave early-access request",
+        textContent: [
+          "A new BinWave early-access request was received.",
+          "",
+          `Email: ${signup.email}`,
+          "",
+          "What they are decoding:",
+          signup.context || "(No details provided)",
+          "",
+          "Manage sign-ups: https://buildincharge.com/admin/",
+        ].join("\n"),
+        tags: ["binwave-early-access"],
+      }),
+    });
+
+    if (!response.ok) {
+      console.error(JSON.stringify({
+        event: "binwave_notification_failed",
+        status: response.status,
+        message: (await response.text()).slice(0, 500),
+      }));
+    }
+  } catch (error) {
+    console.error(JSON.stringify({ event: "binwave_notification_failed", message: String(error) }));
+  }
 }
 
 async function hasValidTurnstileToken(request, input, env) {
@@ -32,7 +79,7 @@ async function hasValidTurnstileToken(request, input, env) {
   }
 }
 
-export async function onRequestPost({ request, env }) {
+export async function onRequestPost({ request, env, waitUntil }) {
   try {
     const contentLength = Number(request.headers.get("content-length") || 0);
     if (contentLength > MAX_BODY_BYTES) return json({ error: "Request is too large." }, 413);
@@ -49,9 +96,15 @@ export async function onRequestPost({ request, env }) {
       return json({ error: "Please provide a valid email address." }, 400);
     }
 
-    await env.DB.prepare(
+    const result = await env.DB.prepare(
       "INSERT INTO binwave_early_access_signups (id, email, context, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(email) DO NOTHING"
     ).bind(crypto.randomUUID(), email, context, new Date().toISOString()).run();
+
+    if (result.meta.changes) {
+      const notification = notifyEarlyAccess(env, { email, context });
+      if (typeof waitUntil === "function") waitUntil(notification);
+      else await notification;
+    }
 
     return json({ ok: true }, 201);
   } catch (error) {

@@ -17,6 +17,7 @@ pub enum Command {
     Cancel,
     OpenDecoder,
     SaveDecoder,
+    SaveDecoderAs,
     NewDecoder,
     Apply,
     Code,
@@ -137,11 +138,8 @@ pub fn menus(s: &State) -> Vec<Item> {
     }
     let mut decoder = vec![
         action("Open decoder...", OpenDecoder, s.available),
-        action(
-            "Save decoder...",
-            SaveDecoder,
-            s.available && s.save_decoder,
-        ),
+        action(if s.native { "Save decoder" } else { "Save decoder..." },
+            SaveDecoder, s.available && s.save_decoder),
         action("New decoder", NewDecoder, s.available),
         action(crate::decoder_ui::RUN_LABEL, Apply, s.apply),
         action("Show definition", Code, true),
@@ -158,6 +156,9 @@ pub fn menus(s: &State) -> Vec<Item> {
                 .collect(),
         ),
     ];
+    if s.native {
+        decoder.insert(2, action("Save decoder as...", SaveDecoderAs, s.available && s.save_decoder));
+    }
     let mut edit = vec![
         action("Undo byte edit", Undo, s.available && s.undo),
         action("Redo byte edit", Redo, s.available && s.redo),
@@ -238,6 +239,7 @@ pub fn native_bar(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)>
                 let shortcut = match command {
                     Command::OpenFile => "Ctrl+O",
                     Command::SaveCopy => "Ctrl+Shift+S",
+                    Command::SaveDecoder => "Ctrl+S",
                     Command::Jump => "Ctrl+G",
                     _ => "",
                 };
@@ -281,11 +283,17 @@ pub fn decoder_controls(
         if crate::decoder_ui::run_button(ui, enabled, disabled_reason).clicked() {
             result = Some(Command::Apply);
         }
-        if ui.add_enabled(can_save, egui::Button::new("Save decoder…"))
+        if ui.add_enabled(can_save, egui::Button::new("Save decoder"))
             .on_hover_text("Save this YAML or Python decoder")
             .clicked()
         {
             result = Some(Command::SaveDecoder);
+        }
+        if ui.add_enabled(can_save, egui::Button::new("Save as…"))
+            .on_hover_text("Choose a decoder filename")
+            .clicked()
+        {
+            result = Some(Command::SaveDecoderAs);
         }
         if busy && ui.button("Stop").clicked() {
             result = Some(Command::Cancel);

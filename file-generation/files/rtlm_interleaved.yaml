@@ -1,0 +1,49 @@
+# RTLM interleaved layout: records from all streams in timestamp order.
+# Each record's payload is chosen by stream_id.
+endian: little
+structures:
+  - name: Imu
+    fields:
+      - {name: ax, type: f32}
+      - {name: ay, type: f32}
+      - {name: az, type: f32}
+      - {name: gx, type: f32}
+      - {name: gy, type: f32}
+      - {name: gz, type: f32}
+      - {name: temp_c, type: f32}
+  - name: Motors
+    fields:
+      - {name: rpm_0, type: f32}
+      - {name: rpm_1, type: f32}
+      - {name: rpm_2, type: f32}
+      - {name: rpm_3, type: f32}
+  - name: Gps
+    fields:
+      - {name: lat, type: f64}
+      - {name: lon, type: f64}
+      - {name: alt_m, type: f32}
+      - {name: speed_mps, type: f32}
+      - {name: sats, type: u8}
+      - {name: fix, type: u8}
+      - {name: reserved, type: u16}
+  - name: Battery
+    fields:
+      - {name: voltage, type: f32}
+      - {name: current_a, type: f32}
+      - {name: soc_pct, type: f32}
+      - {name: temp_c, type: f32}
+  - name: Record
+    fields:
+      - {name: sync, type: u16, expect: 0xA55A}
+      - {name: stream_id, type: u8}
+      - {name: seq, type: u8}
+      - {name: t_us, type: u64}
+      - name: payload
+        type:
+          choose:
+            ref: stream_id
+            cases: {'1': {structure: Imu}, '2': {structure: Motors}, '3': {structure: Gps}, '4': {structure: Battery}}
+      - {name: crc, type: u16}
+actions:
+  - read: {name: magic, type: string, length: 4, expect: RTLM}
+  - read: {name: records, type: {structure: Record}, at: 1024, repeat: until end}

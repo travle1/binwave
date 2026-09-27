@@ -21,6 +21,13 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const PAGE_SIZE: usize = 128;
+// Large records contain nested lazy arrays. Keep one inspector request small
+// instead of constructing 128 complete record trees regardless of record size.
+const INSPECTOR_PAGE_BYTES: usize = 8 * 1024 * 1024;
+fn inspector_page_size(array: &LazyArray) -> usize {
+    let width = usize::try_from(array.stride).unwrap_or(usize::MAX).max(1);
+    (INSPECTOR_PAGE_BYTES / width).clamp(1, PAGE_SIZE)
+}
 const INITIAL_PLOT_SAMPLES: usize = 1024;
 const MAX_HIGHLIGHTS: usize = 256;
 const DISPLAY_POINT_BUDGET: usize = 1_000_000;
@@ -282,7 +289,7 @@ impl StructureViews {
                         let nodes =
                             request
                                 .array
-                                .page(&source, &cancel, request.key.start, PAGE_SIZE)?;
+                                .page(&source, &cancel, request.key.start, inspector_page_size(&request.array))?;
                         source.validate()?;
                         anyhow::ensure!(
                             !cancel.load(Ordering::Relaxed),
@@ -312,7 +319,8 @@ impl StructureViews {
         let Some(array) = &node.lazy else {
             return;
         };
-        let start = start.min(array.count.saturating_sub(1)) / PAGE_SIZE * PAGE_SIZE;
+        let page_size = inspector_page_size(array);
+        let start = start.min(array.count.saturating_sub(1)) / page_size * page_size;
         let key = PageKey {
             path: node.path.clone(),
             start,
@@ -410,7 +418,10 @@ impl StructureViews {
             .or_else(|| self.cached_pages.iter().rev().find(|page| &page.key == key))
     }
     fn remember_page(&mut self, page: Page) {
-        self.cached_pages.retain(|cached| cached.key != page.key);
+        // Only one remembered page per collection is useful to the tree.
+        // Keeping every old sample page can evict the ancestor that contains
+        // this collection, making its expanded rows and controls disappear.
+        self.cached_pages.retain(|cached| cached.key.path != page.key.path);
         self.cached_pages.push(page);
         if self.cached_pages.len() > 8 {
             let index = self.cached_pages.iter()
@@ -854,6 +865,7 @@ impl StructureViews {
         let Some(array) = &node.lazy else {
             return;
         };
+        let page_size = inspector_page_size(array);
         let mut start = self
             .desired
             .as_ref()
@@ -866,26 +878,26 @@ impl StructureViews {
                 .add_enabled(start > 0, egui::Button::new("Previous"))
                 .clicked()
             {
-                start = start.saturating_sub(PAGE_SIZE);
+                start = start.saturating_sub(page_size);
                 self.table_jump = start;
             }
             ui.label(format!(
                 "Samples {}–{} of {}",
                 start,
                 start
-                    .saturating_add(PAGE_SIZE)
+                    .saturating_add(page_size)
                     .min(array.count)
                     .saturating_sub(1),
                 array.count
             ));
             if ui
                 .add_enabled(
-                    start.saturating_add(PAGE_SIZE) < array.count,
+                    start.saturating_add(page_size) < array.count,
                     egui::Button::new("Next"),
                 )
                 .clicked()
             {
-                start = start.saturating_add(PAGE_SIZE);
+                start = start.saturating_add(page_size);
                 self.table_jump = start;
             }
             ui.label("Go to sample");
@@ -935,8 +947,8 @@ impl StructureViews {
         single.sort_by_key(|node| node.path != self.table_target);
         let mut groups: Vec<_> = groups.into_iter().collect();
         groups.sort_by_key(|(_, sensors)| !sensors.iter().any(|(_, node)| node.path == self.table_target));
-        let grouped_containers: HashSet<_> = groups.iter().map(|(_, sensors)| sensors).filter_map(|sensors|
-            sensors.first().and_then(|(_, node)| node.path.rsplit_once('[').map(|(path, _)| path.to_owned()))).collect();
+        let grouped_containers: HashSet<_> = groups.iter().filter_map(|(key, _)|
+            key.rsplit_once('.').map(|(path, _)| path.to_owned())).collect();
         let mut navigation = Vec::new();
         if self.table_target.is_empty() {
             navigation.push(TableNavigation { label: "▾ File elements".into(), path: String::new(), group: false, depth: 0 });
@@ -1569,7 +1581,8 @@ impl StructureViews {
                         let label = if field == "value" {
                             collection_by_path.get(collection_path).map(|node| {
                                 if let Some((_, index)) = sensor_group_key(node) {
-                                    let group = node.name.split_once('[').map_or(node.name.as_str(), |(group, _)| group);
+                                    let group = node.name.rsplit_once(".sensor_").map(|(group, _)| group)
+                                        .unwrap_or_else(|| node.name.split_once('[').map_or(node.name.as_str(), |(group, _)| group));
                                     format!("{group}.Item {index}")
                                 } else {
                                     node.name.clone()
@@ -2515,8 +2528,8 @@ impl SeriesTree {
 fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut std::collections::BTreeSet<String>, filter: &mut String) -> bool {
     let mut changed=false;
     let (single, groups) = grouped_collection_choices(collections);
-    let grouped_containers: HashSet<_> = groups.values().filter_map(|sensors|
-        sensors.first().and_then(|(_, node)| node.path.rsplit_once('[').map(|(path, _)| path.to_owned()))).collect();
+    let grouped_containers: HashSet<_> = groups.keys().filter_map(|key|
+        key.rsplit_once('.').map(|(path, _)| path.to_owned())).collect();
     ui.horizontal(|ui| {
         ui.label(format!("{} selected", selected.len()));
         if ui.add_enabled(!selected.is_empty(), egui::Button::new("Clear selection")).clicked() {
@@ -2615,6 +2628,17 @@ fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut st
 
 fn sensor_group_key(node: &Node) -> Option<(String, usize)> {
     let (group_name, _) = node.name.split_once(" across ")?;
+    // Contiguous definitions expose one named sample array per sensor.
+    // Keep the complete parent path as identity so equal channel names in
+    // different sections do not merge in the picker.
+    if let Some((prefix, sensor)) = node.path.rsplit_once(".sensor_") {
+        let index = sensor.parse::<usize>().ok()?;
+        let (named_parent, named_sensor) = group_name.rsplit_once(".sensor_")?;
+        if named_sensor.parse::<usize>().ok()? != index || !prefix.ends_with(named_parent) {
+            return None;
+        }
+        return Some((format!("{prefix}.sensors"), index));
+    }
     let (name, named_index) = group_name.rsplit_once('[')?;
     let named_index = named_index.strip_suffix(']')?.parse::<usize>().ok()?;
     let (prefix, rest) = node.path.rsplit_once('[')?;
@@ -2635,14 +2659,33 @@ fn grouped_numeric_plans(
         let (Some((key, _)), Some(plan)) = (sensor_group_key(node), node.lazy.as_ref().and_then(|array| array.numeric_plan())) else { continue; };
         candidates.entry(key).or_default().push((node, plan));
     }
-    candidates.into_iter().filter_map(|(key, members)| {
-        if members.len() < 2 { return None; }
-        let count = collection_count(members[0].0);
-        if members.iter().any(|(node, _)| collection_count(node) != count) { return None; }
-        let plan = NumericPlan::combine(&members.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>())?;
-        let paths = members.iter().map(|(node, _)| node.path.clone()).collect();
-        Some((key, (members[0].0.clone(), plan, paths)))
-    }).collect()
+    let mut grouped = BTreeMap::new();
+    for (key, mut members) in candidates {
+        // A logical channel may draw sensors from different physical regions.
+        // Merge only byte-compatible neighbors; others still plot independently.
+        members.sort_by_key(|(_, plan)| plan.offset(0).unwrap_or(usize::MAX));
+        let mut run: Vec<(&Node, NumericPlan)> = Vec::new();
+        let mut runs = Vec::new();
+        for member in members {
+            let mut trial = run.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
+            trial.push(member.1.clone());
+            if !run.is_empty() && (collection_count(run[0].0) != collection_count(member.0)
+                || NumericPlan::combine(&trial).is_none()) {
+                runs.push(std::mem::take(&mut run));
+            }
+            run.push(member);
+        }
+        if !run.is_empty() { runs.push(run); }
+        let multiple_runs = runs.len() > 1;
+        for (index, run) in runs.into_iter().enumerate() {
+            if run.len() < 2 { continue; }
+            let Some(plan) = NumericPlan::combine(&run.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>()) else { continue; };
+            let paths = run.iter().map(|(node, _)| node.path.clone()).collect();
+            let run_key = if multiple_runs { format!("{key}#{index}") } else { key.clone() };
+            grouped.insert(run_key, (run[0].0.clone(), plan, paths));
+        }
+    }
+    grouped
 }
 fn grouped_collection_choices<'a>(collections: &[&'a Node]) -> (Vec<&'a Node>, BTreeMap<String, Vec<(usize, &'a Node)>>) {
     let mut single = Vec::new();
@@ -3362,6 +3405,32 @@ mod tests {
         assert_eq!(left.lazy.as_ref().unwrap().bounds(256), Some(1028..1030));
     }
     #[test]
+    fn contiguous_sensor_collections_group_by_channel_and_sort_numerically() {
+        let yaml = "structures:\n  - name: Sensors\n    fields:\n      - {name: sensor_10, type: u16, repeat: 4096}\n      - {name: sensor_2, type: u16, repeat: 4096}\n  - name: Block\n    fields:\n      - {name: Primary, type: {structure: Sensors}}\n      - {name: AUX, type: {structure: Sensors}}\nactions:\n  - read: {name: blocks, type: {structure: Block}, repeat: 130}\n";
+        let bytes = vec![0; 130 * 4 * 4096 * 2];
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let source = store.view();
+        let output = Program::parse(yaml).unwrap().run(&source, &AtomicBool::new(false)).unwrap();
+        let parent = &output.nodes[0];
+        let first = parent.lazy.as_ref().unwrap().page(&source, &AtomicBool::new(false), 0, 1).unwrap();
+        let mut flat = Vec::new();
+        collect_flattened_descendants(parent, &first[0], Some(&source), &mut flat);
+        let refs: Vec<_> = flat.iter().collect();
+        let (single, groups) = grouped_collection_choices(&refs);
+        assert!(single.is_empty());
+        assert_eq!(groups.len(), 2);
+        for channel in ["Primary", "AUX"] {
+            let sensors = &groups[&format!("blocks.{channel}.sensors")];
+            assert_eq!(sensors.iter().map(|(index, _)| *index).collect::<Vec<_>>(), [2, 10]);
+            assert_eq!(collection_count(sensors[0].1), 130 * 4096);
+        }
+        let mut views = StructureViews::default();
+        views.flattened_collections = flat;
+        let navigation = views.table_navigation(&output);
+        assert!(navigation.iter().any(|entry| entry.group && entry.label.contains("Primary")));
+        assert!(navigation.iter().any(|entry| entry.group && entry.label.contains("AUX")));
+    }
+    #[test]
     fn configured_groups_expose_each_position_across_records() {
         let yaml = r#"
 structures:
@@ -3612,6 +3681,53 @@ actions:
         flatten_visible(&output.nodes, 0, &views.expanded, views.page.as_ref(), &views.cached_pages, output.revision, &mut rows);
         assert!(rows.iter().any(|(node, _)| node.path == "groups[0].items[0]"));
         assert!(rows.iter().any(|(node, _)| node.path == "groups[0].items[0].value_199"));
+    }
+    #[test]
+    fn large_block_inspector_pages_load_one_record_and_can_advance() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let block_bytes = 5_824_522;
+        crate::cache::set_fixture_len(file.as_file(), 190 * block_bytes).unwrap();
+        let source = crate::file_source::FileSource::open(file.path()).unwrap();
+        let store = ByteStore::from_file(Arc::new(source));
+        let yaml = format!("structures:\n  - name: Block\n    fields:\n      - {{name: samples, type: u16, repeat: {}}}\nactions:\n  - read: {{name: blocks, type: {{structure: Block}}, repeat: 190}}\n", block_bytes / 2);
+        let output = Program::parse(&yaml).unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let blocks = &output.nodes[0];
+        assert_eq!(inspector_page_size(blocks.lazy.as_ref().unwrap()), 1);
+        let mut views = StructureViews::default();
+        let ctx = egui::Context::default();
+        for index in [0, 1, 189] {
+            views.request(blocks, index, output.revision, &ctx);
+            settle(&mut views, store.view());
+            let page = views.page_nodes("blocks", output.revision).unwrap();
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].path, format!("blocks[{index}]"));
+            assert!(page[0].children[0].lazy.is_some());
+        }
+    }
+    #[test]
+    fn paging_nested_samples_past_1023_keeps_the_parent_visible() {
+        let yaml = "structures:\n  - name: Block\n    fields:\n      - {name: sensor_0, type: u32, repeat: 4096}\nactions:\n  - read: {name: blocks, type: {structure: Block}, repeat: 190}\n";
+        let bytes = vec![0; 190 * 4096 * 4];
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let output = Program::parse(yaml).unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let mut views = StructureViews::default();
+        let ctx = egui::Context::default();
+        views.expand("blocks");
+        views.request(&output.nodes[0], 0, output.revision, &ctx);
+        settle(&mut views, store.view());
+        let sensor = views.page_nodes("blocks", output.revision).unwrap()[0].children[0].clone();
+        views.expand("blocks[0]");
+        views.expand(&sensor.path);
+        for start in (0..4096).step_by(PAGE_SIZE).chain([896, 1024, 0]) {
+            views.request(&sensor, start, output.revision, &ctx);
+            settle(&mut views, store.view());
+            assert!(views.tree_page_control_node(&output, &sensor.path).is_some(), "lost controls at {start}");
+            let mut rows = Vec::new();
+            flatten_visible(&output.nodes, 0, &views.expanded, views.page.as_ref(), &views.cached_pages, output.revision, &mut rows);
+            let expected = format!("{}[{start}]", sensor.path);
+            assert!(rows.iter().any(|(node, _)| node.path == expected), "lost nested rows at {start}");
+            assert!(views.cached_pages.len() <= 8);
+        }
     }
     #[test]
     fn lazy_pages_are_bounded_and_selectable_without_rendering_the_tree() {

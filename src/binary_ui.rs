@@ -1549,6 +1549,15 @@ impl BinaryWorkspace {
     }
     pub fn save_definition(&mut self, ctx: &Context) {
         if self.commands_available() && self.can_save_definition() {
+            if let Some(path) = self.yaml_path.clone() {
+                self.save(ctx, path, SaveContent::Yaml(self.yaml.clone(), self.language), true);
+            } else {
+                self.choose_save(ctx, true);
+            }
+        }
+    }
+    pub fn save_definition_as(&mut self, ctx: &Context) {
+        if self.commands_available() && self.can_save_definition() {
             self.choose_save(ctx, true);
         }
     }
@@ -1943,16 +1952,17 @@ impl BinaryWorkspace {
                 if ui
                     .add_enabled(
                         self.can_save_definition(),
-                        egui::Button::new(if self.is_python() {
-                            "Save Python…"
-                        } else {
-                            "Save YAML…"
-                        }),
+                        egui::Button::new(if self.is_python() { "Save Python" } else { "Save YAML" }),
                     )
                     .on_hover_text("Save this decoder")
                     .clicked()
                 {
-                    self.choose_save(&ctx, true);
+                    self.save_definition(&ctx);
+                }
+                if ui.add_enabled(self.can_save_definition(), egui::Button::new("Save as…"))
+                    .clicked()
+                {
+                    self.save_definition_as(&ctx);
                 }
                 if crate::decoder_ui::run_button(
                     ui, self.can_apply_definition(), self.run_disabled_reason()).clicked() {
@@ -1970,7 +1980,7 @@ impl BinaryWorkspace {
             self.run_disabled_reason(),
             self.can_save_definition() && enabled,
         ) {
-            match command { crate::app_menu::Command::Apply=>self.apply_definition(&ctx),crate::app_menu::Command::SaveDecoder=>self.save_definition(&ctx),crate::app_menu::Command::Cancel=>self.stop_decoding(),_=>{} }
+            match command { crate::app_menu::Command::Apply=>self.apply_definition(&ctx),crate::app_menu::Command::SaveDecoder=>self.save_definition(&ctx),crate::app_menu::Command::SaveDecoderAs=>self.save_definition_as(&ctx),crate::app_menu::Command::Cancel=>self.stop_decoding(),_=>{} }
         }
         crate::decoder_ui::status_banner(
             ui,
@@ -3721,6 +3731,24 @@ mod tests {
     }
 
     #[test]
+    fn save_definition_writes_to_loaded_path_without_picker() {
+        let ctx = Context::default();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("decoder.yaml");
+        std::fs::write(&path, "old draft").unwrap();
+        let mut workspace = BinaryWorkspace::default();
+        workspace.load_yaml(path.clone(), &ctx);
+        workspace.yaml = "new draft".into();
+        workspace.save_definition(&ctx);
+        assert!(!workspace.dialog_pending());
+        assert!(workspace.overwrite.is_none());
+        settle(&mut workspace, &ctx);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new draft");
+        assert_eq!(workspace.yaml_path.as_ref(), Some(&path));
+        assert_eq!(workspace.saved_yaml, "new draft");
+    }
+
+    #[test]
     fn decoder_save_prefers_remembered_folder_then_its_own_path_and_never_the_data_folder() {
         let temporary = tempfile::tempdir().unwrap();
         let data = temporary.path().join("data");
@@ -3766,7 +3794,7 @@ mod tests {
         let python = workspace.yaml.clone();
         let controls = visible_control_text(&mut workspace, &ctx);
         assert!(controls.contains(crate::decoder_ui::RUN_LABEL));
-        assert!(controls.contains("Save Python…"));
+        assert!(controls.contains("Save Python"));
         click(&mut workspace, &ctx, "YAML");
         assert_eq!(workspace.yaml, yaml);
         assert_eq!(workspace.saved_yaml, "actions: []\n");
@@ -3777,7 +3805,7 @@ mod tests {
         assert!(workspace.draft_dirty(DecoderLanguage::Yaml));
         let controls = visible_control_text(&mut workspace, &ctx);
         assert!(controls.contains(crate::decoder_ui::RUN_LABEL));
-        assert!(controls.contains("Save YAML…"));
+        assert!(controls.contains("Save YAML"));
         click(&mut workspace, &ctx, "Python");
         assert_eq!(workspace.yaml, python);
         assert_eq!(workspace.saved_yaml, "print('saved Python')\n");
@@ -4125,7 +4153,7 @@ mod tests {
         for label in [
             "sample-decoder.yml",
             "Open decoder…",
-            "Save YAML…",
+            "Save YAML",
             crate::decoder_ui::RUN_LABEL,
             "Ready to decode",
             "actions:",

@@ -1076,7 +1076,7 @@ impl BrowserApp {
         match command {
             SimpleDemo=>self.open_simple_demo(),
             AdvancedDemo=>self.open_demo(crate::demos::Demo::Advanced),
-            SaveDecoder=>save_decoder(&self.yaml, if self.language == crate::source_editor::DecoderLanguage::Python { "python" } else { "yaml" }),
+            SaveDecoder | SaveDecoderAs=>save_decoder(&self.yaml, if self.language == crate::source_editor::DecoderLanguage::Python { "python" } else { "yaml" }),
             NewDecoder=>{self.switch_language(crate::source_editor::DecoderLanguage::Yaml);self.yaml="endian: little\nactions: []\n".into();self.reset_decoder();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
             Python=>{self.switch_language(crate::source_editor::DecoderLanguage::Python);self.yaml=crate::source_editor::DecoderLanguage::Python.starter().into();self.reset_decoder();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
             PythonExample=>{self.switch_language(crate::source_editor::DecoderLanguage::Python);self.yaml=crate::source_editor::DecoderLanguage::Python.byte_preview().into();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},

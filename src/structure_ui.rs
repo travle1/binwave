@@ -1286,9 +1286,13 @@ impl Operation {
                     },
                     repeat: None,
                     items_per_group: None,
+                    item_step: None,
+                    layout: crate::structure::GroupLayout::default(),
                     length: None,
                     at: None,
                     relative: None,
+                    offset: None,
+                    step: None,
                 },
             }),
             Self::Choose => Action::Choose(crate::structure::ChooseActions {
@@ -1412,6 +1416,8 @@ struct ReadStep {
     length: ValueInput,
     at: ValueInput,
     relative: ValueInput,
+    offset: ValueInput,
+    step: ValueInput,
     align: ValueInput,
 }
 impl ReadStep {
@@ -1447,6 +1453,8 @@ impl ReadStep {
             length: ValueInput::from_expr(field.length.clone()),
             at: ValueInput::from_expr(field.at.clone()),
             relative: ValueInput::from_expr(field.relative.clone()),
+            offset: ValueInput::from_expr(field.offset.clone()),
+            step: ValueInput::from_expr(field.step.clone()),
             align: ValueInput::from_expr(field.align.clone()),
         }
     }
@@ -1468,6 +1476,8 @@ impl ReadStep {
         field.length = self.length.optional()?;
         field.at = self.at.optional()?;
         field.relative = self.relative.optional()?;
+        field.offset = self.offset.optional()?;
+        field.step = self.step.optional()?;
         field.align = self.align.optional()?;
         Ok(field)
     }
@@ -1530,10 +1540,14 @@ impl ReadStep {
         ui.collapsing("Position and byte order", |ui| {
             self.relative.ui(
                 ui,
-                "Offset relative to containing structure",
-                "blank = sequential",
+                "Offset from current position",
+                "blank = sequential; cannot combine with structure offset",
                 references,
             );
+            self.offset.ui(ui, "Offset from structure start", "blank = sequential", references);
+            if self.repeat_mode == 1 {
+                self.step.ui(ui, "Bytes between repeated items", "blank = packed", references);
+            }
             self.align.ui(
                 ui,
                 "Align before reading",
@@ -1631,9 +1645,13 @@ struct DefineStep {
     choice: TypeChoiceDraft,
     repeat: ValueInput,
     items_per_group: ValueInput,
+    item_step: ValueInput,
+    layout: crate::structure::GroupLayout,
     length: ValueInput,
     at: ValueInput,
     relative: ValueInput,
+    offset: ValueInput,
+    step: ValueInput,
 }
 impl DefineStep {
     fn from_definition(value: &Define) -> Self {
@@ -1651,9 +1669,13 @@ impl DefineStep {
             choice: TypeChoiceDraft::from_choice(&value.fields.kind),
             repeat: ValueInput::from_expr(value.fields.repeat.clone()),
             items_per_group: ValueInput::from_expr(value.fields.items_per_group.clone()),
+            item_step: ValueInput::from_expr(value.fields.item_step.clone()),
+            layout: value.fields.layout,
             length: ValueInput::from_expr(value.fields.length.clone()),
             at: ValueInput::from_expr(value.fields.at.clone()),
             relative: ValueInput::from_expr(value.fields.relative.clone()),
+            offset: ValueInput::from_expr(value.fields.offset.clone()),
+            step: ValueInput::from_expr(value.fields.step.clone()),
         }
     }
     fn build(&self) -> Result<Define> {
@@ -1674,9 +1696,13 @@ impl DefineStep {
                 kind: self.choice.build()?,
                 repeat: self.repeat.optional()?,
                 items_per_group: self.items_per_group.optional()?,
+                item_step: self.item_step.optional()?,
+                layout: self.layout,
                 length: self.length.optional()?,
                 at: self.at.optional()?,
                 relative: self.relative.optional()?,
+                offset: self.offset.optional()?,
+                step: self.step.optional()?,
             },
         })
     }
@@ -1697,6 +1723,15 @@ impl DefineStep {
             .ui(ui, "Item count property (optional)", "e.g. count", &[]);
         self.items_per_group
             .ui(ui, "Items per group (optional)", "e.g. samples_per_group", &[]);
+        self.item_step.ui(ui, "Bytes between group items (optional)", "e.g. item_spacing", &[]);
+        self.step.ui(ui, "Bytes between groups (optional)", "e.g. group_spacing", &[]);
+        self.offset.ui(ui, "Offset from structure start (optional)", "e.g. start_offset", &[]);
+        egui::ComboBox::from_id_salt("group_layout")
+            .selected_text(format!("{:?}", self.layout))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.layout, crate::structure::GroupLayout::Contiguous, "Contiguous: groups are sensors (default)");
+                ui.selectable_value(&mut self.layout, crate::structure::GroupLayout::Interleaved, "Interleaved: groups are samples");
+            });
         self.length
             .ui(ui, "Byte length property (optional)", "e.g. length", &[]);
         self.relative.ui(
@@ -2921,9 +2956,13 @@ impl Builder {
                     },
                     repeat: optional_expr(&self.mapping.repeat)?,
                     items_per_group: None,
+                    item_step: None,
+                    layout: crate::structure::GroupLayout::default(),
                     length: optional_expr(&self.mapping.length)?,
                     at: None,
                     relative: optional_expr(&self.mapping.relative)?,
+                    offset: None,
+                    step: None,
                 },
             }));
             self.name.clone()

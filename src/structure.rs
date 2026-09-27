@@ -137,6 +137,10 @@ pub struct Field {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative: Option<Expr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<Expr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<Expr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align: Option<Expr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endian: Option<Endian>,
@@ -154,6 +158,8 @@ impl Field {
             length: None,
             at: None,
             relative: None,
+            offset: None,
+            step: None,
             align: None,
             endian: None,
             expect: None,
@@ -476,8 +482,8 @@ pub struct Define {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupLayout {
-    #[default]
     Interleaved,
+    #[default]
     Contiguous,
 }
 
@@ -493,6 +499,8 @@ pub struct FieldMapping {
     #[serde(default)]
     pub items_per_group: Option<Expr>,
     #[serde(default)]
+    pub item_step: Option<Expr>,
+    #[serde(default)]
     pub layout: GroupLayout,
     #[serde(default)]
     pub length: Option<Expr>,
@@ -500,6 +508,10 @@ pub struct FieldMapping {
     pub at: Option<Expr>,
     #[serde(default)]
     pub relative: Option<Expr>,
+    #[serde(default)]
+    pub offset: Option<Expr>,
+    #[serde(default)]
+    pub step: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -952,13 +964,18 @@ impl LazyArray {
         let inner = child.lazy.as_ref()?;
         if outer.count == 0 || inner.count == 0 || outer.stride == 0 || inner.stride == 0
             || outer.offsets.is_some() || outer.segmented.is_some()
-            || inner.offsets.is_some() || inner.segmented.is_some() {
+            || inner.offsets.is_some() {
             return None;
         }
+        let inner_step = if let Some(segment) = &inner.segmented {
+            if segment.outer_start != inner.bounds(0)?.start || segment.inner_offset != 0
+                || segment.inner_count != inner.count { return None; }
+            segment.inner_stride
+        } else { inner.stride };
         let outer_start = outer.bounds(0)?.start;
         let inner_start = inner.bounds(0)?.start;
         let inner_offset = inner_start.checked_sub(outer_start)?;
-        let inner_bytes = inner.count.checked_mul(inner.stride)?;
+        let inner_bytes = inner.bounds(inner.count - 1)?.end.checked_sub(inner_start)?;
         if inner_offset.checked_add(inner_bytes)? > outer.stride {
             return None;
         }
@@ -980,13 +997,15 @@ impl LazyArray {
                 outer_stride: outer.stride,
                 inner_offset,
                 inner_count: inner.count,
-                inner_stride: inner.stride,
+                inner_stride: inner_step,
             }),
             plan: Arc::new(plan),
         };
         let end = array.bounds(count - 1)?.end;
         Some(Node {
-            name: format!("{} across {}", child.name, parent.name),
+            // Include the enclosing channel: generated contiguous arrays reuse
+            // names such as sensor_0 in every channel.
+            name: format!("{} across {}", child_suffix.trim_start_matches('.'), parent.name),
             path,
             range: inner_start..end,
             kind: child.kind.clone(),
@@ -1002,14 +1021,22 @@ impl LazyArray {
     pub(crate) fn flattened_group_sensor(parent: &Node, group: &Node, child: &Node, index: Address) -> Option<Node> {
         let outer = parent.lazy.as_ref()?;
         let groups = group.lazy.as_ref()?;
+        let group_step = if let Some(segment) = &groups.segmented {
+            if segment.outer_start != groups.bounds(0)?.start || segment.inner_offset != 0
+                || segment.inner_count != groups.count { return None; }
+            segment.inner_stride
+        } else { groups.stride };
         let (inner_count, width, value_start, mut plan) = if let Some(inner) = child.lazy.as_ref() {
             (inner.count, inner.stride, inner.bounds(index)?.start, (*inner.plan).clone())
         } else {
             let item = child.children.get(usize::try_from(index).ok()?)?;
             let width = item.range.end.checked_sub(item.range.start)?;
+            let step = if child.children.len() > 1 {
+                child.children[1].range.start.checked_sub(child.children[0].range.start)?
+            } else { width };
             if width == 0 || child.children.iter().enumerate().any(|(position, value)|
                 value.range.end.checked_sub(value.range.start) != Some(width)
-                    || (position as Address).checked_mul(width)
+                    || (position as Address).checked_mul(step)
                         .and_then(|offset| child.range.start.checked_add(offset)) != Some(value.range.start)) {
                 return None;
             }
@@ -1021,13 +1048,15 @@ impl LazyArray {
         if index >= inner_count || outer.count == 0 || groups.count == 0 || inner_count == 0
             || outer.stride == 0 || groups.stride == 0 || width == 0
             || outer.offsets.is_some() || outer.segmented.is_some()
-            || groups.offsets.is_some() || groups.segmented.is_some()
-            || child.lazy.as_ref().is_some_and(|inner| inner.offsets.is_some() || inner.segmented.is_some()) {
+            || groups.offsets.is_some()
+            || child.lazy.as_ref().is_some_and(|inner| inner.offsets.is_some()
+                || inner.segmented.as_ref().is_some_and(|segment|
+                    segment.inner_count != inner.count || segment.inner_offset != 0)) {
             return None;
         }
         let outer_start = outer.bounds(0)?.start;
         let inner_offset = value_start.checked_sub(outer_start)?;
-        let last_group_offset = (groups.count - 1).checked_mul(groups.stride)?;
+        let last_group_offset = (groups.count - 1).checked_mul(group_step)?;
         if inner_offset.checked_add(last_group_offset)?.checked_add(width)? > outer.stride { return None; }
         let item_prefix = format!("{}[0]", parent.path);
         let group_suffix = group.path.strip_prefix(&item_prefix)?;
@@ -1047,7 +1076,7 @@ impl LazyArray {
                 outer_stride: outer.stride,
                 inner_offset,
                 inner_count: groups.count,
-                inner_stride: groups.stride,
+                inner_stride: group_step,
             }),
             plan: Arc::new(plan),
         };
@@ -1439,6 +1468,10 @@ fn valid_field(field: &Field) -> Result<()> {
         "{}: use either at or relative",
         field.name
     );
+    ensure!(field.offset.is_none() || (field.at.is_none() && field.relative.is_none() && field.align.is_none()),
+        "{}: offset cannot be combined with at, relative, or align", field.name);
+    ensure!(field.step.is_none() || matches!(field.repeat, Some(Repeat::Count(_))),
+        "{}: step requires a counted repeat", field.name);
     if let Some(Repeat::Until(mode)) = &field.repeat {
         ensure!(
             mode == "until end",
@@ -1449,7 +1482,7 @@ fn valid_field(field: &Field) -> Result<()> {
     if let Some(length) = &field.length {
         valid_expr(length, true)?;
     }
-    for expression in [&field.at, &field.relative, &field.align]
+    for expression in [&field.at, &field.relative, &field.offset, &field.step, &field.align]
         .into_iter()
         .flatten()
     {
@@ -1504,11 +1537,16 @@ fn validate_actions(actions: &[Action], depth: Address) -> Result<()> {
             Action::Read(f) => valid_field(f)?,
             Action::Define(d) => {
                 valid_name(&d.name)?;
+                ensure!(d.fields.item_step.is_none() || d.fields.items_per_group.is_some(),
+                    "item_step requires items_per_group");
                 for expression in [
                     &d.fields.repeat,
                     &d.fields.length,
                     &d.fields.at,
                     &d.fields.relative,
+                    &d.fields.offset,
+                    &d.fields.step,
+                    &d.fields.item_step,
                 ]
                 .into_iter()
                 .flatten()
@@ -1648,6 +1686,7 @@ struct Engine<'a> {
     cancel: &'a AtomicBool,
     revision: u64,
     regions: Vec<Range<Address>>,
+    bases: Vec<Address>,
     structures: BTreeMap<String, Structure>,
     enums: Vec<EnumDef>,
     values: HashMap<String, Value>,
@@ -1670,6 +1709,7 @@ impl<'a> Engine<'a> {
             cancel,
             revision,
             regions: vec![],
+            bases: vec![],
             structures,
             enums,
             values: HashMap::new(),
@@ -1921,6 +1961,11 @@ impl<'a> Engine<'a> {
             start = Address::try_from(position)
                 .context("relative position is before the file or too large")?;
         }
+        if let Some(offset) = &field.offset {
+            let base = self.bases.last().copied().unwrap_or(0);
+            start = base.checked_add(self.size(offset, path)?)
+                .context("field offset overflow")?;
+        }
         ensure!(
             start <= end,
             "{path}: start byte {start} exceeds region end {end}"
@@ -2043,11 +2088,13 @@ impl<'a> Engine<'a> {
             ensure!(structure.actions.is_empty(), "{path}: indexed records cannot define structures");
             let child_endian = field.endian.or(structure.endian).unwrap_or(inherited);
             if length.is_some() { self.regions.push(start..end); }
+            self.bases.push(start);
             for child in &structure.fields {
                 let child_path = child_path(path, &child.name);
                 self.scan_field(child, &child_path, cursor, end, child_endian, depth + 1, needed)
                     .with_context(|| format!("read {child_path} at byte {cursor}"))?;
             }
+            self.bases.pop();
             if length.is_some() { self.regions.pop(); }
         }
         if let Some(expect) = &field.expect {
@@ -2117,11 +2164,55 @@ impl<'a> Engine<'a> {
         element.repeat = None;
         element.at = None;
         element.relative = None;
+        element.offset = None;
+        element.step = None;
         element.align = None;
         let Some(repeat) = &field.repeat else {
             return self.single(&element, path, cursor, end, endian, depth);
         };
         self.check(depth)?;
+        if let Some(step_expr) = &field.step {
+            let Repeat::Count(count_expr) = repeat else { unreachable!() };
+            let count = self.size(count_expr, path)?;
+            let step = self.size(step_expr, path)?;
+            let width = self.fixed_size(&element, path, 0)
+                .with_context(|| format!("{path}: step requires fixed-size elements"))?;
+            ensure!(step > 0 && width > 0, "{path}: step and element size must be positive");
+            let extent = if count == 0 { 0 } else {
+                (count - 1).checked_mul(step).and_then(|distance| distance.checked_add(width))
+                    .context("stepped collection extent overflow")?
+            };
+            let array_end = checked_end(start, extent, end)?;
+            if count > LAZY_THRESHOLD {
+                let mut node = self.fixed_array_node(field, &element, path, start, array_end, count, width, endian)?;
+                node.lazy.as_mut().unwrap().segmented = Some(SegmentedArray {
+                    outer_start: start, outer_stride: extent, inner_offset: 0,
+                    inner_count: count, inner_stride: step,
+                });
+                *cursor = array_end;
+                self.collections.insert(path.into(), node.clone());
+                return Ok(node);
+            }
+            ensure!(count <= MAX_NODES, "{path}: stepped collection exceeds {MAX_NODES} items");
+            let mut children = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                *cursor = start.checked_add(index.checked_mul(step).context("step overflow")?)
+                    .context("item position overflow")?;
+                let mut child = self.single(&element, &format!("{path}[{index}]"), cursor,
+                    end, field.endian.unwrap_or(endian), depth + 1)?;
+                child.name = format!("[{index}]");
+                children.push(child);
+            }
+            *cursor = array_end;
+            let node = Node {
+                name: field.name.clone(), path: path.into(), range: start..array_end,
+                kind: format!("{}[]", self.selected_type(&field.kind, path)?),
+                value: None, children, lazy: None,
+                endian: field.endian.unwrap_or(endian), references: field_references(field), preview: None,
+            };
+            self.collections.insert(path.into(), node.clone());
+            return Ok(node);
+        }
         let stride = self.fixed_size(&element, path, 0);
         let count = match repeat {
             Repeat::Count(expr) => Some(self.size(expr, path)?),
@@ -2386,6 +2477,7 @@ impl<'a> Engine<'a> {
             if length.is_some() {
                 self.regions.push(start..end);
             }
+            self.bases.push(start);
             for child in &structure.fields {
                 let child_path = child_path(path, &child.name);
                 let node = self
@@ -2402,6 +2494,7 @@ impl<'a> Engine<'a> {
                 &mut children,
                 depth + 1,
             )?;
+            self.bases.pop();
             preview = structure.fields.iter().find(|field| field.preview)
                 .and_then(|field| children.iter().find(|child| child.name == field.name))
                 .map(|child| {
@@ -2484,6 +2577,7 @@ impl<'a> Engine<'a> {
         if depth > MAX_DEPTH
             || field.at.is_some()
             || field.relative.is_some()
+            || field.offset.is_some()
             || field.align.is_some()
             || field.expect.is_some()
         {
@@ -2543,7 +2637,14 @@ impl<'a> Engine<'a> {
         };
         match &field.repeat {
             None => Some(base),
-            Some(Repeat::Count(count)) => base.checked_mul(self.size(count, scope).ok()?),
+            Some(Repeat::Count(count)) => {
+                let count = self.size(count, scope).ok()?;
+                if let Some(step) = &field.step {
+                    if count == 0 { Some(0) } else {
+                        (count - 1).checked_mul(self.size(step, scope).ok()?)?.checked_add(base)
+                    }
+                } else { base.checked_mul(count) }
+            }
             Some(Repeat::Until(_)) => None,
         }
     }
@@ -2624,7 +2725,7 @@ impl<'a> Engine<'a> {
         );
         let mut structure = Structure::default();
         let mut names = std::collections::HashSet::new();
-        let mut group_item_types = HashMap::<(String, Address, Option<Address>), String>::new();
+        let mut group_item_types = HashMap::<(String, Address, Option<Address>, Option<Address>), String>::new();
         for (index, element) in children.iter().enumerate() {
             let name = if let Some(reference) = &definition.fields.name {
                 let key = self.lookup(&reference.reference, &element.path)?.key();
@@ -2675,8 +2776,8 @@ impl<'a> Engine<'a> {
                     ))
                 })
                 .transpose()?;
-            ensure!(definition.fields.layout == GroupLayout::Interleaved
-                || definition.fields.items_per_group.is_some(), "contiguous layout requires items_per_group");
+            field.offset = definition.fields.offset.as_ref().map(resolve).transpose()?;
+            field.step = definition.fields.step.as_ref().map(resolve).transpose()?;
             if let Some(items_per_group) = &definition.fields.items_per_group {
                 ensure!(field.repeat.is_some(), "items_per_group requires repeat for the group count");
                 let count = resolve(items_per_group)?;
@@ -2685,7 +2786,9 @@ impl<'a> Engine<'a> {
                     TypeSpec::Name(kind) => kind.clone(),
                     TypeSpec::Select { .. } => unreachable!(),
                 };
-                if definition.fields.layout == GroupLayout::Contiguous {
+                if definition.fields.layout == GroupLayout::Contiguous
+                    && definition.fields.step.is_none()
+                    && definition.fields.item_step.is_none() {
                     let Some(Repeat::Count(groups)) = &field.repeat else { unreachable!() };
                     let groups = constant_size(groups).context("group count must be constant")?;
                     ensure!(groups > 0 && groups <= 4096, "contiguous layout requires 1 to 4096 sensors");
@@ -2697,6 +2800,7 @@ impl<'a> Engine<'a> {
                         let mut samples = Field::scalar(format!("sensor_{sensor}"), value_kind.clone());
                         samples.repeat = Some(Repeat::Count(count.clone()));
                         samples.length = field.length.clone();
+                        samples.step = definition.fields.item_step.as_ref().map(resolve).transpose()?;
                         valid_field(&samples)?;
                         fields.push(samples);
                     }
@@ -2708,7 +2812,9 @@ impl<'a> Engine<'a> {
                     structure.fields.push(field);
                     continue;
                 }
-                let key = (value_kind.clone(), constant_size(&count).unwrap(), field.length.as_ref().and_then(constant_size));
+                let key = (value_kind.clone(), constant_size(&count).unwrap(),
+                    field.length.as_ref().and_then(constant_size),
+                    definition.fields.item_step.as_ref().map(resolve).transpose()?.as_ref().and_then(constant_size));
                 let item_kind = if let Some(existing) = group_item_types.get(&key) {
                     existing.clone()
                 } else {
@@ -2718,6 +2824,7 @@ impl<'a> Engine<'a> {
                     let mut item_field = Field::scalar("values", value_kind);
                     item_field.repeat = Some(Repeat::Count(count));
                     item_field.length = field.length.clone();
+                    item_field.step = definition.fields.item_step.as_ref().map(resolve).transpose()?;
                     valid_field(&item_field)?;
                     self.structures.insert(item_kind.clone(), Structure {
                         fields: vec![item_field], ..Structure::default()
@@ -2878,7 +2985,7 @@ fn contains_remaining(expr: &Expr) -> bool {
 }
 fn field_references(field: &Field) -> Vec<String> {
     let mut refs = Vec::new();
-    for expr in [&field.length, &field.at, &field.relative, &field.align]
+    for expr in [&field.length, &field.at, &field.relative, &field.offset, &field.step, &field.align]
         .into_iter()
         .flatten()
     {
