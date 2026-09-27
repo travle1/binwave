@@ -257,7 +257,7 @@ fn menu_entries(ui: &mut egui::Ui, items: &[Item], selected: &mut Option<(Comman
 
 pub fn overflow_menu(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)> {
     let mut selected = None;
-    ui.menu_button("⋯", |ui| {
+    egui::containers::menu::MenuButton::from_button(egui::Button::new("⋯").frame(false)).ui(ui, |ui| {
         for menu in menus {
             ui.menu_button(&menu.label, |ui| menu_entries(ui, &menu.children, &mut selected));
         }

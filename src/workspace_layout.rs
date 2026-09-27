@@ -12,7 +12,9 @@ impl<T: PartialEq> LegacyFindTab<T> for DockState<T> {
     }
 }
 
-const STORAGE_KEY: &str = "workspace-layout-v3";
+// v3 used the pre-restyle pane geometry. Start v4 from the four-card layout;
+// subsequent user redocking is saved under this key.
+const STORAGE_KEY: &str = "workspace-layout-v4";
 const DECODER_WIDTH: f32 = 0.40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -529,13 +531,11 @@ mod tests {
     #[test]
     fn old_storage_key_does_not_override_current_layout() {
         let mut storage = MemoryStorage::default();
-        eframe::set_value(
-            &mut storage,
-            "workspace-layout-v1",
-            &WorkspaceLayout {
+        for key in ["workspace-layout-v1", "workspace-layout-v3"] {
+            eframe::set_value(&mut storage, key, &WorkspaceLayout {
                 dock: DockState::new(Pane::ALL.to_vec()),
-            },
-        );
+            });
+        }
         assert!(WorkspaceLayout::decode(&storage).is_none());
         assert_eq!(
             WorkspaceLayout::load(Some(&storage))
