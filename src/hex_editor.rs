@@ -660,7 +660,7 @@ A gold underline marks search hits; an orange top edge marks edits.");
                 if ui.button("Save range").clicked() {
                     if let Some(range) = self.selection() {
                         let name = if self.bookmark_name.trim().is_empty() {
-                            format!("0x{:X} · {} bytes", range.start, range.len())
+                            crate::format::byte_range(range.start as u64, range.end as u64)
                         } else {
                             self.bookmark_name.trim().to_owned()
                         };
@@ -724,23 +724,24 @@ A gold underline marks search hits; an orange top edge marks edits.");
         ui.horizontal_wrapped(|ui| {
             if let Some(range) = &selection {
                 if range.len() == 1 {
-                    ui.monospace(format!("Cursor 0x{:X} · byte {}", self.caret, self.caret));
+                    ui.monospace(format!("Cursor 0x{:X} · byte {}", self.caret, crate::format::count(self.caret)));
                 } else {
                     ui.monospace(format!(
-                        "Cursor 0x{:X} · 0x{:X}–0x{:X} · {} selected bytes",
-                        self.caret, range.start, range.end - 1, range.len()
+                        "Cursor 0x{:X} · {} selected",
+                        self.caret, crate::format::byte_range(range.start as u64, range.end as u64)
                     ));
                 }
             } else {
                 ui.weak(format!(
-                    "{} bytes · select bytes to inspect or define a structure",
-                    source.len()
-                ));
+                    "{} · select bytes to inspect or define a structure",
+                    crate::format::size(source.len() as u64)
+                )).on_hover_text(crate::format::exact_bytes(source.len() as u64));
             }
             if let Some(field) = narrowest_highlight(highlights.iter(), self.caret) {
                 let label = field.name.rsplit_once('.').map_or(field.name.as_str(), |(_, name)| name);
                 ui.label(RichText::new(label).color(field.color))
-                    .on_hover_text(format!("{}\nDecoded field · 0x{:X}–0x{:X} · {} bytes\nField tint does not change your byte selection.", field.name, field.range.start, field.range.end - 1, field.range.len()));
+                    .on_hover_text(format!("{}\nDecoded field · {}\nField tint does not change your byte selection.",
+                        field.name, crate::format::byte_range(field.range.start as u64, field.range.end as u64)));
             }
             if self.high_nibble.is_some() {
                 ui.colored_label(Color32::YELLOW, "Type the second hex digit");
@@ -1131,14 +1132,12 @@ A gold underline marks search hits; an orange top edge marks edits.");
         if !wants_context && !ui.input(|i| i.pointer.any_down()) {
             if let Some((response, index, selected, matched)) = byte_tooltip {
                 response.on_hover_ui_at_pointer(|ui| {
-                    ui.monospace(format!("0x{index:X} · byte {index}"));
+                    ui.monospace(format!("0x{index:X} · byte {}", crate::format::count(index)));
                     if let Some(field) = narrowest_highlight(highlights.iter(), index) {
                         ui.colored_label(field.color, &field.name);
                         ui.weak(format!(
-                            "Decoded field · 0x{:X}–0x{:X} · {} bytes",
-                            field.range.start,
-                            field.range.end - 1,
-                            field.range.len()
+                            "Decoded field · {}",
+                            crate::format::byte_range(field.range.start as u64, field.range.end as u64)
                         ));
                     }
                     for bookmark in self.bookmarks.iter().filter(|h| h.range.contains(&index)) {
@@ -1511,9 +1510,9 @@ fn replacement_bytes(
     }
     if bytes.len() != selection.len() {
         return Err(format!(
-            "Select exactly {} bytes to overwrite; {} bytes are currently selected.",
-            bytes.len(),
-            selection.len()
+            "Select exactly {} to overwrite; {} selected.",
+            crate::format::exact_bytes(bytes.len() as u64),
+            crate::format::exact_bytes(selection.len() as u64)
         ));
     }
     if selection.end > len {

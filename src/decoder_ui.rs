@@ -260,7 +260,7 @@ fn parsing_map_ui(ui: &mut Ui, map: &ParsingMap, action: &mut ConsoleAction) {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(format!("{}", index + 1)).strong());
             ui.monospace(&step.label);
-            ui.weak(format!("byte {} (0x{:X})", step.byte, step.byte));
+            ui.weak(format!("byte {} (0x{:X})", crate::format::count(step.byte), step.byte));
             if ui.small_button("Show in Hex").clicked() {
                 action.byte = Some(step.byte);
             }
@@ -278,16 +278,16 @@ fn parsing_map_ui(ui: &mut Ui, map: &ParsingMap, action: &mut ConsoleAction) {
             .show(ui, |ui| {
                 ui.colored_label(color, RichText::new("Read crossed its enclosing boundary").strong());
                 ui.label(format!(
-                    "The read starts at byte {} and requests {} bytes, ending at byte {}. Only {} bytes remain before this region ends at byte {}, so the read overruns it by {} bytes.",
-                    boundary.start,
-                    boundary.requested_bytes(),
-                    boundary.requested_end,
-                    boundary.available_bytes(),
-                    boundary.region_end,
-                    boundary.overrun(),
+                    "The read starts at byte {} and requests {}, ending at byte {}. The region ends at byte {}, {} after the start, so the read overruns it by {}.",
+                    crate::format::count(boundary.start),
+                    crate::format::exact_bytes(boundary.requested_bytes()),
+                    crate::format::count(boundary.requested_end),
+                    crate::format::count(boundary.region_end),
+                    crate::format::exact_bytes(boundary.available_bytes()),
+                    crate::format::exact_bytes(boundary.overrun()),
                 ));
                 ui.horizontal_wrapped(|ui| {
-                    if ui.small_button(format!("Show byte {} in Hex", boundary.start)).clicked() {
+                    if ui.small_button(format!("Show byte {} in Hex", crate::format::count(boundary.start))).clicked() {
                         action.byte = Some(boundary.start);
                     }
                     ui.weak("Check whether the decoded length includes its header, whether a repeat should stop earlier, or whether an earlier field shifted the cursor.");
@@ -299,8 +299,11 @@ fn parsing_map_ui(ui: &mut Ui, map: &ParsingMap, action: &mut ConsoleAction) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.strong("Repeat size check");
             ui.label(format!(
-                "{} available bytes ÷ {} bytes per item = {} complete items, with {} bytes left over.",
-                repeat.region, repeat.item_size, repeat.complete, repeat.remainder,
+                "{} available ÷ {} per item = {}, with {} left over.",
+                crate::format::exact_bytes(repeat.region),
+                crate::format::exact_bytes(repeat.item_size),
+                crate::format::plural(repeat.complete, "complete item", "complete items"),
+                crate::format::exact_bytes(repeat.remainder),
             ));
             if repeat.complete > 0 && repeat.remainder % repeat.complete == 0 {
                 let extra = repeat.remainder / repeat.complete;
@@ -531,7 +534,7 @@ mod tests {
             "Parsing map",
             "Sections[5].payload",
             "Read crossed its enclosing boundary",
-            "Show byte 8344 in Hex",
+            "Show byte 8,344 in Hex",
         ] {
             assert!(labels.contains(&expected), "missing {expected}: {labels:?}");
         }

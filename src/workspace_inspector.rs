@@ -72,23 +72,22 @@ pub fn field_heading(ui: &mut Ui, field: &FieldInfo, samples_collection: Option<
     if let Some(index) = field.sample {
         let collection = field.path.rfind('[').map(|bracket| &field.path[..bracket]);
         let noun = if collection.is_some() && collection == samples_collection { "Sample" } else { "Item" };
-        ui.weak(format!("{noun} {index}"));
+        ui.weak(format!("{noun} {}", crate::format::count(index)));
     }
 }
 
 pub fn field_details(ui: &mut Ui, field: &FieldInfo, definition: Option<(u64, usize)>) {
     if let Some((consumed, types)) = definition {
         ui.label(format!(
-            "Decoder covers {consumed} bytes · {types} reusable types"
-        ));
+            "Decoder covers {} · {}",
+            crate::format::size(consumed),
+            crate::format::plural(types as u64, "reusable type", "reusable types")
+        )).on_hover_text(crate::format::exact_bytes(consumed));
     }
     ui.label("Definition path");
     ui.monospace(&field.path);
     ui.label(format!("Type: {} · {} endian", field.kind, field.endian));
-    ui.label(format!(
-        "Field bytes: 0x{:X}..0x{:X} (end exclusive)",
-        field.start, field.end
-    ));
+    ui.label(format!("Field bytes: {}", crate::format::byte_range(field.start, field.end)));
     if !field.references.is_empty() {
         ui.label(format!("Uses: {}", field.references.join(", ")));
     }
@@ -138,11 +137,11 @@ pub fn byte_selection(ui: &mut Ui, range: Range<u64>, bytes: Option<&[u8]>) {
         return;
     }
     ui.label(RichText::new("Byte selection").strong());
-    ui.monospace(format!("0x{:X}–0x{:X}", range.start, range.end - 1));
+    ui.monospace(crate::format::byte_range(range.start, range.end));
     ui.label(format!(
-        "{} bytes · absolute offset {}",
-        range.end - range.start,
-        range.start
+        "{} · absolute offset {}",
+        crate::format::exact_bytes(range.end - range.start),
+        crate::format::count(range.start)
     ));
     let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty()) else {
         ui.weak("Loading selected bytes…");

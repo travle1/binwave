@@ -21,6 +21,8 @@ mod byte_store;
 mod cache;
 #[path = "../src/file_range.rs"]
 mod file_range;
+#[path = "../src/format.rs"]
+mod format;
 #[path = "../src/file_source.rs"]
 mod file_source;
 #[path = "../src/structure.rs"]

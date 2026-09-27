@@ -244,9 +244,9 @@ impl CsvTable {
         }
         ui.horizontal_wrapped(|ui| {
             if complete {
-                ui.small(format!("{} rows", data.rows));
+                ui.small(crate::format::plural(data.rows as u64, "row", "rows"));
             } else {
-                ui.small(format!("{} rows available", data.rows));
+                ui.small(format!("{} available", crate::format::plural(data.rows as u64, "row", "rows")));
             }
             if awaiting_rows {
                 if reading || response.requested_rows.is_some() {
@@ -269,7 +269,7 @@ impl CsvTable {
             "Read-only CSV values · click to link with Hex and Signal; Shift-click selects rows.",
         );
         if let Some(selection) = self.row_selection {
-            ui.small(format!("{} rows selected", selection.rows().len()));
+            ui.small(format!("{} selected", crate::format::plural(selection.rows().len() as u64, "row", "rows")));
         }
         let key = Key {
             dataset,

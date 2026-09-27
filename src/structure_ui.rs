@@ -557,7 +557,7 @@ impl StructureWorkspace {
         let selected = self
             .output
             .as_ref()
-            .and_then(|output| self.views.table(ui, output, source));
+            .and_then(|output| self.views.table(ui, output, self.program.as_ref(), source));
         if let Some(range) = &selected {
             self.selection = Some(range.clone());
         }
@@ -1070,7 +1070,7 @@ impl FormatEditor {
                                         .hint_text("bytes"),
                                 );
                             } else if let Some(width) = primitive_size(&field.kind) {
-                                ui.weak(format!("{width} bytes"));
+                                ui.weak(crate::format::exact_bytes(width as u64));
                             }
                             if field.repeat_mode == 1 {
                                 ui.weak(format!("repeat {}", field.repeat.text));
@@ -2507,10 +2507,8 @@ impl Builder {
         });
         if let (Some(start), Some(bytes)) = (selected_start, selected_bytes) {
             ui.label(
-                egui::RichText::new(format!(
-                    "0x{start:X} – 0x{:X}",
-                    start.saturating_add(bytes).saturating_sub(1)
-                ))
+                egui::RichText::new(crate::format::byte_range(start as u64,
+                    start.saturating_add(bytes) as u64))
                 .monospace()
                 .weak(),
             );
@@ -2596,7 +2594,7 @@ impl Builder {
                                 ui.label("Length");
                                 ui.add(egui::TextEdit::singleline(&mut field.length).desired_width(48.));
                                 ui.weak("bytes");
-                            } else if let Some(width) = primitive_size(&field.kind) { ui.weak(format!("{width} bytes")); }
+                            } else if let Some(width) = primitive_size(&field.kind) { ui.weak(crate::format::exact_bytes(width as u64)); }
                             if let Some(spec) = specs.get(index) { ui.weak(format!("at 0x{:X}", spec.offset)); }
                         });
                         let unchanged = specs.get(index).is_some_and(|spec| spec.kind == field.kind &&
@@ -2649,13 +2647,16 @@ impl Builder {
             );
             if size <= span {
                 ui.label(format!(
-                    "{size} of {span} bytes described · {} remaining",
-                    span - size
+                    "{} of {} described · {} remaining",
+                    crate::format::count(size),
+                    crate::format::exact_bytes(span as u64),
+                    crate::format::exact_bytes((span - size) as u64)
                 ));
             } else {
                 ui.colored_label(
                     Color32::LIGHT_RED,
-                    format!("The fields need {size} bytes; only {span} are selected."),
+                    format!("The fields need {}; only {} selected.",
+                        crate::format::exact_bytes(size as u64), crate::format::exact_bytes(span as u64)),
                 );
             }
             if size > 0
@@ -2667,7 +2668,8 @@ impl Builder {
             {
                 ui.checkbox(
                     &mut self.repeat_selection,
-                    format!("Decode all {} records in this selection", span / size),
+                    format!("Decode all {} in this selection",
+                        crate::format::plural((span / size) as u64, "record", "records")),
                 );
             } else {
                 self.repeat_selection = false;
@@ -4936,7 +4938,7 @@ actions:
             "Name",
             "Fields",
             "Raw bytes",
-            "15 of 15 bytes described · 0 remaining",
+            "15 of 15 bytes described · 0 bytes remaining",
             "Decode selection",
         ] {
             let text = texts

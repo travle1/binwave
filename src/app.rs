@@ -801,9 +801,9 @@ impl BinwaveApp {
                 .as_ref()
                 .is_some_and(|extent| !extent.complete);
         self.status = if partial {
-            format!("{} CSV rows available", data.rows)
+            format!("{} available", crate::format::plural(data.rows as u64, "CSV row", "CSV rows"))
         } else {
-            format!("{} CSV rows · complete", data.rows)
+            format!("{} · complete", crate::format::plural(data.rows as u64, "CSV row", "CSV rows"))
         };
         self.data = Some(data);
         self.load_has_data = true;
@@ -850,9 +850,11 @@ impl BinwaveApp {
                         format!("CSV: {err:#}")
                     };
                     if self.load_has_data {
+                        let rows = self.data.as_ref().unwrap().rows as u64;
                         self.status.push_str(&format!(
-                            " {} rows remain available.",
-                            self.data.as_ref().unwrap().rows
+                            " {} {} available.",
+                            crate::format::plural(rows, "row", "rows"),
+                            if rows == 1 { "remains" } else { "remain" }
                         ));
                     }
                 }
@@ -1246,10 +1248,11 @@ impl BinwaveApp {
             if let Some(selection) = &self.csv_selection {
                 if let Some(rows) = selection.rows {
                     let range = rows.rows();
-                    ui.strong(format!("CSV rows {}–{}", range.start, range.end - 1));
-                    ui.label(format!("{} rows selected", range.len()));
+                    ui.strong(format!("CSV rows {}–{}", crate::format::count(range.start),
+                        crate::format::count(range.end - 1)));
+                    ui.label(format!("{} selected", crate::format::plural(range.len() as u64, "row", "rows")));
                 } else {
-                    ui.strong(format!("CSV row {}", selection.row.index));
+                    ui.strong(format!("CSV row {}", crate::format::count(selection.row.index)));
                 }
                 if let Some(column) = selection.column {
                     ui.label(format!(
@@ -1259,10 +1262,9 @@ impl BinwaveApp {
                     ));
                 }
                 ui.weak(format!(
-                    "{} selected bytes · 0x{:X}..0x{:X}",
-                    selection.bytes.len(),
-                    selection.bytes.start,
-                    selection.bytes.end
+                    "{} selected · {}",
+                    crate::format::exact_bytes(selection.bytes.len() as u64),
+                    crate::format::byte_range(selection.bytes.start as u64, selection.bytes.end as u64)
                 ));
                 ui.separator();
             }
@@ -1419,13 +1421,12 @@ impl BinwaveApp {
             });
             if self.binary.has_file() {
                 let len = self.binary.file_len();
-                let size = if len >= 1024 * 1024 { format!("{:.1} MiB", len as f64 / (1024. * 1024.)) }
-                    else if len >= 1024 { format!("{:.1} KiB", len as f64 / 1024.) }
-                    else { format!("{len} B") };
-                ui.label(egui::RichText::new(format!("{size} · {}{}",
+                ui.label(egui::RichText::new(format!("{} · {}{}",
+                    crate::format::size(len as u64),
                     self.binary.default_byte_order().unwrap_or("byte order unspecified"),
                     if self.binary.is_dirty() { " · unsaved changes" } else { "" }))
-                    .size(t.font.small).color(t.color.text.muted));
+                    .size(t.font.small).color(t.color.text.muted))
+                    .on_hover_text(crate::format::exact_bytes(len as u64));
                 let partial = self.data_partial || self.binary.status().1;
                 let (badge, color) = if self.binary.is_decoding() { ("Decoding", t.color.accent.base) }
                     else if partial { ("Partial decode", t.color.status.warning) }
@@ -1577,7 +1578,7 @@ impl BinwaveApp {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Decoder library").size(t.font.title).strong());
-            ui.weak(format!("{} decoders", self.file_locations.decoder_paths().len()));
+            ui.weak(crate::format::plural(self.file_locations.decoder_paths().len() as u64, "decoder", "decoders"));
             if ui.add(egui::Button::new("Back to workspace").frame(false)).clicked() {
                 self.decoder_library_open = false;
             }
@@ -2160,7 +2161,8 @@ impl BinwaveApp {
                 |ui| self.ui_csv_columns(ui),
             );
             ui.weak(format!(
-                "X {min:.3}–{max:.3} · {rows} rows{}",
+                "X {min:.3}–{max:.3} · {}{}",
+                crate::format::plural(rows as u64, "row", "rows"),
                 if complete { "" } else { " available" }
             ));
             if !complete && self.loader_rx.is_none() && ui.button("Index entire file").clicked() {
@@ -2380,7 +2382,7 @@ impl BinwaveApp {
         if hidden > 0 {
             ui.colored_label(
                 egui::Color32::YELLOW,
-                format!("{hidden} signals hidden by the plot line limit"),
+                format!("{} hidden by the plot line limit", crate::format::plural(hidden as u64, "signal", "signals")),
             );
         }
     }
@@ -2497,7 +2499,8 @@ impl TabViewer for WorkspaceViewer<'_> {
                         });
                 }
                 if let Some(range) = self.app.binary.byte_selection() {
-                    ui.weak(format!("Cursor 0x{:X} · {} B selected", range.start, range.len()));
+                    ui.weak(format!("Cursor 0x{:X} · {} selected", range.start,
+                        crate::format::plural(range.len() as u64, "byte", "bytes")));
                 }
                 if self.app.displayed_decoder == Decoder::Csv {
                     let highlights = self.app.csv_highlights();

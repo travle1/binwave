@@ -397,7 +397,8 @@ impl BrowserApp {
                     self.plot_sources.clear();
                     self.reveal_results = true;
                     self.mobile_target = Some(Pane::Structures);
-                    self.status = format!("Partial decode through byte {}. Inspect Structure and the Console error together.", self.decoded["consumed"].as_str().unwrap_or("0"));
+                    let consumed = self.decoded["consumed"].as_str().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+                    self.status = format!("Partial decode through byte {}. Inspect Structure and the Console error together.", crate::format::count(consumed));
                     if let Some((start, end)) = parse_offset(&self.range_start).zip(parse_offset(&self.range_end)) {
                         self.request_inspect(start, end);
                     }
@@ -442,7 +443,8 @@ impl BrowserApp {
                         self.request_plot_view(1200, false);
                     } else { self.select_collection(path); if !self.plot_sources.is_empty() { self.request_plot_view(1200, false); } }
                     if !inline { self.mobile_target = Some(if self.collection.is_empty() { Pane::Structures } else { Pane::Plot }); }
-                    self.status = format!("Decoded {} of {} bytes. {}", self.decoded["consumed"].as_str().unwrap_or("0"), self.size,
+                    let consumed = self.decoded["consumed"].as_str().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+                    self.status = format!("Decoded {} of {}. {}", crate::format::count(consumed), crate::format::exact_bytes(self.size),
                         if self.collection.is_empty() { "Inspect the fields in Structure; unread bytes are allowed." }
                         else if self.samples_path().as_deref() == Some(self.collection.as_str()) { "Select samples to inspect their values and bytes." }
                         else { "Select items to inspect their values and bytes." });
@@ -622,13 +624,15 @@ impl BrowserApp {
             }
         });
         ui.label(format!(
-            "64 KiB page at 0x{:X} · {} bytes loaded",
+            "64 KiB page at 0x{:X} · {} loaded",
             self.offset,
-            self.bytes.len()
+            crate::format::exact_bytes(self.bytes.len() as u64)
         ));
         ui.horizontal_wrapped(|ui| {
             ui.menu_button("Selection", |ui| self.hex_menu(ui));
-            ui.label(format!("Bytes {}..{}", self.range_start, self.range_end));
+            if let Some((start, end)) = parse_offset(&self.range_start).zip(parse_offset(&self.range_end)) {
+                ui.label(format!("Bytes {}", crate::format::byte_range(start, end)));
+            }
         });
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         let digit = ui.fonts_mut(|fonts| fonts.layout_no_wrap("0".into(), font.clone(), egui::Color32::WHITE).size().x);
@@ -943,7 +947,8 @@ impl BrowserApp {
                         (Some(start), Some(end)) if start <= end && end <= self.size => {
                             self.selection_anchor = Some(start);
                             self.set_hex_range(start, end);
-                            self.status = format!("Extraction range {start}..{end} set. Use Extract selection above.");
+                            self.status = format!("Extraction range {} set. Use Extract selection above.",
+                                crate::format::byte_range(start, end));
                         }
                         _ => self.status = "Extraction range must be inside the file.".into(),
                     }
@@ -1257,14 +1262,13 @@ impl BrowserApp {
                 if let Some(arrays) = self.decoded["collections"].as_array() {
                     for a in arrays {
                         let path = a["path"].as_str().unwrap_or("");
-                        let count = a["count"].as_str().unwrap_or("0");
-                        let noun = match (samples.as_deref() == Some(path), count == "1") {
-                            (true, true) => "sample",
-                            (true, false) => "samples",
-                            (false, true) => "item",
-                            (false, false) => "items",
+                        let count = a["count"].as_str().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+                        let label = if samples.as_deref() == Some(path) {
+                            crate::format::plural(count, "sample", "samples")
+                        } else {
+                            crate::format::plural(count, "item", "items")
                         };
-                        ui.selectable_value(&mut selected, path.into(), format!("{path} · {count} {noun}"));
+                        ui.selectable_value(&mut selected, path.into(), format!("{path} · {label}"));
                     }
                 }
             });
@@ -1368,7 +1372,8 @@ impl BrowserApp {
             let page_size = page.and_then(|p| p["page_size"].as_u64()).unwrap_or(64);
             let mut next = None;
             ui.horizontal_wrapped(|ui| {
-                ui.weak(format!("{}–{} / {}", start, start.saturating_add(displayed).min(count), count));
+                ui.weak(format!("{}–{} / {}", crate::format::count(start),
+                    crate::format::count(start.saturating_add(displayed).min(count)), crate::format::count(count)));
                 if ui.add_enabled(start > 0, egui::Button::new("Previous")).clicked() { next = Some(start.saturating_sub(page_size)); }
                 if ui.add_enabled(start.saturating_add(displayed) < count, egui::Button::new("Next")).clicked() { next = Some(start.saturating_add(displayed.max(1))); }
                 ui.label("Go to index");
@@ -1619,7 +1624,9 @@ impl BrowserApp {
                 ui.weak("Use Open data → Extract selection to export bytes.");
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak(format!("Samples {}–{} of {}", self.first, self.last, self.plot_count()));
+                let number = |text: &str| text.trim().parse::<u64>().map_or_else(|_| text.to_owned(), crate::format::count);
+                ui.weak(format!("Samples {}–{} of {}", number(&self.first), number(&self.last),
+                    crate::format::count(self.plot_count())));
             });
         });
         if !self.stacked && self.plot_sidebar_open {
@@ -1903,7 +1910,7 @@ impl eframe::App for BrowserApp {
         }).collect();
         menus.insert(0,crate::app_menu::Item {label:"Panels".into(),command:None,argument:0,enabled:true,checked:None,children:panels});
         menus.insert(1,crate::app_menu::Item {label:"Reset layout".into(),command:Some(crate::app_menu::Command::Reset),argument:0,enabled:true,checked:None,children:vec![]});
-        publish_menus(&serde_json::to_string(&menus).unwrap(), &if self.name.is_empty() { String::new() } else { format!("{} · {} bytes{}",self.name,self.size,if self.dirty {" · unsaved changes"}else{""}) }, &self.status, crate::APP_VERSION);
+        publish_menus(&serde_json::to_string(&menus).unwrap(), &if self.name.is_empty() { String::new() } else { format!("{} · {}{}",self.name,crate::format::size(self.size),if self.dirty {" · unsaved changes"}else{""}) }, &self.status, crate::APP_VERSION);
         if self.stacked {
             egui::CentralPanel::default().show(root_ui, |ui| {
                 ui.spacing_mut().interact_size.y = 32.;

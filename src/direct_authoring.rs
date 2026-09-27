@@ -217,7 +217,7 @@ pub fn change(source: &str, range: Range<u64>, name: &str, kind: &str) -> Result
     };
     let length = range.end - range.start;
     if length % size != 0 {
-        return Err(format!("{kind} needs a multiple of {size} bytes."));
+        return Err(format!("{kind} needs a multiple of {}.", crate::format::exact_bytes(size)));
     }
     let prior = existing(source, &range);
     let value: Value = serde_yaml_ng::from_str(source)
@@ -482,8 +482,8 @@ impl DirectAuthoring {
         let mut chosen = None;
         ui.horizontal_wrapped(|ui| {
             ui.weak(format!(
-                "{} bytes at 0x{:X}",
-                range.end - range.start,
+                "{} at 0x{:X}",
+                crate::format::exact_bytes(range.end - range.start),
                 range.start
             ));
             ui.menu_button("Interpret as", |ui| {

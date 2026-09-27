@@ -42,10 +42,13 @@
         worker.postMessage(m);
         return true;
     }
+    // Thousands separators on the decimal string, so 64-bit sizes stay exact.
+    const count = (value) => String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    const bytes = (value) => `${count(value)} ${String(value) === '1' ? 'byte' : 'bytes'}`;
     worker.onmessage = ({data}) => {
         if (data.type === 'ready') { busy = false; controls(); return; }
         if (ignoreDecoder && (['decoded', 'decode_failed','tree_page'].includes(data.type) || (data.type === 'error' && ['decode','decode_python','table','tree_page','plot','probe','pick','inspect','encode'].includes(operation)))) return;
-        if (data.type === 'progress') { status.textContent = `Exported ${data.done} / ${data.total} bytes`; return; }
+        if (data.type === 'progress') { status.textContent = `Exported ${count(data.done)} / ${bytes(data.total)}`; return; }
         if (['opened', 'edited', 'exported'].includes(data.type)) {
             dirty = data.dirty; size = data.size; opened = true;
             exportable = data.exportable && typeof window.showSaveFilePicker === 'function';
@@ -53,11 +56,11 @@
         }
         if (data.type === 'error') { data.operation = operation; status.textContent = data.message; }
         if (data.type === 'decoded') {
-            status.textContent = `Decoded ${data.result.consumed} of ${size} bytes`;
+            status.textContent = `Decoded ${count(data.result.consumed)} of ${bytes(size)}`;
             if (!data.result.collections.length) status.textContent += ' · inspect Structure';
         }
         if (data.type === 'decode_failed') {
-            status.textContent = `Partial decode through byte ${data.result.consumed} · inspect Structure and Console`;
+            status.textContent = `Partial decode through byte ${count(data.result.consumed)} · inspect Structure and Console`;
         }
         if (data.type === 'exported') status.textContent = 'Export complete';
         if (data.type === 'opened') status.textContent = exportable ? 'Local file opened' : 'Inspection available; safe streaming export needs a supported file-system picker';

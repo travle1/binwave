@@ -241,7 +241,7 @@ fn preview_one(
         }
     };
     Ok(if field.length > bytes.len() && !terminated {
-        format!("{value} … ({} bytes)", field.length)
+        format!("{value} … ({})", crate::format::exact_bytes(field.length as u64))
     } else if value.is_empty() {
         "(empty)".into()
     } else {
@@ -387,7 +387,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(remaining, MAX_BYTES - 32);
-        assert!(value.contains("100000 bytes"));
+        assert!(value.contains("100,000 bytes"));
         assert!(value.starts_with(&format!("\"{}\"", "A".repeat(32))));
         let invalid = vec![
             field("u64", usize::MAX, 8, Endian::Little),

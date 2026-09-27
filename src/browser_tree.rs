@@ -10,21 +10,6 @@ pub struct Action {
     pub select: Option<(String, u64, u64)>,
 }
 
-fn number(value: u64) -> String {
-    let text = value.to_string();
-    let mut out = String::with_capacity(text.len() + text.len() / 3);
-    for (index, digit) in text.chars().enumerate() {
-        if index > 0 && (text.len() - index) % 3 == 0 { out.push(','); }
-        out.push(digit);
-    }
-    out
-}
-fn size(bytes: u64) -> String {
-    if bytes < 1024 { format!("{bytes} B") }
-    else if bytes < 1024 * 1024 { format!("{:.2} KiB", bytes as f64 / 1024.) }
-    else if bytes < 1024 * 1024 * 1024 { format!("{:.2} MiB", bytes as f64 / (1024. * 1024.)) }
-    else { format!("{:.2} GiB", bytes as f64 / (1024. * 1024. * 1024.)) }
-}
 fn collect(node: &Value, depth: usize, expanded: &HashSet<String>, pages: &HashMap<String, Value>, rows: &mut Vec<(Value, usize)>) {
     rows.push((node.clone(), depth));
     let path = node["path"].as_str().unwrap_or("");
@@ -37,10 +22,10 @@ fn collect(node: &Value, depth: usize, expanded: &HashSet<String>, pages: &HashM
 }
 fn row_value(node: &Value) -> String {
     if let Some(count) = node["count"].as_str().and_then(|s| s.parse::<u64>().ok()) {
-        return format!("{} items", number(count));
+        return crate::format::plural(count, "item", "items");
     }
     if let Some(value) = node["value"].as_str().filter(|s| !s.is_empty()) {
-        if let Ok(integer) = value.parse::<u64>() { return number(integer); }
+        if let Ok(integer) = value.parse::<u64>() { return crate::format::count(integer); }
         return value.to_owned();
     }
     if let Some(children) = node["children"].as_array() {
@@ -48,7 +33,7 @@ fn row_value(node: &Value) -> String {
             .or_else(|| children.first()) {
             if let Some(value) = identifier["value"].as_str() { return value.to_owned(); }
         }
-        if !children.is_empty() { return format!("{} items", number(children.len() as u64)); }
+        if !children.is_empty() { return crate::format::plural(children.len() as u64, "item", "items"); }
     }
     String::new()
 }
@@ -115,13 +100,14 @@ pub fn show(ui: &mut Ui, decoded: &Value, expanded: &HashSet<String>, pages: &Ha
                     if ui.button("Copy value").clicked() { ui.ctx().copy_text(row_value(node)); ui.close(); }
                     if ui.button("Copy path").clicked() { ui.ctx().copy_text(path.to_owned()); ui.close(); }
                 });
-                response.on_hover_text(format!("{path}\n{} bytes · 0x{start:08X}–0x{end:08X}", number(end.saturating_sub(start))));
+                response.on_hover_text(format!("{path}\n{}\n{}", crate::format::byte_range(start, end),
+                    crate::format::exact_bytes(end.saturating_sub(start))));
                 let fields = [
                     (node["name"].as_str().unwrap_or("" ).to_owned(), theme.color.text.primary, left + 16., widths[0] - (left - rect.left()) - 20.),
                     (node["kind"].as_str().unwrap_or("").to_owned(), theme.color.text.muted, rect.left() + widths[0] + 6., widths[1] - 10.),
                     (row_value(node), theme.color.text.primary, rect.left() + widths[0] + widths[1] + 6., widths[2] - 10.),
                     (format!("0x{start:08X}"), theme.color.text.muted, rect.left() + widths[0] + widths[1] + widths[2] + 6., widths[3] - 10.),
-                    (size(end.saturating_sub(start)), theme.color.text.muted, rect.left() + widths[0] + widths[1] + widths[2] + widths[3] + 6., widths[4] - 10.),
+                    (crate::format::size(end.saturating_sub(start)), theme.color.text.muted, rect.left() + widths[0] + widths[1] + widths[2] + widths[3] + 6., widths[4] - 10.),
                 ];
                 for (text, color, x, width) in fields {
                     let cell = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(width.max(0.), rect.height()));

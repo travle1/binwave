@@ -35,6 +35,7 @@ mod data;
 #[cfg(not(target_arch = "wasm32"))]
 mod field_preview;
 mod field_edit;
+mod format;
 #[cfg(not(target_arch = "wasm32"))]
 mod file_dialog;
 mod file_range;

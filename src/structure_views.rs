@@ -683,7 +683,7 @@ impl StructureViews {
                             .and_then(|page| page.result.as_ref().ok()).map_or(0, Vec::len);
                         let remaining = array.count.saturating_sub(request.key.start.saturating_add(displayed));
                         if remaining > 0 {
-                            ui.weak(format!("… {} more items", comma_number(remaining)));
+                            ui.weak(format!("… {} more", crate::format::plural(remaining as u64, "item", "items")));
                         }
                     }
                     self.page_controls(ui, &node, output.revision, true);
@@ -782,7 +782,7 @@ impl StructureViews {
                         let value = tree_column_value(node, parent_kind, program);
                         let kind = tree_column_type(node);
                         let offset = format!("0x{:08X}", node.range.start);
-                        let size_label = readable_bytes(size);
+                        let size_label = crate::format::size(size as u64);
                         paint_tree_columns(ui, rect, widths,
                             ["", &kind, &value, &offset, &size_label, ""], false);
                         let issue = self.page_for(&node.path, output.revision)
@@ -795,8 +795,10 @@ impl StructureViews {
                                 if warning { crate::theme::DARK.color.status.warning } else { crate::theme::DARK.color.status.success },
                                 false, false, crate::theme::DARK.font.body);
                         }
-                        let tooltip = format!("{}\n{}\n0x{:08X}..0x{:08X}\n{} bytes{}",
-                            node.path, node.kind, node.range.start, node.range.end, comma_number(size),
+                        let tooltip = format!("{}\n{}\n{}\n{}{}",
+                            node.path, node.kind,
+                            crate::format::byte_range(node.range.start as u64, node.range.end as u64),
+                            crate::format::exact_bytes(size as u64),
                             if node.references.is_empty() { String::new() } else { format!("\n{}", node.references.join("\n")) });
                         let tooltip = issue.map_or(tooltip.clone(), |error| format!("{tooltip}\n{error}"));
                         let tooltip = node.numeric_tooltip().map_or(tooltip.clone(), |number| format!("{number}\n\n{tooltip}"));
@@ -904,8 +906,8 @@ impl StructureViews {
                 if let Some(origin) = &definition.origin {
                     if ui
                         .link(format!(
-                            "Defined by 0x{:X}..0x{:X}",
-                            origin.start, origin.end
+                            "Defined by {}",
+                            crate::format::byte_range(origin.start as u64, origin.end as u64)
                         ))
                         .clicked()
                     {
@@ -979,11 +981,10 @@ impl StructureViews {
             } else {
                 let count = collection_count(&node);
                 ui.weak(format!(
-                    "{} {} · 0x{:X}–0x{:X}",
-                    count,
+                    "{} {} · {}",
+                    crate::format::count(count),
                     row_noun(samples, count),
-                    node.range.start,
-                    node.range.end
+                    crate::format::byte_range(node.range.start as u64, node.range.end as u64)
                 ));
             }
         } else if collections.is_empty() {
@@ -1014,12 +1015,12 @@ impl StructureViews {
             ui.label(format!(
                 "{} {}–{} of {}",
                 if item_navigation { "Items" } else { "Samples" },
-                comma_number(start),
-                comma_number(start
+                crate::format::count(start),
+                crate::format::count(start
                     .saturating_add(page_size)
                     .min(array.count)
                     .saturating_sub(1)),
-                comma_number(array.count)
+                crate::format::count(array.count)
             ));
             if ui
                 .add_enabled(
@@ -1119,7 +1120,8 @@ impl StructureViews {
             let open = self.table_open_groups.contains(&key);
             let label = key.rsplit('.').nth(1).unwrap_or(&key);
             navigation.push(TableNavigation {
-                label: format!("{} {label} · {} items", if open { "▾" } else { "▸" }, sensors.len()),
+                label: format!("{} {label} · {}", if open { "▾" } else { "▸" },
+                    crate::format::plural(sensors.len() as u64, "item", "items")),
                 path: key,
                 group: true,
                 depth: 0,
@@ -1156,6 +1158,7 @@ impl StructureViews {
         &mut self,
         ui: &mut Ui,
         output: &ParseOutput,
+        program: Option<&Program>,
         source: ByteView,
     ) -> Option<Range<usize>> {
         self.tick(ui.ctx(), source.clone());
@@ -1306,8 +1309,9 @@ impl StructureViews {
                                     sample_collection,
                                 )
                                 .on_hover_text(format!(
-                                    "Select whole {row_label}\n{}\n0x{:X}..0x{:X}",
-                                    node.path, node.range.start, node.range.end
+                                    "Select whole {row_label}\n{}\n{}",
+                                    node.path,
+                                    crate::format::byte_range(node.range.start as u64, node.range.end as u64)
                                 ))
                                 .clicked()
                                 {
@@ -1315,7 +1319,7 @@ impl StructureViews {
                                 }
                                 if table_numeric_cell(
                                     ui,
-                                    &format!("0x{:X}", node.range.start),
+                                    &crate::format::offset(node.range.start as u64),
                                     widths[1],
                                     row_height,
                                     false,
@@ -1341,9 +1345,15 @@ impl StructureViews {
                                 }
                                 for name in &columns {
                                     if let Some(field) = field_at(node, name) {
+                                        // Enum codes show their meaning, as in Structure: `3 · f64`.
+                                        let parent = name.rsplit_once('.')
+                                            .and_then(|(parent, _)| field_at(node, parent)).unwrap_or(node);
+                                        let text = tree_enum_meaning(field, Some(parent.kind.as_str()), program)
+                                            .map_or_else(|| display(field, 180),
+                                                |meaning| format!("{} · {meaning}", display(field, 180)));
                                         if table_cell_aligned(
                                             ui,
-                                            &display(field, 180),
+                                            &text,
                                             value_width,
                                             row_height,
                                             selected == Some(&field.path),
@@ -1352,12 +1362,10 @@ impl StructureViews {
                                             field.value.as_ref().and_then(Value::numeric).is_some(),
                                         )
                                         .on_hover_text(format!(
-                                            "{}\n{} · {} bytes · 0x{:X}..0x{:X}\n{}",
+                                            "{}\n{} · {}\n{}",
                                             field.path,
                                             field.kind,
-                                            field.range.len(),
-                                            field.range.start,
-                                            field.range.end,
+                                            crate::format::byte_range(field.range.start as u64, field.range.end as u64),
                                             display(field, 600)
                                         ))
                                         .clicked()
@@ -1913,8 +1921,9 @@ impl StructureViews {
                     }
                 }
                 let (bytes, pending, error) = crate::structure_plot::decoded_data_status(&source);
-                ui.weak(format!("Decoded data on disk: {:.1} MiB · {pending} pending",
-                    bytes as f64 / (1024. * 1024.)));
+                ui.weak(format!("Decoded data on disk: {} · {} pending",
+                    crate::format::size(bytes), crate::format::count(pending)))
+                    .on_hover_text(crate::format::exact_bytes(bytes));
                 if let Some(error) = error.or_else(|| self.plot_cache_error.clone()) {
                     ui.colored_label(egui::Color32::LIGHT_RED, format!("New decoded data was not retained: {error}"));
                 }
@@ -1998,17 +2007,19 @@ impl StructureViews {
             }
             if let (Some(bytes), Some(samples)) = (&selected_bytes, &selected_samples) {
                 let label = if samples.len() == 1 {
-                    format!("Sample {}", samples.start)
+                    format!("Sample {}", crate::format::count(samples.start))
                 } else {
-                    format!("Samples {}–{}", samples.start, samples.end.saturating_sub(1))
+                    format!("Samples {}–{}", crate::format::count(samples.start),
+                        crate::format::count(samples.end.saturating_sub(1)))
                 };
-                let unit = if bytes.len() == 1 { "byte" } else { "bytes" };
-                ui.weak(format!("{label} · {} {unit} selected", bytes.len()))
-                    .on_hover_text(format!("0x{:X}..0x{:X} (end exclusive). Whole-sample export includes all interleaved fields.", bytes.start, bytes.end));
+                ui.weak(format!("{label} · {} selected", crate::format::plural(bytes.len() as u64, "byte", "bytes")))
+                    .on_hover_text(format!("{}\nWhole-sample export includes all interleaved fields.",
+                        crate::format::byte_range(bytes.start as u64, bytes.end as u64)));
             }
         });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak(format!("Samples {}–{} of {}", view.start, view.end.saturating_sub(1), count));
+                ui.weak(format!("Samples {}–{} of {}", crate::format::count(view.start),
+                    crate::format::count(view.end.saturating_sub(1)), crate::format::count(count)));
                 let axis = self.plot_axis_group.as_ref()
                     .map(|group| (format!("Y: {} group", plot_series_group_label(group)), group))
                     .or_else(|| self.plot_axis_series.as_ref()
@@ -2044,7 +2055,7 @@ impl StructureViews {
                     || entry.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
                     self.plot_go_open = false;
                 }
-                if sample.is_none() { ui.weak(format!("Enter 0–{}", count - 1)); }
+                if sample.is_none() { ui.weak(format!("Enter 0–{}", crate::format::count(count - 1))); }
             });
         }
         if changed { self.plot_fit_y=true; }
@@ -2179,9 +2190,11 @@ impl StructureViews {
             }
             if extra_loading > 0 {
                 ui.spinner();
-                ui.weak(format!("{extra_loading} other collections loading"));
+                ui.weak(format!("{} loading", crate::format::plural(extra_loading as u64, "other collection", "other collections")));
             }
-            if queued_collections > 0 { ui.weak(format!("{queued_collections} collections queued")); }
+            if queued_collections > 0 {
+                ui.weak(format!("{} queued", crate::format::plural(queued_collections as u64, "collection", "collections")));
+            }
             if !self.plot_paused && (self.plot_reader.is_loading() || extra_loading > 0 || queued_collections > 0)
                 && ui.button("Stop loading").clicked() {
                 self.plot_reader.stop();
@@ -2190,7 +2203,8 @@ impl StructureViews {
                 self.plot_paused = true;
             }
             if self.plot_catalog.len() > 32 {
-                ui.weak(format!("{} available fields; select fields in Series", self.plot_catalog.len()));
+                ui.weak(format!("{} available; select fields in Series",
+                    crate::format::plural(self.plot_catalog.len() as u64, "field", "fields")));
             }
             if self.plot_paused { ui.weak("Stopped · zoom or Fit to read again"); }
         });
@@ -2954,7 +2968,7 @@ fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], samples: Option<&
     let grouped_containers: HashSet<_> = groups.keys().filter_map(|key|
         key.rsplit_once('.').map(|(path, _)| path.to_owned())).collect();
     ui.horizontal(|ui| {
-        ui.label(format!("{} selected", selected.len()));
+        ui.label(format!("{} selected", crate::format::count(selected.len())));
         if ui.add_enabled(!selected.is_empty(), egui::Button::new("Clear selection")).clicked() {
             selected.clear();
             changed = true;
@@ -3003,7 +3017,8 @@ fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], samples: Option<&
                         continue;
                     }
                     let enabled = matching.iter().filter(|(_, node)| selected.contains(&node.path)).count();
-                    egui::CollapsingHeader::new(format!("{label} · {enabled}/{} items", matching.len()))
+                    egui::CollapsingHeader::new(format!("{label} · {}/{} items", crate::format::count(enabled),
+                        crate::format::count(matching.len())))
                         .id_salt(&key)
                         .default_open(!query.is_empty())
                         .show(ui, |ui| {
@@ -3695,7 +3710,7 @@ fn numeric_bounds(values: impl Iterator<Item = f64>) -> Option<(f64, f64)> {
 
 fn collection_label(node: &Node, samples: bool) -> String {
     let count = collection_count(node);
-    format!("{} · {} {}", node.name, count, row_noun(samples, count))
+    format!("{} · {} {}", node.name, crate::format::count(count), row_noun(samples, count))
 }
 
 fn compact_float(value: f64) -> String {
@@ -3738,35 +3753,13 @@ fn display(node: &Node, limit: usize) -> String {
     }
 }
 
-fn comma_number(value: impl std::fmt::Display) -> String {
-    let text = value.to_string();
-    let (sign, digits) = text.strip_prefix('-').map_or(("", text.as_str()), |digits| ("-", digits));
-    let mut grouped = String::from(sign);
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 { grouped.push(','); }
-        grouped.push(digit);
-    }
-    grouped
-}
-
-fn readable_bytes(bytes: usize) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024. && unit + 1 < UNITS.len() {
-        value /= 1024.;
-        unit += 1;
-    }
-    if unit == 0 { format!("{bytes} B") } else { format!("{value:.2} {}", UNITS[unit]) }
-}
-
 fn tree_column_type(node: &Node) -> String {
     if let Some(array) = &node.lazy {
-        format!("{}[{}]", node.kind.trim_end_matches("[]"), comma_number(array.count))
+        format!("{}[{}]", node.kind.trim_end_matches("[]"), crate::format::count(array.count))
     } else if node.kind.ends_with("[]") {
-        format!("{}[{}]", node.kind.trim_end_matches("[]"), comma_number(node.children.len()))
+        format!("{}[{}]", node.kind.trim_end_matches("[]"), crate::format::count(node.children.len()))
     } else if node.kind == "string" {
-        format!("string[{}]", node.range.end.saturating_sub(node.range.start))
+        format!("string[{}]", crate::format::count(node.range.end.saturating_sub(node.range.start)))
     } else {
         node.kind.clone()
     }
@@ -3790,20 +3783,38 @@ fn tree_enum_meaning<'a>(node: &Node, parent_kind: Option<&str>, program: Option
             _ => None,
         })
     }
+    // A `define` elsewhere maps this field when it reads the collection the field
+    // belongs to, e.g. `define: {from: entries, fields: {type: {ref: format, cases}}}`.
+    let collection = node.path.strip_suffix(&format!(".{}", node.name))
+        .and_then(|item| item.strip_suffix(']'))
+        .and_then(|item| item.rsplit_once('[')).map(|(collection, _)| collection)
+        .map(|collection| collection.rsplit('.').next().unwrap_or(collection));
+    fn defined_from<'a>(actions: &'a [Action], collection: &str, name: &str, key: &str, program: &'a Program) -> Option<&'a str> {
+        actions.iter().find_map(|action| match action {
+            Action::Define(definition) if definition.from == collection =>
+                mapped(&definition.fields.kind, name, key, program),
+            Action::Choose(choice) => choice.cases.values()
+                .find_map(|branch| defined_from(branch, collection, name, key, program))
+                .or_else(|| defined_from(&choice.otherwise, collection, name, key, program)),
+            _ => None,
+        })
+    }
     parent_kind.and_then(|kind| program.structures.get(kind)).and_then(|structure|
         structure.fields.iter().find_map(|field| match &field.kind {
             TypeSpec::Select { choose } => mapped(choose, &node.name, &key, program),
             _ => None,
         }).or_else(|| from_actions(&structure.actions, &node.name, &key, program)))
         .or_else(|| from_actions(&program.actions, &node.name, &key, program))
+        .or_else(|| collection.and_then(|collection| program.structures.values()
+            .find_map(|structure| defined_from(&structure.actions, collection, &node.name, &key, program))))
 }
 
 fn tree_column_value(node: &Node, parent_kind: Option<&str>, program: Option<&Program>) -> String {
-    if let Some(array) = &node.lazy { return format!("{} items", comma_number(array.count)); }
+    if let Some(array) = &node.lazy { return crate::format::plural(array.count as u64, "item", "items"); }
     if let Some(value) = &node.value {
         let display = match value {
-            Value::Signed(number) => comma_number(number),
-            Value::Unsigned(number) => comma_number(number),
+            Value::Signed(number) => crate::format::count(number),
+            Value::Unsigned(number) => crate::format::count(number),
             Value::Float(number) => compact_float(*number),
             Value::Text(text) => format!("{text:?}"),
             Value::Bytes(_) => display(node, 90),
@@ -3812,7 +3823,7 @@ fn tree_column_value(node: &Node, parent_kind: Option<&str>, program: Option<&Pr
             .map_or(display.clone(), |meaning| format!("{display} · {meaning}"));
     }
     if node.kind.ends_with("[]") || node.kind == "partial collection" {
-        return format!("{} items", comma_number(node.children.len()));
+        return crate::format::plural(node.children.len() as u64, "item", "items");
     }
     if !node.name.starts_with('[') {
         return node.preview.as_ref().and_then(|preview| preview.split_once('=').map(|(_, value)| value.to_owned()))
@@ -3825,8 +3836,8 @@ fn tree_column_value(node: &Node, parent_kind: Option<&str>, program: Option<&Pr
     identifying.map(|child| {
         let value = match child.value.as_ref().unwrap() {
         Value::Text(text) => text.clone(),
-        Value::Signed(number) => comma_number(number),
-        Value::Unsigned(number) => comma_number(number),
+        Value::Signed(number) => crate::format::count(number),
+        Value::Unsigned(number) => crate::format::count(number),
         value => value.to_string(),
         };
         if child.name == "id" { format!("id {value}") } else { value }
@@ -3946,6 +3957,21 @@ mod tests {
         }), "selected row must be highlighted across all columns");
     }
     #[test]
+    fn enum_meanings_come_from_a_define_that_reads_the_fields_collection() {
+        let yaml = "structures:\n  - name: Field\n    fields:\n      - {name: name, type: string, length: 4}\n      - {name: format, type: u32}\n  - name: Header\n    fields:\n      - {name: entries, type: {structure: Field}, repeat: 2}\n    actions:\n      - define:\n          name: Sample\n          from: entries\n          fields:\n            name: {ref: name}\n            type: {ref: format, cases: {'3': f64, '5': u32}}\nactions:\n  - read: {name: header, type: {structure: Header}}\n";
+        let program = Program::parse(yaml).unwrap();
+        let mut bytes = Vec::new();
+        for (name, format) in [(b"sine", 3_u32), (b"ramp", 5)] {
+            bytes.extend_from_slice(name);
+            bytes.extend_from_slice(&format.to_le_bytes());
+        }
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let output = program.run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let format = |item: usize| find_node(&output.nodes, &format!("header.entries[{item}].format")).unwrap().clone();
+        assert_eq!(tree_column_value(&format(0), Some("Field"), Some(&program)), "3 · f64");
+        assert_eq!(tree_column_value(&format(1), Some("Field"), Some(&program)), "5 · u32");
+    }
+    #[test]
     fn structure_columns_show_item_names_enum_meanings_and_readable_numbers() {
         let yaml = "structures:\n  - name: Field\n    fields:\n      - {name: name, type: string, length: 4}\n      - {name: format, type: u32}\n      - {name: data, type: {choose: {ref: format, cases: {'3': f64}}}}\nactions:\n  - read: {name: entries, type: {structure: Field}, repeat: 2}\n";
         let program = Program::parse(yaml).unwrap();
@@ -3965,8 +3991,8 @@ mod tests {
         assert_eq!(tree_column_value(&items[1], None, Some(&program)), "ramp");
         assert_eq!(tree_column_value(&items[0].children[1], Some("Field"), Some(&program)), "3 · f64");
         assert_eq!(tree_column_value(&items[0].children[0], Some("Field"), Some(&program)), "\"sine\"");
-        assert_eq!(comma_number(2_000_000_000), "2,000,000,000");
-        assert_eq!(readable_bytes(2_000_000_000), "1.86 GiB");
+        assert_eq!(crate::format::count(2_000_000_000), "2,000,000,000");
+        assert_eq!(crate::format::size(2_000_000_000u64), "1.86 GiB");
     }
     #[test]
     fn many_visible_traces_share_a_bounded_query_resolution() {
@@ -4787,7 +4813,7 @@ actions:
             },
             |_ctx, ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    selection = views.table(ui, output, store.view());
+                    selection = views.table(ui, output, None, store.view());
                 });
             },
         );
@@ -5093,7 +5119,7 @@ actions:
         let mut render = || {
             ctx.run(input.clone(), |_ctx, ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    views.table(ui, &output, store.view());
+                    views.table(ui, &output, None, store.view());
                 });
             })
         };
@@ -5105,7 +5131,7 @@ actions:
             "timestamp",
             "pair.z",
             "pair.a",
-            "0x8",
+            "0x00000008",
         ] {
             assert!(
                 labels.iter().any(|text| text == label),
@@ -5115,7 +5141,7 @@ actions:
         views.select_bytes(&output, Some(8 + 100 * 8..8 + 101 * 8));
         let scrolled = ctx.run(input, |_ctx, ui| {
             egui::CentralPanel::default().show(ui, |ui| {
-                views.table(ui, &output, store.view());
+                views.table(ui, &output, None, store.view());
             });
         });
         let labels = texts(&scrolled.shapes);

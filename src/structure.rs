@@ -643,16 +643,17 @@ impl Node {
     pub fn display(&self) -> String {
         if let Some(array) = &self.lazy {
             if array.segmented.is_some() {
-                format!("{} items · across groups", array.count)
+                format!("{} · across groups", crate::format::plural(array.count, "item", "items"))
             } else if array.offsets.is_some() {
-                format!("{} items · variable size", array.count)
+                format!("{} · variable size", crate::format::plural(array.count, "item", "items"))
             } else {
-                format!("{} items · {} bytes each", array.count, array.stride)
+                format!("{} · {} each", crate::format::plural(array.count, "item", "items"),
+                    crate::format::exact_bytes(array.stride))
             }
         } else if let Some(value) = &self.value {
             value.to_string()
         } else {
-            format!("{} bytes", (self.range.end - self.range.start))
+            crate::format::exact_bytes(self.range.end - self.range.start)
         }
     }
 }

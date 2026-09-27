@@ -556,44 +556,41 @@ impl BinaryWorkspace {
                         for entry in &doc.structure.sections {
                             let r = &entry.record;
                             ui.small(format!(
-                                "{}: 0x{:X}..0x{:X} · {}",
+                                "{}: {} · {}",
                                 r.name,
-                                entry.physical.start,
-                                entry.physical.end,
+                                crate::format::byte_range(entry.physical.start as u64, entry.physical.end as u64),
                                 if entry.opaque {
                                     format!(
-                                        "{} uninterpreted bytes",
-                                        entry.physical.end - entry.marker.end
+                                        "{} uninterpreted",
+                                        crate::format::exact_bytes((entry.physical.end - entry.marker.end) as u64)
                                     )
                                 } else {
                                     format!(
-                                        "{} records × {} B · data 0x{:X}",
-                                        r.records, r.record_size, r.data_offset
+                                        "{} × {} · data {}",
+                                        crate::format::plural(r.records as u64, "record", "records"),
+                                        crate::format::size(r.record_size as u64),
+                                        crate::format::offset(r.data_offset as u64)
                                     )
                                 }
                             ));
                             if !entry.marker.is_empty() {
                                 ui.small(format!(
-                                    "  Marker: {} bytes at 0x{:X}",
-                                    entry.marker.len(),
+                                    "  Marker: {} at 0x{:X}",
+                                    crate::format::exact_bytes(entry.marker.len() as u64),
                                     entry.marker.start
                                 ));
                             }
                         }
                         for gap in &doc.structure.gaps {
                             ui.small(format!(
-                                "Gap: {} bytes · 0x{:X}..0x{:X}",
-                                gap.len(),
-                                gap.start,
-                                gap.end
+                                "Gap: {}",
+                                crate::format::byte_range(gap.start as u64, gap.end as u64)
                             ));
                         }
                         let tail = &doc.structure.trailing;
                         ui.small(format!(
-                            "Trailing: {} uninterpreted bytes · 0x{:X}..0x{:X}",
-                            tail.len(),
-                            tail.start,
-                            tail.end
+                            "Trailing: {} uninterpreted",
+                            crate::format::byte_range(tail.start as u64, tail.end as u64)
                         ));
                     });
             });
@@ -1093,10 +1090,9 @@ impl BinaryWorkspace {
                         format!("Saved edited copy: {}", path.display())
                     } else {
                         format!(
-                            "Exported {} bytes (0x{:X}..0x{:X}, end exclusive): {}",
-                            range.len(),
-                            range.start,
-                            range.end,
+                            "Exported {} ({}): {}",
+                            crate::format::exact_bytes(range.len() as u64),
+                            crate::format::byte_range(range.start as u64, range.end as u64),
                             path.display()
                         )
                     }));
@@ -1426,7 +1422,7 @@ impl BinaryWorkspace {
             FileKind::Exports,
             self.dialog_template
                 .clone()
-                .set_title(format!("Export {} selected bytes", range.len()))
+                .set_title(format!("Export {} selected", crate::format::exact_bytes(range.len() as u64)))
                 .set_file_name(format!("{stem}-0x{:X}-0x{:X}.bin", range.start, range.end)),
         );
         self.file_dialog
@@ -1451,8 +1447,8 @@ impl BinaryWorkspace {
                 self.reveal_hex = true;
                 ctx.request_repaint();
                 self.report(Ok(format!(
-                    "Selected {} bytes in Hex (0x{:X}..0x{:X}, end exclusive). Use Overwrite to edit or Selection → Extract selection to save this range.",
-                    range.len(), range.start, range.end
+                    "Selected {} in Hex. Use Overwrite to edit or Selection → Extract selection to save this range.",
+                    crate::format::byte_range(range.start as u64, range.end as u64)
                 )));
             }
             PlotAction::ExportBytes(range) => self.choose_export(ctx, range),
@@ -2478,7 +2474,9 @@ impl BinaryWorkspace {
             ui.label("Updating plot… table and selected bytes remain available.");
         }
         if let Some(data) = &self.plot_data {
-            ui.small(format!("{} finite records · {} displayed samples · click a point to inspect · drag to pan, scroll to zoom, right-drag to box zoom", data.finite_records, data.samples.len()));
+            ui.small(format!("{} · {} · click a point to inspect · drag to pan, scroll to zoom, right-drag to box zoom",
+                crate::format::plural(data.finite_records as u64, "finite record", "finite records"),
+                crate::format::plural(data.samples.len() as u64, "displayed sample", "displayed samples")));
         }
         let navigation = self.navigation.take();
         let selected_sample = self.selected.and_then(|identity| {
@@ -2525,7 +2523,7 @@ impl BinaryWorkspace {
                             .color(crate::theme::DARK.color.status.warning)
                             .name(format!(
                                 "record {} @ 0x{:X}",
-                                sample.record, sample.byte_offset
+                                crate::format::count(sample.record), sample.byte_offset
                             )),
                     );
                 }
@@ -2609,7 +2607,8 @@ impl BinaryWorkspace {
                         ui.selectable_value(
                             &mut section,
                             i,
-                            format!("{} · {} samples", entry.record.name, entry.record.records),
+                            format!("{} · {}", entry.record.name,
+                                crate::format::plural(entry.record.records as u64, "sample", "samples")),
                         );
                     }
                 });
@@ -2695,7 +2694,8 @@ impl BinaryWorkspace {
                                 range.start < offset + doc.layout.record_size && offset < range.end
                             });
                             let response = ui
-                                .selectable_label(selected_row, format!("{record} / 0x{offset:X}"));
+                                .selectable_label(selected_row, format!("{} / {}",
+                                    crate::format::count(record), crate::format::offset(offset as u64)));
                             if response.clicked() {
                                 selection = Some((
                                     record,
@@ -3045,8 +3045,9 @@ impl BinaryWorkspace {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for (index, section) in doc.structure.sections.iter().enumerate() {
                     let title = format!(
-                        "{} · {} records",
-                        section.record.name, section.record.records
+                        "{} · {}",
+                        section.record.name,
+                        crate::format::plural(section.record.records as u64, "record", "records")
                     );
                     if ui.selectable_label(index == doc.section, title).clicked() {
                         selected = Some((index, section.physical.clone()));
@@ -3133,10 +3134,10 @@ impl BinaryWorkspace {
                 self.structure_ui.select_bytes(node.range.clone());
                 self.hex_editor.select_range(node.range.clone(), true);
                 self.report(Ok(format!(
-                    "{} set to {}. Updated {} bytes; Undo restores the previous value.",
+                    "{} set to {}. Updated {}; Undo restores the previous value.",
                     node.name,
                     displayed,
-                    node.range.len()
+                    crate::format::exact_bytes(node.range.len() as u64)
                 )));
             }
             Err(error) => {
@@ -3200,7 +3201,7 @@ impl BinaryWorkspace {
                 if let Some((index, range)) = sample {
                     ui.menu_button("Sample actions", |ui| {
                         if ui
-                            .button(format!("Select all bytes of sample {index}"))
+                            .button(format!("Select all bytes of sample {}", crate::format::count(index)))
                             .clicked()
                         {
                             self.plot_action(PlotAction::InspectBytes(range.clone()), ui.ctx());
@@ -3219,11 +3220,10 @@ impl BinaryWorkspace {
                 if let Some(selected) = self.hex_editor.selection() {
                     if selected != node.range {
                         ui.label(format!(
-                            "{} selected byte(s) within {}: 0x{:X}..0x{:X}",
-                            selected.len(),
+                            "{} selected within {}: {}",
+                            crate::format::exact_bytes(selected.len() as u64),
                             node.name,
-                            selected.start,
-                            selected.end
+                            crate::format::byte_range(selected.start as u64, selected.end as u64)
                         ));
                     }
                 }
@@ -3263,9 +3263,8 @@ fn hex_offset(text: &str, scope: &std::ops::Range<usize>) -> Result<usize> {
     .map_err(|_| anyhow::anyhow!("Enter a decimal byte offset or hexadecimal with a 0x prefix."))?;
     ensure!(
         scope.contains(&offset),
-        "Offset is outside this region (0x{:X}..0x{:X}, end exclusive).",
-        scope.start,
-        scope.end
+        "Offset is outside this region ({}).",
+        crate::format::byte_range(scope.start as u64, scope.end as u64)
     );
     Ok(offset)
 }
@@ -5054,7 +5053,7 @@ mod tests {
                 .unwrap(),
             29u64.to_le_bytes()
         );
-        assert!(workspace.message.contains("Exported 1048608 bytes"));
+        assert!(workspace.message.contains("Exported 1,048,608 bytes"));
     }
 
     #[test]
@@ -5334,7 +5333,7 @@ mod tests {
         settle(&mut workspace, &ctx);
         assert_eq!(workspace.edit_text, "23.45");
 
-        click(&mut workspace, &ctx, "74 / 0x388");
+        click(&mut workspace, &ctx, "74 / 0x00000388");
         assert_eq!(
             workspace.selected,
             workspace
