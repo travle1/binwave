@@ -1,7 +1,4 @@
 //! Display-only transforms. Source values and byte provenance never change.
-#[cfg(test)]
-use crate::egui_compat::ContextRun as _;
-use egui_plot::{PlotPoint, PlotTransform};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug)]
@@ -28,14 +25,35 @@ impl Placement {
 #[derive(Default)]
 pub struct Presentation {
     pub series: BTreeMap<String, Placement>,
-    dragging: Option<String>,
 }
 impl Presentation {
     pub fn placement(&self, name: &str) -> Placement {
         self.series.get(name).copied().unwrap_or_default()
     }
-    pub fn is_dragging(&self) -> bool {
-        self.dragging.is_some()
+    /// Move one trace in display coordinates; the source samples remain intact.
+    pub fn pan_series(&mut self, name: &str, amount: f64) -> bool {
+        let p = self.series.entry(name.to_owned()).or_default();
+        let next = p.offset + amount;
+        if !next.is_finite() || amount == 0. {
+            return false;
+        }
+        p.offset = next;
+        true
+    }
+    /// Zoom one trace around a display-space value, leaving that value fixed.
+    pub fn zoom_series(&mut self, name: &str, factor: f64, center: f64) -> bool {
+        if !factor.is_finite() || factor <= 0. || factor == 1. {
+            return false;
+        }
+        let p = self.series.entry(name.to_owned()).or_default();
+        let scale = p.scale * factor;
+        let offset = center - (center - p.offset) * factor;
+        if !scale.is_finite() || !(1e-12..=1e12).contains(&scale) || !offset.is_finite() {
+            return false;
+        }
+        p.scale = scale;
+        p.offset = offset;
+        true
     }
     pub fn menu(&mut self, ui: &mut egui::Ui, ranges: &[(String, f64, f64)]) -> bool {
         let mut changed = false;
@@ -56,9 +74,14 @@ impl Presentation {
         }
         let mut groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         for (name, _, _) in ranges {
-            let field = name.rsplit_once(" / ").map_or(name.as_str(), |(_, field)| field);
+            let field = name
+                .rsplit_once(" / ")
+                .map_or(name.as_str(), |(_, field)| field);
             let (group, label) = field.split_once('.').unwrap_or(("", field));
-            groups.entry(group.to_owned()).or_default().push((label.to_owned(), name.clone()));
+            groups
+                .entry(group.to_owned())
+                .or_default()
+                .push((label.to_owned(), name.clone()));
         }
         ui.menu_button("Series positions", |ui| {
             egui::ScrollArea::vertical()
@@ -113,125 +136,11 @@ impl Presentation {
             }
         }
     }
-    /// Points are already in display coordinates. Pick on press, then retain the
-    /// selected trace until release so crossing another trace cannot switch it.
-    pub fn drag(
-        &mut self,
-        ui: &egui::Ui,
-        transform: &PlotTransform,
-        points: impl Iterator<Item = (String, [f64; 2])>,
-    ) {
-        let (pressed, down, pointer, delta) = ui.input(|i| {
-            (
-                i.pointer.primary_pressed(),
-                i.pointer.primary_down(),
-                i.pointer.interact_pos(),
-                i.pointer.delta(),
-            )
-        });
-        if !down {
-            self.dragging = None;
-            return;
-        }
-        if pressed {
-            self.dragging = pointer
-                .filter(|p| {
-                    transform.frame().contains(*p)
-                        && ui
-                            .ctx()
-                            .rect_contains_pointer(ui.layer_id(), *transform.frame())
-                })
-                .and_then(|pointer| {
-                    let mut previous = BTreeMap::<String, egui::Pos2>::new();
-                    points
-                        .filter_map(|(name, p)| {
-                            let position =
-                                transform.position_from_point(&PlotPoint::new(p[0], p[1]));
-                            let mut d = position.distance_sq(pointer);
-                            if let Some(start) = previous.insert(name.clone(), position) {
-                                let line = position - start;
-                                if line.length_sq() > 0. {
-                                    let t = ((pointer - start).dot(line) / line.length_sq())
-                                        .clamp(0., 1.);
-                                    d = d.min((start + line * t).distance_sq(pointer));
-                                }
-                            }
-                            (d <= 100.).then_some((d, name))
-                        })
-                        .min_by(|a, b| a.0.total_cmp(&b.0))
-                        .map(|(_, name)| name)
-                });
-        } else if let Some(name) = &self.dragging {
-            let center = transform.frame().center();
-            let amount = transform
-                .value_from_position(center + egui::vec2(0., delta.y))
-                .y
-                - transform.value_from_position(center).y;
-            let p = self.series.entry(name.clone()).or_default();
-            if (p.offset + amount).is_finite() {
-                p.offset += amount;
-            }
-            if delta.y != 0. {
-                ui.ctx().request_repaint();
-            }
-        }
-    }
+
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn dragging_moves_only_the_pressed_series_and_releases() {
-        let ctx = egui::Context::default();
-        let mut p = Presentation::default();
-        let transform = PlotTransform::new(
-            egui::Rect::from_min_max(egui::pos2(20., 20.), egui::pos2(220., 220.)),
-            egui_plot::PlotBounds::from_min_max([-1., -1.], [1., 1.]),
-            false,
-        );
-        let mut frame = |events| {
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(240., 240.),
-                    )),
-                    events,
-                    ..Default::default()
-                },
-                |_ctx, ui| {
-                    egui::CentralPanel::default().show(ui, |ui| {
-                        p.drag(
-                            ui,
-                            &transform,
-                            [("first".into(), [0., 0.]), ("second".into(), [0., 0.8])].into_iter(),
-                        )
-                    });
-                },
-            );
-        };
-        frame(vec![]);
-        frame(vec![]);
-        frame(vec![
-            egui::Event::PointerMoved(egui::pos2(120., 120.)),
-            egui::Event::PointerButton {
-                pos: egui::pos2(120., 120.),
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: Default::default(),
-            },
-        ]);
-        frame(vec![egui::Event::PointerMoved(egui::pos2(120., 80.))]);
-        frame(vec![egui::Event::PointerButton {
-            pos: egui::pos2(120., 80.),
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: Default::default(),
-        }]);
-        assert!((p.placement("first").offset - 0.4).abs() < 1e-10);
-        assert_eq!(p.placement("second").offset, 0.);
-        assert!(!p.is_dragging());
-    }
     #[test]
     fn stacking_separates_ranges_and_is_reversible() {
         let mut p = Presentation::default();
@@ -247,5 +156,16 @@ mod tests {
         assert_eq!(p.placement("flat").display(7.), 6.);
         p.series.clear();
         assert_eq!(p.placement("large").display(200.), 200.);
+    }
+    #[test]
+    fn axis_navigation_changes_only_the_selected_trace() {
+        let mut p = Presentation::default();
+        assert!(p.zoom_series("sine[110]", 2., 32_000.));
+        assert_eq!(p.placement("sine[110]").display(32_000.), 32_000.);
+        assert_eq!(p.placement("sine[111]").display(32_000.), 32_000.);
+        assert!(p.pan_series("sine[110]", 100.));
+        assert_eq!(p.placement("sine[110]").display(32_000.), 32_100.);
+        assert_eq!(p.placement("sine[111]").display(32_000.), 32_000.);
+        assert!(!p.zoom_series("sine[110]", 0., 32_000.));
     }
 }

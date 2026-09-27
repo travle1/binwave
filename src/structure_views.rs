@@ -144,6 +144,8 @@ pub struct StructureViews {
     presentation: crate::plot_presentation::Presentation,
     plot_hidden: HashSet<String>,
     plot_field_filter: String,
+    plot_series_expanded: HashSet<String>,
+    plot_series_collapsed: HashSet<String>,
     plot_catalog_target: String,
     plot_catalog: Vec<String>,
     plot_target: String,
@@ -152,6 +154,7 @@ pub struct StructureViews {
     plot_collections_open: bool,
     plot_sidebar_series: bool,
     plot_axis_series: Option<String>,
+    plot_axis_group: Option<String>,
     plot_collection_filter: String,
     extra_plot_readers: std::collections::BTreeMap<String, PlotReader>,
     group_plot_readers: BTreeMap<String, PlotReader>,
@@ -1520,8 +1523,11 @@ impl StructureViews {
             self.plot_sources_initialized = true;
         }
         let mut changed = false;
-        let mut sidebar_names: Vec<String> = self.plot_catalog.iter()
-            .map(|field| format!("{} / {field}", self.plot_target)).collect();
+        let mut sidebar_names: Vec<String> = self
+            .plot_catalog
+            .iter()
+            .map(|field| format!("{} / {field}", self.plot_target))
+            .collect();
         if let Some((_, overlay)) = &self.plot_overlay {
             sidebar_names.extend(overlay.series.keys().cloned());
         }
@@ -1548,7 +1554,10 @@ impl StructureViews {
                 });
                 ui.separator();
                 if self.plot_sidebar_series {
-                    if let Some(axis) = &self.plot_axis_series {
+                    if let Some(group) = &self.plot_axis_group {
+                        ui.label(format!("Y axis: {} group", plot_series_group_label(group)))
+                            .on_hover_text(group);
+                    } else if let Some(axis) = &self.plot_axis_series {
                         ui.label(format!("Y axis: {}", short_series_label(axis)))
                             .on_hover_text(axis);
                     } else {
@@ -1572,22 +1581,68 @@ impl StructureViews {
                     });
                     egui::ScrollArea::vertical().id_salt("plot-series-sidebar")
                         .show(ui, |ui| {
-                            for name in matching {
-                                ui.push_id(name, |ui| {
+                            let groups = grouped_plot_series(matching.into_iter().map(String::as_str));
+                            for (group, entries) in groups {
+                                let open = !filter.is_empty() || (entries.len() <= 32
+                                    && !self.plot_series_collapsed.contains(&group))
+                                    || self.plot_series_expanded.contains(&group);
+                                let visible = entries.iter().filter(|(_, name)| !self.plot_hidden.contains(*name)).count();
+                                ui.push_id(&group, |ui| {
                                     ui.horizontal(|ui| {
-                                        let mut shown = !self.plot_hidden.contains(name);
-                                        if ui.checkbox(&mut shown, "").changed() {
-                                            if shown { self.plot_hidden.remove(name); }
-                                            else { self.plot_hidden.insert(name.clone()); }
+                                        let arrow = ui.add_sized([18., 18.], egui::Button::new(""));
+                                        let c = arrow.rect.center();
+                                        let (a, b, d) = if open {
+                                            (egui::pos2(c.x - 4., c.y - 2.), egui::pos2(c.x, c.y + 2.), egui::pos2(c.x + 4., c.y - 2.))
+                                        } else {
+                                            (egui::pos2(c.x - 2., c.y - 4.), egui::pos2(c.x + 2., c.y), egui::pos2(c.x - 2., c.y + 4.))
+                                        };
+                                        let stroke = egui::Stroke::new(1.5, ui.visuals().weak_text_color());
+                                        ui.painter().line_segment([a, b], stroke);
+                                        ui.painter().line_segment([b, d], stroke);
+                                        if arrow.clicked() {
+                                            if open { self.plot_series_expanded.remove(&group); self.plot_series_collapsed.insert(group.clone()); }
+                                            else { self.plot_series_collapsed.remove(&group); self.plot_series_expanded.insert(group.clone()); }
+                                        }
+                                        let title = format!("{}  {visible}/{}", plot_series_group_label(&group), entries.len());
+                                        if ui.selectable_label(self.plot_axis_group.as_deref() == Some(group.as_str()), title)
+                                            .on_hover_text(format!("{group}\nClick to use this group for the Y axis")).clicked() {
+                                            self.plot_axis_group = Some(group.clone());
+                                        }
+                                        let group_shown = visible == entries.len();
+                                        if ui.small_button(if group_shown { "Hide" } else { "Show" })
+                                            .on_hover_text("Show or hide every trace in this group").clicked() {
+                                            for (_, name) in &entries {
+                                                if group_shown { self.plot_hidden.insert((*name).to_owned()); }
+                                                else { self.plot_hidden.remove(*name); }
+                                            }
+                                            if group_shown && self.plot_axis_group.as_deref() == Some(group.as_str()) {
+                                                self.plot_axis_group = None;
+                                            }
                                             self.plot_fit_y = true;
                                         }
-                                        let axis = self.plot_axis_series.as_deref() == Some(name);
-                                        if ui.selectable_label(axis, short_series_label(name))
-                                            .on_hover_text(format!("{name}\nClick to use this series for the Y axis"))
-                                            .clicked() {
-                                            self.plot_axis_series = Some(name.clone());
-                                        }
                                     });
+                                    if open {
+                                        for (label, name) in entries {
+                                            ui.push_id(name, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.add_space(16.);
+                                                    let mut shown = !self.plot_hidden.contains(name);
+                                                    if ui.checkbox(&mut shown, "").changed() {
+                                                        if shown { self.plot_hidden.remove(name); }
+                                                        else { self.plot_hidden.insert(name.to_owned()); }
+                                                        self.plot_fit_y = true;
+                                                    }
+                                                    let axis = self.plot_axis_series.as_deref() == Some(name);
+                                                    let label_response = ui.selectable_label(axis, &label)
+                                                        .on_hover_text(format!("{name}\nClick to use this series for the Y axis"));
+                                                    if label_response.clicked() {
+                                                        self.plot_axis_series = Some(name.to_owned());
+                                                        self.plot_axis_group = None;
+                                                    }
+                                                });
+                                            });
+                                        }
+                                    }
                                 });
                             }
                         });
@@ -1716,12 +1771,29 @@ impl StructureViews {
                 ranges.extend(data.bounds.iter().map(|(name, (min, max))| (name.clone(), *min, *max)));
             }
         }
-        let mut names: Vec<String> = self.plot_catalog.iter()
-            .map(|name| format!("{} / {name}", self.plot_target)).collect();
+        let mut names: Vec<String> = self
+            .plot_catalog
+            .iter()
+            .map(|name| format!("{} / {name}", self.plot_target))
+            .collect();
         let mut known: HashSet<String> = names.iter().cloned().collect();
         for (name, _, _) in &ranges {
-            if known.insert(name.clone()) { names.push(name.clone()); }
+            if known.insert(name.clone()) {
+                names.push(name.clone());
+            }
         }
+        if self.plot_axis_group.as_ref().is_some_and(|group| {
+            !names
+                .iter()
+                .any(|name| plot_series_group_key(name) == *group)
+        }) {
+            self.plot_axis_group = None;
+        }
+        let axis_names = plot_axis_target_names(
+            &names,
+            self.plot_axis_group.as_deref(),
+            self.plot_axis_series.as_deref(),
+        );
         let visible_series = names.iter().filter(|name| !self.plot_hidden.contains(*name)).count();
         if self.plot_axis_series.as_ref().is_none_or(|axis|
             !names.contains(axis) || self.plot_hidden.contains(axis)) {
@@ -1867,7 +1939,9 @@ impl StructureViews {
         });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.weak(format!("Samples {}–{} of {}", view.start, view.end.saturating_sub(1), count));
-                if let Some(axis) = &self.plot_axis_series {
+                if let Some(group) = &self.plot_axis_group {
+                    ui.weak(format!("Y: {} group", plot_series_group_label(group))).on_hover_text(group);
+                } else if let Some(axis) = &self.plot_axis_series {
                     ui.weak(format!("Y: {}", short_series_label(axis))).on_hover_text(axis);
                 }
             });
@@ -2146,7 +2220,16 @@ impl StructureViews {
             self.plot_gpu.invalidate();
         }
         log_slow_plot_phase(&mut phase_clock, "assemble plot overlay");
-        let placements=self.presentation.series.clone();
+        let placements = self.presentation.series.clone();
+        let axis_placement = axis_names
+            .first()
+            .map(String::as_str)
+            .map(|name| self.presentation.placement(name))
+            .unwrap_or_default();
+        let axis_uniform = axis_names.iter().all(|name| {
+            let placement = self.presentation.placement(name);
+            placement.scale == axis_placement.scale && placement.offset == axis_placement.offset
+        });
         let data = self.plot_overlay.as_ref().map(|(_, data)| data);
         let plot_id = egui::Id::new(("decoded_structure_plot", "overlay", output.revision));
         let hidden = self.plot_hidden.clone();
@@ -2155,8 +2238,10 @@ impl StructureViews {
                 numeric_bounds(
                     data.series
                         .iter()
-                        .filter(|(name, _)| !hidden.contains(*name)
-                            && self.plot_axis_series.as_ref().is_none_or(|axis| axis == *name))
+                        .filter(|(name, _)| {
+                            !hidden.contains(*name)
+                                && (axis_names.is_empty() || axis_names.contains(name))
+                        })
                         .flat_map(|(_, values)| values)
                         .map(|point| point.value),
                 )
@@ -2180,26 +2265,42 @@ impl StructureViews {
             .auto_bounds(egui::Vec2b::new(false, false))
             .allow_double_click_reset(false)
             .allow_boxed_zoom(false)
-            .allow_drag(egui::Vec2b::new(!self.presentation.is_dragging(), self.plot_free_y && !self.presentation.is_dragging()))
+            .allow_drag(egui::Vec2b::new(true, false))
             .allow_axis_zoom_drag(false)
             .pan_pointer_button(egui::PointerButton::Primary)
-            .allow_zoom(egui::Vec2b::new(true, self.plot_free_y))
+            .allow_zoom(egui::Vec2b::new(true, false))
             .allow_scroll(false)
             .label_formatter(move |position| {
-                if let egui_plot::HoverPosition::NearDataPoint { plot_name, position, .. } = position {
+                if let egui_plot::HoverPosition::NearDataPoint {
+                    plot_name,
+                    position,
+                    ..
+                } = position
+                {
                     let p = placements.get(*plot_name).copied().unwrap_or_default();
-                    Some(format!("{plot_name}\nSample: {:.0}\nValue: {}", position.x, p.original(position.y)))
+                    Some(format!(
+                        "{plot_name}\nSample: {:.0}\nValue: {}",
+                        position.x,
+                        p.original(position.y)
+                    ))
                 } else {
                     None
                 }
             })
-            .y_axis_label(if self.presentation.series.is_empty() {"Value"} else {"Display position"})
+            .custom_y_axes(vec![AxisHints::new_y()
+                .label(if axis_uniform { "Selected series value" } else { "Display position" })
+                .formatter(move |mark, _| {
+                    format!("{:.2}", if axis_uniform { axis_placement.original(mark.value) }
+                        else { mark.value })
+                })])
             .custom_x_axes(vec![AxisHints::new_x()
                 .label("Sample index")
                 .label_spacing(egui::Rangef::new(100., 150.))
                 .formatter(|mark, _| format!("{:.0}", mark.value))
-                .tick_label_font(egui::FontId::new(crate::theme::DARK.font.axis,
-                    egui::FontFamily::Proportional))])
+                .tick_label_font(egui::FontId::new(
+                    crate::theme::DARK.font.axis,
+                    egui::FontFamily::Proportional,
+                ))])
             .show(ui, |plot_ui| {
                 if force_view.is_some() || y_fit.is_some() {
                     let old = plot_ui.plot_bounds();
@@ -2269,20 +2370,23 @@ impl StructureViews {
                 }
                 if !middle_down {
                     self.plot_middle_panning = false;
-                } else if !middle_pressed && self.plot_middle_panning && middle_delta != egui::Vec2::ZERO {
+                } else if !middle_pressed
+                    && self.plot_middle_panning
+                    && middle_delta != egui::Vec2::ZERO
+                {
                     let old = plot_ui.plot_bounds();
                     let x = -(middle_delta.x as f64) * old.width() / inner.width().max(1.) as f64;
-                    let y = if self.plot_free_y {
-                        (middle_delta.y as f64) * old.height() / inner.height().max(1.) as f64
-                    } else {
-                        0.
-                    };
+                    if self.plot_free_y {
+                        let amount =
+                            -(middle_delta.y as f64) * old.height() / inner.height().max(1.) as f64;
+                        for name in &axis_names {
+                            self.presentation.pan_series(name, amount);
+                        }
+                    }
                     let mut min = old.min();
                     let mut max = old.max();
                     min[0] += x;
                     max[0] += x;
-                    min[1] += y;
-                    max[1] += y;
                     plot_ui.set_plot_bounds(PlotBounds::from_min_max(min, max));
                     self.plot_fit_y = false;
                     plot_ctx.request_repaint();
@@ -2297,17 +2401,21 @@ impl StructureViews {
                         egui::pos2(inner.left(), inner.bottom()),
                     ),
                 ];
-                let (primary_pressed, primary_down, primary_delta, primary_origin) =
-                    plot_ctx.input(|input| (
-                        input.pointer.button_pressed(egui::PointerButton::Primary),
-                        input.pointer.button_down(egui::PointerButton::Primary),
-                        input.pointer.delta(),
-                        input.pointer.press_origin(),
-                    ));
+                let (primary_pressed, primary_down, primary_delta, primary_origin) = plot_ctx
+                    .input(|input| {
+                        (
+                            input.pointer.button_pressed(egui::PointerButton::Primary),
+                            input.pointer.button_down(egui::PointerButton::Primary),
+                            input.pointer.delta(),
+                            input.pointer.press_origin(),
+                        )
+                    });
                 if primary_pressed {
-                    self.plot_axis_panning = primary_origin.and_then(|origin|
-                        axis_rects.iter().enumerate().find_map(|(axis, rect)|
-                            rect.intersect(plot_clip).contains(origin).then_some(axis)));
+                    self.plot_axis_panning = primary_origin.and_then(|origin| {
+                        axis_rects.iter().enumerate().find_map(|(axis, rect)| {
+                            rect.intersect(plot_clip).contains(origin).then_some(axis)
+                        })
+                    });
                 }
                 if !primary_down {
                     self.plot_axis_panning = None;
@@ -2316,13 +2424,28 @@ impl StructureViews {
                         let old = plot_ui.plot_bounds();
                         let mut min = old.min();
                         let mut max = old.max();
-                        let pixels = if axis == 0 { inner.width() } else { inner.height() }.max(1.);
+                        let pixels = if axis == 0 {
+                            inner.width()
+                        } else {
+                            inner.height()
+                        }
+                        .max(1.);
                         let distance = primary_delta[axis] as f64
-                            * if axis == 0 { -old.width() } else { old.height() }
+                            * if axis == 0 {
+                                -old.width()
+                            } else {
+                                old.height()
+                            }
                             / pixels as f64;
-                        min[axis] += distance;
-                        max[axis] += distance;
-                        plot_ui.set_plot_bounds(PlotBounds::from_min_max(min, max));
+                        if axis == 1 {
+                            for name in &axis_names {
+                                self.presentation.pan_series(name, -distance);
+                            }
+                        } else {
+                            min[axis] += distance;
+                            max[axis] += distance;
+                            plot_ui.set_plot_bounds(PlotBounds::from_min_max(min, max));
+                        }
                         self.plot_fit_y = false;
                         plot_ctx.request_repaint();
                     }
@@ -2363,14 +2486,13 @@ impl StructureViews {
                         {
                             // Built-in pinch/Ctrl-wheel zoom only sees the canvas.
                             let factor = if axis == 0 { pinch.x } else { pinch.y };
-                            plot_ui.zoom_bounds(
-                                if axis == 0 {
-                                    egui::vec2(factor, 1.)
-                                } else {
-                                    egui::vec2(1., factor)
-                                },
-                                center,
-                            );
+                            if axis == 1 {
+                                for name in &axis_names {
+                                    self.presentation.zoom_series(name, factor as f64, center.y);
+                                }
+                            } else {
+                                plot_ui.zoom_bounds(egui::vec2(factor, 1.), center);
+                            }
                             wheel_zoomed = factor != 1.;
                         } else if pinch == egui::Vec2::splat(1.) {
                             // egui-winit remaps Shift+wheel into horizontal scroll.
@@ -2386,28 +2508,41 @@ impl StructureViews {
                                     let axis = axis_hover.map_or(0, |(axis, _)| axis);
                                     let mut min = old.min();
                                     let mut max = old.max();
-                                    let fraction = (f64::from(delta) / 240.).clamp(-1., 1.);
+                                    let fraction = (f64::from(delta)
+                                        / if axis == 1 { 120. } else { 240. }).clamp(-1., 1.);
                                     let distance = if axis == 0 {
                                         -fraction * old.width()
                                     } else {
                                         fraction * old.height()
                                     };
-                                    min[axis] += distance;
-                                    max[axis] += distance;
-                                    plot_ui.set_plot_bounds(PlotBounds::from_min_max(min, max));
+                                    if axis == 1 {
+                                        for name in &axis_names {
+                                            self.presentation.pan_series(name, -distance);
+                                        }
+                                    } else {
+                                        min[axis] += distance;
+                                        max[axis] += distance;
+                                        plot_ui.set_plot_bounds(PlotBounds::from_min_max(min, max));
+                                    }
                                 } else {
-                                    let factor = (delta * 0.005).clamp(-1., 1.).exp();
+                                    let factor = (delta * if axis_hover.is_some_and(|(axis, _)| axis == 1)
+                                        { 0.012 } else { 0.005 }).clamp(-1., 1.).exp();
                                     let axes = axis_hover.map_or(
                                         egui::Vec2b::new(true, self.plot_free_y),
                                         |(axis, _)| egui::Vec2b::new(axis == 0, axis == 1),
                                     );
-                                    plot_ui.zoom_bounds(
-                                        egui::vec2(
-                                            if axes.x { factor } else { 1. },
-                                            if axes.y { factor } else { 1. },
-                                        ),
-                                        center,
-                                    );
+                                    if axes.y {
+                                        for name in &axis_names {
+                                            self.presentation.zoom_series(
+                                                name,
+                                                factor as f64,
+                                                center.y,
+                                            );
+                                        }
+                                    }
+                                    if axes.x {
+                                        plot_ui.zoom_bounds(egui::vec2(factor, 1.), center);
+                                    }
                                 }
                                 wheel_zoomed = true;
                             }
@@ -2599,9 +2734,6 @@ impl StructureViews {
                 ui.visuals().text_color(),
             );
         }
-        self.presentation.drag(ui,&response.transform,data.into_iter().flat_map(|d|d.series.iter())
-            .filter(|(name,_)| !hidden.contains(*name))
-            .flat_map(|(name,points)|points.iter().map(move |p|(name.clone(),[p.index as f64,p.value]))));
         if response.response.clicked() {
             if let Some(pointer) = response
                 .response
@@ -2636,6 +2768,7 @@ impl StructureViews {
                             .min_by(|a, b| a.0.total_cmp(&b.0));
                     if let Some((_, name, point)) = nearest {
                         self.plot_axis_series = Some(name.clone());
+                        self.plot_axis_group = None;
                         self.plot_anchor = Some(point.index);
                         picked = Some((point.bytes.clone(), Some(point.path.to_string())));
                     } else if let Some(bytes) = sample_bytes(&node, index..index + 1) {
@@ -3238,9 +3371,76 @@ fn ranges_overlap(a: &Range<usize>, b: &Range<usize>) -> bool {
 
 
 fn short_series_label(name: &str) -> String {
-    name.rsplit_once(" / ").map_or_else(|| name.to_owned(), |(path, field)| {
-        format!("{} / {field}", path.rsplit('.').next().unwrap_or(path))
+    name.rsplit_once(" / ").map_or_else(
+        || name.to_owned(),
+        |(path, field)| format!("{} / {field}", path.rsplit('.').next().unwrap_or(path)),
+    )
+}
+
+fn grouped_plot_series<'a>(
+    names: impl Iterator<Item = &'a str>,
+) -> BTreeMap<String, Vec<(String, &'a str)>> {
+    let mut groups: BTreeMap<String, Vec<(String, &'a str)>> = BTreeMap::new();
+    for name in names {
+        let (path, field) = name.rsplit_once(" / ").unwrap_or((name, "value"));
+        let indexed = plot_series_index(path);
+        let (group, label) = if let Some((start, end)) = indexed {
+            (
+                path[..start].to_owned(),
+                format!("{}{} / {field}", &path[start..=end], &path[end + 1..]),
+            )
+        } else {
+            (path.to_owned(), field.to_owned())
+        };
+        groups.entry(group).or_default().push((label, name));
+    }
+    for entries in groups.values_mut() {
+        entries.sort_by(|a, b| {
+            let index = |label: &str| {
+                label
+                    .strip_prefix('[')
+                    .and_then(|rest| rest.split_once(']'))
+                    .and_then(|(digits, _)| digits.parse::<usize>().ok())
+            };
+            index(&a.0).cmp(&index(&b.0)).then_with(|| a.0.cmp(&b.0))
+        });
+    }
+    groups
+}
+
+fn plot_series_index(path: &str) -> Option<(usize, usize)> {
+    path.rfind('[').and_then(|start| {
+        let end = path[start..].find(']')? + start;
+        path[start + 1..end]
+            .chars()
+            .all(|c| c.is_ascii_digit())
+            .then_some((start, end))
     })
+}
+
+fn plot_series_group_key(name: &str) -> String {
+    let path = name.rsplit_once(" / ").map_or(name, |(path, _)| path);
+    plot_series_index(path).map_or_else(|| path.to_owned(), |(start, _)| path[..start].to_owned())
+}
+
+fn plot_axis_target_names(
+    names: &[String],
+    group: Option<&str>,
+    series: Option<&str>,
+) -> Vec<String> {
+    if let Some(group) = group {
+        names
+            .iter()
+            .filter(|name| plot_series_group_key(name) == group)
+            .cloned()
+            .collect()
+    } else {
+        series.into_iter().map(str::to_owned).collect()
+    }
+}
+
+fn plot_series_group_label(group: &str) -> &str {
+    group.rsplit('.').next().unwrap_or(group)
 }
 
 fn centered_view(center: usize, width: usize, count: usize) -> Range<usize> {
@@ -3492,6 +3692,28 @@ fn paint_tree_columns(ui: &Ui, rect: egui::Rect, widths: [f32; 6], texts: [&str;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plot_series_groups_keep_sensor_identity() {
+        let names = [
+            "sections[3].payload.channels.sine[110].values / value",
+            "sections[3].payload.channels.sine[111].values / value",
+            "sections[3].payload.channels.triangle[0].values / value",
+        ];
+        let groups = super::grouped_plot_series(names.into_iter());
+        assert_eq!(groups.len(), 2);
+        let sine = &groups["sections[3].payload.channels.sine"];
+        assert_eq!(sine[0].0, "[110].values / value");
+        assert_eq!(sine[1].0, "[111].values / value");
+        let names = names.map(str::to_owned);
+        assert_eq!(
+            super::plot_axis_target_names(
+                &names,
+                Some("sections[3].payload.channels.sine"),
+                Some(&names[2])
+            ),
+            names[..2]
+        );
+    }
     #[test]
     fn structure_row_columns_and_full_width_selection_render() {
         let yaml = "structures:\n  - name: Header\n    fields:\n      - {name: signature, type: string, length: 4}\nactions:\n  - read: {name: header, type: {structure: Header}}\n";
@@ -5162,31 +5384,58 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
         views.plot_sidebar_series = true;
         views.plot_force_view = Some(900..1100);
         settle_plot(&ctx, &mut views, &output, &store);
-        let frame = |views: &mut StructureViews, events| ctx.run(egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
-                egui::vec2(1200., 700.))),
-            events,
-            ..Default::default()
-        }, |_ctx, ui| {
-            egui::CentralPanel::default().show(ui, |ui| {
-                views.plot(ui, &output, store.view());
-            });
-        });
+        let frame = |views: &mut StructureViews, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200., 700.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        views.plot(ui, &output, store.view());
+                    });
+                },
+            )
+        };
+        for _ in 0..12 {
+            frame(&mut views, vec![]);
+        }
         let rendered = frame(&mut views, vec![]);
-        let row = rendered.shapes.iter().find_map(|shape| match &shape.shape {
-            egui::Shape::Text(text) if text.galley.text() == "samples / ramp" =>
-                Some(text.pos + text.galley.rect.center().to_vec2()),
-            _ => None,
-        }).expect("ramp series row must be visible");
+        let row = rendered
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "ramp" && text.pos.x > 800. => {
+                    Some(text.pos + text.galley.rect.center().to_vec2())
+                }
+                _ => None,
+            })
+            .expect("ramp series row must be visible");
         let before = *navigation_memory(&ctx, &views, &output).bounds();
         let view = views.plot_view.clone();
         frame(&mut views, vec![egui::Event::PointerMoved(row)]);
-        frame(&mut views, vec![egui::Event::PointerButton { pos: row,
-            button: egui::PointerButton::Primary, pressed: true,
-            modifiers: egui::Modifiers::NONE }]);
-        frame(&mut views, vec![egui::Event::PointerButton { pos: row,
-            button: egui::PointerButton::Primary, pressed: false,
-            modifiers: egui::Modifiers::NONE }]);
+        frame(
+            &mut views,
+            vec![egui::Event::PointerButton {
+                pos: row,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        frame(
+            &mut views,
+            vec![egui::Event::PointerButton {
+                pos: row,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
         settle_plot(&ctx, &mut views, &output, &store);
         let after = *navigation_memory(&ctx, &views, &output).bounds();
         assert_eq!(views.plot_axis_series.as_deref(), Some("samples / ramp"));
@@ -5649,6 +5898,8 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             settle_plot(&ctx, &mut views, &output, &store);
             let memory = navigation_memory(&ctx, &views, &output);
             let before = *memory.bounds();
+            let axis = views.plot_axis_series.clone().unwrap();
+            let scale_before = views.presentation.placement(&axis).scale;
             let pointer = memory.transform().frame().center();
             render_plot(
                 &ctx,
@@ -5663,7 +5914,12 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 &mut views,
                 &output,
                 &store,
-                vec![egui::Event::MouseWheel { unit, delta: egui::vec2(0., delta), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE }],
+                vec![egui::Event::MouseWheel {
+                    unit,
+                    delta: egui::vec2(0., delta),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                }],
                 egui::Modifiers::NONE,
             );
             settle_plot(&ctx, &mut views, &output, &store);
@@ -5673,9 +5929,10 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 "ordinary wheel must zoom horizontally: {before:?} -> {after:?}"
             );
             if free_y {
+                navigation_assert_y(before, after);
                 assert!(
-                    after.height() < before.height() * 0.99,
-                    "unlocked wheel should zoom both axes"
+                    views.presentation.placement(&axis).scale > scale_before,
+                    "unlocked wheel should zoom only the selected trace vertically"
                 );
             } else {
                 navigation_assert_y(before, after);
@@ -5759,6 +6016,8 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             let page = views.desired.as_ref().unwrap().key.clone();
             let memory = navigation_memory(&ctx, &views, &output);
             let before = *memory.bounds();
+            let axis = views.plot_axis_series.clone().unwrap();
+            let scale_before = views.presentation.placement(&axis).scale;
             let pointer = axis_navigation_position(&memory, y_axis);
             axis_navigation_send(
                 &ctx,
@@ -5766,16 +6025,22 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 &output,
                 &store,
                 pointer,
-                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0., 48.), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE },
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0., 48.),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
                 egui::Modifiers::NONE,
             );
             settle_plot(&ctx, &mut views, &output, &store);
             let after = *navigation_memory(&ctx, &views, &output).bounds();
             if y_axis {
                 axis_navigation_assert_x(before, after);
+                navigation_assert_y(before, after);
                 assert!(
-                    after.height() < before.height() * 0.99,
-                    "explicit Y-axis zoom must work while Lock Y is enabled"
+                    views.presentation.placement(&axis).scale > scale_before,
+                    "explicit Y-axis zoom must scale the selected series"
                 );
             } else {
                 navigation_assert_y(before, after);
@@ -5805,6 +6070,8 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             let page = views.desired.as_ref().unwrap().key.clone();
             let memory = navigation_memory(&ctx, &views, &output);
             let before = *memory.bounds();
+            let axis = views.plot_axis_series.clone().unwrap();
+            let offset_before = views.presentation.placement(&axis).offset;
             let pointer = axis_navigation_position(&memory, y_axis);
             let shift = egui::Modifiers {
                 shift: true,
@@ -5817,7 +6084,12 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 &output,
                 &store,
                 pointer,
-                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(48., 0.), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE },
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(48., 0.),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
                 shift,
             );
             let immediately_after = *navigation_memory(&ctx, &views, &output).bounds();
@@ -5825,9 +6097,10 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             assert!((immediately_after.height() - before.height()).abs() < 1e-8);
             if y_axis {
                 axis_navigation_assert_x(before, immediately_after);
+                navigation_assert_y(before, immediately_after);
                 assert!(
-                    immediately_after.min()[1] - before.min()[1] > before.height() * 0.15,
-                    "positive Y scroll pans to higher values"
+                    views.presentation.placement(&axis).offset < offset_before,
+                    "positive Y scroll moves only the selected series"
                 );
             } else {
                 navigation_assert_y(before, immediately_after);
@@ -5889,28 +6162,59 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             let (ctx, store, output, mut views) = axis_navigation_fixture();
             let selected = views.last_hex_selection.clone();
             let before = *navigation_memory(&ctx, &views, &output).bounds();
+            let axis = views.plot_axis_series.clone().unwrap();
+            let offset_before = views.presentation.placement(&axis).offset;
             let from = axis_navigation_position(&navigation_memory(&ctx, &views, &output), y_axis);
-            let to = from + if y_axis { egui::vec2(0., -40.) } else { egui::vec2(80., 0.) };
+            let to = from
+                + if y_axis {
+                    egui::vec2(0., -40.)
+                } else {
+                    egui::vec2(80., 0.)
+                };
             let button = |pos, pressed| egui::Event::PointerButton {
                 pos,
                 button: egui::PointerButton::Primary,
                 pressed,
                 modifiers: egui::Modifiers::NONE,
             };
-            render_plot(&ctx, &mut views, &output, &store,
-                vec![egui::Event::PointerMoved(from), button(from, true)], egui::Modifiers::NONE);
-            render_plot(&ctx, &mut views, &output, &store,
-                vec![egui::Event::PointerMoved(to)], egui::Modifiers::NONE);
-            render_plot(&ctx, &mut views, &output, &store,
-                vec![button(to, false)], egui::Modifiers::NONE);
+            render_plot(
+                &ctx,
+                &mut views,
+                &output,
+                &store,
+                vec![egui::Event::PointerMoved(from), button(from, true)],
+                egui::Modifiers::NONE,
+            );
+            render_plot(
+                &ctx,
+                &mut views,
+                &output,
+                &store,
+                vec![egui::Event::PointerMoved(to)],
+                egui::Modifiers::NONE,
+            );
+            render_plot(
+                &ctx,
+                &mut views,
+                &output,
+                &store,
+                vec![button(to, false)],
+                egui::Modifiers::NONE,
+            );
             let after = *navigation_memory(&ctx, &views, &output).bounds();
             if y_axis {
                 axis_navigation_assert_x(before, after);
-                assert!(after.min()[1] < before.min()[1], "Y drag should pan: {before:?} -> {after:?}");
-                assert!((after.height() - before.height()).abs() < 1e-8);
+                navigation_assert_y(before, after);
+                assert!(
+                    views.presentation.placement(&axis).offset > offset_before,
+                    "Y drag should move the selected series"
+                );
             } else {
                 navigation_assert_y(before, after);
-                assert!(after.min()[0] < before.min()[0], "X drag should pan: {before:?} -> {after:?}");
+                assert!(
+                    after.min()[0] < before.min()[0],
+                    "X drag should pan: {before:?} -> {after:?}"
+                );
                 assert!((after.width() - before.width()).abs() < 1e-8);
             }
             assert_eq!(views.last_hex_selection, selected);
@@ -5955,6 +6259,8 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             let page = views.desired.as_ref().unwrap().key.clone();
             let memory = navigation_memory(&ctx, &views, &output);
             let before = *memory.bounds();
+            let axis = views.plot_axis_series.clone().unwrap();
+            let scale_before = views.presentation.placement(&axis).scale;
             let pointer = axis_navigation_position(&memory, y_axis);
             let control = egui::Modifiers {
                 ctrl: true,
@@ -5973,9 +6279,10 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             let after = *navigation_memory(&ctx, &views, &output).bounds();
             if y_axis {
                 axis_navigation_assert_x(before, after);
+                navigation_assert_y(before, after);
                 assert!(
-                    (after.height() - before.height() / 1.4).abs() < 1e-4,
-                    "axis zoom factor must be applied exactly once"
+                    (views.presentation.placement(&axis).scale - scale_before * 1.4).abs() < 1e-4,
+                    "selected series zoom factor must be applied exactly once"
                 );
             } else {
                 navigation_assert_y(before, after);
