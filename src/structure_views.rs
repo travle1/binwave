@@ -339,7 +339,10 @@ impl StructureViews {
             start,
             revision,
         };
+        // Page controls read their position from `desired`, so a page served from
+        // memory must also become the desired one; tick() won't re-read it.
         if self.page.as_ref().is_some_and(|page| page.key == key) {
+            self.desired = Some(Request { key, array: array.clone() });
             return;
         }
         if let Some(index) = self.cached_pages.iter().position(|page| page.key == key) {
@@ -347,6 +350,7 @@ impl StructureViews {
             if let Some(previous) = self.page.replace(cached) {
                 self.remember_page(previous);
             }
+            self.desired = Some(Request { key, array: array.clone() });
             return;
         }
         if self
@@ -991,6 +995,7 @@ impl StructureViews {
             .map(|request| request.key.start)
             .or_else(|| self.page_for(&node.path, revision).map(|page| page.key.start))
             .unwrap_or(0);
+        let before = start;
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(start > 0, egui::Button::new("Previous"))
@@ -1039,6 +1044,10 @@ impl StructureViews {
                 }
             }
         });
+        let aligned = start.min(array.count.saturating_sub(1)) / page_size * page_size;
+        if aligned != before {
+            self.carry_expansion(&node.path, before, aligned, page_size);
+        }
         self.request(node, start, revision, ui.ctx());
         if let Some(page) = self.page_for(&node.path, revision) {
             if let Err(error) = &page.result {
@@ -1047,6 +1056,21 @@ impl StructureViews {
         } else {
             ui.weak("Reading this page…");
         }
+    }
+    /// Paging keeps the same fields open: expansion under `collection[i]` on the
+    /// old page follows to the item at the same position on the new page.
+    fn carry_expansion(&mut self, collection: &str, from: usize, to: usize, page_size: usize) {
+        let prefix = format!("{collection}[");
+        let moved: Vec<String> = self.expanded.iter().filter_map(|path| {
+            let (index, tail) = path.strip_prefix(&prefix)?.split_once(']')?;
+            let index: usize = index.parse().ok()?;
+            if !(from..from.saturating_add(page_size)).contains(&index) {
+                return None;
+            }
+            let target = (index + to).checked_sub(from)?;
+            Some(format!("{prefix}{target}]{tail}"))
+        }).collect();
+        self.expanded.extend(moved);
     }
     fn target_rows<'a>(&'a self, output: &'a ParseOutput) -> &'a [Node] {
         match self.collection_node(output, &self.table_target) {
@@ -4586,6 +4610,37 @@ actions:
             .run(&store.view(), &AtomicBool::new(false))
             .unwrap();
         (store, output)
+    }
+    #[test]
+    fn returning_to_a_cached_page_stays_there() {
+        let (store, output) = records();
+        let node = &output.nodes[2];
+        let page = inspector_page_size(node.lazy.as_ref().unwrap());
+        assert!(collection_count(node) > page);
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        for start in [0, page, 0] {
+            views.request(node, start, output.revision, &ctx);
+            settle(&mut views, store.view());
+        }
+        // Page controls read their position from the desired request each frame.
+        assert_eq!(views.desired.as_ref().unwrap().key.start, 0);
+        views.request(node, views.desired.as_ref().unwrap().key.start, output.revision, &ctx);
+        assert_eq!(views.page_for(&node.path, output.revision).unwrap().key.start, 0);
+    }
+    #[test]
+    fn paging_keeps_the_same_fields_expanded() {
+        let mut views = StructureViews::default();
+        for path in ["samples", "samples[5]", "samples[5].pair", "samples[300]"] {
+            views.expanded.insert(path.into());
+        }
+        views.carry_expansion("samples", 0, 128, 128);
+        assert!(views.expanded.contains("samples[133]"));
+        assert!(views.expanded.contains("samples[133].pair"));
+        assert!(views.expanded.contains("samples[5]"), "going back keeps the old item open");
+        assert!(!views.expanded.contains("samples[428]"), "items outside the old page don't move");
+        views.carry_expansion("samples", 133, 132, 1);
+        assert!(views.expanded.contains("samples[132].pair"));
     }
     #[test]
     fn default_table_chooses_samples_and_keeps_definition_column_order() {
