@@ -532,11 +532,26 @@ impl StructureWorkspace {
             .partial_output
             .as_ref()
             .or(self.output.as_ref())
-            .and_then(|output| self.views.tree(ui, output, selection, names));
+            .and_then(|output| self.views.tree(ui, output, self.program.as_ref(), selection, names));
         if let Some(range) = &selected {
             self.selection = Some(range.clone());
         }
         selected
+    }
+    pub fn take_tree_definition_jump(&mut self) -> Option<String> {
+        self.views.take_tree_definition_jump()
+    }
+    pub fn take_tree_reveal_hex(&mut self) -> bool {
+        self.views.take_tree_reveal_hex()
+    }
+    pub fn jump_to_yaml_definition(&mut self, yaml: &str, name: &str) {
+        if let Some((line, _)) = yaml.lines().enumerate().find(|(_, line)| {
+            line.trim_start().strip_prefix("- name:")
+                .is_some_and(|value| value.trim().trim_matches(['\'', '"']) == name)
+        }) {
+            self.yaml_layout.go_to_line(line + 1);
+        }
+        self.show_yaml();
     }
     pub fn table(&mut self, ui: &mut Ui, source: ByteView) -> Option<Range<usize>> {
         let selected = self

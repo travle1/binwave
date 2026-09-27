@@ -3016,18 +3016,21 @@ impl BinaryWorkspace {
                     ui.label(error);
                 });
         }
-        self.direct_controls(ui, true);
+        self.author_in_structure = false;
         if self.structure_ui.has_output() {
             let mut edit = None;
             let source = &self.yaml;
             let authoring = &mut self.authoring;
             if let Some(range) = self.structure_ui.tree(ui, self.hex_editor.selection(), &mut |ui, node| {
-                let (response, change) = if node.path == node.name { authoring.name_ui(ui, source, &node.name, node.range.start as u64..node.range.end as u64) } else { (ui.selectable_label(false, node.tree_label()), None) };
+                let (response, change) = if node.path == node.name { authoring.name_ui(ui, source, &node.name, node.range.start as u64..node.range.end as u64) } else { (ui.label(node.tree_label()), None) };
                 if change.is_some() { edit = change; }
                 response
             }) {
-                self.author_in_structure = true;
                 self.hex_editor.select_range(range, true);
+            }
+            if let Some(name) = self.structure_ui.take_tree_definition_jump() {
+                self.structure_ui.jump_to_yaml_definition(&self.yaml, &name);
+                self.reveal_definition = true;
             }
             if let Some(crate::direct_authoring::Edit::Commit(source)) = edit {
                 self.yaml = source; self.validate_layout(ui.ctx()); self.structure_ui.keep_navigation();
@@ -3061,6 +3064,10 @@ impl BinaryWorkspace {
                 self.open_decoder();
             }
         }
+    }
+
+    pub fn take_structure_reveal_hex(&mut self) -> bool {
+        self.structure_ui.take_tree_reveal_hex()
     }
 
     fn prepare_value_edit(&mut self, node: &Node) {

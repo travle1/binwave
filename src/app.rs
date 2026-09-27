@@ -2027,6 +2027,9 @@ impl BinwaveApp {
                 }
             }
         });
+        if self.binary.take_structure_reveal_hex() {
+            workspace.reveal(Pane::Hex);
+        }
         self.workspace = workspace;
         if let Some(message) = self.cache_message.clone() {
             let mut open = true;

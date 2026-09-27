@@ -7,7 +7,7 @@ use crate::hex_editor::HexHighlight;
 use crate::plot_trace::{decoded_channel_borrowed, TraceMeshCache};
 use crate::plot_raster::PlotRaster;
 use crate::plot_gpu::GpuPlot;
-use crate::structure::{LazyArray, Node, NumericPlan, ParseOutput, Value};
+use crate::structure::{Action, LazyArray, Node, NumericPlan, ParseOutput, Program, TypeChoice, TypeSpec, Value};
 use crate::structure_plot::{PlotData, PlotQuality, PlotReader};
 use egui::{Color32, Ui};
 use egui_plot::{AxisHints, Plot, PlotBounds, PlotPoint, PlotTransform, Points};
@@ -116,6 +116,8 @@ pub struct StructureViews {
     reveal_selected_row: bool,
     expanded: HashSet<String>,
     reveal_tree: Option<String>,
+    tree_jump_definition: Option<String>,
+    tree_reveal_hex: bool,
     table_target: String,
     table_open_groups: HashSet<String>,
     table_anchor: Option<TableAnchor>,
@@ -633,6 +635,7 @@ impl StructureViews {
         &mut self,
         ui: &mut Ui,
         output: &ParseOutput,
+        program: Option<&Program>,
         selection: Option<Range<usize>>,
         names: &mut dyn FnMut(&mut Ui, &Node) -> egui::Response,
     ) -> Option<Range<usize>> {
@@ -644,13 +647,31 @@ impl StructureViews {
             return None;
         }
         self.select_bytes(output, selection);
-        ui.weak("Expand an item to inspect its fields. Click a row to highlight its bytes in Hex; hover a number for decimal, hex, and binary.");
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(egui_phosphor::regular::INFO)
+                    .font(egui::FontId::new(14., egui::FontFamily::Name("phosphor".into())))
+                    .color(crate::theme::DARK.color.text.muted))
+                    .on_hover_text("Expand an item to inspect its fields. Click a row to highlight its bytes in Hex. Hover a number for decimal, hex, and binary.");
+            });
+        });
         let mut clicked = None;
-        self.definition_details(ui, output, &mut clicked);
+        egui::Panel::bottom("structure_types")
+            .show(ui, |ui| self.definition_details(ui, output, &mut clicked));
         if let Some(request) = self.desired.clone().filter(|request| self.expanded.contains(&request.key.path)) {
             let node = self.tree_page_control_node(output, &request.key.path);
             if let Some(node) = node {
-                self.page_controls(ui, &node, output.revision);
+                egui::Panel::bottom("structure_page_controls").show(ui, |ui| {
+                    if let Some(array) = &node.lazy {
+                        let displayed = self.page_for(&node.path, output.revision)
+                            .and_then(|page| page.result.as_ref().ok()).map_or(0, Vec::len);
+                        let remaining = array.count.saturating_sub(request.key.start.saturating_add(displayed));
+                        if remaining > 0 {
+                            ui.weak(format!("… {} more items", comma_number(remaining)));
+                        }
+                    }
+                    self.page_controls(ui, &node, output.revision, true);
+                });
             }
         }
         let mut rows = Vec::new();
@@ -670,68 +691,133 @@ impl StructureViews {
         {
             ui.colored_label(ui.visuals().error_fg_color, format!("Could not load samples: {error}"));
         }
-        let row_height = ui.text_style_height(&egui::TextStyle::Body).max(18.) + 4.;
+        let row_height = 24.;
+        let name_width = rows.iter().map(|(_, depth)| 160. + (*depth).min(32) as f32 * 16.)
+            .max_by(f32::total_cmp).unwrap_or(300.).max(300.);
+        let minimum_width = name_width + 620.;
+        let table_width = ui.available_width().max(minimum_width);
+        let widths = [
+            name_width + (table_width - minimum_width) * 0.55,
+            150.,
+            220. + (table_width - minimum_width) * 0.45,
+            130.,
+            100.,
+            20.,
+        ];
         let mut toggle = None;
         let mut node_click = None;
+        let mut reveal_definition = None;
+        let mut reveal_hex = false;
+        let old_row_spacing = ui.spacing().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = 0.;
         let mut scroll = egui::ScrollArea::both();
         if let Some(path) = self.reveal_tree.take() {
-            if let Some(index) = rows.iter().position(|(node, _)| node.path == path) { scroll = scroll.vertical_scroll_offset(index as f32 * row_height); }
+            if let Some(index) = rows.iter().position(|(node, _)| node.path == path) { scroll = scroll.vertical_scroll_offset((index + 1) as f32 * row_height); }
         }
         scroll
             .id_salt("decoded_structure_tree")
             .auto_shrink([false, false])
-            .show_rows(ui, row_height, rows.len(), |ui, range| {
+            .show_rows(ui, row_height, rows.len() + 1, |ui, range| {
                 for index in range {
+                    if index == 0 {
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(table_width, row_height), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, egui::CornerRadius::same(crate::theme::DARK.radius.row), crate::theme::DARK.color.surface.raised);
+                        paint_tree_columns(ui, rect, widths, ["Name", "Type", "Value", "Offset", "Size", ""], true);
+                        continue;
+                    }
+                    let index = index - 1;
                     let (node, depth) = rows[index];
+                    let parent_kind = rows[..index].iter().rev()
+                        .find(|(_, parent_depth)| *parent_depth + 1 == depth)
+                        .map(|(parent, _)| parent.kind.as_str());
                     ui.push_id(&node.path, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.add_space((depth.min(32) * 14) as f32);
-                            if node.lazy.is_some() || !node.children.is_empty() {
-                                let open = self.expanded.contains(&node.path);
-                                let (_, response) = ui.allocate_exact_size(
-                                    egui::vec2(18., 18.),
-                                    egui::Sense::click(),
-                                );
-                                egui::collapsing_header::paint_default_icon(
-                                    ui,
-                                    if open { 1_f32 } else { 0_f32 },
-                                    &response,
-                                );
-                                if response
-                                    .on_hover_text(if open { "Collapse" } else { "Expand" })
-                                    .clicked()
-                                {
-                                    toggle = Some(node.clone());
-                                }
-                            } else {
-                                ui.add_space(18.);
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(table_width, row_height), egui::Sense::hover());
+                        let selected = self.selected.as_deref() == Some(&node.path);
+                        if selected {
+                            ui.painter().rect_filled(rect.shrink2(egui::vec2(0., 1.)),
+                                egui::CornerRadius::same(crate::theme::DARK.radius.selection),
+                                crate::theme::DARK.color.accent.base.gamma_multiply(crate::theme::DARK.color.accent.selection_alpha));
+                        }
+                        let expandable = node.lazy.is_some() || !node.children.is_empty();
+                        let open = self.expanded.contains(&node.path);
+                        let name_left = rect.left() + 8. + depth.min(32) as f32 * 16.;
+                        let chevron_rect = egui::Rect::from_min_size(
+                            egui::pos2(name_left, rect.top() + 3.), egui::vec2(16., 18.));
+                        if expandable {
+                            ui.painter().with_clip_rect(chevron_rect).text(
+                                chevron_rect.center(), egui::Align2::CENTER_CENTER,
+                                if open { egui_phosphor::regular::CARET_DOWN } else { egui_phosphor::regular::CARET_RIGHT },
+                                egui::FontId::new(11., egui::FontFamily::Name("phosphor".into())),
+                                crate::theme::DARK.color.text.muted);
+                        }
+                        let name_rect = egui::Rect::from_min_max(
+                            egui::pos2(name_left + 16., rect.top()),
+                            egui::pos2(rect.left() + widths[0] - 4., rect.bottom()));
+                        let mut name_clicked = false;
+                        if node.path == node.name {
+                            let mut name_ui = ui.new_child(egui::UiBuilder::new().max_rect(name_rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)));
+                            name_clicked = names(&mut name_ui, node).clicked();
+                        } else {
+                            paint_tree_text(ui, name_rect, &node.tree_label(),
+                                crate::theme::DARK.color.text.primary, false, false, crate::theme::DARK.font.body);
+                        }
+                        let size = node.range.end.saturating_sub(node.range.start);
+                        let value = tree_column_value(node, parent_kind, program);
+                        let kind = tree_column_type(node);
+                        let offset = format!("0x{:08X}", node.range.start);
+                        let size_label = readable_bytes(size);
+                        paint_tree_columns(ui, rect, widths,
+                            ["", &kind, &value, &offset, &size_label, ""], false);
+                        let issue = self.page_for(&node.path, output.revision)
+                            .and_then(|page| page.result.as_ref().err());
+                        if issue.is_some() || node.kind.starts_with("partial") || depth == 0 {
+                            let status_rect = egui::Rect::from_min_max(
+                                egui::pos2(rect.right() - widths[5], rect.top()), rect.right_bottom());
+                            let warning = issue.is_some() || node.kind.starts_with("partial");
+                            paint_tree_text(ui, status_rect, if warning { "!" } else { "✓" },
+                                if warning { crate::theme::DARK.color.status.warning } else { crate::theme::DARK.color.status.success },
+                                false, false, crate::theme::DARK.font.body);
+                        }
+                        let tooltip = format!("{}\n{}\n0x{:08X}..0x{:08X}\n{} bytes{}",
+                            node.path, node.kind, node.range.start, node.range.end, comma_number(size),
+                            if node.references.is_empty() { String::new() } else { format!("\n{}", node.references.join("\n")) });
+                        let tooltip = issue.map_or(tooltip.clone(), |error| format!("{tooltip}\n{error}"));
+                        let tooltip = node.numeric_tooltip().map_or(tooltip.clone(), |number| format!("{number}\n\n{tooltip}"));
+                        let row_response = ui.interact(rect, ui.id().with("tree_row"), egui::Sense::click())
+                            .on_hover_text(tooltip);
+                        if expandable && row_response.clicked() && chevron_rect.contains(ui.input(|i| i.pointer.interact_pos().unwrap_or_default())) {
+                            toggle = Some(node.clone());
+                        } else if row_response.clicked() || name_clicked {
+                            node_click = Some(node.clone());
+                        }
+                        row_response.context_menu(|ui| {
+                            if ui.button("Copy value").clicked() {
+                                ui.ctx().copy_text(node.value.as_ref().map_or_else(|| value.clone(), ToString::to_string));
+                                ui.close();
                             }
-                            let response = names(ui, node);
-                            let tooltip = format!(
-                                "{}\n{} · 0x{:X}..0x{:X}\n{}",
-                                node.path,
-                                node.kind,
-                                node.range.start,
-                                node.range.end,
-                                node.references.join("\n")
-                            );
-                            let tooltip = node.numeric_tooltip().map_or(tooltip.clone(), |number| format!("{number}\n\n{tooltip}"));
-                            let value_response = ui.selectable_label(self.selected.as_deref() == Some(&node.path), format!("· {}", tree_display(node, 90)))
-                                .on_hover_text(&tooltip);
-                            if let Some(error) = self.page_for(&node.path, output.revision)
-                                .and_then(|page| page.result.as_ref().err())
-                            {
-                                ui.colored_label(ui.visuals().error_fg_color, "Could not load samples")
-                                    .on_hover_text(error);
-                            }
-                            response.clone().on_hover_text(&tooltip);
-                            if response.clicked() || value_response.clicked() {
+                            if ui.button("Copy path").clicked() { ui.ctx().copy_text(node.path.clone()); ui.close(); }
+                            if ui.button("Reveal in Hex").clicked() {
                                 node_click = Some(node.clone());
+                                reveal_hex = true;
+                                ui.close();
+                            }
+                            if ui.button("Jump to definition").clicked() {
+                                let kind = node.kind.trim_end_matches("[]");
+                                reveal_definition = Some(if program.is_some_and(|program| program.structures.contains_key(kind)) {
+                                    kind.to_owned()
+                                } else {
+                                    parent_kind.unwrap_or(&node.name).to_owned()
+                                });
+                                ui.close();
                             }
                         });
                     });
                 }
             });
+        ui.spacing_mut().item_spacing.y = old_row_spacing;
+        if reveal_definition.is_some() { self.tree_jump_definition = reveal_definition; }
+        if reveal_hex { self.tree_reveal_hex = true; }
         if let Some(node) = toggle {
             if is_collection(&node) && find_node(&output.nodes, &node.path).is_some() {
                 self.table_target = node.path.clone();
@@ -754,15 +840,29 @@ impl StructureViews {
         clicked.or_else(|| self.navigation_selection.take())
     }
 
+    pub fn take_tree_definition_jump(&mut self) -> Option<String> {
+        self.tree_jump_definition.take()
+    }
+    pub fn take_tree_reveal_hex(&mut self) -> bool {
+        std::mem::take(&mut self.tree_reveal_hex)
+    }
+
     fn definition_details(
         &mut self,
         ui: &mut Ui,
         output: &ParseOutput,
         clicked: &mut Option<Range<usize>>,
     ) {
-        ui.collapsing(
-            format!("Decoder type definitions ({})", output.definitions.len()),
-            |ui| {
+        egui::CollapsingHeader::new(egui::RichText::new(format!("Decoder type definitions ({})", output.definitions.len()))
+            .color(crate::theme::DARK.color.text.muted))
+            .default_open(false)
+            .icon(|ui, openness, response| {
+                ui.painter().text(response.rect.left_center(), egui::Align2::LEFT_CENTER,
+                    if openness > 0.5 { egui_phosphor::regular::CARET_DOWN } else { egui_phosphor::regular::CARET_RIGHT },
+                    egui::FontId::new(11., egui::FontFamily::Name("phosphor".into())),
+                    crate::theme::DARK.color.text.muted);
+            })
+            .show(ui, |ui| {
                 if output.definitions.is_empty() {
                     ui.weak("No resolved types.");
                     return;
@@ -814,9 +914,7 @@ impl StructureViews {
                             ui.label(format!("{}: {} {}", field.name, field.kind, details));
                         }
                     });
-            },
-        );
-        ui.separator();
+            });
     }
 
     fn initialize_target(&mut self, output: &ParseOutput) {
@@ -854,7 +952,7 @@ impl StructureViews {
         });
         if let Some(node) = self.collection_node(output, &self.table_target).cloned() {
             if node.lazy.is_some() {
-                self.page_controls(ui, &node, output.revision);
+                self.page_controls(ui, &node, output.revision, false);
             } else {
                 ui.weak(format!(
                     "{} samples · 0x{:X}–0x{:X}",
@@ -867,7 +965,7 @@ impl StructureViews {
             ui.weak("No repeated samples are defined. In Decoder, repeat a structure by count or until end to create a sample collection.");
         }
     }
-    fn page_controls(&mut self, ui: &mut Ui, node: &Node, revision: u64) {
+    fn page_controls(&mut self, ui: &mut Ui, node: &Node, revision: u64, item_navigation: bool) {
         let Some(array) = &node.lazy else {
             return;
         };
@@ -888,13 +986,14 @@ impl StructureViews {
                 self.table_jump = start;
             }
             ui.label(format!(
-                "Samples {}–{} of {}",
-                start,
-                start
+                "{} {}–{} of {}",
+                if item_navigation { "Items" } else { "Samples" },
+                comma_number(start),
+                comma_number(start
                     .saturating_add(page_size)
                     .min(array.count)
-                    .saturating_sub(1),
-                array.count
+                    .saturating_sub(1)),
+                comma_number(array.count)
             ));
             if ui
                 .add_enabled(
@@ -906,7 +1005,7 @@ impl StructureViews {
                 start = start.saturating_add(page_size);
                 self.table_jump = start;
             }
-            ui.label("Go to sample");
+            ui.label(if item_navigation { "Go to index" } else { "Go to sample" });
             let entry = ui.add(
                 egui::DragValue::new(&mut self.table_jump)
                     .range(0..=array.count.saturating_sub(1)),
@@ -3272,16 +3371,214 @@ fn display(node: &Node, limit: usize) -> String {
     }
 }
 
-fn tree_display(node: &Node, limit: usize) -> String {
-    if node.value.is_some() || node.lazy.is_some() {
-        display(node, limit)
+fn comma_number(value: impl std::fmt::Display) -> String {
+    let text = value.to_string();
+    let (sign, digits) = text.strip_prefix('-').map_or(("", text.as_str()), |digits| ("-", digits));
+    let mut grouped = String::from(sign);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 { grouped.push(','); }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+fn readable_bytes(bytes: usize) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024. && unit + 1 < UNITS.len() {
+        value /= 1024.;
+        unit += 1;
+    }
+    if unit == 0 { format!("{bytes} B") } else { format!("{value:.2} {}", UNITS[unit]) }
+}
+
+fn tree_column_type(node: &Node) -> String {
+    if let Some(array) = &node.lazy {
+        format!("{}[{}]", node.kind.trim_end_matches("[]"), comma_number(array.count))
+    } else if node.kind.ends_with("[]") {
+        format!("{}[{}]", node.kind.trim_end_matches("[]"), comma_number(node.children.len()))
+    } else if node.kind == "string" {
+        format!("string[{}]", node.range.end.saturating_sub(node.range.start))
     } else {
-        clipped(&node.tree_summary(), limit)
+        node.kind.clone()
+    }
+}
+
+fn tree_enum_meaning<'a>(node: &Node, parent_kind: Option<&str>, program: Option<&'a Program>) -> Option<&'a str> {
+    let program = program?;
+    let key = node.value.as_ref()?.to_string();
+    fn mapped<'a>(choice: &'a TypeChoice, name: &str, key: &str, program: &'a Program) -> Option<&'a str> {
+        if choice.reference != name { return None; }
+        choice.cases.get(key).map(String::as_str).or_else(|| {
+            choice.enum_name.as_ref().and_then(|name| program.enums.iter().find(|item| &item.name == name))
+                .and_then(|item| item.cases.get(key).map(String::as_str))
+        })
+    }
+    fn from_actions<'a>(actions: &'a [Action], name: &str, key: &str, program: &'a Program) -> Option<&'a str> {
+        actions.iter().find_map(|action| match action {
+            Action::Define(definition) => mapped(&definition.fields.kind, name, key, program),
+            Action::Choose(choice) => choice.cases.values().find_map(|branch| from_actions(branch, name, key, program))
+                .or_else(|| from_actions(&choice.otherwise, name, key, program)),
+            _ => None,
+        })
+    }
+    parent_kind.and_then(|kind| program.structures.get(kind)).and_then(|structure|
+        structure.fields.iter().find_map(|field| match &field.kind {
+            TypeSpec::Select { choose } => mapped(choose, &node.name, &key, program),
+            _ => None,
+        }).or_else(|| from_actions(&structure.actions, &node.name, &key, program)))
+        .or_else(|| from_actions(&program.actions, &node.name, &key, program))
+}
+
+fn tree_column_value(node: &Node, parent_kind: Option<&str>, program: Option<&Program>) -> String {
+    if let Some(array) = &node.lazy { return format!("{} items", comma_number(array.count)); }
+    if let Some(value) = &node.value {
+        let display = match value {
+            Value::Signed(number) => comma_number(number),
+            Value::Unsigned(number) => comma_number(number),
+            Value::Float(number) => compact_float(*number),
+            Value::Text(text) => format!("{text:?}"),
+            Value::Bytes(_) => display(node, 90),
+        };
+        return tree_enum_meaning(node, parent_kind, program)
+            .map_or(display.clone(), |meaning| format!("{display} · {meaning}"));
+    }
+    if node.kind.ends_with("[]") || node.kind == "partial collection" {
+        return format!("{} items", comma_number(node.children.len()));
+    }
+    if !node.name.starts_with('[') {
+        return node.preview.as_ref().and_then(|preview| preview.split_once('=').map(|(_, value)| value.to_owned()))
+            .unwrap_or_default();
+    }
+    let identifying = node.children.iter()
+        .find(|child| ["name", "id", "label"].contains(&child.name.as_str())
+            && child.value.is_some())
+        .or_else(|| node.children.iter().find(|child| child.value.is_some()));
+    identifying.map(|child| {
+        let value = match child.value.as_ref().unwrap() {
+        Value::Text(text) => text.clone(),
+        Value::Signed(number) => comma_number(number),
+        Value::Unsigned(number) => comma_number(number),
+        value => value.to_string(),
+        };
+        if child.name == "id" { format!("id {value}") } else { value }
+    }).or_else(|| node.preview.as_ref().and_then(|preview| preview.split_once('=').map(|(_, value)| value.to_owned())))
+        .unwrap_or_default()
+}
+
+fn paint_tree_text(ui: &Ui, rect: egui::Rect, text: &str, color: Color32, mono: bool, right: bool, size: f32) {
+    if !ui.is_rect_visible(rect) { return; }
+    let font = egui::FontId::new(size, if mono { egui::FontFamily::Monospace } else { egui::FontFamily::Proportional });
+    let position = if right { rect.right_center() - egui::vec2(6., 0.) } else { rect.left_center() + egui::vec2(4., 0.) };
+    ui.painter().with_clip_rect(rect).text(position,
+        if right { egui::Align2::RIGHT_CENTER } else { egui::Align2::LEFT_CENTER }, text, font, color);
+}
+
+fn paint_tree_columns(ui: &Ui, rect: egui::Rect, widths: [f32; 6], texts: [&str; 6], header: bool) {
+    let mut left = rect.left();
+    for (index, width) in widths.into_iter().enumerate() {
+        let cell = egui::Rect::from_min_max(egui::pos2(left, rect.top()), egui::pos2(left + width, rect.bottom()));
+        let color = if header || index == 1 || index == 3 || index == 4 {
+            crate::theme::DARK.color.text.muted
+        } else {
+            crate::theme::DARK.color.text.primary
+        };
+        paint_tree_text(ui, cell, texts[index], color, !header && index >= 2, index == 4 && !header,
+            if header { crate::theme::DARK.font.small } else { crate::theme::DARK.font.body });
+        left += width;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn structure_row_columns_and_full_width_selection_render() {
+        let yaml = "structures:\n  - name: Header\n    fields:\n      - {name: signature, type: string, length: 4}\nactions:\n  - read: {name: header, type: {structure: Header}}\n";
+        let program = Program::parse(yaml).unwrap();
+        let store = ByteStore::from_snapshot(Original::from_bytes(b"PWAV").unwrap());
+        let output = program.run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut views = StructureViews::default();
+        views.expanded.insert("header".into());
+        let mut frame = |events| ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100., 700.))),
+            events,
+            ..Default::default()
+        }, |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let selection = views.last_hex_selection.clone();
+                views.tree(ui, &output, Some(&program), selection, &mut |ui, node| ui.label(node.tree_label()));
+            });
+        });
+        let first = frame(vec![]);
+        let labels: Vec<_> = first.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+            _ => None,
+        }).collect();
+        for label in ["Name", "Type", "Value", "Offset", "Size", "0x00000000", "4 B"] {
+            assert!(labels.iter().any(|item| item == label), "missing {label}: {labels:?}");
+        }
+        assert!(first.shapes.iter().any(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == egui_phosphor::regular::CARET_DOWN =>
+                text.galley.job.sections.iter().any(|section|
+                    section.format.font_id.family == egui::FontFamily::Name("phosphor".into())),
+            _ => false,
+        }), "tree chevrons must use the Phosphor font");
+        let mut offset_rows: Vec<_> = first.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "0x00000000" => Some(text.pos.y),
+            _ => None,
+        }).collect();
+        offset_rows.sort_by(f32::total_cmp);
+        assert_eq!(offset_rows.len(), 2);
+        assert!(((offset_rows[1] - offset_rows[0]) - 24.).abs() < 1.,
+            "tree rows should be 24 px high: {offset_rows:?}");
+        let offset = first.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "0x00000000" =>
+                Some(text.pos + text.galley.rect.center().to_vec2()),
+            _ => None,
+        }).unwrap();
+        frame(vec![egui::Event::PointerMoved(offset), egui::Event::PointerButton {
+            pos: offset, button: egui::PointerButton::Primary, pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        frame(vec![egui::Event::PointerButton {
+            pos: offset, button: egui::PointerButton::Primary, pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let selected = frame(vec![]);
+        drop(frame);
+        assert_eq!(views.selected.as_deref(), Some("header"));
+        assert!(selected.shapes.iter().any(|shape| match &shape.shape {
+            egui::Shape::Rect(rect) => rect.rect.width() >= 920.
+                && rect.fill == crate::theme::DARK.color.accent.base.gamma_multiply(crate::theme::DARK.color.accent.selection_alpha),
+            _ => false,
+        }), "selected row must be highlighted across all columns");
+    }
+    #[test]
+    fn structure_columns_show_item_names_enum_meanings_and_readable_numbers() {
+        let yaml = "structures:\n  - name: Field\n    fields:\n      - {name: name, type: string, length: 4}\n      - {name: format, type: u32}\n      - {name: data, type: {choose: {ref: format, cases: {'3': f64}}}}\nactions:\n  - read: {name: entries, type: {structure: Field}, repeat: 2}\n";
+        let program = Program::parse(yaml).unwrap();
+        let mut bytes = Vec::new();
+        for name in [b"sine", b"ramp"] {
+            bytes.extend_from_slice(name);
+            bytes.extend_from_slice(&3_u32.to_le_bytes());
+            bytes.extend_from_slice(&1_f64.to_le_bytes());
+        }
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let output = program.run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let entries = &output.nodes[0];
+        let items = entries.lazy.as_ref().map_or_else(|| Ok(entries.children.clone()), |array|
+            array.page(&store.view(), &AtomicBool::new(false), 0, 2)).unwrap();
+        assert_eq!(tree_column_type(entries), "Field[2]");
+        assert_eq!(tree_column_value(&items[0], None, Some(&program)), "sine");
+        assert_eq!(tree_column_value(&items[1], None, Some(&program)), "ramp");
+        assert_eq!(tree_column_value(&items[0].children[1], Some("Field"), Some(&program)), "3 · f64");
+        assert_eq!(tree_column_value(&items[0].children[0], Some("Field"), Some(&program)), "\"sine\"");
+        assert_eq!(comma_number(2_000_000_000), "2,000,000,000");
+        assert_eq!(readable_bytes(2_000_000_000), "1.86 GiB");
+    }
     #[test]
     fn many_visible_traces_share_a_bounded_query_resolution() {
         use super::plot_query_pixel_width;
