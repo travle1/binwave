@@ -1793,9 +1793,9 @@ impl BinaryWorkspace {
         } else if self.is_decoding() {
             "The last successful results remain visible while this run completes."
         } else if matches!(self.decoder_status(), "Decoded" | "Script finished") {
-            "Decoded structure, Plot, Samples, Inspector, and Hex now use these results."
+            "Structure, Signal, Samples, Inspector, and Hex now use these results."
         } else {
-            "Press ▶ Run (F5) to update Decoded structure, Plot, Samples, Inspector, and Hex."
+            "Press ▶ Run (F5) to update Structure, Signal, Samples, Inspector, and Hex."
         }
     }
 
@@ -3036,7 +3036,7 @@ impl BinaryWorkspace {
                 self.yaml = source; self.validate_layout(ui.ctx()); self.structure_ui.keep_navigation();
             }
         } else if let Some(doc) = &self.document {
-            ui.label("Decoded structure");
+            ui.label("Structure");
             if self.interpretation_stale {
                 ui.colored_label(Color32::YELLOW, "Revalidating changed bytes…");
                 return;
@@ -3158,7 +3158,8 @@ impl BinaryWorkspace {
                 &node,
                 sample.as_ref().map(|(index, range)| (*index as u64, range.start as u64..range.end as u64)),
             );
-            crate::workspace_inspector::field_heading(ui, &field);
+            crate::workspace_inspector::field_heading(ui, &field,
+                self.structure_ui.samples_collection_path().as_deref());
             if editable_value(&node) {
                 self.prepare_value_edit(&node);
                 let enabled = self.commands_available() && !self.cell_dirty();

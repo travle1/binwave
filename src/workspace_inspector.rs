@@ -54,7 +54,7 @@ pub fn empty_selection(ui: &mut Ui, has_file: bool, has_decoded: bool) {
     } else if has_decoded {
         (
             "Select a field or byte range",
-            "Choose a field in Decoded structure, a sample in Plot or Samples, or bytes in Hex. The linked selection appears here.",
+            "Choose a field in Structure, a point in Signal, a row in Samples, or bytes in Hex. The linked selection appears here.",
         )
     } else {
         (
@@ -65,17 +65,21 @@ pub fn empty_selection(ui: &mut Ui, has_file: bool, has_decoded: bool) {
     crate::decoder_ui::empty_state(ui, title, detail);
 }
 
-pub fn field_heading(ui: &mut Ui, field: &FieldInfo) {
+/// `samples_collection` names the samples collection; indices in any other
+/// collection are items.
+pub fn field_heading(ui: &mut Ui, field: &FieldInfo, samples_collection: Option<&str>) {
     ui.heading(&field.name);
     if let Some(index) = field.sample {
-        ui.weak(format!("Sample {index}"));
+        let collection = field.path.rfind('[').map(|bracket| &field.path[..bracket]);
+        let noun = if collection.is_some() && collection == samples_collection { "Sample" } else { "Item" };
+        ui.weak(format!("{noun} {index}"));
     }
 }
 
 pub fn field_details(ui: &mut Ui, field: &FieldInfo, definition: Option<(u64, usize)>) {
     if let Some((consumed, types)) = definition {
         ui.label(format!(
-            "Definition covers {consumed} bytes · {types} reusable types"
+            "Decoder covers {consumed} bytes · {types} reusable types"
         ));
     }
     ui.label("Definition path");

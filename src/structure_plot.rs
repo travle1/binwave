@@ -2081,7 +2081,7 @@ fn read_numeric(
 ) -> Result<PlotData> {
     ensure!(
         request.source.revision == plan.revision,
-        "Bytes changed; apply the definition again before plotting this collection."
+        "Bytes changed; run the decoder again before plotting this collection."
     );
     let field_count = plan.fields.len().max(1) as Address;
     let quality = if quality == PlotQuality::Exact

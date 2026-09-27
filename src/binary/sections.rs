@@ -138,7 +138,7 @@ impl<'de> Deserialize<'de> for Entry {
         impl<'de> Visitor<'de> for V {
             type Value = Entry;
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("one field-name: definition entry")
+                f.write_str("one field-name: type entry")
             }
             fn visit_map<M: MapAccess<'de>>(
                 self,

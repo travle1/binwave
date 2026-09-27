@@ -1181,7 +1181,7 @@ impl LazyArray {
     ) -> Result<Vec<Node>> {
         ensure!(
             source.revision == self.plan.revision,
-            "Bytes changed; apply the definition again before expanding this collection."
+            "Bytes changed; run the decoder again before expanding this collection."
         );
         source.validate()?;
         ensure!(
@@ -1335,7 +1335,7 @@ impl Program {
     pub fn parse(yaml: &str) -> Result<Self> {
         ensure!(
             yaml.len() as Address <= MAX_YAML,
-            "definition exceeds 256 KiB"
+            "decoder exceeds 256 KiB"
         );
         let program: Self = serde_yaml_ng::from_str(yaml).context("read structure YAML")?;
         ensure!(!program.actions.is_empty(), "define at least one action");
@@ -1728,7 +1728,7 @@ impl<'a> Engine<'a> {
         ensure!(!self.cancel.load(Ordering::Relaxed), "parsing cancelled");
         ensure!(
             depth <= MAX_DEPTH,
-            "structure nesting exceeds {MAX_DEPTH} levels (possibly a recursive definition)"
+            "structure nesting exceeds {MAX_DEPTH} levels (possibly a recursive structure)"
         );
         self.nodes += 1;
         ensure!(self.nodes <= MAX_NODES, "variable-size parsing exceeds {MAX_NODES} elements; narrow the region or use a fixed-size collection");
@@ -2241,7 +2241,7 @@ impl<'a> Engine<'a> {
                             })
                             .unwrap_or_default();
                         anyhow::bail!(
-                            "{path}: fixed-size repeat at byte {start} has {region} bytes available; {complete} complete {width}-byte items fit; {remainder} bytes remain. Their ranges are available as a tentative prefix in Decoded structure; expand an item to decode its fields.{per_item}"
+                            "{path}: fixed-size repeat at byte {start} has {region} bytes available; {complete} complete {width}-byte items fit; {remainder} bytes remain. Their ranges are available as a tentative prefix in Structure; expand an item to decode its fields.{per_item}"
                         );
                     }
                     Some((end - start) / width)
@@ -2718,7 +2718,7 @@ impl<'a> Engine<'a> {
         } else {
             collection.children.clone()
         };
-        ensure!(!children.is_empty(), "definition input is empty");
+        ensure!(!children.is_empty(), "define input is empty");
         ensure!(
             children.len() <= 4096,
             "at most 4096 discovered fields are allowed"

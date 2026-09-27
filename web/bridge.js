@@ -54,10 +54,10 @@
         if (data.type === 'error') { data.operation = operation; status.textContent = data.message; }
         if (data.type === 'decoded') {
             status.textContent = `Decoded ${data.result.consumed} of ${size} bytes`;
-            if (!data.result.collections.length) status.textContent += ' · inspect Decoded structure';
+            if (!data.result.collections.length) status.textContent += ' · inspect Structure';
         }
         if (data.type === 'decode_failed') {
-            status.textContent = `Partial decode through byte ${data.result.consumed} · inspect Decoded structure and Console`;
+            status.textContent = `Partial decode through byte ${data.result.consumed} · inspect Structure and Console`;
         }
         if (data.type === 'exported') status.textContent = 'Export complete';
         if (data.type === 'opened') status.textContent = exportable ? 'Local file opened' : 'Inspection available; safe streaming export needs a supported file-system picker';

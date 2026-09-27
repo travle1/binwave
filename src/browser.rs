@@ -397,7 +397,7 @@ impl BrowserApp {
                     self.plot_sources.clear();
                     self.reveal_results = true;
                     self.mobile_target = Some(Pane::Structures);
-                    self.status = format!("Partial decode through byte {}. Inspect Decoded structure and the Console error together.", self.decoded["consumed"].as_str().unwrap_or("0"));
+                    self.status = format!("Partial decode through byte {}. Inspect Structure and the Console error together.", self.decoded["consumed"].as_str().unwrap_or("0"));
                     if let Some((start, end)) = parse_offset(&self.range_start).zip(parse_offset(&self.range_end)) {
                         self.request_inspect(start, end);
                     }
@@ -435,12 +435,7 @@ impl BrowserApp {
                     self.plot = Default::default();
                     let inline = std::mem::take(&mut self.inline_decode);
                     self.reveal_results |= !inline;
-                    let path = self.decoded["collections"]
-                        .as_array()
-                        .and_then(|a| a.iter().max_by_key(|c| c["count"].as_str().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0)))
-                        .and_then(|v| v["path"].as_str())
-                        .unwrap_or("")
-                        .to_owned();
+                    let path = self.samples_path().unwrap_or_default();
                     if inline && !self.collection.is_empty() && self.decoded["collections"].as_array().is_some_and(|a| a.iter().any(|v| v["path"].as_str() == Some(&self.collection))) {
                         self.table_start = self.table_start.min(self.count().saturating_sub(1));
                         self.request_table();
@@ -448,8 +443,9 @@ impl BrowserApp {
                     } else { self.select_collection(path); if !self.plot_sources.is_empty() { self.request_plot_view(1200, false); } }
                     if !inline { self.mobile_target = Some(if self.collection.is_empty() { Pane::Structures } else { Pane::Plot }); }
                     self.status = format!("Decoded {} of {} bytes. {}", self.decoded["consumed"].as_str().unwrap_or("0"), self.size,
-                        if self.collection.is_empty() { "Inspect the fields in Decoded structure; unread bytes are allowed." }
-                        else { "Select samples to inspect their values and bytes." });
+                        if self.collection.is_empty() { "Inspect the fields in Structure; unread bytes are allowed." }
+                        else if self.samples_path().as_deref() == Some(self.collection.as_str()) { "Select samples to inspect their values and bytes." }
+                        else { "Select items to inspect their values and bytes." });
                     if let Some((start, end)) = parse_offset(&self.range_start).zip(parse_offset(&self.range_end)) {
                         self.request_inspect(start, end);
                     }
@@ -554,7 +550,7 @@ impl BrowserApp {
                     self.decoding = false;
                     self.pending.clear();
                     self.status = if decoder_failure {
-                        "Decoder failed. See Definition → Console for details.".into()
+                        "Decoder failed. See Console for details.".into()
                     } else {
                         event.message
                     };
@@ -859,7 +855,7 @@ impl BrowserApp {
     fn inspector(&mut self, ui: &mut egui::Ui) {
         let mut reveal = None;
         if let Some(field) = self.inspected.clone() {
-            crate::workspace_inspector::field_heading(ui, &field);
+            crate::workspace_inspector::field_heading(ui, &field, self.samples_path().as_deref());
             ui.label("Value");
             if field.editable {
                 let apply = crate::workspace_inspector::value_editor(
@@ -1058,6 +1054,15 @@ impl BrowserApp {
             self.status = "Decoding in worker…".into();
         }
     }
+    /// The samples collection is the largest one; rows elsewhere are items.
+    fn samples_path(&self) -> Option<String> {
+        self.decoded["collections"]
+            .as_array()?
+            .iter()
+            .max_by_key(|c| c["count"].as_str().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0))
+            .and_then(|v| v["path"].as_str())
+            .map(str::to_owned)
+    }
     fn count(&self) -> u64 {
         self.decoded["collections"]
             .as_array()
@@ -1241,6 +1246,7 @@ impl BrowserApp {
     }
     fn collection_picker(&mut self, ui: &mut egui::Ui) {
         let mut selected = self.collection.clone();
+        let samples = self.samples_path();
         egui::ComboBox::from_id_salt("collection")
             .selected_text(if selected.is_empty() {
                 "Run a decoder"
@@ -1251,11 +1257,14 @@ impl BrowserApp {
                 if let Some(arrays) = self.decoded["collections"].as_array() {
                     for a in arrays {
                         let path = a["path"].as_str().unwrap_or("");
-                        ui.selectable_value(
-                            &mut selected,
-                            path.into(),
-                            format!("{} · {} samples", path, a["count"].as_str().unwrap_or("0")),
-                        );
+                        let count = a["count"].as_str().unwrap_or("0");
+                        let noun = match (samples.as_deref() == Some(path), count == "1") {
+                            (true, true) => "sample",
+                            (true, false) => "samples",
+                            (false, true) => "item",
+                            (false, false) => "items",
+                        };
+                        ui.selectable_value(&mut selected, path.into(), format!("{path} · {count} {noun}"));
                     }
                 }
             });
@@ -1265,6 +1274,7 @@ impl BrowserApp {
     }
     fn samples(&mut self, ui: &mut egui::Ui) {
         self.collection_picker(ui);
+        let samples = self.samples_path().as_deref() == Some(self.collection.as_str());
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(self.table_start > 0, egui::Button::new("Previous 128"))
@@ -1283,14 +1293,17 @@ impl BrowserApp {
                 self.table_start += 128;
                 self.request_table();
             }
-            ui.label("Go to sample");
+            ui.label(if samples { "Go to sample" } else { "Go to item" });
             let enter = ui.add_sized([86., 24.], egui::TextEdit::singleline(&mut self.table_jump)).lost_focus()
                 && ui.input(|input| input.key_pressed(egui::Key::Enter));
             if ui.button("Go").clicked() || enter {
                 if let Some(index) = parse_offset(&self.table_jump).filter(|index| *index < self.count()) {
                     self.table_start = index;
                     self.request_table();
-                } else { self.status = "Enter a sample index inside this collection.".into(); }
+                } else {
+                    self.status = if samples { "Enter a sample index inside this collection." }
+                        else { "Enter an item index inside this collection." }.into();
+                }
             }
         });
         let mut selection = None;
@@ -1304,7 +1317,7 @@ impl BrowserApp {
                 egui::Grid::new("decoded-samples")
                     .striped(true)
                     .show(ui, |ui| {
-                        ui.strong("Sample");
+                        ui.strong(if samples { "Sample" } else { "Item" });
                         for key in &columns {
                             ui.strong(*key);
                         }
@@ -1315,7 +1328,7 @@ impl BrowserApp {
                                 let cell = &row["cells"][*key];
                                 if ui
                                     .selectable_label(self.selected_sample == row["index"].as_str().and_then(parse_offset), cell["text"].as_str().unwrap_or("—"))
-                                    .on_hover_text("Select in Hex and Plot")
+                                    .on_hover_text("Select in Hex and Signal")
                                     .clicked()
                                 {
                                     selection = cell["start"]
@@ -1328,7 +1341,7 @@ impl BrowserApp {
                         }
                     });
             } else {
-                ui.label(if self.decoded.is_null() { "Press ▶ Run (F5) to populate samples." } else { "No repeated samples yet. Your decoded fields are in Decoded structure." });
+                ui.label(if self.decoded.is_null() { "Press ▶ Run (F5) to fill this table." } else { "No collections yet. Your decoded fields are in Structure." });
             }
         });
         if let Some((start, end)) = selection {
@@ -1337,7 +1350,7 @@ impl BrowserApp {
     }
     fn structures(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.weak("Decoded structure");
+            ui.weak("Structure");
             ui.small_button("i").on_hover_text("Expand an item to inspect its fields. Click a row to highlight its bytes in Hex. Hover a number for decimal, hex, and binary.");
         });
         if self.decoded["partial"].as_bool() == Some(true) {

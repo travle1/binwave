@@ -694,7 +694,7 @@ impl StructureViews {
             .filter_map(|page| page.result.as_ref().err())
             .next()
         {
-            ui.colored_label(ui.visuals().error_fg_color, format!("Could not load samples: {error}"));
+            ui.colored_label(ui.visuals().error_fg_color, format!("Could not load items: {error}"));
         }
         let row_height = 24.;
         let name_width = rows.iter().map(|(_, depth)| 160. + (*depth).min(32) as f32 * 16.)
@@ -858,7 +858,7 @@ impl StructureViews {
         output: &ParseOutput,
         clicked: &mut Option<Range<usize>>,
     ) {
-        egui::CollapsingHeader::new(egui::RichText::new(format!("Decoder type definitions ({})", output.definitions.len()))
+        egui::CollapsingHeader::new(egui::RichText::new(format!("Decoder types ({})", output.definitions.len()))
             .color(crate::theme::DARK.color.text.muted))
             .default_open(false)
             .icon(|ui, openness, response| {
@@ -938,16 +938,23 @@ impl StructureViews {
             .max_by_key(|node| collection_score(node, output))
             .map_or_else(String::new, |node| node.path.clone());
     }
+    fn samples_path(&self, output: &ParseOutput) -> Option<String> {
+        let mut collections = Vec::new();
+        collect_collections(&output.nodes, &mut collections);
+        collections.extend(self.flattened_collections.iter());
+        samples_collection(collections, output).map(|node| node.path.clone())
+    }
     fn target_controls(&mut self, ui: &mut Ui, output: &ParseOutput) {
         self.initialize_target(output);
         let mut collections = Vec::new();
         collect_collections(&output.nodes, &mut collections);
         let mut collections: Vec<Node> = collections.into_iter().cloned().collect();
         collections.extend(self.flattened_collections.iter().cloned());
+        let samples = self.samples_path(output).as_deref() == Some(self.table_target.as_str());
         let selected_text = if self.table_target.is_empty() {
             "File elements".to_owned()
         } else if let Some(node) = collections.iter().find(|node| node.path == self.table_target) {
-            collection_label(node)
+            collection_label(node, samples)
         } else {
             self.table_target.clone()
         };
@@ -957,17 +964,19 @@ impl StructureViews {
         });
         if let Some(node) = self.collection_node(output, &self.table_target).cloned() {
             if node.lazy.is_some() {
-                self.page_controls(ui, &node, output.revision, false);
+                self.page_controls(ui, &node, output.revision, !samples);
             } else {
+                let count = collection_count(&node);
                 ui.weak(format!(
-                    "{} samples · 0x{:X}–0x{:X}",
-                    collection_count(&node),
+                    "{} {} · 0x{:X}–0x{:X}",
+                    count,
+                    row_noun(samples, count),
                     node.range.start,
                     node.range.end
                 ));
             }
         } else if collections.is_empty() {
-            ui.weak("No repeated samples are defined. In Decoder, repeat a structure by count or until end to create a sample collection.");
+            ui.weak("No collections are defined. In Decoder, repeat a structure by count or until end to create one.");
         }
     }
     fn page_controls(&mut self, ui: &mut Ui, node: &Node, revision: u64, item_navigation: bool) {
@@ -1127,7 +1136,12 @@ impl StructureViews {
         self.start_nested_discovery(output, source, ui.ctx());
         if let Some(error) = &self.discovery_error { ui.colored_label(Color32::LIGHT_RED, error); }
         self.target_controls(ui, output);
-        ui.weak("Click a sample or value · Shift-click to select a range of whole samples.");
+        let samples_target = self.samples_path(output).as_deref() == Some(self.table_target.as_str());
+        ui.weak(if samples_target {
+            "Click a sample or value · Shift-click to select a range of whole samples."
+        } else {
+            "Click an item or value · Shift-click to select a range of whole items."
+        });
         let navigation = self.table_navigation(output);
         let rows = self.target_rows(output);
         let mut lines = Vec::with_capacity(navigation.len() + rows.len());
@@ -1152,12 +1166,9 @@ impl StructureViews {
         let sample_collection = !self.table_target.is_empty();
         let mut chosen = None;
         let row_height = 26.;
+        let row_label = if samples_target { "sample" } else { "item" };
         let metadata = [
-            if sample_collection {
-                "Sample"
-            } else {
-                "Element"
-            },
+            if samples_target { "Sample" } else { "Item" },
             "Byte offset",
             "Bytes",
         ];
@@ -1264,7 +1275,7 @@ impl StructureViews {
                                     sample_collection,
                                 )
                                 .on_hover_text(format!(
-                                    "Select whole sample\n{}\n0x{:X}..0x{:X}",
+                                    "Select whole {row_label}\n{}\n0x{:X}..0x{:X}",
                                     node.path, node.range.start, node.range.end
                                 ))
                                 .clicked()
@@ -1661,8 +1672,10 @@ impl StructureViews {
                             }
                         });
                 } else {
-                    changed |= plot_collection_choices(ui, &collections, &mut self.plot_sources,
-                        &mut self.plot_collection_filter);
+                    let samples = samples_collection(collections.iter().copied(), output)
+                        .map(|node| node.path.clone());
+                    changed |= plot_collection_choices(ui, &collections, samples.as_deref(),
+                        &mut self.plot_sources, &mut self.plot_collection_filter);
                 }
             });
         if close_collections { self.plot_collections_open = false; }
@@ -1704,7 +1717,7 @@ impl StructureViews {
         }
         if changed { self.plot_fit_y = true; }
         let Some(node) = self.collection_node(output, &self.plot_target).cloned() else {
-            ui.label("No sample collection. Repeat a numeric field or structure in the definition to plot it.");
+            ui.label("No sample collection. Repeat a numeric field or structure in the decoder to plot it.");
             return None;
         };
         let count = collection_count(&node);
@@ -2868,7 +2881,7 @@ impl StructureViews {
     }
 }
 
-fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut std::collections::BTreeSet<String>, filter: &mut String) -> bool {
+fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], samples: Option<&str>, selected: &mut std::collections::BTreeSet<String>, filter: &mut String) -> bool {
     let mut changed=false;
     let (single, groups) = grouped_collection_choices(collections);
     let grouped_containers: HashSet<_> = groups.keys().filter_map(|key|
@@ -2893,7 +2906,7 @@ fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], selected: &mut st
                         && !node.path.to_lowercase().contains(&query) { continue; }
                     ui.push_id(&node.path, |ui| {
                         let mut enabled=selected.contains(&node.path);
-                        if ui.checkbox(&mut enabled,collection_label(node))
+                        if ui.checkbox(&mut enabled,collection_label(node, samples == Some(node.path.as_str())))
                             .on_hover_text(&node.path).changed() {
                             if enabled {selected.insert(node.path.clone());} else {selected.remove(&node.path);}
                             changed=true;
@@ -3207,6 +3220,32 @@ fn numeric_kind(kind: &str) -> bool {
 }
 fn has_numeric(node: &Node) -> bool {
     node.numeric().is_some() || node.children.iter().any(has_numeric)
+}
+/// The samples collection is the numeric collection with the most elements.
+/// Rows of every other collection are items.
+fn samples_collection<'a>(
+    collections: impl IntoIterator<Item = &'a Node>,
+    output: &ParseOutput,
+) -> Option<&'a Node> {
+    collections
+        .into_iter()
+        .map(|node| (collection_score(node, output), node))
+        .filter(|(score, _)| score.0)
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, node)| node)
+}
+pub(crate) fn samples_collection_path(output: &ParseOutput) -> Option<String> {
+    let mut collections = Vec::new();
+    collect_collections(&output.nodes, &mut collections);
+    samples_collection(collections, output).map(|node| node.path.clone())
+}
+fn row_noun(samples: bool, count: usize) -> &'static str {
+    match (samples, count == 1) {
+        (true, true) => "sample",
+        (true, false) => "samples",
+        (false, true) => "item",
+        (false, false) => "items",
+    }
 }
 fn collection_score(node: &Node, output: &ParseOutput) -> (bool, usize, usize) {
     let numeric = has_numeric(node)
@@ -3554,8 +3593,9 @@ fn numeric_bounds(values: impl Iterator<Item = f64>) -> Option<(f64, f64)> {
     Some(((min - margin).max(-f64::MAX), (max + margin).min(f64::MAX)))
 }
 
-fn collection_label(node: &Node) -> String {
-    format!("{} · {} samples", node.name, collection_count(node))
+fn collection_label(node: &Node, samples: bool) -> String {
+    let count = collection_count(node);
+    format!("{} · {} {}", node.name, count, row_noun(samples, count))
 }
 
 fn compact_float(value: f64) -> String {

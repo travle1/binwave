@@ -21,13 +21,13 @@ const YAML_INSERT_TEMPLATES: &[(&str, &str)] = &[
     ("Length-bounded bytes", "- {name: payload, type: bytes, length: {ref: payload_length}}"),
     ("Choice by earlier field", "- name: payload\n  type:\n    choose:\n      ref: kind\n      cases:\n        '1': {structure: KnownPayload}\n      otherwise: bytes\n  length: {ref: payload_length}"),
     ("Repeated records", "- name: records\n  type: {structure: Record}\n  repeat: {ref: count}"),
-    ("Structure definition", "- name: Record\n  fields:\n    - {name: value, type: u32}"),
+    ("Structure", "- name: Record\n  fields:\n    - {name: value, type: u32}"),
     ("Read action", "- read: {name: records, type: {structure: Record}, repeat: until end}"),
 ];
 
 const PYTHON_INSERT_TEMPLATES: &[(&str, &str)] = &[
     ("Import decoder types", "from binwave import Field, Struct"),
-    ("Structure definition", "Record = Struct(\"Record\", [\n    (\"value\", \"u32\"),\n], endian=\"little\")"),
+    ("Structure", "Record = Struct(\"Record\", [\n    (\"value\", \"u32\"),\n], endian=\"little\")"),
     ("Fixed-length string field", "Field(\"label\", \"string\", length=8)"),
     ("Read one structure", "record = file.read_struct(\"record\", Record)"),
     ("Read repeated records", "records = file.records(\"records\", Record, count=record.count)"),
@@ -895,7 +895,7 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.heading("Binwave decoder guide");
-            ui.label("A decoder describes how bytes become named values. Open a data file, edit the Definition, then press ▶ Run (F5). A successful run publishes the same decoded structure to Plot, Samples, Inspector, and Hex.");
+            ui.label("A decoder describes how bytes become named values. Open a data file, edit the decoder, then press ▶ Run (F5). A successful run publishes the same decoded structure to Signal, Samples, Inspector, and Hex.");
             ui.label("This guide documents Binwave's decoder types and cursor rules. YAML is the declarative format; Python is available when the layout needs loops, validation, or other program logic.");
             ui.separator();
 
@@ -1037,7 +1037,7 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
                 .show(ui, |ui| {
                     ui.label("define is different from choose. choose selects an existing type; define creates a new type from an earlier description collection. Creating the type consumes no payload bytes—the later read does that.");
                     ui.code("- define:\n    name: GeneratedRecord\n    from: description.fields\n    fields:\n      name: {ref: label}\n      type: {ref: format, cases: {'1': u16, '2': i16, '3': f32}}\n      repeat: {ref: count}");
-                    ui.label("Optional mappings also include length, at, and relative. Generated names and formats come from decoded data, but the mapping from numeric format codes to Binwave types belongs to the decoder definition.");
+                    ui.label("Optional mappings also include length, at, and relative. Generated names and formats come from decoded data, but the mapping from numeric format codes to Binwave types belongs to the decoder.");
                     ui.code("repeat: {ref: group_count}\nitems_per_group: {ref: values_per_group}");
                     ui.label("For grouped values, repeat counts groups and items_per_group counts consecutive values in each group. With layout: interleaved, each position is a sensor followed across sample groups. With layout: contiguous (default), each group is a sensor with items_per_group consecutive samples; these appear as sensor_0, sensor_1, etc. Leave items_per_group out for a flat repeated field.");
                     ui.label("Because define executes during parsing, the description bytes and define action must occur before any read that references GeneratedRecord.");
@@ -1065,7 +1065,7 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
                     ui.label("Field(name, type, length=None, count=None, offset=None, endian=None, expect=None) accepts a fixed numeric type, string, bytes, or another Struct. (name, type) is shorthand.");
                     ui.label("Struct(name, fields, endian=None) creates a fixed layout and exposes size and fields.");
                     ui.label("file.size is the byte length. file.tell() and file.seek(offset, whence=0) control the cursor. file.read(length) advances it; file.read_at(offset, length) does not. file.unpack(format, offset=None) uses Python struct formats.");
-                    ui.label("file.read_struct(name, struct, offset=None) decodes metadata now. file.records(name, struct, count=None, offset=None) registers a lazy collection for Plot and Samples. Without count, records consumes complete records to the end of the file.");
+                    ui.label("file.read_struct(name, struct, offset=None) decodes metadata now. file.records(name, struct, count=None, offset=None) registers a lazy collection for Signal and Samples. Without count, records consumes complete records to the end of the file.");
                     ui.strong("Calculated checksum example");
                     ui.code("import zlib\n\ndef crc32_range(start, length):\n    crc = 0\n    while length:\n        size = min(length, 1024 * 1024)\n        crc = zlib.crc32(file.read_at(start, size), crc)\n        start += size\n        length -= size\n    return crc & 0xFFFFFFFF\n\nif crc32_range(payload_start, payload_bytes) != stored_checksum:\n    raise ValueError('checksum mismatch')");
                     ui.label("A single read/read_at call is limited to 1 MiB, so calculated validation over larger ranges must use bounded chunks as shown above.");
@@ -1074,7 +1074,7 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
 
             egui::CollapsingHeader::new("Large files and lazy decoding")
                 .show(ui, |ui| {
-                    ui.label("Fixed-size collections are kept lazy: Binwave stores the collection plan and decodes only the pages requested by Plot, Samples, Inspector, or Hex. This is the preferred representation for very large recordings.");
+                    ui.label("Fixed-size collections are kept lazy: Binwave stores the collection plan and decodes only the pages requested by Signal, Samples, Inspector, or Hex. This is the preferred representation for very large recordings.");
                     ui.label("Variable-size records must be scanned to discover their boundaries. A tagged record containing choose is variable-size unless every selected layout has a known common stride. Keep each record length-delimited when the format provides a length.");
                     ui.label("Use file.records in Python or a fixed-size repeated structure in YAML for large homogeneous arrays. Avoid turning a large raw payload into one decoded node per byte.");
                 });
@@ -1082,9 +1082,9 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
             egui::CollapsingHeader::new("Editing and troubleshooting")
                 .show(ui, |ui| {
                     ui.label("YAML syntax and indentation are checked while you type. Select a reported line to jump there. Run-time errors remain in the Console because they depend on the open data.");
-                    ui.label("Copy, cut, paste, undo, redo, select all, and toggle comments are available from Edit → Definition editing and from the editor context menu. Ctrl/Cmd+C, X, and V use the same selection.");
+                    ui.label("Copy, cut, paste, undo, redo, select all, and toggle comments are available from Edit → Decoder editing and from the editor context menu. Ctrl/Cmd+C, X, and V use the same selection.");
                     ui.label("Tab inserts spaces to the next indentation stop; Shift+Tab dedents selected lines. Enter preserves indentation and adds one level after YAML or Python block openers. Right-click the editor to choose a tab width from 1–8 spaces or convert existing leading tabs.");
-                    ui.label("Use the line numbers and the bottom-right Ln/Col indicator to locate errors. The highlighted source line and exact reported column show where YAML stopped understanding the definition.");
+                    ui.label("Use the line numbers and the bottom-right Ln/Col indicator to locate errors. The highlighted source line and exact reported column show where YAML stopped understanding the decoder.");
                     ui.label("Start with Decoder → Examples, run after each small change, and compare the decoded byte ranges with the format specification. Keep an otherwise: bytes branch while investigating unknown variants.");
                     ui.label("Click a decoded value or plot point to reveal its exact bytes. Shift-click a plot sample to select the complete range from the anchor through that sample.");
                 });

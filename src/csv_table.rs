@@ -262,11 +262,11 @@ impl CsvTable {
             return response;
         }
         if columns.is_empty() {
-            ui.label("Select signals in Plot to show columns.");
+            ui.label("Select signals in Signal to show columns.");
             return response;
         }
         ui.small(
-            "Read-only CSV values · click to link with Hex and Plot; Shift-click selects rows.",
+            "Read-only CSV values · click to link with Hex and Signal; Shift-click selects rows.",
         );
         if let Some(selection) = self.row_selection {
             ui.small(format!("{} rows selected", selection.rows().len()));

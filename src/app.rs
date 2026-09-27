@@ -1145,7 +1145,7 @@ impl BinwaveApp {
         self.csv_advance_plot = false;
         self.dataset = self.dataset.wrapping_add(1);
         self.cfg.data_path = None;
-        self.status = "Choose a decoder to populate Plot and Table.".into();
+        self.status = "Choose a decoder to populate Signal and Table.".into();
     }
 
     fn poll_workspace(&mut self, ctx: &Context) {
@@ -2062,7 +2062,7 @@ impl BinwaveApp {
             ui.heading("Inspect and edit a file");
             ui.add_space(8.);
             ui.label("Open any file to explore its bytes.");
-            ui.label("Build reusable definitions from the structures you discover.");
+            ui.label("Build reusable decoders from the structures you discover.");
             ui.add_space(18.);
             if ui
                 .add_enabled(
@@ -2088,7 +2088,7 @@ impl BinwaveApp {
                 }
             }
             ui.add_space(18.);
-            if ui.link("Create a definition").clicked() {
+            if ui.link("Create a decoder").clicked() {
                 if self.decoder == Decoder::Layout {
                     self.binary.show_yaml();
                 }

@@ -1,7 +1,7 @@
 # PWAV waveform fixture, version 1: a generic synthetic tagged container.
 # The reusable parser discovers numeric fields from descriptors in the file.
 # Generate matching data with samples/generators/generate_waveform_stress.rs.
-# Section IDs, names, and numeric formats come from this definition and the file.
+# Section IDs, names, and numeric formats come from this decoder and the file.
 endian: little
 structures:
   - name: Header

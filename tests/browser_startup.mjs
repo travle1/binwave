@@ -152,7 +152,7 @@ test('successful partial decode replaces a previous range error', () => {
     receive({type:'error', message:'read samples exceeds enclosing region'});
     assert.match(get('status').textContent, /exceeds/);
     receive({type:'decoded', result:{consumed:'4', collections:[], nodes:[]}});
-    assert.equal(get('status').textContent, 'Decoded 4 of 1024 bytes · inspect Decoded structure');
+    assert.equal(get('status').textContent, 'Decoded 4 of 1024 bytes · inspect Structure');
 });
 
 test('decoder save downloads the exact YAML without a filesystem picker', async () => {

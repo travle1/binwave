@@ -412,7 +412,7 @@ impl StructureWorkspace {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     let explicit = self.explicit_apply_pending;
                     self.stop_worker();
-                    let error = "Definition worker stopped before returning a result.".to_owned();
+                    let error = "Decoder worker stopped before returning a result.".to_owned();
                     if explicit {
                         self.run_finished = Some(RunOutcome::Failed(error.clone()));
                     }
@@ -592,6 +592,11 @@ impl StructureWorkspace {
             .as_ref()
             .or(self.output.as_ref())
             .and_then(|output| self.views.selected_node(output))
+    }
+
+    pub fn samples_collection_path(&self) -> Option<String> {
+        self.partial_output.as_ref().or(self.output.as_ref())
+            .and_then(crate::structure_views::samples_collection_path)
     }
 
     pub fn selected_sample(&self) -> Option<(usize, Range<usize>)> {
@@ -2131,7 +2136,7 @@ impl StepsEditor {
             editing.draft.ui(ui, &available_types(yaml), &references);
             let changed_outside = editing.base != yaml;
             if changed_outside {
-                ui.colored_label(Color32::YELLOW, "The definition changed while this form was open. Cancel and reopen the step to use the new version.");
+                ui.colored_label(Color32::YELLOW, "The decoder changed while this form was open. Cancel and reopen the step to use the new version.");
             }
             ui.horizontal(|ui| {
                 if ui
@@ -2204,16 +2209,16 @@ fn draft_program(yaml: &str) -> Result<Program> {
             actions: Vec::new(),
         })
     } else if StructureWorkspace::is_generic(yaml) {
-        parse_authoring(yaml).context("Fix the definition syntax before editing steps")
+        parse_authoring(yaml).context("Fix the decoder syntax before editing steps")
     } else {
-        bail!("This is a legacy layout. It remains editable in YAML; create a new definition to use guided steps.")
+        bail!("This is a legacy layout. It remains editable in YAML; create a new decoder to use guided steps.")
     }
 }
 // An empty step list is a valid editing draft. Running it still uses Program::parse,
 // which explains that at least one action is required.
 fn parse_authoring(yaml: &str) -> Result<Program> {
     if yaml.len() > 256 * 1024 {
-        bail!("Definition exceeds 256 KiB");
+        bail!("Decoder exceeds 256 KiB");
     }
     let mut program: Program = serde_yaml_ng::from_str(yaml)?;
     if program.actions.is_empty() {
@@ -2256,7 +2261,7 @@ fn update_steps(yaml: &str, change: StepChange) -> Result<String> {
         }
     }
     let next = serde_yaml_ng::to_string(&program)?;
-    parse_authoring(&next).context("This change would make the definition invalid")?;
+    parse_authoring(&next).context("This change would make the decoder invalid")?;
     Ok(next)
 }
 fn action_label(action: &Action) -> String {
@@ -2668,7 +2673,7 @@ impl Builder {
                 self.repeat_selection = false;
             }
         } else {
-            ui.weak("The byte count will be resolved when the definition runs.");
+            ui.weak("The byte count will be resolved when the decoder runs.");
         }
         ui.add_space(8.);
         ui.collapsing("Advanced", |ui| {
@@ -2940,7 +2945,7 @@ impl Builder {
         let mut base = yaml.to_owned();
         if let Some((previous, instance, name, reuse, mapping)) = &self.last_decoded {
             if previous != yaml {
-                bail!("The definition changed in another editor. Discard this form and start a new selection.");
+                bail!("The decoder changed in another editor. Discard this form and start a new selection.");
             }
             let mut program = parse_authoring(yaml)?;
             program.actions.retain(|action| {
@@ -2974,7 +2979,7 @@ impl Builder {
         } else if StructureWorkspace::is_generic(yaml) {
             parse_authoring(yaml).context("Fix the current YAML before adding fields")?
         } else {
-            bail!("This file uses a legacy layout. Save it, then clear the YAML editor to start a generic definition.")
+            bail!("This file uses a legacy layout. Save it, then clear the YAML editor to start a generic decoder.")
         };
         if program.actions.iter().any(|action| match action {
             Action::Read(field) => field.name == self.instance.trim(),
@@ -4002,7 +4007,7 @@ actions:
                 }
                 _ => None,
             })
-            .unwrap_or_else(|| panic!("Missing {label:?} in definition editor"));
+            .unwrap_or_else(|| panic!("Missing {label:?} in decoder editor"));
         editor_frame(
             workspace,
             yaml,

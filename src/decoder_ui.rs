@@ -309,7 +309,7 @@ fn parsing_map_ui(ui: &mut Ui, map: &ParsingMap, action: &mut ConsoleAction) {
                     if extra == 1 { "byte" } else { "bytes" },
                 ));
             }
-            ui.weak("The complete-sized item ranges form a tentative prefix in Decoded structure. Expand the first item to decode its fields.");
+            ui.weak("The complete-sized item ranges form a tentative prefix in Structure. Expand the first item to decode its fields.");
             ui.horizontal_wrapped(|ui| {
                 if ui.small_button("Show first item in Hex").clicked() {
                     action.byte = Some(repeat.start);
@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn repeat_size_error_shows_arithmetic_and_inspection_targets() {
-        let error = "read records at byte 4096: records: fixed-size repeat at byte 4096 has 82320 bytes available; 40 complete 2048-byte items fit; 400 bytes remain. Their ranges are available as a tentative prefix in Decoded structure.";
+        let error = "read records at byte 4096: records: fixed-size repeat at byte 4096 has 82320 bytes available; 40 complete 2048-byte items fit; 400 bytes remain. Their ranges are available as a tentative prefix in Structure.";
         let repeat = parse_repeat_size_failure(error).unwrap();
         assert_eq!(repeat.complete, 40);
         assert_eq!(repeat.remainder / repeat.complete, 10);

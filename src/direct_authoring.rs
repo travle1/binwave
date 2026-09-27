@@ -514,7 +514,7 @@ impl DirectAuthoring {
                     }
                 }
             });
-            if ui.small_button("Edit definition").clicked() {
+            if ui.small_button("Edit decoder").clicked() {
                 result = Some(Edit::Code);
             }
         });
