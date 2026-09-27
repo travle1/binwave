@@ -1901,6 +1901,65 @@ impl BinaryWorkspace {
         self.controls_inner(ui, false);
     }
 
+    pub fn decoder_menu_controls(&mut self, ui: &mut Ui, compact_toolbar: bool) {
+        let ctx = ui.ctx().clone();
+        let enabled = self.commands_available();
+        let mut recent = Vec::new();
+        if let Some(path) = &self.yaml_path { recent.push(path.clone()); }
+        for pair in self.file_locations.recent_pairs() {
+            if let Some(path) = pair.decoder {
+                if !recent.contains(&path) { recent.push(path); }
+            }
+        }
+        let mut choice = None;
+        let mut new = false;
+        let mut open = false;
+        let mut save_as = false;
+        let mut run = false;
+        let mut save = false;
+        let mut stop = false;
+        let mut editor_page = None;
+        let can_run = self.can_apply_definition() && enabled;
+        let can_save = self.can_save_definition() && enabled;
+        let busy = self.is_decoding();
+        let reason = self.run_disabled_reason().map(str::to_owned);
+        ui.menu_button("v", |ui| {
+            for path in &recent {
+                let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                if ui.button(name.as_ref()).on_hover_text(path.display().to_string()).clicked() {
+                    choice = Some(path.clone()); ui.close();
+                }
+            }
+            if !recent.is_empty() { ui.separator(); }
+            new = ui.button("New decoder").clicked();
+            open = ui.button("Open decoder…").clicked();
+            save_as = ui.add_enabled(can_save, egui::Button::new("Save as…")).clicked();
+        }).response.on_hover_text("Switch decoder");
+        ui.menu_button("Editor", |ui| {
+            if ui.button("Source").clicked() { editor_page = Some(0); ui.close(); }
+            if ui.button("Fields").clicked() { editor_page = Some(1); ui.close(); }
+            if ui.button("Steps").clicked() { editor_page = Some(2); ui.close(); }
+        });
+        if compact_toolbar {
+            save = ui.add_enabled(can_save, egui::Button::new("Save")).on_hover_text("Save decoder").clicked();
+            run = crate::decoder_ui::run_button(ui, can_run, reason.as_deref()).clicked();
+            if busy { stop = ui.button("Stop").clicked(); }
+        }
+        if let Some(path) = choice { self.load_yaml(path, &ctx); }
+        match editor_page {
+            Some(0) => self.structure_ui.show_yaml(),
+            Some(1) => self.structure_ui.show_fields(),
+            Some(2) => self.structure_ui.show_steps(),
+            _ => {}
+        }
+        if new { if self.is_python() { self.new_python(&ctx); } else { self.new_yaml(&ctx); } }
+        if open { self.choose_definition(&ctx); }
+        if save_as { self.save_definition_as(&ctx); }
+        if save { self.save_definition(&ctx); }
+        if run { self.apply_definition(&ctx); }
+        if stop { self.stop_decoding(); }
+    }
+
     pub fn decoder_tab_title(&self) -> String {
         let name = self.yaml_path.as_deref().and_then(Path::file_name)
             .map(|name| name.to_string_lossy().into_owned())
@@ -1957,53 +2016,6 @@ impl BinaryWorkspace {
         if show_language {
             let response = ui.strong(title.clone());
             if let Some(path) = &self.yaml_path { response.on_hover_text(path.display().to_string()); }
-        } else {
-            let mut recent = Vec::new();
-            if let Some(path) = &self.yaml_path { recent.push(path.clone()); }
-            for pair in self.file_locations.recent_pairs() {
-                if let Some(path) = pair.decoder {
-                    if !recent.contains(&path) { recent.push(path); }
-                }
-            }
-            let mut choice = None;
-            let mut new = false;
-            let mut open = false;
-            let mut save_as = false;
-            let mut run = false;
-            let mut save = false;
-            let mut stop = false;
-            let can_run = self.can_apply_definition() && enabled;
-            let can_save = self.can_save_definition() && enabled;
-            let busy = self.is_decoding();
-            let reason = self.run_disabled_reason().map(str::to_owned);
-            let compact_toolbar = ui.available_width() + 2.0 * crate::theme::DARK.spacing.card_padding
-                < crate::theme::DARK.size.decoder_header_actions_min_width;
-            ui.horizontal_wrapped(|ui| {
-                ui.menu_button("Switch decoder ▾", |ui| {
-                    for path in &recent {
-                        let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
-                        if ui.button(name.as_ref()).on_hover_text(path.display().to_string()).clicked() {
-                            choice = Some(path.clone()); ui.close();
-                        }
-                    }
-                    if !recent.is_empty() { ui.separator(); }
-                    new = ui.button("New decoder").clicked();
-                    open = ui.button("Open decoder…").clicked();
-                    save_as = ui.add_enabled(can_save, egui::Button::new("Save as…")).clicked();
-                });
-                if compact_toolbar {
-                    save = ui.add_enabled(can_save, egui::Button::new("Save")).on_hover_text("Save decoder").clicked();
-                    run = crate::decoder_ui::run_button(ui, can_run, reason.as_deref()).clicked();
-                    if busy { stop = ui.button("Stop").clicked(); }
-                }
-            });
-            if let Some(path) = choice { self.load_yaml(path, &ctx); }
-            if new { if self.is_python() { self.new_python(&ctx); } else { self.new_yaml(&ctx); } }
-            if open { self.choose_definition(&ctx); }
-            if save_as { self.save_definition_as(&ctx); }
-            if save { self.save_definition(&ctx); }
-            if run { self.apply_definition(&ctx); }
-            if stop { self.stop_decoding(); }
         }
         if show_language {
         ui.add_enabled_ui(enabled, |ui| {
@@ -2089,12 +2101,15 @@ impl BinaryWorkspace {
         }
         ui.add_enabled_ui(enabled, |ui| {
             let previous = self.yaml.clone();
-            let replacement = self.structure_ui.editor(
-                ui,
-                &mut self.yaml,
-                self.hex_editor.selection(),
-                self.language,
-            );
+            let replacement = if show_language {
+                self.structure_ui.editor(
+                    ui, &mut self.yaml, self.hex_editor.selection(), self.language,
+                )
+            } else {
+                self.structure_ui.editor_without_console(
+                    ui, &mut self.yaml, self.hex_editor.selection(), self.language,
+                )
+            };
             if self.yaml != previous {
                 self.demo_yaml = false;
                 self.decode_error = None;
@@ -2953,6 +2968,21 @@ impl BinaryWorkspace {
         if reveal {
             self.hex_editor.select_range(range, true);
         }
+    }
+
+    pub fn decoder_console(&mut self, ui: &mut Ui) {
+        self.structure_ui.console(ui, self.language);
+        if let Some(byte) = self.structure_ui.take_console_byte_jump() {
+            if let Ok(start) = usize::try_from(byte) {
+                if start < self.file_len() {
+                    self.hex_editor.select_range(start..start + 1, true);
+                }
+            }
+        }
+    }
+
+    pub fn decoder_console_error_count(&self) -> usize {
+        self.structure_ui.console_error_count()
     }
 
     pub fn structures(&mut self, ui: &mut Ui) {

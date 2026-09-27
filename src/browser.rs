@@ -1688,6 +1688,7 @@ impl TabViewer for BrowserApp {
             Pane::Plot => self.decoded_plot(ui),
             Pane::Table => self.samples(ui),
             Pane::Structures => self.structures(ui),
+            Pane::Console => self.decoder(ui),
         }
     }
 }

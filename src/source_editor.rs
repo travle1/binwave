@@ -295,10 +295,18 @@ impl YamlLayoutCache {
     }
 
     pub(crate) fn editor(&mut self, ui: &mut Ui, yaml: &mut String, language: DecoderLanguage) {
+        self.editor_inner(ui, yaml, language, true);
+    }
+
+    pub(crate) fn editor_compact(&mut self, ui: &mut Ui, yaml: &mut String, language: DecoderLanguage) {
+        self.editor_inner(ui, yaml, language, false);
+    }
+
+    fn editor_inner(&mut self, ui: &mut Ui, yaml: &mut String, language: DecoderLanguage, show_toolbar: bool) {
         if let Some(error)=&self.paste_error { ui.colored_label(ui.visuals().error_fg_color,error); }
         let mut apply_spacing_fix = None;
         if language == DecoderLanguage::Yaml {
-            ui.horizontal_wrapped(|ui| {
+            if show_toolbar { ui.horizontal_wrapped(|ui| {
                 let dark = ui.visuals().dark_mode;
                 ui.menu_button("YAML help", |ui| {
                     ui.set_max_width(330.);
@@ -315,7 +323,7 @@ impl YamlLayoutCache {
                     ui.label("Open Help → Decoder guide for every supported type, field option, action, expression, and a complete Python API reference.");
                 });
                 self.tab_width_menu(ui);
-            });
+            }); }
             self.refresh_diagnostic(yaml);
             if let Some(diagnostic) = self.diagnostic.clone() {
                 egui::Frame::NONE
@@ -368,7 +376,7 @@ impl YamlLayoutCache {
                         }
                     });
             }
-        } else {
+        } else if show_toolbar {
             ui.horizontal(|ui| self.tab_width_menu(ui));
         }
         let mut font = egui::TextStyle::Monospace.resolve(ui.style());

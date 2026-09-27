@@ -21,6 +21,7 @@ const DECODER_WIDTH: f32 = 0.40;
 pub enum Pane {
     Structures,
     Inspector,
+    Console,
     Layout,
     Plot,
     Table,
@@ -28,10 +29,11 @@ pub enum Pane {
 }
 impl Pane {
     #[cfg(test)]
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Hex,
         Self::Structures,
         Self::Inspector,
+        Self::Console,
         Self::Layout,
         Self::Plot,
         Self::Table,
@@ -40,6 +42,7 @@ impl Pane {
         match self {
             Self::Structures => "Structure",
             Self::Inspector => "Inspector",
+            Self::Console => "Console",
             Self::Layout => "Decoder",
             Self::Plot => "Signal",
             Self::Table => "Samples",
@@ -60,7 +63,7 @@ impl Default for WorkspaceLayout {
         let [left, right] = dock.main_surface_mut()
             .split_right(NodeIndex::root(), 0.70, vec![Pane::Layout]);
         dock.main_surface_mut().split_below(left, 0.42, vec![Pane::Hex]);
-        dock.main_surface_mut().split_below(right, 0.54, vec![Pane::Structures]);
+        dock.main_surface_mut().split_below(right, 0.54, vec![Pane::Structures, Pane::Console]);
         Self { dock }
     }
 }
@@ -84,11 +87,16 @@ impl WorkspaceLayout {
             return None;
         }
         // eframe's RON storage preserves the infinite rectangles of unopened panes.
-        let result: Self = eframe::get_value(storage, STORAGE_KEY)?;
+        let mut result: Self = eframe::get_value(storage, STORAGE_KEY)?;
         let mut panes = std::collections::HashSet::new();
         for (_, pane) in result.dock.iter_all_tabs() {
             if !panes.insert(*pane) {
                 return None;
+            }
+        }
+        if !panes.contains(&Pane::Console) {
+            if let Some((surface, node, _)) = result.dock.find_tab_legacy(&Pane::Structures) {
+                result.dock[surface][node].append_tab(Pane::Console);
             }
         }
         Some(result)
@@ -162,12 +170,8 @@ impl WorkspaceLayout {
         if self.dock.find_tab_legacy(&pane).is_none() {
             match pane {
                 Pane::Layout => unreachable!(),
-                Pane::Structures | Pane::Inspector => {
-                    let companion = if pane == Pane::Structures {
-                        Pane::Inspector
-                    } else {
-                        Pane::Structures
-                    };
+                Pane::Structures | Pane::Inspector | Pane::Console => {
+                    let companion = if pane == Pane::Structures { Pane::Console } else { Pane::Structures };
                     let target = [Pane::Layout, companion]
                         .into_iter()
                         .find_map(|target| self.dock.find_tab_legacy(&target));
@@ -201,7 +205,7 @@ impl WorkspaceLayout {
     /// panes. This puts results below both Plot and Hex in their comparison view.
     fn editor_branch(&self, surface: SurfaceIndex, mut node: NodeIndex) -> NodeIndex {
         while let Some(parent) = node.parent() {
-            let contains_support = [Pane::Layout, Pane::Inspector, Pane::Structures]
+            let contains_support = [Pane::Layout, Pane::Inspector, Pane::Structures, Pane::Console]
                 .into_iter()
                 .filter_map(|pane| self.dock.find_tab_legacy(&pane))
                 .any(|(other_surface, other_node, _)| {
@@ -220,7 +224,7 @@ impl WorkspaceLayout {
         // show_samples is the explicit action that gives the results their own row.
         if let Some((surface, node, _)) = self.editor_location() {
             self.dock[surface][node].append_tab(pane);
-        } else if let Some((surface, node, _)) = [Pane::Layout, Pane::Inspector, Pane::Structures]
+        } else if let Some((surface, node, _)) = [Pane::Layout, Pane::Inspector, Pane::Structures, Pane::Console]
             .into_iter()
             .find_map(|pane| self.dock.find_tab_legacy(&pane))
         {
@@ -288,7 +292,7 @@ mod tests {
     #[test]
     fn default_shows_four_primary_cards_with_inspector_embedded_in_hex() {
         let workspace = WorkspaceLayout::default();
-        assert_eq!(workspace.dock.iter_all_tabs().count(), 4);
+        assert_eq!(workspace.dock.iter_all_tabs().count(), 5);
         assert!(workspace.dock.find_tab_legacy(&Pane::Plot).is_some());
         assert!(workspace.dock.find_tab_legacy(&Pane::Table).is_none());
         assert_eq!(
@@ -297,6 +301,7 @@ mod tests {
         );
         let (surface, node, tab) = workspace.dock.find_tab_legacy(&Pane::Structures).unwrap();
         assert!(matches!(&workspace.dock[surface][node], Node::Leaf(leaf) if leaf.active == tab));
+        assert_eq!(workspace.dock.find_tab_legacy(&Pane::Console).unwrap().1, node);
         assert_eq!(node, NodeIndex::root().right().right());
         assert_eq!(
             workspace.dock.find_tab_legacy(&Pane::Layout).unwrap().1,
@@ -325,7 +330,7 @@ mod tests {
         }
         assert_eq!(workspace.dock.find_tab_legacy(&Pane::Plot), Some(plot));
         assert_eq!(workspace.dock.find_tab_legacy(&Pane::Hex), Some(hex));
-        assert_eq!(workspace.dock.iter_all_tabs().count(), 4);
+        assert_eq!(workspace.dock.iter_all_tabs().count(), 5);
     }
 
     #[test]
@@ -434,7 +439,7 @@ mod tests {
         assert_eq!(workspace.dock.find_tab_legacy(&Pane::Layout), Some(decoder));
         assert_eq!(workspace.dock.find_tab_legacy(&Pane::Table), Some(table));
         assert_eq!(workspace.dock.find_tab_legacy(&Pane::Hex), Some(hex));
-        assert_eq!(workspace.dock.iter_all_tabs().count(), 5);
+        assert_eq!(workspace.dock.iter_all_tabs().count(), 6);
     }
 
     #[test]
@@ -525,7 +530,7 @@ mod tests {
                 .dock
                 .iter_all_tabs()
                 .count(),
-            4
+            5
         );
     }
     #[test]
@@ -542,7 +547,7 @@ mod tests {
                 .dock
                 .iter_all_tabs()
                 .count(),
-            4
+            5
         );
     }
 }

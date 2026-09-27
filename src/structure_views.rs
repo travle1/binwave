@@ -176,6 +176,7 @@ pub struct StructureViews {
     plot_paused: bool,
     plot_anchor: Option<usize>,
     plot_jump: usize,
+    plot_jump_text: String,
     plot_range_first: usize,
     plot_range_last: usize,
     plot_action: Option<PlotAction>,
@@ -1291,6 +1292,7 @@ impl StructureViews {
                     }
                     if let Some(samples) = sample_indices_for_bytes(collection, range) {
                         self.plot_jump = samples.start;
+                        self.plot_jump_text = samples.start.to_string();
                         self.plot_range_first = samples.start;
                         self.plot_range_last = samples.end.saturating_sub(1);
                         let view = selection_view(
@@ -1350,6 +1352,7 @@ impl StructureViews {
                 self.table_target = collection.path.clone();
                 self.table_jump = samples.start;
                 self.plot_jump = samples.start;
+                self.plot_jump_text = samples.start.to_string();
                 self.plot_range_first = samples.start;
                 self.plot_range_last = samples.end.saturating_sub(1);
                 self.target_initialized = true;
@@ -1402,22 +1405,23 @@ impl StructureViews {
             self.plot_sources_initialized = true;
         }
         let mut changed = false;
-        if self.plot_collections_open {
-            let mut open = self.plot_collections_open;
-            let ctx = ui.ctx().clone();
-            egui::Window::new("Plot collections")
-                .id(egui::Id::new("plot_collections_window"))
-                .open(&mut open)
-                .default_size([380.0, 560.0])
-                .min_width(340.0)
-                .max_width(380.0)
-                .resizable(egui::Vec2b::new(false, true))
-                .show(&ctx, |ui| {
-                    changed |= plot_collection_choices(ui, &collections, &mut self.plot_sources,
-                        &mut self.plot_collection_filter);
+        let mut close_collections = false;
+        egui::Panel::right("plot_collections_sidebar")
+            .default_size(320.0)
+            .min_size(260.0)
+            .max_size(380.0)
+            .resizable(true)
+            .show_collapsible(ui, &mut self.plot_collections_open, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Collections");
+                    if ui.button("×").on_hover_text("Close collections").clicked() {
+                        close_collections = true;
+                    }
                 });
-            self.plot_collections_open = open;
-        }
+                changed |= plot_collection_choices(ui, &collections, &mut self.plot_sources,
+                    &mut self.plot_collection_filter);
+            });
+        if close_collections { self.plot_collections_open = false; }
         if changed {
             self.plot_sources.retain(|path| collection_by_path.contains_key(path.as_str()));
             self.plot_fit_y = true;
@@ -1434,7 +1438,7 @@ impl StructureViews {
             self.extra_plot_readers.clear();
             self.group_plot_readers.clear();
             self.group_plan_cache = None;
-            if ui.button("Collections…").clicked() { self.plot_collections_open = true; }
+            if ui.button("Collections…").clicked() { self.plot_collections_open = !self.plot_collections_open; }
             ui.label(if self.discovery_rx.is_some() {
                 "Finding collections… Choose one to plot when it appears."
             } else {
@@ -1602,13 +1606,20 @@ impl StructureViews {
                 ui.separator();
                 if self.presentation.menu(ui,&ranges) { self.plot_fit_y=true; }
             });
-            if ui.button("Collections…").clicked() { self.plot_collections_open = true; }
+            if ui.button("Collections…").clicked() { self.plot_collections_open = !self.plot_collections_open; }
             if ui.button("Fit").on_hover_text("Show the full sample range and fit the visible fields").clicked() { force_view=Some(0..count); self.plot_fit_y=true; }
             ui.menu_button("Go to sample…", |ui| {
                 ui.label("Sample index (starts at 0)");
-                self.plot_jump=self.plot_jump.min(count-1);
-                ui.add(egui::DragValue::new(&mut self.plot_jump).range(0..=count-1));
-                if ui.button("Go").clicked() {
+                if self.plot_jump_text.is_empty() {
+                    self.plot_jump_text = self.plot_jump.min(count - 1).to_string();
+                }
+                let entry = ui.add(egui::TextEdit::singleline(&mut self.plot_jump_text)
+                    .desired_width(130.0).hint_text("Sample index"));
+                let sample = self.plot_jump_text.trim().parse::<usize>().ok()
+                    .filter(|index| *index < count);
+                if ui.add_enabled(sample.is_some(), egui::Button::new("Go")).clicked()
+                    || entry.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) && sample.is_some() {
+                    self.plot_jump = sample.unwrap();
                     force_view=Some(centered_view(self.plot_jump,view.len().min(INITIAL_PLOT_SAMPLES).max(64),count));
                     if let Some(bytes)=sample_bytes(&node,self.plot_jump..self.plot_jump+1) {picked=Some((bytes,None));}
                     ui.close();
@@ -2105,11 +2116,8 @@ impl StructureViews {
                     && (axis_hover.is_some() || plot_ui.response().hovered())
                 {
                     let (scroll, pan_scroll, shift, pinch, pointer) = plot_ctx.input(|input| {
-                        let scroll = input.raw.events.iter().filter_map(|event| match event {
-                            egui::Event::MouseWheel { delta, .. } => Some(*delta),
-                            _ => None,
-                        }).fold(egui::Vec2::ZERO, |sum, delta| sum + delta);
-                        let pan_scroll = wheel_pan_points(&input.raw.events);
+                        let scroll = wheel_pan_points(&input.raw.events);
+                        let pan_scroll = scroll;
                         let shift = input.modifiers.shift;
                         (
                             scroll,
@@ -2443,6 +2451,7 @@ impl StructureViews {
                 self.plot_range_first = samples.start;
                 self.plot_range_last = samples.end.saturating_sub(1);
                 self.plot_jump = samples.start;
+                self.plot_jump_text = samples.start.to_string();
             }
             self.choose_plot_bytes(output, bytes.clone(), path);
             return Some(bytes);
@@ -3191,8 +3200,10 @@ mod tests {
         });
         assert!(views.plot_sources.is_empty());
         assert!(views.plot_reader.data().is_none());
-        let dialog = ctx.memory(|memory| memory.area_rect(egui::Id::new("plot_collections_window"))).unwrap();
-        assert!(dialog.width() <= 381., "dialog has unused horizontal space: {dialog:?}");
+        let sidebar = egui::containers::panel::PanelState::load(
+            &ctx, egui::Id::new("plot_collections_sidebar"),
+        ).unwrap();
+        assert!(sidebar.size().x <= 381., "sidebar has unused horizontal space: {sidebar:?}");
     }
 
     #[test]
@@ -5074,7 +5085,12 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
 
     #[test]
     fn ordinary_wheel_zooms_x_with_y_locked_and_both_axes_when_unlocked() {
-        for free_y in [false, true] {
+        for (unit, delta, free_y) in [
+            (egui::MouseWheelUnit::Point, 80., false),
+            (egui::MouseWheelUnit::Point, 80., true),
+            (egui::MouseWheelUnit::Line, 1., false),
+            (egui::MouseWheelUnit::Line, 1., true),
+        ] {
             let (store, output) = array();
             let ctx = egui::Context::default();
             let mut views = StructureViews::default();
@@ -5096,13 +5112,13 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 &mut views,
                 &output,
                 &store,
-                vec![egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0., 80.), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE }],
+                vec![egui::Event::MouseWheel { unit, delta: egui::vec2(0., delta), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE }],
                 egui::Modifiers::NONE,
             );
             settle_plot(&ctx, &mut views, &output, &store);
             let after = *navigation_memory(&ctx, &views, &output).bounds();
             assert!(
-                after.width() < before.width() * 0.99,
+                after.width() < before.width() * 0.9,
                 "ordinary wheel must zoom horizontally: {before:?} -> {after:?}"
             );
             if free_y {

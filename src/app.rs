@@ -879,12 +879,17 @@ impl BinwaveApp {
             1
         };
         let previous = mode;
+        let compact_toolbar = ui.available_width() + 2.0 * crate::theme::DARK.spacing.card_padding
+            < crate::theme::DARK.size.decoder_header_actions_min_width;
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(self.commands_available(), |ui| {
                 ui.selectable_value(&mut mode, 1, "YAML");
                 ui.selectable_value(&mut mode, 0, "Python");
                 ui.selectable_value(&mut mode, 2, "CSV");
             });
+            if self.decoder != Decoder::Csv {
+                self.binary.decoder_menu_controls(ui, compact_toolbar);
+            }
         });
         if previous != mode {
             if mode == 2 {
@@ -2359,6 +2364,9 @@ impl TabViewer for WorkspaceViewer<'_> {
     fn title(&mut self, pane: &mut Pane) -> egui::WidgetText {
         if *pane == Pane::Layout {
             self.app.binary.decoder_tab_title().into()
+        } else if *pane == Pane::Console {
+            let errors = self.app.binary.decoder_console_error_count();
+            if errors > 0 { format!("Console  {errors}").into() } else { "Console".into() }
         } else {
             pane.title().into()
         }
@@ -2389,6 +2397,7 @@ impl TabViewer for WorkspaceViewer<'_> {
             Pane::Inspector => {
                 egui::ScrollArea::vertical().show(ui, |ui| self.app.ui_inspector(ui));
             }
+            Pane::Console => self.app.binary.decoder_console(ui),
             Pane::Layout => self.app.ui_decoder(ui),
             Pane::Hex => {
                 let t = &crate::theme::DARK;
@@ -2615,6 +2624,40 @@ mod tests {
             assert_eq!(app.sidebar_open, expected);
             assert_eq!(app.workspace.dock.iter_all_tabs().map(|(_, tab)| *tab).collect::<Vec<_>>(), tabs);
         }
+    }
+
+    #[test]
+    fn collapsed_sidebar_reopens_through_native_header() {
+        let ctx = Context::default();
+        crate::theme::install(&ctx);
+        let mut app = BinwaveApp::default();
+        app.sidebar_open = false;
+        let button = egui::pos2(32., 31.);
+        for events in [
+            vec![],
+            vec![egui::Event::PointerMoved(button), egui::Event::PointerButton {
+                pos: button,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![egui::Event::PointerButton {
+                pos: button,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ] {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600., 1000.))),
+                    events,
+                    ..Default::default()
+                },
+                |_ctx, ui| crate::window_frame::show(ui, |ui| app.ui_workspace(ui)),
+            );
+        }
+        assert!(app.sidebar_open, "native header must let the sidebar button receive clicks");
     }
     fn workspace_click(app: &mut BinwaveApp, ctx: &Context, label: &str) {
         workspace_frame(app, ctx);
@@ -3375,6 +3418,7 @@ mod tests {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
+            workspace_click(&mut app, &ctx, "Console");
             let shown = text(workspace_frame(&mut app, &ctx));
             assert!(shown.contains("Run finished"), "{shown}");
             assert!(!shown.contains("ValueError"));

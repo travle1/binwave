@@ -113,9 +113,13 @@ fn header_regions(
     );
     let maximize = close.translate(vec2(-button_width, 0.));
     let minimize = maximize.translate(vec2(-button_width, 0.));
+    // Keep the draggable background clear of the file, sidebar and overflow
+    // controls. An overlapping drag interaction captures their pointer press.
+    let drag_left = rect.left() + DARK.size.header_drag_left_clearance;
+    let drag_right = (minimize.left() - DARK.size.header_drag_right_clearance).max(drag_left);
     let drag = Rect::from_min_max(
-        pos2(rect.left() + grab, rect.top() + grab),
-        pos2(minimize.left(), rect.bottom()),
+        pos2(drag_left, rect.top() + grab),
+        pos2(drag_right, rect.bottom()),
     );
     (minimize, maximize, close, drag)
 }
@@ -298,8 +302,8 @@ mod tests {
             assert_eq!(button.center().y, header.center().y);
         }
         assert_eq!(close.right(), header.right());
-        assert_eq!(drag.right(), minimize.left());
-        assert!(drag.contains(pos2(200., header.center().y)));
+        assert_eq!(drag.right(), minimize.left() - DARK.size.header_drag_right_clearance);
+        assert!(drag.contains(pos2(700., header.center().y)));
         assert!(!drag.contains(minimize.center()));
     }
 
@@ -369,7 +373,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::theme::install(&ctx);
         frame(&ctx, vec![]);
-        let drag = pos2(300., 30.);
+        let drag = pos2(700., 30.);
         let commands = frame(
             &ctx,
             vec![egui::Event::PointerMoved(drag), pointer_button(drag, true)],
@@ -410,11 +414,35 @@ mod tests {
     }
 
     #[test]
+    fn header_controls_receive_clicks_outside_drag_region() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut clicked = false;
+        for events in [
+            vec![],
+            vec![egui::Event::PointerMoved(pos2(50., 30.)), pointer_button(pos2(50., 30.), true)],
+            vec![pointer_button(pos2(50., 30.), false)],
+        ] {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1600., 1000.))),
+                    events,
+                    ..Default::default()
+                },
+                |_ctx, ui| show(ui, |ui| header(ui, |ui| {
+                    if ui.button("Open file").clicked() { clicked = true; }
+                })),
+            );
+        }
+        assert!(clicked, "header drag must not cover interactive controls");
+    }
+
+    #[test]
     fn double_clicking_header_toggles_maximize() {
         let ctx = egui::Context::default();
         crate::theme::install(&ctx);
         frame(&ctx, vec![]);
-        let header = pos2(300., 30.);
+        let header = pos2(700., 30.);
         frame(
             &ctx,
             vec![

@@ -455,6 +455,9 @@ impl StructureWorkspace {
     pub fn show_steps(&mut self) {
         self.editor_page = EditorPage::Steps;
     }
+    pub fn show_fields(&mut self) {
+        self.editor_page = EditorPage::Structures;
+    }
     pub fn show_yaml(&mut self) {
         self.editor_page = EditorPage::Yaml;
     }
@@ -622,11 +625,32 @@ impl StructureWorkspace {
         range: Option<Range<usize>>,
         language: DecoderLanguage,
     ) -> Option<String> {
+        self.editor_inner(ui, yaml, range, language, true)
+    }
+
+    pub fn editor_without_console(
+        &mut self,
+        ui: &mut Ui,
+        yaml: &mut String,
+        range: Option<Range<usize>>,
+        language: DecoderLanguage,
+    ) -> Option<String> {
+        self.editor_inner(ui, yaml, range, language, false)
+    }
+
+    fn editor_inner(
+        &mut self,
+        ui: &mut Ui,
+        yaml: &mut String,
+        range: Option<Range<usize>>,
+        language: DecoderLanguage,
+        show_console: bool,
+    ) -> Option<String> {
         if language == DecoderLanguage::Python {
-            self.python_editor(ui, yaml);
+            self.python_editor(ui, yaml, show_console);
             return None;
         }
-        ui.horizontal_wrapped(|ui| {
+        if show_console { ui.horizontal_wrapped(|ui| {
             if ui
                 .selectable_label(self.editor_page == EditorPage::Yaml, "Source")
                 .clicked()
@@ -635,23 +659,28 @@ impl StructureWorkspace {
             }
             ui.selectable_value(&mut self.editor_page, EditorPage::Structures, "Fields");
             ui.selectable_value(&mut self.editor_page, EditorPage::Steps, "Steps");
-        });
+        }); }
         if self.last_run_language != Some(DecoderLanguage::Python)
             && self.editor_page != EditorPage::Yaml
         {
             self.status(ui);
         }
-        ui.separator();
+        if show_console { ui.separator(); }
         if self.editor_page == EditorPage::Yaml {
             let active_yaml = self.last_run_language == Some(DecoderLanguage::Yaml);
             let error = if active_yaml { self.error.clone() } else { None };
-            let action = crate::decoder_ui::source_console(
-                ui,
-                "",
-                error.as_deref(),
-                active_yaml && self.is_parsing(),
-                |ui| self.yaml_layout.editor(ui, yaml, DecoderLanguage::Yaml),
-            );
+            let action = if show_console {
+                crate::decoder_ui::source_console(
+                    ui,
+                    "",
+                    error.as_deref(),
+                    active_yaml && self.is_parsing(),
+                    |ui| self.yaml_layout.editor(ui, yaml, DecoderLanguage::Yaml),
+                )
+            } else {
+                self.yaml_layout.editor_compact(ui, yaml, DecoderLanguage::Yaml);
+                crate::decoder_ui::ConsoleAction::default()
+            };
             if action.copy {
                 if let Some(error) = error {
                     ui.ctx().copy_text(error);
@@ -675,15 +704,20 @@ impl StructureWorkspace {
         self.fields_editor(ui, yaml, range)
     }
 
-    fn python_editor(&mut self, ui: &mut Ui, code: &mut String) {
+    fn python_editor(&mut self, ui: &mut Ui, code: &mut String, show_console: bool) {
         let active_python = self.last_run_language == Some(DecoderLanguage::Python);
-        let action = crate::decoder_ui::source_console(
-            ui,
-            if active_python { &self.python_stdout } else { "" },
-            if active_python { self.error.as_deref() } else { None },
-            active_python && self.is_parsing(),
-            |ui| self.yaml_layout.editor(ui, code, DecoderLanguage::Python),
-        );
+        let action = if show_console {
+            crate::decoder_ui::source_console(
+                ui,
+                if active_python { &self.python_stdout } else { "" },
+                if active_python { self.error.as_deref() } else { None },
+                active_python && self.is_parsing(),
+                |ui| self.yaml_layout.editor(ui, code, DecoderLanguage::Python),
+            )
+        } else {
+            self.yaml_layout.editor_compact(ui, code, DecoderLanguage::Python);
+            crate::decoder_ui::ConsoleAction::default()
+        };
         if action.copy {
             let mut text = self.python_stdout.clone();
             if let Some(error) = &self.error {
@@ -698,6 +732,36 @@ impl StructureWorkspace {
         if let Some(byte) = action.byte {
             self.console_byte_jump = Some(byte);
         }
+    }
+
+    pub fn console(&mut self, ui: &mut Ui, language: DecoderLanguage) {
+        let active = self.last_run_language == Some(language);
+        let stdout = if active && language == DecoderLanguage::Python {
+            self.python_stdout.as_str()
+        } else {
+            ""
+        };
+        let error = if active { self.error.as_deref() } else { None };
+        let action = crate::decoder_ui::console(ui, stdout, error, active && self.is_parsing());
+        if action.copy {
+            let mut text = stdout.to_owned();
+            if let Some(error) = error {
+                if !text.is_empty() { text.push('\n'); }
+                text.push_str(error);
+            }
+            ui.ctx().copy_text(text);
+        }
+        if let Some(line) = action.line {
+            self.yaml_layout.go_to_line(line);
+            self.show_yaml();
+        }
+        if let Some(byte) = action.byte {
+            self.console_byte_jump = Some(byte);
+        }
+    }
+
+    pub fn console_error_count(&self) -> usize {
+        usize::from(self.error.is_some())
     }
 
     fn fields_editor(
