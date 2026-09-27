@@ -32,6 +32,7 @@ impl FileKind {
 
 const FILE_LOCATIONS_KEY: &str = "binwave.file_locations.v1";
 const MAX_RECENT_PAIRS: usize = 8;
+const MAX_LIBRARY_DECODERS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecentPair {
@@ -39,6 +40,13 @@ pub struct RecentPair {
     pub decoder: Option<PathBuf>,
     #[serde(default)]
     pub opened_at_unix_secs: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DecoderRun {
+    pub decoder: PathBuf,
+    pub data: PathBuf,
+    pub completed_at_unix_secs: u64,
 }
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -50,6 +58,8 @@ struct SavedLocations {
     csv_config: Option<PathBuf>,
     exports: Option<PathBuf>,
     recent_pairs: Vec<RecentPair>,
+    decoder_library: Vec<PathBuf>,
+    decoder_runs: Vec<DecoderRun>,
 }
 impl SavedLocations {
     fn directory(&self, kind: FileKind) -> &Option<PathBuf> {
@@ -78,6 +88,55 @@ pub struct FileLocations {
     state: Arc<Mutex<SavedLocations>>,
 }
 impl FileLocations {
+    pub fn decoder_paths(&self) -> Vec<PathBuf> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut paths = state.decoder_library.clone();
+        for path in state.recent_pairs.iter().filter_map(|pair| pair.decoder.as_ref()) {
+            if !paths.contains(path) { paths.push(path.clone()); }
+        }
+        paths
+    }
+
+    pub fn forget_decoder(&self, path: &Path) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.decoder_library.retain(|saved| saved != path);
+        state.decoder_runs.retain(|run| run.decoder != path);
+        for pair in &mut state.recent_pairs {
+            if pair.decoder.as_deref() == Some(path) { pair.decoder = None; }
+        }
+    }
+
+    pub fn rename_decoder(&self, old: &Path, new: &Path) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        for saved in &mut state.decoder_library {
+            if saved == old { *saved = new.to_path_buf(); }
+        }
+        for pair in &mut state.recent_pairs {
+            if pair.decoder.as_deref() == Some(old) { pair.decoder = Some(new.to_path_buf()); }
+        }
+        for run in &mut state.decoder_runs {
+            if run.decoder == old { run.decoder = new.to_path_buf(); }
+        }
+    }
+
+    pub fn remember_decoder_run(&self, decoder: &Path, data: &Path) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.decoder_runs.retain(|run| run.decoder != decoder);
+        state.decoder_runs.insert(0, DecoderRun {
+            decoder: decoder.to_path_buf(),
+            data: data.to_path_buf(),
+            completed_at_unix_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
+        });
+        state.decoder_runs.truncate(MAX_LIBRARY_DECODERS);
+    }
+
+    pub fn decoder_run(&self, decoder: &Path) -> Option<DecoderRun> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+            .decoder_runs.iter().find(|run| run.decoder == decoder).cloned()
+    }
+
     pub fn recent_pairs(&self) -> Vec<RecentPair> {
         self.state
             .lock()
@@ -97,6 +156,11 @@ impl FileLocations {
                 .map_or(0, |elapsed| elapsed.as_secs()),
         };
         state.recent_pairs.retain(|old| old.data != pair.data);
+        if let Some(path) = &pair.decoder {
+            state.decoder_library.retain(|saved| saved != path);
+            state.decoder_library.insert(0, path.clone());
+            state.decoder_library.truncate(MAX_LIBRARY_DECODERS);
+        }
         state.recent_pairs.insert(0, pair);
         state.recent_pairs.truncate(MAX_RECENT_PAIRS);
     }
@@ -170,11 +234,13 @@ impl FileLocations {
         let Some(parent) = absolute.parent().filter(|parent| parent.is_dir()) else {
             return;
         };
-        *self
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .directory_mut(kind) = Some(parent.to_path_buf());
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        *state.directory_mut(kind) = Some(parent.to_path_buf());
+        if matches!(kind, FileKind::Yaml | FileKind::Python | FileKind::CsvConfig) {
+            state.decoder_library.retain(|saved| saved != &absolute);
+            state.decoder_library.insert(0, absolute);
+            state.decoder_library.truncate(MAX_LIBRARY_DECODERS);
+        }
     }
 
     pub fn configure(&self, kind: FileKind, dialog: rfd::AsyncFileDialog) -> rfd::AsyncFileDialog {
@@ -411,6 +477,34 @@ mod tests {
     fn previous_recent_file_settings_without_open_time_still_load() {
         let pair: RecentPair = serde_json::from_str(r#"{"data":"/data/example.bin","decoder":null}"#).unwrap();
         assert_eq!(pair.opened_at_unix_secs, 0);
+    }
+
+    #[test]
+    fn decoder_library_keeps_independent_files_and_forgetting_clears_recent_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join("one.yaml");
+        let python = dir.path().join("two.py");
+        std::fs::write(&yaml, "actions: []").unwrap();
+        std::fs::write(&python, "print('ready')").unwrap();
+        let locations = FileLocations::default();
+        locations.remember_file(FileKind::Yaml, &yaml);
+        locations.remember_file(FileKind::Python, &python);
+        locations.remember_pair(&dir.path().join("data.bin"), Some(&yaml));
+        locations.remember_decoder_run(&yaml, &dir.path().join("data.bin"));
+        assert_eq!(locations.decoder_paths(), vec![yaml.clone(), python.clone()]);
+        let mut storage = LocationsStorage::default();
+        locations.save(&mut storage);
+        let restored = FileLocations::load(Some(&storage));
+        assert_eq!(restored.decoder_paths(), locations.decoder_paths());
+        assert_eq!(restored.decoder_run(&yaml).unwrap().data, dir.path().join("data.bin"));
+        let renamed = dir.path().join("renamed.yaml");
+        restored.rename_decoder(&yaml, &renamed);
+        assert_eq!(restored.decoder_run(&renamed).unwrap().decoder, renamed);
+        assert_eq!(restored.recent_pairs()[0].decoder.as_deref(), Some(renamed.as_path()));
+        restored.forget_decoder(&renamed);
+        assert_eq!(restored.decoder_paths(), vec![python]);
+        assert!(restored.decoder_run(&renamed).is_none());
+        assert_eq!(restored.recent_pairs()[0].decoder, None);
     }
 
     #[derive(Default)]

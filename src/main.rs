@@ -58,6 +58,8 @@ mod source_editor;
 mod direct_authoring;
 mod app_menu;
 mod decoder_ui;
+#[cfg(not(target_arch = "wasm32"))]
+mod decoder_library;
 mod demos;
 mod structure;
 mod structure_plot;

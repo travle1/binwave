@@ -7,6 +7,7 @@ use crate::cache::LoadProgress;
 use crate::config::AppConfig;
 use crate::csv_table::{CsvCellSelection, CsvRowSelection, CsvTable};
 use crate::data::{CsvRow, DataStore};
+use crate::decoder_library::{self, Format as LibraryFormat};
 use crate::file_dialog::{FileKind as DialogFileKind, FileLocations, NativeFileDialog};
 use crate::hex_editor::HexHighlight;
 use crate::loaders::{file_kind, load_csv_rows, FileKind, CSV_INITIAL_ROWS};
@@ -18,6 +19,8 @@ use egui::{Context, Ui};
 use egui_dock::{DockArea, TabViewer};
 use egui_plot::{Line, Plot, PlotBounds, PlotPoint, Points, VLine};
 use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::io::Read;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -167,6 +170,7 @@ struct CsvLinkJob {
 enum AppDialogAction {
     OpenData,
     LoadCsvConfig,
+    ImportDecoder,
 }
 
 pub struct BinwaveApp {
@@ -199,6 +203,12 @@ pub struct BinwaveApp {
     sidebar_search_open: bool,
     sidebar_query: String,
     decoder_library_open: bool,
+    library_query: String,
+    library_filter: LibraryFormat,
+    library_selected: Option<PathBuf>,
+    library_renaming: bool,
+    library_rename_draft: String,
+    library_delete_confirm: bool,
     sidebar_settings_open: bool,
     csv_table: CsvTable,
     pending_config: Option<AppConfig>,
@@ -260,6 +270,12 @@ impl Default for BinwaveApp {
             sidebar_search_open: false,
             sidebar_query: String::new(),
             decoder_library_open: false,
+            library_query: String::new(),
+            library_filter: LibraryFormat::All,
+            library_selected: None,
+            library_renaming: false,
+            library_rename_draft: String::new(),
+            library_delete_confirm: false,
             sidebar_settings_open: false,
             csv_table: CsvTable::default(),
             pending_config: None,
@@ -1141,6 +1157,11 @@ impl BinwaveApp {
         if self.binary.take_interpretation_ready() { self.workspace.reveal(Pane::Structures); }
         let initial_plot_ready = self.binary.take_initial_plot_ready();
         if self.binary.take_layout_applied() {
+            if !self.binary.showing_byte_preview() {
+                if let (Some(data), Some(decoder)) = (self.binary.source_path(), self.binary.decoder_path()) {
+                    self.file_locations.remember_decoder_run(decoder, data);
+                }
+            }
             if initial_plot_ready {
                 self.workspace.show_initial_plot();
             } else {
@@ -1268,7 +1289,20 @@ impl BinwaveApp {
         };
         match action {
             AppDialogAction::OpenData => self.open_path(path, ctx),
-            AppDialogAction::LoadCsvConfig => match AppConfig::load_from_file(&path) {
+            AppDialogAction::LoadCsvConfig => self.load_csv_config_path(path, ctx),
+            AppDialogAction::ImportDecoder => {
+                if let Some(format) = LibraryFormat::from_path(&path) {
+                    self.file_locations.remember_file(Self::library_file_kind(format), &path);
+                    self.library_selected = Some(path);
+                } else {
+                    self.cache_message = Some("Select a YAML, Python, or CSV configuration file.".into());
+                }
+            }
+        }
+    }
+
+    fn load_csv_config_path(&mut self, path: PathBuf, ctx: &Context) {
+        match AppConfig::load_from_file(&path) {
                 Ok(cfg) => {
                     self.file_locations
                         .remember_file(DialogFileKind::CsvConfig, &path);
@@ -1284,7 +1318,6 @@ impl BinwaveApp {
                     log::error!("Config: {error:#}");
                     self.cache_message = Some(format!("Config: {error:#}"));
                 }
-            },
         }
     }
 
@@ -1456,42 +1489,276 @@ impl BinwaveApp {
 
     fn ui_decoder_library_entry(&mut self, ui: &mut Ui) {
         let t = &crate::theme::DARK;
+        let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
             ui.heading("Decoder library");
             if ui.button("Back to workspace").clicked() { self.decoder_library_open = false; }
-            if ui.button("Import decoder…").clicked() {
-                self.decoder = Decoder::Layout;
-                self.binary.choose_definition(ui.ctx());
-                self.decoder_library_open = false;
+        });
+        let mut paths: Vec<_> = self.file_locations.decoder_paths().into_iter()
+            .filter(|path| path.is_file() && LibraryFormat::from_path(path).is_some())
+            .collect();
+        paths.sort_by_key(|path| decoder_library::name(path).to_ascii_lowercase());
+        if self.library_selected.as_ref().is_none_or(|selected| !paths.contains(selected)) {
+            self.library_selected = paths.first().cloned();
+        }
+        let mut open = None;
+        let mut duplicate = None;
+        let mut delete = None;
+        let mut rename = None;
+        let mut imported: Vec<PathBuf> = Vec::new();
+        egui::Panel::right("decoder_library_details")
+            .default_size(t.size.library_details_width)
+            .frame(egui::Frame::new().fill(t.color.surface.card)
+                .corner_radius(t.radius.card).inner_margin(t.spacing.card_padding as i8))
+            .show(ui, |ui| {
+                if let Some(path) = self.library_selected.clone() {
+                    let name = decoder_library::name(&path);
+                    let format = LibraryFormat::from_path(&path).unwrap_or_default();
+                    ui.heading(&name);
+                    ui.weak(format.label());
+                    ui.horizontal(|ui| {
+                        if ui.button("Open in workspace").clicked() { open = Some(path.clone()); }
+                        if ui.button("Duplicate").clicked() { duplicate = Some(path.clone()); }
+                        if ui.button("Rename").clicked() {
+                            self.library_renaming = true;
+                            self.library_rename_draft = name.clone();
+                        }
+                    });
+                    if self.library_renaming {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.library_rename_draft)
+                                .hint_text("Decoder file name"));
+                            if ui.button("Save name").clicked() { rename = Some(path.clone()); }
+                            if ui.button("Cancel").clicked() { self.library_renaming = false; }
+                        });
+                    }
+                    ui.separator();
+                    ui.weak(path.display().to_string());
+                    if let Ok(metadata) = std::fs::metadata(&path) {
+                        ui.label(format!("{} bytes", metadata.len()));
+                    }
+                    if let Some(edited) = decoder_library::edited_label(&path) { ui.weak(edited); }
+                    if let Some(run) = self.file_locations.decoder_run(&path) {
+                        ui.colored_label(t.color.status.success,
+                            format!("Last run succeeded · {}", decoder_library::name(&run.data)));
+                    } else {
+                        ui.weak("No recorded run");
+                    }
+                    let structures = decoder_library::yaml_structures(&path);
+                    if !structures.is_empty() {
+                        ui.label(format!("{} structures", structures.len()));
+                        ui.horizontal_wrapped(|ui| {
+                            for structure in &structures {
+                                egui::Frame::new().fill(t.color.surface.raised)
+                                    .corner_radius(t.radius.chip)
+                                    .inner_margin(t.spacing.sidebar_row_gap as i8)
+                                    .show(ui, |ui| { ui.label(structure); });
+                            }
+                        });
+                    }
+                    let used_with: Vec<_> = self.file_locations.recent_pairs().into_iter()
+                        .filter(|pair| pair.decoder.as_deref() == Some(path.as_path()))
+                        .map(|pair| decoder_library::name(&pair.data)).collect();
+                    if !used_with.is_empty() {
+                        ui.label("Used with");
+                        for file in used_with { ui.weak(file); }
+                    }
+                    ui.label("Preview");
+                    let preview = std::fs::File::open(&path).ok().and_then(|file| {
+                        let mut bytes = Vec::new();
+                        file.take(t.size.library_preview_bytes as u64)
+                            .read_to_end(&mut bytes).ok()?;
+                        Some(String::from_utf8_lossy(&bytes).into_owned())
+                    });
+                    egui::ScrollArea::vertical().max_height(t.size.library_preview_height)
+                        .show(ui, |ui| {
+                            ui.monospace(preview.as_deref().unwrap_or("Preview unavailable"));
+                        });
+                    ui.separator();
+                    if ui.add(egui::Button::new(egui::RichText::new("Delete decoder")
+                        .color(t.color.status.danger)).frame(false)).clicked() {
+                        self.library_delete_confirm = true;
+                    }
+                    if self.library_delete_confirm {
+                        ui.colored_label(t.color.status.danger,
+                            format!("Delete {name} from disk? This cannot be undone."));
+                        ui.horizontal(|ui| {
+                            if ui.button("Delete file").clicked() { delete = Some(path.clone()); }
+                            if ui.button("Cancel").clicked() { self.library_delete_confirm = false; }
+                        });
+                    }
+                } else {
+                    ui.weak("Select a decoder to inspect it.");
+                }
+            });
+        egui::Frame::new().fill(t.color.surface.card)
+            .corner_radius(t.radius.card).inner_margin(t.spacing.card_padding as i8)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.library_query)
+                        .hint_text("Search decoders…"));
+                    if ui.button("Import…").clicked() {
+                        let dialog = self.file_locations.configure(DialogFileKind::Yaml,
+                            self.dialog_template.clone().set_title("Import decoder — Binwave")
+                                .add_filter("Decoder", &["yaml", "yml", "py", "md", "markdown", "csv"]));
+                        self.file_dialog.begin_open(dialog, AppDialogAction::ImportDecoder, &ctx);
+                    }
+                    if ui.button("New decoder").clicked() {
+                        self.decoder = Decoder::Layout;
+                        self.binary.new_yaml(&ctx);
+                        self.decoder_library_open = false;
+                        self.show_view(Pane::Layout);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    for filter in LibraryFormat::FILTERS {
+                        ui.selectable_value(&mut self.library_filter, filter, filter.label());
+                    }
+                });
+                ui.separator();
+                let query = self.library_query.trim().to_ascii_lowercase();
+                let filtered: Vec<_> = paths.iter().filter(|path| {
+                    (self.library_filter == LibraryFormat::All
+                        || LibraryFormat::from_path(path) == Some(self.library_filter))
+                        && decoder_library::name(path).to_ascii_lowercase().contains(&query)
+                }).collect();
+                if filtered.is_empty() { ui.weak("No decoders match this view."); }
+                egui::ScrollArea::vertical()
+                    .max_height((ui.available_height() - t.size.library_drop_height).max(t.size.library_row_height))
+                    .show(ui, |ui| {
+                    for path in filtered {
+                        let name = decoder_library::name(path);
+                        let format = LibraryFormat::from_path(path).unwrap_or_default();
+                        let selected = self.library_selected.as_ref() == Some(path);
+                        let edited = decoder_library::edited_label(path).unwrap_or_default();
+                        let run = self.file_locations.decoder_run(path)
+                            .map_or("Not run", |_| "Run succeeded");
+                        if ui.add_sized([ui.available_width(), t.size.library_row_height],
+                            egui::Button::new(format!("{name}  ·  {}  ·  {run}\n{edited}", format.label()))
+                                .selected(selected)).on_hover_text(path.display().to_string()).clicked() {
+                            self.library_selected = Some(path.clone());
+                            self.library_delete_confirm = false;
+                            self.library_renaming = false;
+                        }
+                    }
+                });
+                ui.separator();
+                let drop = egui::Frame::new()
+                    .corner_radius(t.radius.inset).inner_margin(t.spacing.card_padding as i8)
+                    .show(ui, |ui| { ui.centered_and_justified(|ui| {
+                        ui.weak("Drop YAML, Python, or CSV configuration files here to import");
+                    }); });
+                let rect = drop.response.rect;
+                ui.painter().extend(egui::Shape::dashed_line(
+                    &[rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom(), rect.left_top()],
+                    egui::Stroke::new(t.size.frame_border, t.color.border.control),
+                    t.size.library_drop_dash, t.size.library_drop_gap));
+            });
+        for file in ctx.input(|input| input.raw.dropped_files.clone()) {
+            let path = file.path();
+            if path.is_file() {
+                if let Some(format) = LibraryFormat::from_path(&path) {
+                    self.file_locations.remember_file(Self::library_file_kind(format), &path);
+                    imported.push(path.to_path_buf());
+                }
             }
-            if ui.button("New decoder").clicked() {
+        }
+        if let Some(path) = imported.last() { self.library_selected = Some(path.clone()); }
+        if let Some(path) = open { self.open_library_decoder(path, &ctx); }
+        if let Some(path) = duplicate { self.duplicate_library_decoder(&path); }
+        if let Some(path) = rename { self.rename_library_decoder(&path, &ctx); }
+        if let Some(path) = delete { self.delete_library_decoder(&path, &ctx); }
+    }
+
+    fn library_file_kind(format: LibraryFormat) -> DialogFileKind {
+        match format {
+            LibraryFormat::Yaml | LibraryFormat::All => DialogFileKind::Yaml,
+            LibraryFormat::Python => DialogFileKind::Python,
+            LibraryFormat::Csv => DialogFileKind::CsvConfig,
+        }
+    }
+
+    fn open_library_decoder(&mut self, path: PathBuf, ctx: &Context) {
+        match LibraryFormat::from_path(&path) {
+            Some(LibraryFormat::Yaml | LibraryFormat::Python) => {
                 self.decoder = Decoder::Layout;
-                self.binary.new_yaml(ui.ctx());
+                self.binary.load_yaml(path, ctx);
                 self.decoder_library_open = false;
                 self.show_view(Pane::Layout);
             }
-        });
-        ui.label("Recent decoders");
-        let mut paths = Vec::new();
-        for pair in self.file_locations.recent_pairs() {
-            if let Some(path) = pair.decoder {
-                if !paths.contains(&path) { paths.push(path); }
-            }
+            Some(LibraryFormat::Csv) => self.load_csv_config_path(path, ctx),
+            _ => self.cache_message = Some("Unsupported decoder format.".into()),
         }
-        if paths.is_empty() { ui.weak("No decoders used yet."); }
-        let mut selected = None;
-        for path in paths {
-            let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
-            if ui.add_sized([ui.available_width(), t.size.recent_file_row_height],
-                egui::Button::new(name.as_ref())).on_hover_text(path.display().to_string()).clicked() {
-                selected = Some(path);
+    }
+
+    fn duplicate_library_decoder(&mut self, path: &Path) {
+        let Some(destination) = decoder_library::duplicate_path(path) else {
+            self.cache_message = Some("Could not find an unused copy name.".into());
+            return;
+        };
+        let result = (|| -> std::io::Result<()> {
+            let mut source = std::fs::File::open(path)?;
+            let mut target = std::fs::OpenOptions::new().write(true).create_new(true).open(&destination)?;
+            std::io::copy(&mut source, &mut target)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                let format = LibraryFormat::from_path(&destination).unwrap();
+                self.file_locations.remember_file(Self::library_file_kind(format), &destination);
+                self.library_selected = Some(destination);
             }
+            Err(error) => self.cache_message = Some(format!("Could not duplicate decoder: {error}")),
         }
-        if let Some(path) = selected {
-            self.decoder = Decoder::Layout;
-            self.binary.load_yaml(path, ui.ctx());
-            self.decoder_library_open = false;
-            self.show_view(Pane::Layout);
+    }
+
+    fn rename_library_decoder(&mut self, path: &Path, ctx: &Context) {
+        let active = self.binary.decoder_path() == Some(path);
+        if active && self.binary.is_dirty() {
+            self.cache_message = Some("Save the open decoder before renaming it.".into());
+            return;
+        }
+        let name = self.library_rename_draft.trim();
+        if !decoder_library::valid_new_name(name) {
+            self.cache_message = Some("Enter a file name without directory separators.".into());
+            return;
+        }
+        let destination = path.with_file_name(name);
+        let Some(format) = LibraryFormat::from_path(&destination) else {
+            self.cache_message = Some("Use a YAML, Python, or CSV configuration extension.".into());
+            return;
+        };
+        if destination != path && destination.exists() {
+            self.cache_message = Some("A file with that name already exists.".into());
+            return;
+        }
+        if let Err(error) = std::fs::rename(path, &destination) {
+            self.cache_message = Some(format!("Could not rename decoder: {error}"));
+            return;
+        }
+        self.file_locations.rename_decoder(path, &destination);
+        self.file_locations.remember_file(Self::library_file_kind(format), &destination);
+        if active && format != LibraryFormat::Csv {
+            self.binary.load_yaml(destination.clone(), ctx);
+        }
+        self.library_selected = Some(destination);
+        self.library_renaming = false;
+    }
+
+    fn delete_library_decoder(&mut self, path: &Path, ctx: &Context) {
+        let active = self.binary.decoder_path() == Some(path);
+        if active && self.binary.is_dirty() {
+            self.cache_message = Some("Save the open decoder before deleting it.".into());
+            return;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                self.file_locations.forget_decoder(path);
+                if active { self.binary.new_yaml(ctx); }
+                self.library_selected = None;
+                self.library_delete_confirm = false;
+            }
+            Err(error) => self.cache_message = Some(format!("Could not delete decoder: {error}")),
         }
     }
 
@@ -2247,6 +2514,22 @@ mod tests {
                 }],
             );
         }
+    }
+
+    #[test]
+    fn decoder_library_lists_imported_files_without_a_data_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let decoder = dir.path().join("example.yaml");
+        std::fs::write(&decoder, "structures:\n  - name: Header\n").unwrap();
+        let ctx = Context::default();
+        let mut app = BinwaveApp::default();
+        app.file_locations.remember_file(DialogFileKind::Yaml, &decoder);
+        app.decoder_library_open = true;
+        let shown = text(workspace_frame(&mut app, &ctx));
+        assert!(shown.contains("example.yaml"));
+        assert!(shown.contains("Header"));
+        assert!(shown.contains("Open in workspace"));
+        assert!(app.binary.source_path().is_none());
     }
     fn csv_fixture(directory: &std::path::Path, rows: usize) -> std::path::PathBuf {
         let path = directory.join("values.csv");
