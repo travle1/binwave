@@ -274,6 +274,7 @@ impl<T> Default for LruMap<T> {
 }
 #[cfg(not(target_arch = "wasm32"))]
 impl<T: Clone> LruMap<T> {
+    #[cfg(test)]
     fn len(&self) -> usize { self.entries.len() }
     fn clear(&mut self) {
         self.entries.clear();

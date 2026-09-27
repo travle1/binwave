@@ -34,6 +34,7 @@ impl FileSource {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn io_stats(&self) -> (u64, u64) {
         (self.read_calls.load(Ordering::Relaxed), self.bytes_read.load(Ordering::Relaxed))
     }

@@ -733,7 +733,7 @@ impl NumericPlan {
             field.source_path, field.kind, field.endian,
         ]).to_string()).collect()
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn cache_layout_key(&self) -> String {
         let segment = self.segmented.as_ref().map(|part| [
             part.outer_start, part.outer_stride, part.inner_offset,
