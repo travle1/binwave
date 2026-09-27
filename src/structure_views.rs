@@ -1598,11 +1598,14 @@ impl StructureViews {
                 });
                 ui.separator();
                 if self.plot_sidebar_series {
+                    let body = egui::TextStyle::Body.resolve(ui.style());
                     if let Some(group) = &self.plot_axis_group {
-                        ui.label(format!("Y axis: {} group", plot_series_group_label(group)))
+                        let text = format!("Y axis: {} group", plot_series_group_label(group));
+                        ui.label(elide_start(ui, &text, &body, ui.available_width()))
                             .on_hover_text(group);
                     } else if let Some(axis) = &self.plot_axis_series {
-                        ui.label(format!("Y axis: {}", short_series_label(axis)))
+                        let text = format!("Y axis: {}", short_series_label(axis));
+                        ui.label(elide_start(ui, &text, &body, ui.available_width()))
                             .on_hover_text(axis);
                     } else {
                         ui.weak("Select a series for the Y axis");
@@ -1659,23 +1662,29 @@ impl StructureViews {
                                             if open { self.plot_series_expanded.remove(&group); self.plot_series_collapsed.insert(group.clone()); }
                                             else { self.plot_series_collapsed.remove(&group); self.plot_series_expanded.insert(group.clone()); }
                                         }
-                                        let title = format!("{}  {visible}/{}", plot_series_group_label(&group), entries.len());
-                                        if ui.selectable_label(self.plot_axis_group.as_deref() == Some(group.as_str()), title)
-                                            .on_hover_text(format!("{group}\nClick to use this group for the Y axis")).clicked() {
-                                            self.plot_axis_group = Some(group.clone());
-                                        }
-                                        let group_shown = visible == entries.len();
-                                        if ui.small_button(if group_shown { "Hide" } else { "Show" })
-                                            .on_hover_text("Show or hide every trace in this group").clicked() {
-                                            for (_, name) in &entries {
-                                                if group_shown { self.plot_hidden.insert((*name).to_owned()); }
-                                                else { self.plot_hidden.remove(*name); }
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            let group_shown = visible == entries.len();
+                                            if ui.small_button(if group_shown { "Hide" } else { "Show" })
+                                                .on_hover_text("Show or hide every trace in this group").clicked() {
+                                                for (_, name) in &entries {
+                                                    if group_shown { self.plot_hidden.insert((*name).to_owned()); }
+                                                    else { self.plot_hidden.remove(*name); }
+                                                }
+                                                if group_shown && self.plot_axis_group.as_deref() == Some(group.as_str()) {
+                                                    self.plot_axis_group = None;
+                                                }
+                                                self.plot_fit_y = true;
                                             }
-                                            if group_shown && self.plot_axis_group.as_deref() == Some(group.as_str()) {
-                                                self.plot_axis_group = None;
-                                            }
-                                            self.plot_fit_y = true;
-                                        }
+                                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                let title = format!("{}  {visible}/{}", plot_series_group_label(&group), entries.len());
+                                                let font = egui::TextStyle::Button.resolve(ui.style());
+                                                let title = elide_start(ui, &title, &font, button_text_width(ui));
+                                                if ui.selectable_label(self.plot_axis_group.as_deref() == Some(group.as_str()), title)
+                                                    .on_hover_text(format!("{group}\nClick to use this group for the Y axis")).clicked() {
+                                                    self.plot_axis_group = Some(group.clone());
+                                                }
+                                            });
+                                        });
                                     });
                                     if open {
                                         for (label, name) in entries {
@@ -1689,6 +1698,8 @@ impl StructureViews {
                                                         self.plot_fit_y = true;
                                                     }
                                                     let axis = self.plot_axis_series.as_deref() == Some(name);
+                                                    let font = egui::TextStyle::Button.resolve(ui.style());
+                                                    let label = elide_start(ui, &label, &font, button_text_width(ui));
                                                     let label_response = ui.selectable_label(axis, &label)
                                                         .on_hover_text(format!("{name}\nClick to use this series for the Y axis"));
                                                     if label_response.clicked() {
@@ -1998,10 +2009,15 @@ impl StructureViews {
         });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.weak(format!("Samples {}–{} of {}", view.start, view.end.saturating_sub(1), count));
-                if let Some(group) = &self.plot_axis_group {
-                    ui.weak(format!("Y: {} group", plot_series_group_label(group))).on_hover_text(group);
-                } else if let Some(axis) = &self.plot_axis_series {
-                    ui.weak(format!("Y: {}", short_series_label(axis))).on_hover_text(axis);
+                let axis = self.plot_axis_group.as_ref()
+                    .map(|group| (format!("Y: {} group", plot_series_group_label(group)), group))
+                    .or_else(|| self.plot_axis_series.as_ref()
+                        .map(|axis| (format!("Y: {}", short_series_label(axis)), axis)));
+                if let Some((text, full)) = axis {
+                    // Only the space left beside the toolbar; never overlap the sidebar.
+                    let font = egui::TextStyle::Body.resolve(ui.style());
+                    let text = elide_start(ui, &text, &font, ui.available_width());
+                    if text != "…" { ui.weak(text).on_hover_text(full); }
                 }
             });
         });
@@ -3504,6 +3520,22 @@ fn ranges_overlap(a: &Range<usize>, b: &Range<usize>) -> bool {
 
 
 
+/// Shortens `text` from the start ("…tail") so it fits `max_width`. The end of a
+/// series name is what tells neighbouring series apart; hover shows the full name.
+fn elide_start(ui: &Ui, text: &str, font: &egui::FontId, max_width: f32) -> String {
+    let width = |text: String| ui.fonts_mut(|fonts|
+        fonts.layout_no_wrap(text, font.clone(), Color32::WHITE).size().x);
+    if width(text.to_owned()) <= max_width {
+        return text.to_owned();
+    }
+    let starts: Vec<usize> = text.char_indices().map(|(index, _)| index).skip(1).collect();
+    // The shortest suffix that fits: later cuts are always narrower.
+    let cut = starts.partition_point(|&start| width(format!("…{}", &text[start..])) > max_width);
+    starts.get(cut).map_or_else(|| "…".to_owned(), |&start| format!("…{}", &text[start..]))
+}
+fn button_text_width(ui: &Ui) -> f32 {
+    (ui.available_width() - 2. * ui.spacing().button_padding.x).max(0.)
+}
 fn short_series_label(name: &str) -> String {
     name.rsplit_once(" / ").map_or_else(
         || name.to_owned(),
@@ -5275,6 +5307,63 @@ actions:
         assert!(views.plot_reader.data().unwrap().range.end >= 768);
     }
 
+    #[test]
+    fn long_series_names_are_shortened_from_the_start() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let font = egui::TextStyle::Button.resolve(ui.style());
+                let name = "sections[3].payload.channels.sine[110] / values.[0].amplitude";
+                let short = elide_start(ui, name, &font, 120.);
+                assert!(short.starts_with('…') && name.ends_with(&short[short.char_indices().nth(1).unwrap().0..]));
+                assert!(short.ends_with("amplitude"), "the distinctive tail stays visible: {short}");
+                let width = ui.fonts_mut(|fonts| fonts.layout_no_wrap(short.clone(), font.clone(),
+                    Color32::WHITE).size().x);
+                assert!(width <= 120., "{short} is {width} px");
+                assert_eq!(elide_start(ui, "sine", &font, 120.), "sine");
+            });
+        });
+    }
+    #[test]
+    fn long_series_names_stay_inside_the_series_sidebar() {
+        let field = |i: usize| format!("{{name: amplitude_measured_at_the_primary_input_channel_{i}, type: u16}}");
+        let yaml = format!("structures: [{{name: S, fields: [{}, {}]}}]\nactions: [{{read: {{name: \
+            samples_recorded_by_a_long_named_acquisition_channel, type: {{structure: S}}, repeat: until end}}}}]",
+            field(0), field(1));
+        let bytes = vec![0u8; 4096];
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let output = Program::parse(&yaml).unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut views = StructureViews::default();
+        settle_plot(&ctx, &mut views, &output, &store);
+        views.plot_collections_open = true;
+        views.plot_sidebar_series = true;
+        views.plot_axis_series = views.plot_overlay_points.keys().next().cloned();
+        let width = 1200.;
+        let mut time = 0.;
+        let mut frame = || {
+            // Advance the clock so the sidebar's open animation completes.
+            time += 1.;
+            ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 700.))),
+                time: Some(time),
+                ..Default::default()
+            }, |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| { views.plot(ui, &output, store.view()); });
+            })
+        };
+        for _ in 0..3 { let _ = frame(); }
+        let rendered = frame();
+        let overflowing: Vec<_> = rendered.shapes.iter().filter_map(|shape| match &shape.shape {
+            // Right-aligned galleys extend left of `pos`, so use the placed rect.
+            egui::Shape::Text(text) if text.galley.rect.translate(text.pos.to_vec2()).right() > width + 1. =>
+                Some(text.galley.text().to_owned()),
+            _ => None,
+        }).collect();
+        assert!(overflowing.is_empty(), "text runs past the window: {overflowing:?}");
+    }
     #[test]
     fn moving_a_trace_vertically_reuses_the_overlay() {
         let (store, output) = array();
