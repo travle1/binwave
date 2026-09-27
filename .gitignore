@@ -23,3 +23,8 @@ __pycache__/
 
 # Local Cloudflare deployment state
 /.wrangler/
+
+# Local-only: proprietary data and design references. Never remove or weaken.
+/private/
+/design/
+/docs/design/

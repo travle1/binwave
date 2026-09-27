@@ -1,6 +1,6 @@
 //! Shared design tokens and egui theme setup.
 //!
-//! Tokens started from `design/binwave-egui-v2-design/design-tokens.json`.
+//! Tokens started from `docs/design/binwave-egui-v2-design/design-tokens.json`.
 //! Later phases should read these tokens instead of embedding presentation values.
 #![allow(dead_code)] // Later design phases consume the remaining tokens.
 
