@@ -1,5 +1,6 @@
 //! Cached screen-space rendering for many ordinary colored decoded traces.
 //! Data and hit testing stay in the plot model; this replaces only painted traces.
+use crate::plot_presentation::Placement;
 use crate::plot_trace::series_color;
 use egui::{Color32, ColorImage, Context, TextureHandle, TextureOptions};
 use egui_plot::{PlotImage, PlotPoint, PlotUi};
@@ -37,9 +38,11 @@ impl PlotRaster {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
+    /// `series` holds stored values; each trace's display scale and offset come
+    /// from `presentation` and are part of the cache key, like the view bounds.
     pub fn show(&mut self, ctx: &Context, plot: &mut PlotUi<'_>,
         series: &BTreeMap<String, Arc<Vec<PlotPoint>>>, hidden: &HashSet<String>,
-        data_generation: u64) -> bool {
+        data_generation: u64, presentation: &crate::plot_presentation::Presentation) -> bool {
         let bounds = plot.plot_bounds();
         let frame = plot.response().rect;
         let ppp = ctx.pixels_per_point();
@@ -60,6 +63,13 @@ impl PlotRaster {
         height.hash(&mut hasher);
         ppp.to_bits().hash(&mut hasher);
         for value in bounds.min().into_iter().chain(bounds.max()) { value.to_bits().hash(&mut hasher); }
+        let visible: Vec<_> = series.iter().filter(|(name, _)| !hidden.contains(*name))
+            .map(|(name, points)| (name.clone(), Arc::clone(points), presentation.placement(name)))
+            .collect();
+        for (_, _, placement) in &visible {
+            placement.scale.to_bits().hash(&mut hasher);
+            placement.offset.to_bits().hash(&mut hasher);
+        }
         let key = hasher.finish();
         let requested_bounds = [bounds.min()[0], bounds.min()[1], bounds.max()[0], bounds.max()[1]];
         if self.pending.as_ref().is_some_and(|pending| pending.key != key) {
@@ -82,15 +92,14 @@ impl PlotRaster {
             }
         }
         if self.key != Some(key) && self.pending.is_none() {
-            let visible: Vec<_> = series.iter().filter(|(name, _)| !hidden.contains(*name))
-                .map(|(name, points)| (name.clone(), Arc::clone(points))).collect();
             let (sender, receiver) = mpsc::sync_channel(1);
             let repaint = ctx.clone();
             let cancel = Arc::new(AtomicBool::new(false));
             let worker_cancel = cancel.clone();
             std::thread::spawn(move || {
                 let borrowed: Vec<_> = visible.iter()
-                    .map(|(name, points)| (name.as_str(), points.as_slice())).collect();
+                    .map(|(name, points, placement)| (name.as_str(), points.as_slice(), *placement))
+                    .collect();
                 if let Some(image) = rasterize_with_cancel(&borrowed, width, height,
                     requested_bounds, Some(&worker_cancel)) {
                     let _ = sender.send(image);
@@ -115,10 +124,11 @@ impl PlotRaster {
 
 #[cfg(test)]
 fn rasterize(series: &[(&str, &[PlotPoint])], width: usize, height: usize, bounds: [f64; 4]) -> ColorImage {
-    rasterize_with_cancel(series, width, height, bounds, None).unwrap()
+    let placed: Vec<_> = series.iter().map(|(name, points)| (*name, *points, Placement::default())).collect();
+    rasterize_with_cancel(&placed, width, height, bounds, None).unwrap()
 }
 
-fn rasterize_with_cancel(series: &[(&str, &[PlotPoint])], width: usize, height: usize,
+fn rasterize_with_cancel(series: &[(&str, &[PlotPoint], Placement)], width: usize, height: usize,
     bounds: [f64; 4], cancel: Option<&AtomicBool>) -> Option<ColorImage> {
     let mut pixels = vec![[0u8; 4]; width * height];
     // Work on a few series at a time so parallel coverage masks stay bounded.
@@ -126,7 +136,7 @@ fn rasterize_with_cancel(series: &[(&str, &[PlotPoint])], width: usize, height: 
     // brighten themselves into a solid min/max rectangle.
     for batch in series.chunks(8) {
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) { return None; }
-        let prepared: Vec<_> = batch.par_iter().map(|(name, points)| {
+        let prepared: Vec<_> = batch.par_iter().map(|(name, points, placement)| {
             let mut covered = vec![false; width * height];
             let mut touched = Vec::new();
             let mut mark = |x: i32, y: i32| {
@@ -137,7 +147,8 @@ fn rasterize_with_cancel(series: &[(&str, &[PlotPoint])], width: usize, height: 
                 }
             };
             for pair in points.windows(2) {
-                let (a, b) = (pair[0], pair[1]);
+                let place = |p: PlotPoint| PlotPoint::new(p.x, placement.display(p.y));
+                let (a, b) = (place(pair[0]), place(pair[1]));
                 if !a.x.is_finite() || !a.y.is_finite() || !b.x.is_finite() || !b.y.is_finite()
                     || b.x < a.x { continue; }
                 let x0 = (a.x - bounds[0]) / (bounds[2] - bounds[0]) * (width - 1) as f64;
@@ -149,7 +160,7 @@ fn rasterize_with_cancel(series: &[(&str, &[PlotPoint])], width: usize, height: 
                 }
             }
             if points.len() == 1 {
-                let point = points[0];
+                let point = PlotPoint::new(points[0].x, placement.display(points[0].y));
                 if point.x.is_finite() && point.y.is_finite() {
                     let x = (point.x - bounds[0]) / (bounds[2] - bounds[0]) * (width - 1) as f64;
                     let y = (bounds[3] - point.y) / (bounds[3] - bounds[1]) * (height - 1) as f64;
@@ -274,8 +285,18 @@ mod tests {
     fn cancelled_raster_does_not_publish_a_partial_image() {
         let points = [PlotPoint::new(0., 0.), PlotPoint::new(10., 10.)];
         let cancelled = AtomicBool::new(true);
-        assert!(rasterize_with_cancel(&[("trace", &points)], 11, 11,
+        assert!(rasterize_with_cancel(&[("trace", &points, Placement::default())], 11, 11,
             [0., 0., 10., 10.], Some(&cancelled)).is_none());
+    }
+    #[test]
+    fn placement_moves_the_rasterized_trace() {
+        let points = [PlotPoint::new(0., 0.), PlotPoint::new(10., 0.)];
+        let placed = Placement { scale: 1., offset: 5. };
+        let image = rasterize_with_cancel(&[("trace", &points, placed)], 11, 11,
+            [0., 0., 10., 10.], None).unwrap();
+        let row_lit = |row: usize| (0..11).all(|x| image.pixels[row * 11 + x].a() > 0);
+        assert!(row_lit(5), "offset 5 draws the trace in the middle row");
+        assert!(!row_lit(10), "the unplaced bottom row stays empty");
     }
     #[test]
     fn raster_worker_publishes_on_a_later_ui_frame() {
@@ -295,7 +316,8 @@ mod tests {
                     egui_plot::Plot::new("raster-worker-test").show(ui, |plot| {
                         plot.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
                             [0., 0.], [10., 10.]));
-                        raster.show(&ctx, plot, &series, &HashSet::new(), 1);
+                        raster.show(&ctx, plot, &series, &HashSet::new(), 1,
+                            &crate::plot_presentation::Presentation::default());
                     });
                 });
             });
@@ -310,7 +332,8 @@ mod tests {
                 egui_plot::Plot::new("raster-worker-test").show(ui, |plot| {
                     plot.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
                         [0., 0.], [10., 10.]));
-                    painted_stale = raster.show(&ctx, plot, &series, &HashSet::new(), 2);
+                    painted_stale = raster.show(&ctx, plot, &series, &HashSet::new(), 2,
+                        &crate::plot_presentation::Presentation::default());
                 });
             });
         });
@@ -322,7 +345,8 @@ mod tests {
                 egui_plot::Plot::new("raster-worker-test").show(ui, |plot| {
                     plot.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
                         [2., 0.], [6., 10.]));
-                    painted_previous_zoom = raster.show(&ctx, plot, &series, &HashSet::new(), 2);
+                    painted_previous_zoom = raster.show(&ctx, plot, &series, &HashSet::new(), 2,
+                        &crate::plot_presentation::Presentation::default());
                 });
             });
         });

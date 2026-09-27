@@ -1,7 +1,9 @@
-struct Segment { coords: vec4<f32>, color: u32, pad: array<u32, 3> };
+struct Segment { coords: vec4<f32>, color: u32, series: u32, pad: array<u32, 2> };
 struct View { bounds: vec4<f32>, size: vec2<f32>, pad: vec2<f32> };
 @group(0) @binding(0) var<storage, read> segments: array<Segment>;
 @group(0) @binding(1) var<uniform> view: View;
+// Per-series display scale and offset, applied to the stored Y values.
+@group(0) @binding(2) var<storage, read> placements: array<vec2<f32>>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -10,12 +12,15 @@ struct VertexOutput {
 @vertex fn vs_main(@builtin(vertex_index) vertex: u32,
                    @builtin(instance_index) instance: u32) -> VertexOutput {
     let segment = segments[instance];
+    let placement = placements[segment.series];
+    let y0 = segment.coords.y * placement.x + placement.y;
+    let y1 = segment.coords.w * placement.x + placement.y;
     let span = max(view.bounds.y - view.bounds.x, 0.000001);
     let rise = max(view.bounds.w - view.bounds.z, 0.000001);
     let p0 = vec2<f32>((segment.coords.x - view.bounds.x) / span * view.size.x,
-                       (view.bounds.w - segment.coords.y) / rise * view.size.y);
+                       (view.bounds.w - y0) / rise * view.size.y);
     let p1 = vec2<f32>((segment.coords.z - view.bounds.x) / span * view.size.x,
-                       (view.bounds.w - segment.coords.w) / rise * view.size.y);
+                       (view.bounds.w - y1) / rise * view.size.y);
     let direction = p1 - p0;
     let normal = vec2<f32>(-direction.y, direction.x) / max(length(direction), 0.001) * 0.65;
     let start = vertex == 0u || vertex == 1u || vertex == 4u;

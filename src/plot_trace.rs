@@ -186,6 +186,7 @@ pub struct TraceMeshCache(Mutex<HashMap<String, (MeshKey, Arc<egui::epaint::Mesh
 #[cfg(not(target_arch = "wasm32"))]
 impl TraceMeshCache {
     pub fn clear(&self) { self.0.lock().unwrap().clear(); }
+    pub fn remove(&self, name: &str) { self.0.lock().unwrap().remove(name); }
     fn get(&self, name: &str, key: MeshKey) -> Option<Arc<egui::epaint::Mesh>> {
         self.0.lock().unwrap().get(name).and_then(|(old, mesh)| (*old == key).then(|| mesh.clone()))
     }

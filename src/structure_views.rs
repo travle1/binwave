@@ -162,6 +162,8 @@ pub struct StructureViews {
     plot_overlay: Option<(u64, PlotData)>,
     plot_overlay_generations: BTreeMap<String, u64>,
     plot_overlay_points: BTreeMap<String, Arc<Vec<PlotPoint>>>,
+    /// Display-space copies of overlay points for non-GPU drawing, per trace.
+    plot_placed: HashMap<String, PlacedPoints>,
     plot_overlay_revision: u64,
     plot_mesh_cache: Arc<TraceMeshCache>,
     plot_raster: PlotRaster,
@@ -214,6 +216,7 @@ impl StructureViews {
         self.plot_overlay = None;
         self.plot_overlay_generations.clear();
         self.plot_overlay_points.clear();
+        self.plot_placed.clear();
         self.plot_mesh_cache.clear();
         self.plot_raster.invalidate();
         self.plot_gpu.invalidate();
@@ -2185,16 +2188,14 @@ impl StructureViews {
         let mut hidden_fields: Vec<_> = self.plot_hidden.iter().collect();
         hidden_fields.sort_unstable();
         for field in hidden_fields { field.hash(&mut overlay_hash); }
-        for (name, placement) in &self.presentation.series {
-            name.hash(&mut overlay_hash);
-            placement.scale.to_bits().hash(&mut overlay_hash);
-            placement.offset.to_bits().hash(&mut overlay_hash);
-        }
+        // Series scale and offset are applied when drawing, so moving a trace
+        // vertically never rebuilds the overlay or the GPU and raster geometry.
         let overlay_key = overlay_hash.finish();
         if self.plot_overlay.as_ref().map(|(key, _)| *key) != Some(overlay_key) {
             self.plot_overlay = None;
             self.plot_overlay_generations.clear();
             self.plot_overlay_points.clear();
+            self.plot_placed.clear();
             self.plot_overlay_revision = self.plot_overlay_revision.wrapping_add(1);
             self.plot_mesh_cache.clear();
             self.plot_raster.invalidate();
@@ -2218,10 +2219,10 @@ impl StructureViews {
             if self.plot_overlay_generations.get(&self.plot_target) != Some(&primary_generation) {
                 if let Some((_, (_, _, paths))) = primary_group {
                     update_group_overlay(combined, &mut self.plot_overlay_points, paths, Some(raw),
-                        &self.plot_hidden, &self.presentation);
+                        &self.plot_hidden);
                 } else {
                     update_overlay_source(combined, &mut self.plot_overlay_points, &self.plot_target,
-                        Some(raw), &self.plot_hidden, &self.presentation);
+                        Some(raw), &self.plot_hidden);
                 }
                 self.plot_mesh_cache.clear();
                 self.plot_overlay_revision = self.plot_overlay_revision.wrapping_add(1);
@@ -2237,7 +2238,7 @@ impl StructureViews {
                 let extra = reader.display_data().filter(|_| collection_by_path.contains_key(path.as_str()));
                 let generation = reader.data_generation();
                 if self.plot_overlay_generations.get(path) != Some(&generation) {
-                    update_overlay_source(combined, &mut self.plot_overlay_points, path, extra, &self.plot_hidden, &self.presentation);
+                    update_overlay_source(combined, &mut self.plot_overlay_points, path, extra, &self.plot_hidden);
                     self.plot_mesh_cache.clear();
                     self.plot_overlay_revision = self.plot_overlay_revision.wrapping_add(1);
                     self.plot_overlay_generations.insert(path.clone(), generation);
@@ -2256,7 +2257,7 @@ impl StructureViews {
                 let generation = reader.data_generation();
                 if self.plot_overlay_generations.get(&generation_key) != Some(&generation) {
                     update_group_overlay(combined, &mut self.plot_overlay_points, paths, extra,
-                        &self.plot_hidden, &self.presentation);
+                        &self.plot_hidden);
                     self.plot_mesh_cache.clear();
                     self.plot_overlay_revision = self.plot_overlay_revision.wrapping_add(1);
                     self.plot_overlay_generations.insert(generation_key, generation);
@@ -2271,6 +2272,7 @@ impl StructureViews {
             self.plot_overlay = None;
             self.plot_overlay_generations.clear();
             self.plot_overlay_points.clear();
+            self.plot_placed.clear();
             self.plot_mesh_cache.clear();
             self.plot_raster.invalidate();
             self.plot_gpu.invalidate();
@@ -2298,14 +2300,20 @@ impl StructureViews {
                             !hidden.contains(*name)
                                 && (self.plot_fit_all_y || axis_names.is_empty() || axis_names.contains(name))
                         })
-                        .flat_map(|(_, values)| values)
-                        .map(|point| point.value)
+                        .flat_map(|(name, values)| {
+                            let placement = self.presentation.placement(name);
+                            values.iter().map(move |point| placement.display(point.value))
+                        })
                         .chain(data.envelopes.iter()
                             .filter(|(name, _)| {
                                 !hidden.contains(*name)
                                     && (self.plot_fit_all_y || axis_names.is_empty() || axis_names.contains(name))
                             })
-                            .flat_map(|(_, bands)| bands.iter().flat_map(|band| [band.min.value, band.max.value]))),
+                            .flat_map(|(name, bands)| {
+                                let placement = self.presentation.placement(name);
+                                bands.iter().flat_map(move |band|
+                                    [placement.display(band.min.value), placement.display(band.max.value)])
+                            })),
                 )
             })
         } else {
@@ -2322,7 +2330,18 @@ impl StructureViews {
         let plot_layer = ui.layer_id();
         let dot_radius = self.plot_dot_radius.unwrap_or(2.5);
         let mut axis_hover = None;
-        let mut gpu_mode = false;
+        let visible_trace_count = self.plot_overlay_points.keys()
+            .filter(|name| !hidden.contains(*name)).count();
+        let gpu_mode = data.is_some_and(|data| data.quality != PlotQuality::SampledPreview)
+            && visible_trace_count >= 64
+            && self.plot_gpu.update(&plot_ctx, &self.plot_overlay_points, &hidden,
+                overlay_key ^ self.plot_overlay_revision.rotate_left(17));
+        // The GPU applies placements itself; other paths draw placed copies that
+        // are recomputed only for traces whose scale or offset changed.
+        let placed = if gpu_mode { BTreeMap::new() } else {
+            placed_points(&mut self.plot_placed, &self.plot_mesh_cache, &self.plot_overlay_points,
+                &hidden, &self.presentation)
+        };
         let axis_key = (self.plot_axis_series.clone(), self.plot_axis_group.clone(), axis_uniform);
         if self.plot_y_axis_key.as_ref() != Some(&axis_key) {
             self.plot_y_axis_key = Some(axis_key);
@@ -2385,30 +2404,25 @@ impl StructureViews {
                     ));
                 }
                 if let Some(data) = data {
-                    let visible_trace_count = self.plot_overlay_points.keys()
-                        .filter(|name| !hidden.contains(*name)).count();
-                    gpu_mode = data.quality != PlotQuality::SampledPreview
-                        && visible_trace_count >= 64
-                        && self.plot_gpu.update(&plot_ctx, &self.plot_overlay_points, &hidden,
-                            overlay_key ^ self.plot_overlay_revision.rotate_left(17));
                     let raster_candidate = !gpu_mode && data.quality != PlotQuality::SampledPreview
                         && visible_trace_count >= 16
                         && (data.quality != PlotQuality::Exact
                             || requested.len() > pixel_width);
                     let raster_mode = raster_candidate && self.plot_raster.show(&plot_ctx, plot_ui,
                         &self.plot_overlay_points, &hidden,
-                        overlay_key ^ self.plot_overlay_revision.rotate_left(17));
+                        overlay_key ^ self.plot_overlay_revision.rotate_left(17), &self.presentation);
                     for (name, values) in data.series.iter() {
                         if raster_mode || gpu_mode { break; }
                         if hidden.contains(name) {
                             continue;
                         }
-                        let Some(points) = self.plot_overlay_points.get(name).map(|points| points.as_slice()) else { continue; };
+                        let Some(points) = placed.get(name).map(|points| points.as_slice()) else { continue; };
                         let color = plot_series_color(name);
+                        let placement = self.presentation.placement(name);
                         let bands = (data.quality == PlotQuality::SampledPreview).then(|| {
                             data.envelopes.get(name).into_iter().flatten().map(|band| [
                                 band.range.start as f64 - 0.5, band.range.end as f64 - 0.5,
-                                band.min.value, band.max.value,
+                                placement.display(band.min.value), placement.display(band.max.value),
                             ]).collect::<Vec<_>>()
                         });
                         if data.quality == PlotQuality::Exact && values.len() <= canvas_width as usize / 5 {
@@ -2624,7 +2638,7 @@ impl StructureViews {
         response.response.clone().on_hover_text(
             "Drag or middle-drag to pan · Shift+wheel to pan horizontally · wheel or pinch to zoom · click a point to link Hex and Inspector"
         );
-        if gpu_mode { self.plot_gpu.paint(ui.painter(), &response.transform); }
+        if gpu_mode { self.plot_gpu.paint(ui.painter(), &response.transform, &self.presentation); }
         log_slow_plot_phase(&mut phase_clock, "draw plot");
         self.plot_axis_width = (plot_outer.width() - response.transform.frame().width()).max(0.);
         self.plot_y_axis_thickness = self.plot_y_axis_thickness
@@ -2835,8 +2849,9 @@ impl StructureViews {
                             .filter(|(name, _)| !hidden.contains(*name))
                             .flat_map(|(name, values)| values.iter().map(move |point| (name, point)))
                             .filter_map(|(name, point)| {
+                                let value = self.presentation.placement(name).display(point.value);
                                 let screen = response.transform.position_from_point(
-                                    &PlotPoint::new(point.index as f64, point.value),
+                                    &PlotPoint::new(point.index as f64, value),
                                 );
                                 let distance = screen.distance_sq(pointer);
                                 (distance < 144.).then_some((distance, name, point))
@@ -3107,7 +3122,6 @@ fn update_overlay_source(
     path: &str,
     source: Option<&PlotData>,
     hidden: &HashSet<String>,
-    presentation: &crate::plot_presentation::Presentation,
 ) {
     let prefix = format!("{path} / ");
     overlay.series.retain(|name, _| !name.starts_with(&prefix));
@@ -3117,22 +3131,14 @@ fn update_overlay_source(
     for (name, points) in &source.series {
         let full = format!("{prefix}{name}");
         if hidden.contains(&full) { continue; }
-        let placement = presentation.placement(&full);
-        let mut points = points.clone();
-        for point in &mut points { point.value = placement.display(point.value); }
+        let points = points.clone();
         prepared.insert(full.clone(), Arc::new(points.iter().map(|point| PlotPoint::new(point.index as f64, point.value)).collect()));
         overlay.series.insert(full, points);
     }
     for (name, bands) in &source.envelopes {
         let full = format!("{prefix}{name}");
         if hidden.contains(&full) { continue; }
-        let placement = presentation.placement(&full);
-        let mut bands = bands.clone();
-        for band in &mut bands {
-            band.min.value = placement.display(band.min.value);
-            band.max.value = placement.display(band.max.value);
-        }
-        overlay.envelopes.insert(full, bands);
+        overlay.envelopes.insert(full, bands.clone());
     }
 }
 fn update_group_overlay(
@@ -3141,7 +3147,6 @@ fn update_group_overlay(
     paths: &[String],
     source: Option<&PlotData>,
     hidden: &HashSet<String>,
-    presentation: &crate::plot_presentation::Presentation,
 ) {
     let belongs = |name: &str| paths.iter().any(|path| name.starts_with(&format!("{path} / ")));
     overlay.series.retain(|name, _| !belongs(name));
@@ -3150,22 +3155,49 @@ fn update_group_overlay(
     let Some(source) = source else { return; };
     for (name, points) in &source.series {
         if hidden.contains(name) { continue; }
-        let placement = presentation.placement(name);
-        let mut points = points.clone();
-        for point in &mut points { point.value = placement.display(point.value); }
+        let points = points.clone();
         prepared.insert(name.clone(), Arc::new(points.iter().map(|point| PlotPoint::new(point.index as f64, point.value)).collect()));
         overlay.series.insert(name.clone(), points);
     }
     for (name, bands) in &source.envelopes {
         if hidden.contains(name) { continue; }
-        let placement = presentation.placement(name);
-        let mut bands = bands.clone();
-        for band in &mut bands {
-            band.min.value = placement.display(band.min.value);
-            band.max.value = placement.display(band.max.value);
-        }
-        overlay.envelopes.insert(name.clone(), bands);
+        overlay.envelopes.insert(name.clone(), bands.clone());
     }
+}
+/// A trace's display-space points and the stored points and placement they came from.
+struct PlacedPoints {
+    source: Arc<Vec<PlotPoint>>,
+    placement: (u64, u64),
+    points: Arc<Vec<PlotPoint>>,
+}
+/// Display-space points for every visible trace. Only traces whose stored points or
+/// placement changed are recomputed, and only their cached meshes are dropped.
+fn placed_points(
+    cache: &mut HashMap<String, PlacedPoints>,
+    meshes: &TraceMeshCache,
+    stored: &BTreeMap<String, Arc<Vec<PlotPoint>>>,
+    hidden: &HashSet<String>,
+    presentation: &crate::plot_presentation::Presentation,
+) -> BTreeMap<String, Arc<Vec<PlotPoint>>> {
+    cache.retain(|name, _| stored.contains_key(name));
+    stored.iter().filter(|(name, _)| !hidden.contains(*name)).map(|(name, source)| {
+        let placement = presentation.placement(name);
+        let key = (placement.scale.to_bits(), placement.offset.to_bits());
+        let current = cache.get(name)
+            .filter(|entry| entry.placement == key && Arc::ptr_eq(&entry.source, source));
+        if let Some(entry) = current {
+            return (name.clone(), Arc::clone(&entry.points));
+        }
+        meshes.remove(name);
+        let points = if key == (1f64.to_bits(), 0f64.to_bits()) {
+            Arc::clone(source)
+        } else {
+            Arc::new(source.iter().map(|point| PlotPoint::new(point.x, placement.display(point.y))).collect())
+        };
+        cache.insert(name.clone(), PlacedPoints { source: Arc::clone(source), placement: key,
+            points: Arc::clone(&points) });
+        (name.clone(), points)
+    }).collect()
 }
 fn plot_series_color(name: &str) -> Color32 {
     crate::plot_trace::series_color(name)
@@ -4112,15 +4144,14 @@ mod tests {
         overlay.series.clear();
         let mut prepared = BTreeMap::new();
         let hidden = HashSet::new();
-        let presentation = crate::plot_presentation::Presentation::default();
-        update_overlay_source(&mut overlay, &mut prepared, "a", Some(&source(1.0)), &hidden, &presentation);
+        update_overlay_source(&mut overlay, &mut prepared, "a", Some(&source(1.0)), &hidden);
         let point_ptr = overlay.series["a / value"].as_ptr();
         let geometry_ptr = prepared["a / value"].as_ptr();
-        update_overlay_source(&mut overlay, &mut prepared, "b", Some(&source(2.0)), &hidden, &presentation);
+        update_overlay_source(&mut overlay, &mut prepared, "b", Some(&source(2.0)), &hidden);
         assert_eq!(overlay.series["a / value"].as_ptr(), point_ptr);
         assert_eq!(prepared["a / value"].as_ptr(), geometry_ptr);
         assert_eq!(overlay.series["b / value"][0].value, 2.0);
-        update_overlay_source(&mut overlay, &mut prepared, "b", None, &hidden, &presentation);
+        update_overlay_source(&mut overlay, &mut prepared, "b", None, &hidden);
         assert!(!overlay.series.contains_key("b / value"));
         assert!(!prepared.contains_key("b / value"));
     }
@@ -5237,6 +5268,25 @@ actions:
         assert!(views.plot_reader.data().unwrap().range.end >= 768);
     }
 
+    #[test]
+    fn moving_a_trace_vertically_reuses_the_overlay() {
+        let (store, output) = array();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        settle_plot(&ctx, &mut views, &output, &store);
+        let name = views.plot_overlay_points.keys().next().unwrap().clone();
+        let stored = Arc::clone(&views.plot_overlay_points[&name]);
+        let (builds, revision) = (views.plot_overlay_builds, views.plot_overlay_revision);
+        views.presentation.pan_series(&name, 100.);
+        views.presentation.zoom_series(&name, 2., 0.);
+        render_plot(&ctx, &mut views, &output, &store, Vec::new(), Default::default());
+        assert_eq!((views.plot_overlay_builds, views.plot_overlay_revision), (builds, revision),
+            "a Y pan or zoom must not rebuild the plot overlay");
+        assert!(Arc::ptr_eq(&views.plot_overlay_points[&name], &stored));
+        let placement = views.presentation.placement(&name);
+        let placed = &views.plot_placed[&name].points;
+        assert_eq!(placed[3].y, placement.display(stored[3].y));
+    }
     #[test]
     fn y_axis_width_holds_when_tick_labels_get_shorter() {
         let bytes: Vec<u8> = (0..200_000)
