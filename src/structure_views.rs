@@ -1436,7 +1436,12 @@ impl StructureViews {
                 });
                 ui.separator();
                 if self.plot_sidebar_series {
-                    ui.label("Y axis follows the selected series");
+                    if let Some(axis) = &self.plot_axis_series {
+                        ui.label(format!("Y axis: {}", short_series_label(axis)))
+                            .on_hover_text(axis);
+                    } else {
+                        ui.weak("Select a series for the Y axis");
+                    }
                     ui.add(egui::TextEdit::singleline(&mut self.plot_field_filter)
                         .hint_text("Find series…"));
                     let filter = self.plot_field_filter.trim().to_lowercase();
@@ -1465,11 +1470,11 @@ impl StructureViews {
                                             self.plot_fit_y = true;
                                         }
                                         let axis = self.plot_axis_series.as_deref() == Some(name);
-                                        if ui.selectable_label(axis, "Y").on_hover_text("Use this series for the Y axis").clicked() {
+                                        if ui.selectable_label(axis, short_series_label(name))
+                                            .on_hover_text(format!("{name}\nClick to use this series for the Y axis"))
+                                            .clicked() {
                                             self.plot_axis_series = Some(name.clone());
-                                            self.plot_fit_y = true;
                                         }
-                                        ui.label(short_series_label(name)).on_hover_text(name);
                                     });
                                 });
                             }
@@ -2449,7 +2454,6 @@ impl StructureViews {
                             .min_by(|a, b| a.0.total_cmp(&b.0));
                     if let Some((_, name, point)) = nearest {
                         self.plot_axis_series = Some(name.clone());
-                        self.plot_fit_y = true;
                         self.plot_anchor = Some(point.index);
                         picked = Some((point.bytes.clone(), Some(point.path.to_string())));
                     } else if let Some(bytes) = sample_bytes(&node, index..index + 1) {
@@ -3267,7 +3271,9 @@ mod tests {
             egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
             _ => None,
         }).collect();
-        assert!(text.iter().any(|label| label == "Y axis follows the selected series"));
+        assert!(text.iter().any(|label| label.starts_with("Y axis: ")));
+        assert!(!text.iter().any(|label| label == "Y"),
+            "each series row should use its name, not a separate Y button");
         assert!(egui::containers::panel::PanelState::load(&ctx,
             egui::Id::new("plot_collections_sidebar")).is_some());
     }
@@ -4736,6 +4742,51 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
         assert!(sine_bounds.min()[1] < -3. && sine_bounds.max()[1] > 3.);
         assert!(ramp_bounds.min()[1] > 9. && ramp_bounds.max()[1] < 15.,
             "Y axis must follow its selected series: sine={sine_bounds:?}, ramp={ramp_bounds:?}");
+    }
+
+    #[test]
+    fn changing_y_axis_series_preserves_the_horizontal_zoom() {
+        let (store, output) = waveform_plot_fixture();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        settle_plot(&ctx, &mut views, &output, &store);
+        views.plot_collections_open = true;
+        views.plot_sidebar_series = true;
+        views.plot_force_view = Some(900..1100);
+        settle_plot(&ctx, &mut views, &output, &store);
+        let frame = |views: &mut StructureViews, events| ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                egui::vec2(1200., 700.))),
+            events,
+            ..Default::default()
+        }, |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                views.plot(ui, &output, store.view());
+            });
+        });
+        let rendered = frame(&mut views, vec![]);
+        let row = rendered.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "samples / ramp" =>
+                Some(text.pos + text.galley.rect.center().to_vec2()),
+            _ => None,
+        }).expect("ramp series row must be visible");
+        let before = *navigation_memory(&ctx, &views, &output).bounds();
+        let view = views.plot_view.clone();
+        frame(&mut views, vec![egui::Event::PointerMoved(row)]);
+        frame(&mut views, vec![egui::Event::PointerButton { pos: row,
+            button: egui::PointerButton::Primary, pressed: true,
+            modifiers: egui::Modifiers::NONE }]);
+        frame(&mut views, vec![egui::Event::PointerButton { pos: row,
+            button: egui::PointerButton::Primary, pressed: false,
+            modifiers: egui::Modifiers::NONE }]);
+        settle_plot(&ctx, &mut views, &output, &store);
+        let after = *navigation_memory(&ctx, &views, &output).bounds();
+        assert_eq!(views.plot_axis_series.as_deref(), Some("samples / ramp"));
+        assert_eq!(views.plot_view, view);
+        assert_eq!(after.min()[0], before.min()[0]);
+        assert_eq!(after.max()[0], before.max()[0]);
+        assert_eq!(after.min()[1], before.min()[1]);
+        assert_eq!(after.max()[1], before.max()[1]);
     }
 
     #[test]
