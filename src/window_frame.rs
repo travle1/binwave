@@ -120,8 +120,9 @@ fn header_regions(
     (minimize, maximize, close, drag)
 }
 
-fn header(ui: &mut Ui, maximized: bool) {
+pub fn header(ui: &mut Ui, content: impl FnOnce(&mut Ui)) {
     let t = &DARK;
+    let maximized = ui.ctx().input(|input| input.viewport().maximized.unwrap_or(false));
     let (rect, _) = ui.allocate_exact_size(
         vec2(ui.available_width(), t.size.header_height),
         Sense::hover(),
@@ -136,13 +137,14 @@ fn header(ui: &mut Ui, maximized: bool) {
         ui.id().with("header_drag"),
         Sense::click_and_drag(),
     );
-    ui.painter().text(
-        pos2(rect.left() + t.spacing.card_padding, rect.center().y),
-        Align2::LEFT_CENTER,
-        "BinWave",
-        FontId::new(t.font.title, FontFamily::Name("Geist SemiBold".into())),
-        t.color.text.primary,
+    let content_rect = Rect::from_min_max(
+        pos2(rect.left() + t.spacing.card_padding, rect.top()),
+        pos2(minimize.left() - t.spacing.card_padding, rect.bottom()),
     );
+    let mut child = ui.new_child(egui::UiBuilder::new()
+        .max_rect(content_rect)
+        .layout(egui::Layout::left_to_right(egui::Align::Center)));
+    content(&mut child);
     if drag.double_clicked() {
         ui.ctx()
             .send_viewport_cmd(ViewportCommand::Maximized(!maximized));
@@ -212,7 +214,6 @@ pub fn show(ui: &mut Ui, content: impl FnOnce(&mut Ui)) {
             viewport.width() - margin.left - margin.right,
             viewport.height() - margin.top - margin.bottom,
         ));
-        header(ui, maximized);
         content(ui);
     });
     if !maximized {
@@ -249,7 +250,7 @@ mod tests {
                 events,
                 ..Default::default()
             },
-            |_ctx, ui| show(ui, |_| {}),
+            |_ctx, ui| show(ui, |ui| header(ui, |_| {})),
         );
         output.viewport_output[&egui::ViewportId::ROOT]
             .commands

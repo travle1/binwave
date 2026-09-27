@@ -1291,12 +1291,7 @@ impl BinwaveApp {
     fn ui_toolbar(&mut self, ui: &mut Ui) {
         use crate::app_menu::{self, Command::*};
         let ctx=ui.ctx().clone();
-        if !self.sidebar_open && ui.button(egui::RichText::new(egui_phosphor::regular::SIDEBAR_SIMPLE)
-            .font(egui::FontId::new(crate::theme::DARK.size.sidebar_icon,
-                egui::FontFamily::Name("phosphor".into()))))
-            .on_hover_text("Show sidebar (Ctrl+B)").clicked() {
-            self.sidebar_open = true;
-        }
+        let t = &crate::theme::DARK;
         let available=self.commands_available();
         let (undo,redo)=self.binary.menu_history();
         let recent=self.file_locations.recent_pairs().iter().map(Self::recent_label).collect();
@@ -1304,7 +1299,56 @@ impl BinwaveApp {
             file:self.binary.has_file(), selection:self.binary.has_selection(), undo,redo,
             save_decoder:self.decoder==Decoder::Layout && self.binary.can_save_definition(), apply:available && if self.decoder==Decoder::Csv { self.binary.source_path().is_some() && !self.binary.has_byte_edits() } else { self.binary.can_apply_definition() },
             busy:self.binary.is_decoding(), });
-        if let Some((command,argument))=app_menu::native_bar(ui,&menus) {
+        let mut chosen = None;
+        let mut recent_file = None;
+        let mut open_file = false;
+        let mut export = false;
+        ui.horizontal(|ui| {
+            if !self.sidebar_open {
+                let icon_font = egui::FontId::new(t.size.sidebar_icon, egui::FontFamily::Name("phosphor".into()));
+                if ui.button(egui::RichText::new(egui_phosphor::regular::SIDEBAR_SIMPLE).font(icon_font.clone()))
+                    .on_hover_text("Show sidebar (Ctrl+B)").clicked() { self.sidebar_open = true; }
+                if ui.button(egui::RichText::new(egui_phosphor::regular::FOLDER_OPEN).font(icon_font))
+                    .on_hover_text("Open file (Ctrl+O)").clicked() { open_file = true; }
+            }
+            let title = self.binary.source_path().and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Open a file".into());
+            ui.menu_button(egui::RichText::new(title).size(t.font.title).strong(), |ui| {
+                if ui.button("Open file…").clicked() { open_file = true; ui.close(); }
+                for (index, pair) in self.file_locations.recent_pairs().iter().enumerate() {
+                    let label = Self::recent_label(pair);
+                    if ui.button(label).clicked() { recent_file = Some(index); ui.close(); }
+                }
+            });
+            if self.binary.has_file() {
+                let len = self.binary.file_len();
+                let size = if len >= 1024 * 1024 { format!("{:.1} MiB", len as f64 / (1024. * 1024.)) }
+                    else if len >= 1024 { format!("{:.1} KiB", len as f64 / 1024.) }
+                    else { format!("{len} B") };
+                ui.label(egui::RichText::new(format!("{size} · {}{}",
+                    self.binary.default_byte_order().unwrap_or("byte order unspecified"),
+                    if self.binary.is_dirty() { " · unsaved changes" } else { "" }))
+                    .size(t.font.small).color(t.color.text.muted));
+                let partial = self.data_partial || self.binary.status().1;
+                let (badge, color) = if self.binary.is_decoding() { ("Decoding", t.color.accent.base) }
+                    else if partial { ("Partial decode", t.color.status.warning) }
+                    else { ("Ready", t.color.status.success) };
+                egui::Frame::new().fill(color.gamma_multiply(t.color.status.warning_badge_alpha))
+                    .corner_radius(egui::CornerRadius::same(t.radius.pill.min(u8::MAX as u16) as u8))
+                    .inner_margin(egui::Margin::symmetric((t.spacing.card_padding / 2.) as i8,
+                        t.spacing.sidebar_row_gap as i8))
+                    .show(ui, |ui| { ui.label(egui::RichText::new(badge).size(t.font.label).color(color)); });
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                chosen = app_menu::overflow_menu(ui, &menus);
+                if ui.add_enabled(self.binary.has_file(), egui::Button::new("Export"))
+                    .on_hover_text("Save an edited copy of this file").clicked() { export = true; }
+            });
+        });
+        if open_file { self.choose_data_file(&ctx); }
+        if let Some(index) = recent_file { self.open_recent(index, &ctx); }
+        if export { self.binary.save_copy(&ctx); }
+        if let Some((command,argument))=chosen {
             if let Some(pane)=command.pane() {
                 if pane==Pane::Layout { self.binary.show_yaml(); }
                 self.show_view(pane);
@@ -1347,10 +1391,6 @@ impl BinwaveApp {
                 Help => self.show_decoding_guide=true,
                 _ => {}
             }}
-        }
-        if self.binary.has_file() {
-            let title=self.binary.source_path().and_then(|p|p.file_name()).map(|n|n.to_string_lossy().into_owned()).unwrap_or_else(||"Embedded demo".into());
-            ui.add(egui::Label::new(format!("{title} · {} bytes{}",self.binary.file_len(),if self.binary.is_dirty(){" · unsaved changes"}else{""})).truncate());
         }
     }
 
@@ -1501,7 +1541,10 @@ impl BinwaveApp {
         self.ui_sidebar(root_ui);
         self.ui_sidebar_search(&ctx);
         self.ui_sidebar_settings(&ctx);
-        egui::Panel::top("workspace_toolbar").show(root_ui, |ui| self.ui_toolbar(ui));
+        egui::Panel::top("workspace_header")
+            .exact_size(crate::theme::DARK.size.header_height)
+            .frame(egui::Frame::new().fill(crate::theme::DARK.color.surface.window))
+            .show(root_ui, |ui| crate::window_frame::header(ui, |ui| self.ui_toolbar(ui)));
         if self.show_decoding_guide {
             egui::Window::new("Decoding guide").open(&mut self.show_decoding_guide).default_width(540.).resizable(true).show(&ctx, |ui| {
                 crate::source_editor::decoding_guide(ui);
@@ -2976,18 +3019,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            top.iter().map(String::as_str).collect::<Vec<_>>().ends_with(&[
-                "File",
-                "Edit",
-                "View",
-                "Decode",
-                "Tools",
-                "Help",
-                crate::APP_VERSION,
-            ]),
-            "{top:?}"
-        );
+        assert!(top.iter().any(|label| label == "Open a file")
+            && top.iter().any(|label| label == "⋯")
+            && !top.iter().any(|label| label == "File"), "{top:?}");
+        workspace_click(&mut app, &ctx, "⋯");
         workspace_click(&mut app, &ctx, "File");
         workspace_click(&mut app, &ctx, "Open sensor demo");
         let deadline = Instant::now() + std::time::Duration::from_secs(5);

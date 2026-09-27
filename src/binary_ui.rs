@@ -682,6 +682,17 @@ impl BinaryWorkspace {
             .or_else(|| self.raw_source.as_ref().map(|s| s.len))
             .unwrap_or(0)
     }
+    pub fn default_byte_order(&self) -> Option<&'static str> {
+        if self.is_python() { return None; }
+        self.yaml.lines().find_map(|line| {
+            let value = line.strip_prefix("endian:")?.trim();
+            match value {
+                "little" => Some("little-endian"),
+                "big" => Some("big-endian"),
+                _ => None,
+            }
+        })
+    }
     pub fn status(&self) -> (&str, bool) {
         (&self.message, self.error)
     }

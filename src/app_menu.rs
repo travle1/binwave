@@ -231,8 +231,7 @@ pub fn menus(s: &State) -> Vec<Item> {
         Item::menu("Help", vec![action("Decoder guide", Help, true)]),
     ]
 }
-pub fn native_bar(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)> {
-    fn entries(ui: &mut egui::Ui, items: &[Item], selected: &mut Option<(Command, usize)>) {
+fn menu_entries(ui: &mut egui::Ui, items: &[Item], selected: &mut Option<(Command, usize)>) {
         ui.set_min_width(200.);
         for item in items {
             if let Some(command) = item.command {
@@ -251,14 +250,29 @@ pub fn native_bar(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)>
                     ui.close();
                 }
             } else {
-                ui.menu_button(&item.label, |ui| entries(ui, &item.children, selected));
+                ui.menu_button(&item.label, |ui| menu_entries(ui, &item.children, selected));
             }
         }
-    }
+}
+
+pub fn overflow_menu(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)> {
+    let mut selected = None;
+    ui.menu_button("⋯", |ui| {
+        for menu in menus {
+            ui.menu_button(&menu.label, |ui| menu_entries(ui, &menu.children, &mut selected));
+        }
+        ui.separator();
+        ui.weak(crate::APP_VERSION);
+    });
+    selected
+}
+
+#[cfg(test)]
+pub fn native_bar(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)> {
     let mut selected = None;
     egui::MenuBar::new().ui(ui, |ui| {
         for menu in menus {
-            ui.menu_button(&menu.label, |ui| entries(ui, &menu.children, &mut selected));
+            ui.menu_button(&menu.label, |ui| menu_entries(ui, &menu.children, &mut selected));
         }
         let row = ui.min_rect();
         ui.painter().text(
