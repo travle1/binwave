@@ -248,6 +248,7 @@
   section.block { padding-block: clamp(72px, 11vw, 140px); border-top: 1px solid var(--line); }
   section.block.tight-top { border-top: 0; }
   .split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: clamp(28px, 5vw, 80px); align-items: start; }
+  .split > * { min-width: 0; }
   .split.flip { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); }
   @media (max-width: 960px) { .split, .split.flip { grid-template-columns: 1fr; } .split.flip > :first-child { order: 2; } }
   .sticky { position: sticky; top: 100px; }
@@ -288,7 +289,7 @@
   .seg button + button { border-left: 1px solid var(--line-2); }
   .seg button[aria-pressed="true"] { background: var(--sel); color: #fff; }
   .probe-grid { display: grid; grid-template-columns: minmax(0, 1fr) 340px; }
-  @media (max-width: 980px) { .probe-grid { grid-template-columns: 1fr; } }
+  @media (max-width: 980px) { .probe-grid { grid-template-columns: minmax(0, 1fr); } }
   .pane { position: relative; min-width: 0; }
   .pane + .pane { border-left: 1px solid var(--line); }
   @media (max-width: 980px) { .pane + .pane { border-left: 0; border-top: 1px solid var(--line); } }
@@ -325,7 +326,7 @@
   .kv dt { color: var(--ink-3); font-family: var(--mono); font-size: 12px; padding-top: 1px; }
   .kv dd { margin: 0; font-family: var(--mono); font-size: 12.5px; color: var(--ink-2); overflow-wrap: anywhere; }
 
-  .table-scroll { overflow-x: auto; }
+  .table-scroll { max-width: 100%; overflow-x: auto; }
   table.samples { border-collapse: collapse; width: 100%; font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
   table.samples th { text-align: left; font-weight: 500; color: var(--ink-3); padding: 8px 12px; border-bottom: 1px solid var(--line); }
   table.samples td { padding: 6px 12px; color: var(--ink-2); cursor: pointer; }
@@ -345,11 +346,12 @@
   .lang-tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--amber); }
   .lang-tabs button:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
   .lang-panel { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: clamp(24px, 4vw, 56px); padding-top: 32px; }
-  @media (max-width: 960px) { .lang-panel { grid-template-columns: 1fr; } }
+  .lang-panel > * { min-width: 0; }
+  @media (max-width: 960px) { .lang-panel { grid-template-columns: minmax(0, 1fr); } }
   .code {
     margin: 0; background: #070808; border: 1px solid var(--line); border-radius: 8px;
     font-family: var(--mono); font-size: 13.5px; line-height: 1.7; color: #C9CEC9;
-    padding: 18px 20px; overflow-x: auto; counter-reset: ln;
+    padding: 18px 20px; max-width: 100%; overflow-x: auto; counter-reset: ln;
   }
   .code .c { color: #6A7470; font-style: italic; }
   .code .k { color: #7FB8F0; }
@@ -458,7 +460,7 @@
   <!-- ================= HERO ================= -->
   <section class="hero">
     <div class="wrap">
-      <span class="eyebrow">Native desktop workbench for data files</span>
+      <span class="eyebrow">Desktop and browser workbench for data files</span>
       <h1 class="wordmark">BinWave</h1>
     </div>
     <canvas class="scope-strip" id="scope" aria-hidden="true"></canvas>
@@ -468,7 +470,7 @@
         <div>
           <p class="hero-sub">Open binary captures, CSV logs, or any file as bytes. Describe the format in <strong>YAML</strong> or <strong>Python</strong>, then plot, inspect, and edit the data, even in multi-gigabyte files.</p>
           <ul class="facts" aria-label="Product facts">
-            <li>Native desktop app</li>
+            <li>Desktop and browser apps</li>
             <li>YAML or Python decoders</li>
             <li>CSV, binary, or any file</li>
             <li>Byte editing with undo / redo</li>
@@ -494,22 +496,18 @@
 
       <figure class="shot-hero" style="margin-inline:0; margin-bottom:0;">
         <div class="window">
-          <div class="window-bar"><i></i><i></i><i></i><b>waveform_demo_2gb.bin</b><span class="size">2.0 GB · 31,249,935 samples</span></div>
-          <div class="shot" data-full="screenshots/11-cross-probing.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
-            <img src="screenshots/11-cross-probing.webp" width="1920" height="1200" alt="BinWave workspace with one selection linked across four views: the plot cursor at sample 100, the decoded samples row 100 with sine = -1.530734 at byte offset 0x2900, eight highlighted hex bytes labeled sine · f64, and the Inspector showing -1.5307337294603587" fetchpriority="high">
-            <span class="pin" style="left:55.4%; top:46.2%">1</span>
-            <span class="pin" style="left:45.3%; top:87.5%">2</span>
-            <span class="pin" style="left:32.6%; top:67.6%">3</span>
-            <span class="pin" style="left:17.5%; top:62.6%">4</span>
+          <div class="window-bar"><i></i><i></i><i></i><b>waveform_demo_2gb.bin</b><span class="size">1.86 GiB · 31,249,935 samples</span></div>
+          <div class="shot" data-full="screenshots/workspace-2026.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
+            <img src="screenshots/workspace-2026.webp" width="2560" height="1408" alt="Current BinWave desktop workspace showing twelve waveform series, a selected sample in the Samples table, its highlighted bytes in Hex, the YAML editor, and the decoded Structure panel" fetchpriority="high">
           </div>
         </div>
         <div class="legend">
-          <div><b data-n="1">Plot</b>Cursor on <code>sample 100</code>. Twelve channels, samples 64–191 of 31,249,935.</div>
-          <div><b data-n="2">Decoded samples</b>Row 100, <code>sine</code> cell = <code>-1.530734</code>, byte offset <code>0x2900</code>.</div>
-          <div><b data-n="3">Hex</b>Exactly 8 bytes, <code>0x2900–0x2907</code>, labeled <code>sine · f64</code>.</div>
-          <div><b data-n="4">Inspector</b>Full value <code>-1.5307337294603587</code>, ready to edit or export.</div>
+          <div><b data-n="1">Signal</b>Twelve series over samples 988–1,164, with the selected series controlling the Y axis.</div>
+          <div><b data-n="2">Samples</b>Row 1,064 highlights <code>alternating = 97</code>.</div>
+          <div><b data-n="3">Hex</b>Four selected bytes at <code>0x11A34–0x11A37</code>, identified as <code>alternating · i32</code>.</div>
+          <div><b data-n="4">Decoder &amp; Structure</b>The YAML definition and decoded values stay beside the plot and bytes.</div>
         </div>
-        <figcaption class="caption">Real capture of the app, not a mockup. Bytes <span class="mono">61 A9 AE A6 E2 7D F8 BF</span> read as a little-endian f64 reproduce the Inspector value exactly.</figcaption>
+        <figcaption class="caption">Current desktop capture using the public synthetic waveform demo. Plot, Samples, Hex, Decoder, and Structure are shown together.</figcaption>
       </figure>
     </div>
   </section>
@@ -660,12 +658,12 @@ header = file.<span class="fn">read_struct</span>(<span class="s">"header"</span
           <div class="code-cap" style="margin-top:14px"><span>Console</span><span></span></div>
 <pre class="code" style="color:var(--ink-2)">Discovered 12 fields, 64 bytes per sample
 Registered 31,249,935 samples at byte 4,096; values load on demand
-Ready: choose Show samples or Show plot.</pre>
+Ready: explore in Signal, Samples, Hex, and Structure.</pre>
         </div>
         <div>
           <h3>Python: ordinary code, lazy results</h3>
           <ul class="ticks">
-            <li><b>Real Python.</b> Imports, functions, loops, asserts, and your installed libraries, including a virtual environment of your choice.</li>
+            <li><b>Real Python.</b> Imports, functions, loops, and asserts. The desktop app can use your installed libraries and a selected virtual environment; the web app uses its bundled Python runtime.</li>
             <li><b><code>file.read_struct()</code></b> decodes metadata you can branch on. <b><code>file.records()</code></b> registers a typed collection for Plot, Table, and Hex <em>without loading it</em>.</li>
             <li><code>Field</code> and <code>Struct</code> cover <code>u8</code>–<code>u64</code>, <code>i8</code>–<code>i64</code>, <code>f32</code>, <code>f64</code>, <code>text</code>, <code>bytes</code>, nested structs, counts, offsets, per-field endianness, and <code>expect=</code> checks.</li>
             <li>Scripts see the <b>working bytes, including unsaved hex edits</b>. Edit a byte and the last successful decoder reruns. <b>Stop</b> cancels a runaway loop.</li>
@@ -706,14 +704,14 @@ Ready: choose Show samples or Show plot.</pre>
         <p class="callout">Reverse the descriptor order, widen the unknown section, and move the payload from byte 4,096 to 8,192. <strong>The same script and the same YAML still decode it</strong>.</p>
       </div>
       <div>
-        <div class="frame" data-full="screenshots/09-decoded-structure.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
-          <img src="screenshots/09-decoded-structure.webp" width="1100" height="800" loading="lazy" decoding="async" alt="Decoded structure tree: header (32 bytes) with signature PWAV, version 1, file_bytes 2000000000, sample_count 31249935, section_count 4, descriptor_count 12; descriptors (288 bytes) expanded to show sine and triangle, format 3, byte_width 8; unknown_section_1 of 3728 bytes; samples: 31249935 items · 64 bytes each; footer 48 bytes">
+        <div class="frame" data-full="screenshots/structure-2026.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
+          <img src="screenshots/structure-2026.webp" width="502" height="524" loading="lazy" decoding="async" alt="Current Structure panel showing the header, waves, measurements, and events collections in a column-based decoded tree">
         </div>
-        <p class="figcap">Decoded structure: an expandable tree of everything the decoder read, including the unknown section kept as raw bytes.</p>
-        <div class="frame" style="margin-top:22px" data-full="screenshots/10-yaml-decoder.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
-          <img src="screenshots/10-yaml-decoder.webp" width="1600" height="1200" loading="lazy" decoding="async" alt="The YAML decoder editor with Source, Fields, and Steps tabs showing the waveform.yaml definition">
+        <p class="figcap">Structure: decoded fields and collections in a compact, expandable table.</p>
+        <div class="frame" style="margin-top:22px" data-full="screenshots/decoder-2026.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
+          <img src="screenshots/decoder-2026.webp" width="529" height="715" loading="lazy" decoding="async" alt="Current YAML decoder editor showing the Sample type defined from descriptors in waveform.yaml">
         </div>
-        <p class="figcap">The YAML decoder with its Source, Fields, and Steps tabs. <kbd>F5</kbd> decodes.</p>
+        <p class="figcap">YAML editor: define the Sample layout from descriptors in the file, then press <kbd>F5</kbd> to decode.</p>
       </div>
     </div>
   </section>
@@ -723,10 +721,10 @@ Ready: choose Show samples or Show plot.</pre>
     <div class="wrap">
       <div class="split flip">
         <div>
-          <div class="frame" data-full="screenshots/05-waveform-plot.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
-            <img src="screenshots/05-waveform-plot.webp" width="1920" height="1080" loading="lazy" decoding="async" alt="BinWave plot with all 12 named channels over samples 0–383 of 31,249,935: bit_pattern, counter_ramp, alternating, zigzag, damped_sine, staircase, pulse, square, chirp, ramp, triangle, and sine, with a cursor at sample 100">
+          <div class="frame" data-full="screenshots/signal-2026.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
+            <img src="screenshots/signal-2026.webp" width="1512" height="875" loading="lazy" decoding="async" alt="Current Signal panel plotting all twelve named waveform series around sample 1,064, with the active Y axis following the alternating series">
           </div>
-          <p class="figcap">Plot: 12 channels, samples 0–383, cursor on sample 100. Toolbar: Overview · Zoom in · Zoom out · Lock Y · Fit Y · Fit selection · Select sample range… · Inspect / edit bytes · Export selected bytes…</p>
+          <p class="figcap">Signal: twelve series around sample 1,064. The current toolbar offers Series, Collections, Fit, Go to sample, and Plot options.</p>
         </div>
         <div class="sticky">
           <span class="eyebrow">Plotting</span>
@@ -734,9 +732,9 @@ Ready: choose Show samples or Show plot.</pre>
           <p class="body">Plot any numeric field across the whole collection, with <strong>many channels overlaid at once</strong>. Zoomed all the way out, peaks and dips stay visible instead of disappearing between pixels. Zoom in and every individual sample is there.</p>
           <ul class="ticks">
             <li><b>Every point keeps its address.</b> Click a peak at any zoom level and you get that sample's exact bytes.</li>
-            <li><b>Overview</b> shows the whole collection at a glance. <b>Scan for all peaks</b> reads every sample in the current range when you need to be sure nothing was missed.</li>
-            <li>Drag to pan, wheel to zoom, <b>right-drag</b> to zoom to a range. Wheel over an axis to zoom only that axis. <b>Lock Y</b> holds the scale and <b>Fit Y</b> refits it.</li>
-            <li>Select a sample range, then <b>Inspect / edit bytes</b> or <b>Export selected bytes…</b> to write exactly those interleaved records to a file.</li>
+            <li><b>Series and Collections</b> let you choose the signals you see. Select a series to make its values the Y axis, or fit the selected series or all visible series vertically.</li>
+            <li>Drag or middle-drag to pan; use the wheel or pinch to zoom. <b>Go to sample</b> centers a specific sample without losing your place in the file.</li>
+            <li>Click a plotted point to reveal its decoded value and raw bytes in the linked Samples, Hex, and Inspector views.</li>
           </ul>
         </div>
       </div>
@@ -760,14 +758,14 @@ Ready: choose Show samples or Show plot.</pre>
           </ul>
         </div>
         <div>
-          <div class="frame" data-full="screenshots/07-hex-editor.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
-            <img src="screenshots/07-hex-editor.webp" width="1440" height="900" loading="lazy" decoding="async" alt="Hex editor with Back, Forward, Jump, Find, Selection, View and Overwrite controls. Cursor 0x2907, 0x2900–0x2907, 8 selected bytes labeled sine · f64, highlighted in both hex and text columns">
+          <div class="frame" data-full="screenshots/hex-2026.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
+            <img src="screenshots/hex-2026.webp" width="490" height="875" loading="lazy" decoding="async" alt="Current Hex panel showing four selected bytes at 0x11A34, identified as the alternating i32 field">
           </div>
-          <p class="figcap">Hex: the selection <span class="mono">0x2900–0x2907</span> is identified as <span class="mono">sine · f64</span> and highlighted in both the hex and text columns.</p>
-          <div class="frame" style="margin-top:22px" data-full="screenshots/08-value-inspector.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
-            <img src="screenshots/08-value-inspector.webp" width="960" height="400" loading="lazy" decoding="async" alt="Inspector panel: sine, Sample 100, value -1.5307337294603587, Apply value, Show field bytes, Export field…, Sample actions; technical details show the definition covers 2000000000 bytes with 6 reusable types, path samples[100].sine, type f64 little endian, field bytes 0x2900..0x2908">
+          <p class="figcap">Hex: <span class="mono">0x11A34–0x11A37</span> is identified as <span class="mono">alternating · i32</span> and highlighted in the hex and text columns.</p>
+          <div class="frame" style="margin-top:22px" data-full="screenshots/hex-inspector-2026.webp" role="button" tabindex="0" aria-label="Open full-size screenshot">
+            <img src="screenshots/hex-inspector-2026.webp" width="1155" height="280" loading="lazy" decoding="async" alt="Current Hex and Inspector panels showing the triangle value at sample 5 and its four selected bytes">
           </div>
-          <p class="figcap">Inspector: value, definition path, type, and exact field bytes, with Apply value, Show field bytes, and Export field…</p>
+          <p class="figcap">Inspector: the selected sample's decoded value and exact bytes, with actions to reveal the field in Hex.</p>
 
           <div class="cards" style="grid-template-columns:1fr; margin-top:28px">
             <div class="card">
@@ -810,7 +808,7 @@ Ready: choose Show samples or Show plot.</pre>
         <div class="card">
           <span class="tag">Workspace</span>
           <h3>Dock it how you work.</h3>
-          <p>Drag panel titles to split, stack, or float the Decoder, Plot, Hex, Decoded samples, Decoded structure, and Inspector. Your layout persists. Closing a panel keeps its selection and history, and every open and save dialog remembers its own folder.</p>
+          <p>Arrange Signal, Hex, Samples, Structure, Decoder, and Console around the file you are exploring. Close panels you do not need, then reopen them from the header menu or search. Your layout and recent files persist between sessions.</p>
         </div>
       </div>
     </div>
@@ -853,9 +851,9 @@ Ready: choose Show samples or Show plot.</pre>
         <li>Bitfield and UTF-16 field types</li>
         <li>Inserting or removing bytes</li>
         <li>Checksum verification and repair</li>
-        <li>Browser version</li>
+        <li>Desktop CSV decoding in the browser</li>
       </ul>
-      <p>Python decoders run with your user permissions. YAML definitions can't run code.</p>
+      <p>The web app supports YAML and Python decoders in your browser. On desktop, Python decoders run with your user permissions. YAML definitions cannot run code.</p>
     </div>
   </section>
 
@@ -867,7 +865,7 @@ Ready: choose Show samples or Show plot.</pre>
       <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#141717" stroke="#323838"/><path d="M5 21h4v-10h5v10h2.5" fill="none" stroke="#F2A93B" stroke-width="2.6" stroke-linejoin="round"/><path d="M16.5 21c2.2 0 2.5-10 5-10s2.8 10 5.5 10" fill="none" stroke="#4CC9C0" stroke-width="2.6" stroke-linecap="round"/></svg>
       <span>BinWave</span>
     </a>
-    <span class="mono">Native desktop app · runs on your machine</span>
+    <span class="mono">Desktop and browser apps · your files stay local</span>
     <span>A <a href="https://buildincharge.com">Build In Charge</a> project · <a href="mailto:hello@buildincharge.com">hello@buildincharge.com</a></span>
   </div>
 </footer>
