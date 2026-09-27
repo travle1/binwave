@@ -4078,7 +4078,7 @@ mod tests {
         let store=ByteStore::from_snapshot(Original::from_bytes(crate::demos::Demo::Advanced.bytes()).unwrap());
         let output=Program::parse(crate::demos::Demo::Advanced.yaml()).unwrap().run(&store.view(),&AtomicBool::new(false)).unwrap();
         let mut views=StructureViews::default();
-        for _ in 0..20 {render_plot(&ctx,&mut views,&output,&store,vec![],Default::default());std::thread::sleep(std::time::Duration::from_millis(5));}
+        settle_plot(&ctx, &mut views, &output, &store);
         let raw=views.extra_plot_readers["measurements"].data().unwrap().series["temperature"][10].value;
         views.presentation.series.insert("measurements / temperature".into(),crate::plot_presentation::Placement {scale:0.5,offset:200.});
         views.plot_axis_series = Some("measurements / temperature".into());
@@ -5152,7 +5152,14 @@ actions:
         for _ in 0..2 {
             loop {
                 render_plot(ctx, views, output, store, Vec::new(), Default::default());
-                if !views.plot_reader.is_loading() {
+                // The plot draws nothing until nested discovery finishes, and extra
+                // collections load on their own readers; slow runners reach this
+                // loop before either is done.
+                let busy = views.plot_reader.is_loading()
+                    || views.discovery_rx.is_some()
+                    || views.extra_plot_readers.values().any(|reader| reader.is_loading())
+                    || views.group_plot_readers.values().any(|reader| reader.is_loading());
+                if !busy {
                     break;
                 }
                 assert!(
