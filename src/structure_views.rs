@@ -171,6 +171,8 @@ pub struct StructureViews {
     plot_dot_radius: Option<f32>,
     plot_range_fill_percent: Option<u32>,
     plot_range_zoom: Option<RangeZoom>,
+    plot_middle_panning: bool,
+    plot_axis_panning: Option<usize>,
     plot_zoom_y: Option<(f64, f64)>,
     plot_follow_selection: bool,
     plot_sampled_preview: bool,
@@ -2074,18 +2076,14 @@ impl StructureViews {
         let dot_radius = self.plot_dot_radius.unwrap_or(2.5);
         let mut axis_hover = None;
         let mut gpu_mode = false;
-        let pan_button = if ui.input(|input| input.pointer.button_down(egui::PointerButton::Middle)) {
-            egui::PointerButton::Middle
-        } else {
-            egui::PointerButton::Primary
-        };
         let response = Plot::new(plot_id)
             .id(plot_id)
             .auto_bounds(egui::Vec2b::new(false, false))
             .allow_double_click_reset(false)
             .allow_boxed_zoom(false)
             .allow_drag(egui::Vec2b::new(!self.presentation.is_dragging(), self.plot_free_y && !self.presentation.is_dragging()))
-            .pan_pointer_button(pan_button)
+            .allow_axis_zoom_drag(false)
+            .pan_pointer_button(egui::PointerButton::Primary)
             .allow_zoom(egui::Vec2b::new(true, self.plot_free_y))
             .allow_scroll(false)
             .label_formatter(move |position| {
@@ -2155,6 +2153,41 @@ impl StructureViews {
                     }
                 }
                 let inner = plot_ui.response().rect;
+                // Middle-button panning is handled directly. Switching the plot's
+                // drag button while a pointer gesture is in progress is unreliable
+                // with native input, since egui has already assigned the drag to
+                // the response from the press frame.
+                let (middle_pressed, middle_down, middle_delta, middle_origin) =
+                    plot_ctx.input(|input| (
+                        input.pointer.button_pressed(egui::PointerButton::Middle),
+                        input.pointer.button_down(egui::PointerButton::Middle),
+                        input.pointer.delta(),
+                        input.pointer.press_origin(),
+                    ));
+                if middle_pressed {
+                    self.plot_middle_panning = middle_origin.is_some_and(|origin|
+                        inner.contains(origin) && plot_clip.contains(origin));
+                }
+                if !middle_down {
+                    self.plot_middle_panning = false;
+                } else if !middle_pressed && self.plot_middle_panning && middle_delta != egui::Vec2::ZERO {
+                    let old = plot_ui.plot_bounds();
+                    let x = -(middle_delta.x as f64) * old.width() / inner.width().max(1.) as f64;
+                    let y = if self.plot_free_y {
+                        (middle_delta.y as f64) * old.height() / inner.height().max(1.) as f64
+                    } else {
+                        0.
+                    };
+                    let mut min = old.min();
+                    let mut max = old.max();
+                    min[0] += x;
+                    max[0] += x;
+                    min[1] += y;
+                    max[1] += y;
+                    plot_ui.set_plot_bounds(PlotBounds::from_min_max(min, max));
+                    self.plot_fit_y = false;
+                    plot_ctx.request_repaint();
+                }
                 let axis_rects = [
                     egui::Rect::from_min_max(
                         egui::pos2(inner.left(), inner.bottom()),
@@ -2165,6 +2198,36 @@ impl StructureViews {
                         egui::pos2(inner.left(), inner.bottom()),
                     ),
                 ];
+                let (primary_pressed, primary_down, primary_delta, primary_origin) =
+                    plot_ctx.input(|input| (
+                        input.pointer.button_pressed(egui::PointerButton::Primary),
+                        input.pointer.button_down(egui::PointerButton::Primary),
+                        input.pointer.delta(),
+                        input.pointer.press_origin(),
+                    ));
+                if primary_pressed {
+                    self.plot_axis_panning = primary_origin.and_then(|origin|
+                        axis_rects.iter().enumerate().find_map(|(axis, rect)|
+                            rect.intersect(plot_clip).contains(origin).then_some(axis)));
+                }
+                if !primary_down {
+                    self.plot_axis_panning = None;
+                } else if let Some(axis) = self.plot_axis_panning.filter(|_| !primary_pressed) {
+                    if primary_delta[axis] != 0. {
+                        let old = plot_ui.plot_bounds();
+                        let mut min = old.min();
+                        let mut max = old.max();
+                        let pixels = if axis == 0 { inner.width() } else { inner.height() }.max(1.);
+                        let distance = primary_delta[axis] as f64
+                            * if axis == 0 { -old.width() } else { old.height() }
+                            / pixels as f64;
+                        min[axis] += distance;
+                        max[axis] += distance;
+                        plot_ui.set_plot_bounds(PlotBounds::from_min_max(min, max));
+                        self.plot_fit_y = false;
+                        plot_ctx.request_repaint();
+                    }
+                }
                 axis_hover = axis_rects
                     .iter()
                     .enumerate()
@@ -2266,9 +2329,9 @@ impl StructureViews {
                 egui::Sense::hover(),
             )
             .on_hover_text(if axis == 0 {
-                "X axis: wheel to zoom · Shift+wheel to pan"
+                "X axis: drag or Shift+wheel to pan · wheel to zoom"
             } else {
-                "Y axis: wheel to zoom · Shift+wheel to pan"
+                "Y axis: drag or Shift+wheel to pan · wheel to zoom"
             });
         }
         if response.response.dragged()
@@ -5521,6 +5584,40 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
         assert!((after.width() - before.width()).abs() < 1e-8);
         navigation_assert_y(before, after);
         assert_eq!(views.last_hex_selection, selected);
+    }
+
+    #[test]
+    fn left_drag_on_axis_pans_that_axis_without_zooming() {
+        for y_axis in [false, true] {
+            let (ctx, store, output, mut views) = axis_navigation_fixture();
+            let selected = views.last_hex_selection.clone();
+            let before = *navigation_memory(&ctx, &views, &output).bounds();
+            let from = axis_navigation_position(&navigation_memory(&ctx, &views, &output), y_axis);
+            let to = from + if y_axis { egui::vec2(0., -40.) } else { egui::vec2(80., 0.) };
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            render_plot(&ctx, &mut views, &output, &store,
+                vec![egui::Event::PointerMoved(from), button(from, true)], egui::Modifiers::NONE);
+            render_plot(&ctx, &mut views, &output, &store,
+                vec![egui::Event::PointerMoved(to)], egui::Modifiers::NONE);
+            render_plot(&ctx, &mut views, &output, &store,
+                vec![button(to, false)], egui::Modifiers::NONE);
+            let after = *navigation_memory(&ctx, &views, &output).bounds();
+            if y_axis {
+                axis_navigation_assert_x(before, after);
+                assert!(after.min()[1] < before.min()[1], "Y drag should pan: {before:?} -> {after:?}");
+                assert!((after.height() - before.height()).abs() < 1e-8);
+            } else {
+                navigation_assert_y(before, after);
+                assert!(after.min()[0] < before.min()[0], "X drag should pan: {before:?} -> {after:?}");
+                assert!((after.width() - before.width()).abs() < 1e-8);
+            }
+            assert_eq!(views.last_hex_selection, selected);
+        }
     }
 
     #[test]
