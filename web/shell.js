@@ -134,7 +134,14 @@
             recentHeading.hidden = names.length === 0;
             recent.replaceChildren(...names.map((name, index) => {
                 const button = document.createElement('button');
-                button.textContent = name;
+                const icon = document.createElement('span');
+                icon.className = 'phosphor';
+                icon.setAttribute('aria-hidden', 'true');
+                icon.textContent = '\uE230';
+                const label = document.createElement('span');
+                label.className = 'recent-name';
+                label.textContent = name;
+                button.append(icon, label);
                 button.title = name;
                 button.classList.toggle('active', index === 0);
                 button.onclick = () => window.binwave.reopenRecent(index);

@@ -1,3 +1,8 @@
+@font-face { font-family: Geist; src: url('fonts/Geist-Regular.ttf'); font-weight: 400; font-display: swap; }
+@font-face { font-family: Geist; src: url('fonts/Geist-Medium.ttf'); font-weight: 500; font-display: swap; }
+@font-face { font-family: Geist; src: url('fonts/Geist-SemiBold.ttf'); font-weight: 600 900; font-display: swap; }
+@font-face { font-family: 'Geist Mono'; src: url('fonts/GeistMono-Regular.ttf'); font-weight: 400; font-display: swap; }
+@font-face { font-family: Phosphor; src: url('fonts/Phosphor.ttf'); font-weight: 400; font-display: block; }
 :root {
   color-scheme: dark;
   --sidebar: #181818; --window: #1c1c1c; --card: #232323;
@@ -18,15 +23,18 @@ button:focus-visible, input:focus-visible, summary:focus-visible { outline:2px s
 #sidebar[hidden] { display:none; }
 .sidebar-head { display:flex; align-items:center; gap:9px; min-height:40px; padding:0 8px; margin-bottom:6px; }
 .sidebar-head strong { font-size:14px; font-weight:600; }
-.brand-mark { width:24px; height:24px; display:grid; place-items:center; border-radius:7px; color:#181818; background:var(--accent); font-weight:800; }
-.icon-button { border:0; background:transparent; padding:5px 8px; font-size:19px; line-height:24px; }
+.brand-mark { width:24px; height:24px; display:grid; place-items:center; border-radius:7px; color:#181818; background:var(--accent); font-size:13px; font-weight:600; }
+.phosphor { font-family:Phosphor; font-weight:400; font-variant-ligatures:none; line-height:1; speak:none; }
+.icon-button { border:0; background:transparent; padding:5px 8px; font-size:17px; line-height:24px; color:var(--secondary); }
 #collapse-sidebar { margin-left:auto; }
 .sidebar-action, .recent-files button { width:100%; min-height:36px; display:flex; align-items:center; gap:11px; padding:0 10px; background:transparent; border:0; text-align:left; border-radius:7px; }
 .sidebar-action:hover, .recent-files button:hover { background:var(--active); }
-.sidebar-action > span:first-child { width:18px; text-align:center; color:var(--secondary); font-size:17px; }
+.sidebar-action > span:first-child { width:18px; flex:none; text-align:center; color:var(--secondary); font-size:17px; }
 .shortcut { margin-left:auto; color:var(--muted); font-size:11px; }
 .sidebar-heading { margin:25px 10px 8px; color:var(--muted); font-size:11px; }
-.recent-files button { display:block; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; color:var(--secondary); font-size:12px; }
+.recent-files button { display:flex; overflow:hidden; white-space:nowrap; align-items:center; gap:11px; color:var(--secondary); font-size:12px; }
+.recent-files button > .phosphor { width:18px; flex:none; text-align:center; font-size:17px; }
+.recent-name { overflow:hidden; text-overflow:ellipsis; }
 .recent-files button.active { background:var(--active); color:var(--text); }
 .sidebar-spacer { flex:1; }
 .sidebar-user { display:flex; align-items:center; gap:9px; min-height:40px; padding:0 8px; font-size:12px; }

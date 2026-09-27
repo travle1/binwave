@@ -7,25 +7,26 @@
   <base data-trunk-public-url>
   <link data-trunk rel="rust" data-bin="binwave">
   <link data-trunk rel="copy-dir" href="web">
+  <link data-trunk rel="copy-dir" href="assets/fonts" data-target-path="web/fonts">
   <link data-trunk rel="copy-dir" href="node_modules/pyodide" data-target-path="pyodide">
   <link data-trunk rel="copy-dir" href="samples/decoders/yaml" data-target-path="decoders">
   <link data-trunk rel="copy-dir" href="samples/quickstart" data-target-path="examples">
-  <link rel="stylesheet" href="web/theme.css">
+  <link rel="stylesheet" href="web/theme.css?v=0.1.7">
 </head>
 <body>
   <aside id="sidebar" aria-label="Main navigation">
-    <div class="sidebar-head"><span class="brand-mark" aria-hidden="true">~</span><strong>BinWave</strong><button id="collapse-sidebar" class="icon-button" title="Collapse sidebar (Ctrl+B)" aria-label="Collapse sidebar">◧</button></div>
-    <button id="sidebar-open" class="sidebar-action"><span aria-hidden="true">▣</span>Open file<span class="shortcut">Ctrl O</span></button>
-    <button id="sidebar-search" class="sidebar-action"><span aria-hidden="true">⌕</span>Search<span class="shortcut">Ctrl K</span></button>
-    <button id="sidebar-library" class="sidebar-action"><span aria-hidden="true">◇</span>Decoder library</button>
+    <div class="sidebar-head"><span class="brand-mark" aria-hidden="true">B</span><strong>BinWave</strong><button id="collapse-sidebar" class="icon-button" title="Collapse sidebar (Ctrl+B)" aria-label="Collapse sidebar"><span class="phosphor" aria-hidden="true">&#xEC24;</span></button></div>
+    <button id="sidebar-open" class="sidebar-action"><span class="phosphor" aria-hidden="true">&#xE256;</span>Open file<span class="shortcut">Ctrl O</span></button>
+    <button id="sidebar-search" class="sidebar-action"><span class="phosphor" aria-hidden="true">&#xE30C;</span>Search<span class="shortcut">Ctrl K</span></button>
+    <button id="sidebar-library" class="sidebar-action"><span class="phosphor" aria-hidden="true">&#xE0E6;</span>Decoder library</button>
     <div id="recent-heading" class="sidebar-heading" hidden>Today</div>
     <div id="recent-files" class="recent-files"></div>
     <div class="sidebar-spacer"></div>
-    <div class="sidebar-user"><span class="avatar">T</span><span>BinWave</span><span id="app-version" aria-label="Application version"></span></div>
+    <div class="sidebar-user"><span class="avatar">B</span><span>BinWave</span><span id="app-version" aria-label="Application version"></span></div>
   </aside>
   <div id="app-content">
   <header aria-label="Application commands">
-    <div class="menu-row"><button id="expand-sidebar" class="icon-button" title="Show sidebar (Ctrl+B)" aria-label="Show sidebar" hidden>◧</button><button id="header-open" class="icon-button" title="Open file (Ctrl+O)" aria-label="Open file" hidden>▣</button><div id="file-heading"><button id="file-title" type="button" title="Open file">No file open <span class="chevron" aria-hidden="true">⌄</span></button><span id="file-context"></span></div><span id="decode-badge" hidden></span><div class="header-spacer"></div><button id="header-export" disabled>↧&nbsp; Export</button><nav id="app-menus" aria-label="More commands"></nav></div>
+    <div class="menu-row"><button id="expand-sidebar" class="icon-button" title="Show sidebar (Ctrl+B)" aria-label="Show sidebar" hidden><span class="phosphor" aria-hidden="true">&#xEC24;</span></button><button id="header-open" class="icon-button" title="Open file (Ctrl+O)" aria-label="Open file" hidden><span class="phosphor" aria-hidden="true">&#xE256;</span></button><div id="file-heading"><button id="file-title" type="button" title="Open file">No file open <span class="chevron" aria-hidden="true">⌄</span></button><span id="file-context"></span></div><span id="decode-badge" hidden></span><div class="header-spacer"></div><button id="header-export" disabled>↧&nbsp; Export</button><nav id="app-menus" aria-label="More commands"></nav></div>
   </header>
   <div hidden aria-hidden="true">
     <button id="open" disabled>Open file...</button><input type="file" id="file">
