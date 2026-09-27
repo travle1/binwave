@@ -1936,7 +1936,7 @@ impl BinwaveApp {
             DockArea::new(&mut workspace.dock)
                 .id(egui::Id::new("workspace_dock"))
                 .style(crate::theme::dock_style(ui.style().as_ref()))
-                .show_close_buttons(false)
+                .show_close_buttons(true)
                 .show_leaf_close_all_buttons(false)
                 .show_leaf_collapse_buttons(false)
                 .tab_context_menus(true)
