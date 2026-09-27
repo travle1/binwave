@@ -710,15 +710,23 @@ impl StructureViews {
         let row_height = 24.;
         let name_width = rows.iter().map(|(_, depth)| 160. + (*depth).min(32) as f32 * 16.)
             .max_by(f32::total_cmp).unwrap_or(300.).max(300.);
-        let minimum_width = name_width + 620.;
-        let table_width = ui.available_width().max(minimum_width);
+        let sizes = &crate::theme::DARK.size;
+        let show_type = ui.available_width() >= sizes.structure_type_min_width;
+        let has_issues = tree_has_issues(&output.nodes)
+            || self.page.as_ref().into_iter().chain(self.cached_pages.iter())
+                .any(|page| page.key.revision == output.revision && page.result.is_err());
+        let type_width = if show_type { 150. } else { 0. };
+        let status_width = if has_issues { sizes.structure_status_width } else { 0. };
+        let minimum_width = name_width + type_width + 450. + status_width;
+        let scroll = &ui.spacing().scroll;
+        let table_width = (ui.available_width() - scroll.bar_width - scroll.bar_outer_margin).max(minimum_width);
         let widths = [
             name_width + (table_width - minimum_width) * 0.55,
-            150.,
+            type_width,
             220. + (table_width - minimum_width) * 0.45,
             130.,
             100.,
-            20.,
+            status_width,
         ];
         let mut toggle = None;
         let mut node_click = None;
@@ -787,21 +795,39 @@ impl StructureViews {
                             ["", &kind, &value, &offset, &size_label, ""], false);
                         let issue = self.page_for(&node.path, output.revision)
                             .and_then(|page| page.result.as_ref().err());
-                        if issue.is_some() || node.kind.starts_with("partial") || depth == 0 {
-                            let status_rect = egui::Rect::from_min_max(
-                                egui::pos2(rect.right() - widths[5], rect.top()), rect.right_bottom());
-                            let warning = issue.is_some() || node.kind.starts_with("partial");
-                            paint_tree_text(ui, status_rect, if warning { "!" } else { "✓" },
-                                if warning { crate::theme::DARK.color.status.warning } else { crate::theme::DARK.color.status.success },
-                                false, false, crate::theme::DARK.font.body);
-                        }
+                        let warning = issue.is_some() || node.kind.starts_with("partial");
+                        let status_rect = egui::Rect::from_min_max(
+                            egui::pos2(rect.right() - widths[5], rect.top()), rect.right_bottom());
+                        let status_tooltip = (has_issues && (warning || depth == 0)).then(|| {
+                            let (icon, color, text) = if warning {
+                                (egui_phosphor::regular::WARNING, crate::theme::DARK.color.status.warning,
+                                    issue.map_or_else(|| "Incomplete: decoding stopped inside this item".to_owned(),
+                                        |error| format!("Could not load items: {error}")))
+                            } else {
+                                (egui_phosphor::regular::CHECK, crate::theme::DARK.color.status.success,
+                                    "Decoded without issues".to_owned())
+                            };
+                            if ui.is_rect_visible(status_rect) {
+                                ui.painter().with_clip_rect(status_rect).text(status_rect.center(),
+                                    egui::Align2::CENTER_CENTER, icon,
+                                    egui::FontId::new(crate::theme::DARK.font.body,
+                                        egui::FontFamily::Name("phosphor".into())), color);
+                            }
+                            text
+                        });
                         let tooltip = format!("{}\n{}\n{}\n{}{}",
-                            node.path, node.kind,
+                            node.path, kind,
                             crate::format::byte_range(node.range.start as u64, node.range.end as u64),
                             crate::format::exact_bytes(size as u64),
                             if node.references.is_empty() { String::new() } else { format!("\n{}", node.references.join("\n")) });
                         let tooltip = issue.map_or(tooltip.clone(), |error| format!("{tooltip}\n{error}"));
                         let tooltip = node.numeric_tooltip().map_or(tooltip.clone(), |number| format!("{number}\n\n{tooltip}"));
+                        let over_status = ui.input(|i| i.pointer.hover_pos())
+                            .is_some_and(|position| status_rect.contains(position));
+                        let tooltip = match status_tooltip {
+                            Some(status) if over_status => status,
+                            _ => tooltip,
+                        };
                         let row_response = ui.interact(rect, ui.id().with("tree_row"), egui::Sense::click())
                             .on_hover_text(tooltip);
                         if expandable && row_response.clicked() && chevron_rect.contains(ui.input(|i| i.pointer.interact_pos().unwrap_or_default())) {
@@ -3825,13 +3851,23 @@ fn tree_column_value(node: &Node, parent_kind: Option<&str>, program: Option<&Pr
     if node.kind.ends_with("[]") || node.kind == "partial collection" {
         return crate::format::plural(node.children.len() as u64, "item", "items");
     }
+    // An item's struct payload stands in for it: "12 entries", "marker PWAV-END".
+    let item_payload = node.path.strip_suffix(&format!(".{}", node.name)).is_some_and(|parent| parent.ends_with(']'));
+    if item_payload && is_struct(node) {
+        if let Some(summary) = payload_summary(node) { return summary; }
+    }
     if !node.name.starts_with('[') {
         return node.preview.as_ref().and_then(|preview| preview.split_once('=').map(|(_, value)| value.to_owned()))
             .unwrap_or_default();
     }
-    let identifying = node.children.iter()
-        .find(|child| ["name", "id", "label"].contains(&child.name.as_str())
-            && child.value.is_some())
+    let named = |names: &[&str]| node.children.iter()
+        .find(|child| names.contains(&child.name.as_str()) && child.value.is_some());
+    if named(&["name", "label"]).is_none() {
+        if let Some(summary) = node.children.iter().filter(|child| is_struct(child)).find_map(payload_summary) {
+            return summary;
+        }
+    }
+    let identifying = named(&["name", "id", "label"])
         .or_else(|| node.children.iter().find(|child| child.value.is_some()));
     identifying.map(|child| {
         let value = match child.value.as_ref().unwrap() {
@@ -3845,8 +3881,33 @@ fn tree_column_value(node: &Node, parent_kind: Option<&str>, program: Option<&Pr
         .unwrap_or_default()
 }
 
+fn is_struct(node: &Node) -> bool {
+    node.value.is_none() && !is_collection(node) && !node.children.is_empty()
+}
+
+/// Summarizes a struct that wraps one nested collection ("31,249,935 records")
+/// or carries a text marker ("marker PWAV-END").
+fn payload_summary(node: &Node) -> Option<String> {
+    if let [child] = node.children.as_slice() {
+        if is_collection(child) {
+            let singular = child.name.strip_suffix("ies").map(|stem| format!("{stem}y"))
+                .or_else(|| child.name.strip_suffix('s').map(str::to_owned))
+                .unwrap_or_else(|| child.name.clone());
+            return Some(crate::format::plural(collection_count(child) as u64, &singular, &child.name));
+        }
+    }
+    node.children.iter().find_map(|child| match &child.value {
+        Some(Value::Text(text)) => Some(format!("{} {text}", child.name)),
+        _ => None,
+    })
+}
+
+fn tree_has_issues(nodes: &[Node]) -> bool {
+    nodes.iter().any(|node| node.kind.starts_with("partial") || tree_has_issues(&node.children))
+}
+
 fn paint_tree_text(ui: &Ui, rect: egui::Rect, text: &str, color: Color32, mono: bool, right: bool, size: f32) {
-    if !ui.is_rect_visible(rect) { return; }
+    if rect.width() <= 0. || !ui.is_rect_visible(rect) { return; }
     let font = egui::FontId::new(size, if mono { egui::FontFamily::Monospace } else { egui::FontFamily::Proportional });
     let position = if right { rect.right_center() - egui::vec2(6., 0.) } else { rect.left_center() + egui::vec2(4., 0.) };
     ui.painter().with_clip_rect(rect).text(position,
@@ -3892,6 +3953,75 @@ mod tests {
             names[..2]
         );
     }
+    const PAYLOAD_YAML: &str = "structures:
+  - {name: Entry, fields: [{name: name, type: string, length: 2}]}
+  - {name: List, fields: [{name: entries, type: {structure: Entry}, repeat: 2}]}
+  - {name: Tail, fields: [{name: marker, type: string, length: 3}]}
+  - name: Item
+    fields:
+      - {name: id, type: u8}
+      - {name: size, type: u8}
+      - name: payload
+        type: {choose: {ref: id, cases: {'1': {structure: List}, '2': {structure: Tail}}, otherwise: bytes}}
+        length: {ref: size}
+actions:
+  - read: {name: items, type: {structure: Item}, repeat: 3}
+";
+    const PAYLOAD_BYTES: &[u8] = b"\x01\x04abcd\x02\x03END\x07\x01z";
+
+    fn tree_frame(views: &mut StructureViews, output: &ParseOutput, program: &Program, width: f32) -> Vec<String> {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 700.))),
+            ..Default::default()
+        }, |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                views.tree(ui, output, Some(program), None, &mut |ui, node| ui.label(node.tree_label()));
+            });
+        }).shapes.into_iter().filter_map(|shape| match shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn structure_items_summarize_nested_payloads() {
+        let program = Program::parse(PAYLOAD_YAML).unwrap();
+        let store = ByteStore::from_snapshot(Original::from_bytes(PAYLOAD_BYTES).unwrap());
+        let output = program.run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let items = &output.nodes[0].children;
+        let values: Vec<_> = items.iter()
+            .map(|item| tree_column_value(item, Some("Item[]"), Some(&program))).collect();
+        assert_eq!(values, ["2 entries", "marker END", "id 7"]);
+        assert_eq!(tree_column_value(&items[0].children[2], Some("Item"), Some(&program)), "2 entries");
+        let entry = &items[0].children[2].children[0].children[0];
+        assert_eq!(tree_column_value(entry, Some("Entry[]"), Some(&program)), "ab");
+    }
+
+    #[test]
+    fn structure_status_and_type_columns_follow_issues_and_width() {
+        let program = Program::parse(PAYLOAD_YAML).unwrap();
+        let store = ByteStore::from_snapshot(Original::from_bytes(PAYLOAD_BYTES).unwrap());
+        let output = program.run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let mut views = StructureViews::default();
+        views.expanded.insert("items".into());
+        let wide = tree_frame(&mut views, &output, &program, 1100.);
+        assert!(wide.iter().any(|text| text == "Type"), "{wide:?}");
+        assert!(!wide.iter().any(|text| text == egui_phosphor::regular::CHECK
+            || text == egui_phosphor::regular::WARNING), "no status column without issues");
+        let narrow = tree_frame(&mut views, &output, &program, 480.);
+        assert!(!narrow.iter().any(|text| text == "Type" || text == "Item[3]"), "{narrow:?}");
+        assert!(narrow.iter().any(|text| text == "Value"));
+
+        let truncated = ByteStore::from_snapshot(Original::from_bytes(&PAYLOAD_BYTES[..9]).unwrap());
+        let failure = program.run_with_partial(&truncated.view(), &AtomicBool::new(false)).unwrap_err();
+        assert!(tree_has_issues(&failure.output.nodes));
+        let partial = tree_frame(&mut views, &failure.output, &program, 1100.);
+        assert!(partial.iter().any(|text| text == egui_phosphor::regular::WARNING), "{partial:?}");
+        assert!(!partial.iter().any(|text| text == "!" || text == "✓"));
+    }
+
     #[test]
     fn structure_row_columns_and_full_width_selection_render() {
         let yaml = "structures:\n  - name: Header\n    fields:\n      - {name: signature, type: string, length: 4}\nactions:\n  - read: {name: header, type: {structure: Header}}\n";
