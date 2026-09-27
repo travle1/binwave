@@ -1493,8 +1493,11 @@ impl BinwaveApp {
         let t = &crate::theme::DARK;
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
-            ui.heading("Decoder library");
-            if ui.button("Back to workspace").clicked() { self.decoder_library_open = false; }
+            ui.label(egui::RichText::new("Decoder library").size(t.font.title).strong());
+            ui.weak(format!("{} decoders", self.file_locations.decoder_paths().len()));
+            if ui.add(egui::Button::new("Back to workspace").frame(false)).clicked() {
+                self.decoder_library_open = false;
+            }
         });
         let mut paths: Vec<_> = self.file_locations.decoder_paths().into_iter()
             .filter(|path| path.is_file() && LibraryFormat::from_path(path).is_some())
@@ -1509,17 +1512,23 @@ impl BinwaveApp {
         let mut rename = None;
         let mut imported: Vec<PathBuf> = Vec::new();
         egui::Panel::right("decoder_library_details")
-            .default_size(t.size.library_details_width)
+            .exact_size(t.size.library_details_width)
+            .resizable(false)
             .frame(egui::Frame::new().fill(t.color.surface.card)
                 .corner_radius(t.radius.card).inner_margin(t.spacing.card_padding as i8))
             .show(ui, |ui| {
+                ui.set_width(t.size.library_details_width - 2. * t.spacing.card_padding);
                 if let Some(path) = self.library_selected.clone() {
                     let name = decoder_library::name(&path);
                     let format = LibraryFormat::from_path(&path).unwrap_or_default();
-                    ui.heading(&name);
+                    ui.label(egui::RichText::new(&name).size(t.font.title).strong())
+                        .on_hover_text(path.display().to_string());
                     ui.weak(format.label());
                     ui.horizontal(|ui| {
-                        if ui.button("Open in workspace").clicked() { open = Some(path.clone()); }
+                        if ui.add(egui::Button::new(egui::RichText::new("Open in workspace")
+                            .color(t.color.text.on_accent)).fill(t.color.accent.base)).clicked() {
+                            open = Some(path.clone());
+                        }
                         if ui.button("Duplicate").clicked() { duplicate = Some(path.clone()); }
                         if ui.button("Rename").clicked() {
                             self.library_renaming = true;
@@ -1535,29 +1544,51 @@ impl BinwaveApp {
                         });
                     }
                     ui.separator();
-                    ui.weak(path.display().to_string());
-                    if let Ok(metadata) = std::fs::metadata(&path) {
-                        ui.label(format!("{} bytes", metadata.len()));
-                    }
-                    if let Some(edited) = decoder_library::edited_label(&path) { ui.weak(edited); }
+                    ui.label("Last run");
                     if let Some(run) = self.file_locations.decoder_run(&path) {
                         ui.colored_label(t.color.status.success,
                             format!("Last run succeeded · {}", decoder_library::name(&run.data)));
                     } else {
-                        ui.weak("No recorded run");
+                        ui.weak("Not run yet");
                     }
+                    ui.add_space(t.spacing.card_padding);
                     let structures = decoder_library::yaml_structures(&path);
                     if !structures.is_empty() {
-                        ui.label(format!("{} structures", structures.len()));
-                        ui.horizontal_wrapped(|ui| {
-                            for structure in &structures {
+                        ui.label(format!("Structures · {}", structures.len()));
+                        ui.horizontal(|ui| {
+                            for structure in structures.iter().take(2) {
                                 egui::Frame::new().fill(t.color.surface.raised)
                                     .corner_radius(t.radius.chip)
                                     .inner_margin(t.spacing.sidebar_row_gap as i8)
                                     .show(ui, |ui| { ui.label(structure); });
                             }
+                            if structures.len() > 2 {
+                                ui.weak(format!("+{} more", structures.len() - 2));
+                            }
                         });
                     }
+                    ui.add_space(t.spacing.card_padding);
+                    ui.label("Preview");
+                    let preview = std::fs::File::open(&path).ok().and_then(|file| {
+                        let mut bytes = Vec::new();
+                        file.take(t.size.library_preview_bytes as u64)
+                            .read_to_end(&mut bytes).ok()?;
+                        Some(String::from_utf8_lossy(&bytes).lines().take(14)
+                            .map(|line| line.chars().take(58).collect::<String>())
+                            .collect::<Vec<_>>().join("\n"))
+                    });
+                    egui::Frame::new().fill(t.color.surface.window)
+                        .corner_radius(t.radius.well)
+                        .inner_margin(t.spacing.card_padding as i8)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(t.size.library_preview_height)
+                                .show(ui, |ui| {
+                                    ui.add(egui::Label::new(egui::RichText::new(
+                                        preview.as_deref().unwrap_or("Preview unavailable"))
+                                        .monospace()).wrap());
+                                });
+                        });
+                    ui.add_space(t.spacing.card_padding);
                     let used_with: Vec<_> = self.file_locations.recent_pairs().into_iter()
                         .filter(|pair| pair.decoder.as_deref() == Some(path.as_path()))
                         .map(|pair| decoder_library::name(&pair.data)).collect();
@@ -1565,17 +1596,6 @@ impl BinwaveApp {
                         ui.label("Used with");
                         for file in used_with { ui.weak(file); }
                     }
-                    ui.label("Preview");
-                    let preview = std::fs::File::open(&path).ok().and_then(|file| {
-                        let mut bytes = Vec::new();
-                        file.take(t.size.library_preview_bytes as u64)
-                            .read_to_end(&mut bytes).ok()?;
-                        Some(String::from_utf8_lossy(&bytes).into_owned())
-                    });
-                    egui::ScrollArea::vertical().max_height(t.size.library_preview_height)
-                        .show(ui, |ui| {
-                            ui.monospace(preview.as_deref().unwrap_or("Preview unavailable"));
-                        });
                     ui.separator();
                     if ui.add(egui::Button::new(egui::RichText::new("Delete decoder")
                         .color(t.color.status.danger)).frame(false)).clicked() {
@@ -1597,24 +1617,24 @@ impl BinwaveApp {
             .corner_radius(t.radius.card).inner_margin(t.spacing.card_padding as i8)
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.library_query)
-                        .hint_text("Search decoders…"));
+                    ui.add_sized([260., t.size.control_height],
+                        egui::TextEdit::singleline(&mut self.library_query)
+                            .hint_text("Search decoders and structures"));
+                    for filter in LibraryFormat::FILTERS {
+                        ui.selectable_value(&mut self.library_filter, filter, filter.label());
+                    }
                     if ui.button("Import…").clicked() {
                         let dialog = self.file_locations.configure(DialogFileKind::Yaml,
                             self.dialog_template.clone().set_title("Import decoder — Binwave")
                                 .add_filter("Decoder", &["yaml", "yml", "py", "md", "markdown", "csv"]));
                         self.file_dialog.begin_open(dialog, AppDialogAction::ImportDecoder, &ctx);
                     }
-                    if ui.button("New decoder").clicked() {
+                    if ui.add(egui::Button::new(egui::RichText::new("+ New decoder")
+                        .color(t.color.text.on_accent)).fill(t.color.accent.base)).clicked() {
                         self.decoder = Decoder::Layout;
                         self.binary.new_yaml(&ctx);
                         self.decoder_library_open = false;
                         self.show_view(Pane::Layout);
-                    }
-                });
-                ui.horizontal(|ui| {
-                    for filter in LibraryFormat::FILTERS {
-                        ui.selectable_value(&mut self.library_filter, filter, filter.label());
                     }
                 });
                 ui.separator();
@@ -1625,6 +1645,16 @@ impl BinwaveApp {
                         && decoder_library::name(path).to_ascii_lowercase().contains(&query)
                 }).collect();
                 if filtered.is_empty() { ui.weak("No decoders match this view."); }
+                if !filtered.is_empty() {
+                    let header_width = ui.available_width();
+                    ui.horizontal(|ui| {
+                        ui.add_sized([header_width * 0.39, t.size.control_height], egui::Label::new("Name"));
+                        ui.add_sized([header_width * 0.14, t.size.control_height], egui::Label::new("Format"));
+                        ui.add_sized([header_width * 0.15, t.size.control_height], egui::Label::new("Structures"));
+                        ui.add_sized([header_width * 0.15, t.size.control_height], egui::Label::new("Last edited"));
+                        ui.label("Last run");
+                    });
+                }
                 egui::ScrollArea::vertical()
                     .max_height((ui.available_height() - t.size.library_drop_height).max(t.size.library_row_height))
                     .show(ui, |ui| {
@@ -1635,9 +1665,31 @@ impl BinwaveApp {
                         let edited = decoder_library::edited_label(path).unwrap_or_default();
                         let run = self.file_locations.decoder_run(path)
                             .map_or("Not run", |_| "Run succeeded");
-                        if ui.add_sized([ui.available_width(), t.size.library_row_height],
-                            egui::Button::new(format!("{name}  ·  {}  ·  {run}\n{edited}", format.label()))
-                                .selected(selected)).on_hover_text(path.display().to_string()).clicked() {
+                        let width = ui.available_width();
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(width, t.size.library_row_height), egui::Sense::click());
+                        if selected || response.hovered() {
+                            ui.painter().rect_filled(rect, t.radius.row,
+                                if selected { t.color.surface.active } else { t.color.surface.raised });
+                        }
+                        let y = rect.center().y;
+                        let x = |fraction: f32| rect.left() + t.spacing.card_padding + width * fraction;
+                        for (fraction, value, color) in [
+                            (0., name.as_str(), t.color.text.primary),
+                            (0.40, format.label(), t.color.text.muted),
+                            (0.55, "", t.color.text.secondary),
+                            (0.70, edited.as_str(), t.color.text.muted),
+                            (0.85, run, t.color.text.muted),
+                        ] {
+                            if !value.is_empty() {
+                                ui.painter().text(egui::pos2(x(fraction), y), egui::Align2::LEFT_CENTER,
+                                    value, egui::FontId::proportional(t.font.body), color);
+                            }
+                        }
+                        ui.painter().text(egui::pos2(x(0.55), y), egui::Align2::LEFT_CENTER,
+                            decoder_library::yaml_structures(path).len().to_string(),
+                            egui::FontId::proportional(t.font.body), t.color.text.secondary);
+                        if response.on_hover_text(path.display().to_string()).clicked() {
                             self.library_selected = Some(path.clone());
                             self.library_delete_confirm = false;
                             self.library_renaming = false;
