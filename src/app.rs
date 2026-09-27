@@ -200,6 +200,7 @@ pub struct BinwaveApp {
     show_decoding_guide: bool,
     sidebar_open: bool,
     sidebar_search_open: bool,
+    sidebar_search_focus: bool,
     sidebar_query: String,
     decoder_library_open: bool,
     library_query: String,
@@ -267,6 +268,7 @@ impl Default for BinwaveApp {
             show_decoding_guide: false,
             sidebar_open: true,
             sidebar_search_open: false,
+            sidebar_search_focus: false,
             sidebar_query: String::new(),
             decoder_library_open: false,
             library_query: String::new(),
@@ -1281,6 +1283,14 @@ impl BinwaveApp {
         }
     }
 
+    fn toggle_view(&mut self, pane: Pane) {
+        if let Some((surface, node, tab)) = self.workspace.dock.find_tab_legacy(&pane) {
+            self.workspace.dock.remove_tab(egui_dock::TabPath::new(surface, node, tab));
+        } else {
+            self.show_view(pane);
+        }
+    }
+
     fn commands_available(&self) -> bool {
         !self.file_dialog.pending() && self.binary.commands_available()
     }
@@ -1370,6 +1380,8 @@ impl BinwaveApp {
             file:self.binary.has_file(), selection:self.binary.has_selection(), undo,redo,
             save_decoder:self.decoder==Decoder::Layout && self.binary.can_save_definition(), apply:available && if self.decoder==Decoder::Csv { self.binary.source_path().is_some() && !self.binary.has_byte_edits() } else { self.binary.can_apply_definition() },
             busy:self.binary.is_decoding(), });
+        let panels = Pane::PANELS.map(|pane|
+            (pane, self.workspace.dock.find_tab_legacy(&pane).is_some()));
         let mut chosen = None;
         let mut recent_file = None;
         let mut open_file = false;
@@ -1384,7 +1396,21 @@ impl BinwaveApp {
             }
             let title = self.binary.source_path().and_then(|path| path.file_name())
                 .map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Open a file".into());
-            ui.menu_button(egui::RichText::new(title).size(t.font.title).strong(), |ui| {
+            let mut title_job = egui::text::LayoutJob::default();
+            title_job.append(&title, 0., egui::TextFormat {
+                font_id: egui::FontId::new(t.font.title, egui::FontFamily::Name("Geist SemiBold".into())),
+                color: t.color.text.primary,
+                ..Default::default()
+            });
+            title_job.append("  ", 0., egui::TextFormat::default());
+            title_job.append(egui_phosphor::regular::CARET_DOWN, 0., egui::TextFormat {
+                font_id: egui::FontId::new(t.font.label, egui::FontFamily::Name("phosphor".into())),
+                color: t.color.text.muted,
+                ..Default::default()
+            });
+            egui::containers::menu::MenuButton::from_button(
+                egui::Button::new(title_job).frame(false)
+            ).ui(ui, |ui| {
                 if ui.button("Open file…").clicked() { open_file = true; ui.close(); }
                 for (index, pair) in self.file_locations.recent_pairs().iter().enumerate() {
                     let label = Self::recent_label(pair);
@@ -1412,7 +1438,7 @@ impl BinwaveApp {
                     .response.on_hover_text(self.binary.status().0);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                chosen = app_menu::overflow_menu(ui, &menus);
+                chosen = app_menu::overflow_menu(ui, &menus, &panels);
                 if ui.add_enabled(self.binary.has_file(), egui::Button::new("Export")
                     .stroke(egui::Stroke::new(t.size.frame_border, t.color.border.control)))
                     .on_hover_text("Save an edited copy of this file").clicked() { export = true; }
@@ -1421,7 +1447,9 @@ impl BinwaveApp {
         if open_file { self.choose_data_file(&ctx); }
         if let Some(index) = recent_file { self.open_recent(index, &ctx); }
         if export { self.binary.save_copy(&ctx); }
-        if let Some((command,argument))=chosen {
+        if let Some(app_menu::OverflowSelection::Panel(pane)) = chosen {
+            self.toggle_view(pane);
+        } else if let Some(app_menu::OverflowSelection::Command(command,argument))=chosen {
             if let Some(pane)=command.pane() {
                 if pane==Pane::Layout { self.binary.show_yaml(); }
                 self.show_view(pane);
@@ -1486,7 +1514,10 @@ impl BinwaveApp {
         match result.and_then(|result| result.inner) {
             Some(crate::sidebar::Action::Collapse) => self.sidebar_open = false,
             Some(crate::sidebar::Action::OpenFile) => self.choose_data_file(&ctx),
-            Some(crate::sidebar::Action::Search) => self.sidebar_search_open = true,
+            Some(crate::sidebar::Action::Search) => {
+                self.sidebar_search_open = true;
+                self.sidebar_search_focus = true;
+            }
             Some(crate::sidebar::Action::DecoderLibrary) => self.decoder_library_open = true,
             Some(crate::sidebar::Action::Recent(index)) => self.open_recent(index, &ctx),
             Some(crate::sidebar::Action::Settings) => self.sidebar_settings_open = true,
@@ -1497,13 +1528,25 @@ impl BinwaveApp {
     fn ui_sidebar_search(&mut self, ctx: &Context) {
         if !self.sidebar_search_open { return; }
         let mut selected = None;
+        let mut selected_pane = None;
         let recent = self.file_locations.recent_pairs();
         egui::Window::new("Search files")
             .open(&mut self.sidebar_search_open)
             .default_width(crate::theme::DARK.size.sidebar_width * 2.)
             .show(ctx, |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.sidebar_query).hint_text("Find a recent file or decoder…"));
+                let entry = ui.add(egui::TextEdit::singleline(&mut self.sidebar_query)
+                    .hint_text("Find a panel or recent file…"));
+                if self.sidebar_search_focus {
+                    entry.request_focus();
+                    self.sidebar_search_focus = false;
+                }
                 let query = self.sidebar_query.trim().to_lowercase();
+                for pane in Pane::PANELS {
+                    if query.is_empty() || pane.title().to_lowercase().contains(&query) {
+                        if ui.button(pane.title()).clicked() { selected_pane = Some(pane); }
+                    }
+                }
+                if !recent.is_empty() { ui.separator(); }
                 for (index, pair) in recent.iter().enumerate() {
                     let label = Self::recent_label(pair);
                     if (query.is_empty() || label.to_lowercase().contains(&query))
@@ -1515,6 +1558,9 @@ impl BinwaveApp {
         if let Some(index) = selected {
             self.sidebar_search_open = false;
             self.open_recent(index, ctx);
+        } else if let Some(pane) = selected_pane {
+            self.sidebar_search_open = false;
+            self.show_view(pane);
         }
     }
 
@@ -1872,7 +1918,11 @@ impl BinwaveApp {
         let toggle_sidebar = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::B);
         let search_sidebar = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K);
         if ctx.input_mut(|i| i.consume_shortcut(&toggle_sidebar)) { self.sidebar_open = !self.sidebar_open; }
-        if ctx.input_mut(|i| i.consume_shortcut(&search_sidebar)) { self.sidebar_search_open = true; }
+        if ctx.input_mut(|i| i.consume_shortcut(&search_sidebar)) {
+            egui::Popup::close_all(&ctx);
+            self.sidebar_search_open = true;
+            self.sidebar_search_focus = true;
+        }
         let save = egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
             egui::Key::S,
@@ -1941,6 +1991,7 @@ impl BinwaveApp {
                 .show_leaf_collapse_buttons(false)
                 .tab_context_menus(true)
                 .show_inside(ui, &mut WorkspaceViewer { app: self });
+            paint_hovered_tab_close(ui, &workspace.dock);
             if let Some((surface, node, _)) = workspace.dock.find_tab_legacy(&Pane::Layout) {
                 if let Some(rect) = workspace.dock[surface][node].rect() {
                     if rect.width() >= crate::theme::DARK.size.decoder_header_actions_min_width {
@@ -2356,6 +2407,29 @@ impl eframe::App for BinwaveApp {
     }
 }
 
+fn paint_hovered_tab_close(ui: &Ui, dock: &egui_dock::DockState<Pane>) {
+    let ctx = ui.ctx();
+    let Some(pointer) = ctx.input(|input| input.pointer.hover_pos()) else {
+        return;
+    };
+    let dock_id = egui::Id::new("workspace_dock");
+    for (path, _) in dock.iter_all_tabs() {
+        let tab_id = dock_id
+            .with((path.surface, "surface"))
+            .with((path.node, "node"))
+            .with((path.tab.0, "tab"));
+        let Some(tab) = ctx.read_response(tab_id) else { continue; };
+        if !tab.rect.contains(pointer) { continue; }
+        let Some(close) = ctx.read_response(tab_id.with("close-button")) else { continue; };
+        let x = egui::Rect::from_center_size(close.rect.center(), egui::Vec2::splat(9.0));
+        let stroke = egui::Stroke::new(1.0, crate::theme::DARK.color.text.secondary);
+        let painter = ctx.layer_painter(tab.layer_id);
+        painter.line_segment([x.left_top(), x.right_bottom()], stroke);
+        painter.line_segment([x.right_top(), x.left_bottom()], stroke);
+        break;
+    }
+}
+
 struct WorkspaceViewer<'a> {
     app: &'a mut BinwaveApp,
 }
@@ -2398,6 +2472,7 @@ impl TabViewer for WorkspaceViewer<'_> {
                 egui::ScrollArea::vertical().show(ui, |ui| self.app.ui_inspector(ui));
             }
             Pane::Console => self.app.binary.decoder_console(ui),
+            Pane::ParsingMap => self.app.binary.parsing_map(ui),
             Pane::Layout => self.app.ui_decoder(ui),
             Pane::Hex => {
                 let t = &crate::theme::DARK;
@@ -2662,6 +2737,128 @@ mod tests {
             );
         }
         assert!(app.sidebar_open, "native header must let the sidebar button receive clicks");
+    }
+    #[test]
+    fn middle_click_closes_a_tab_and_view_command_reopens_it() {
+        let ctx = Context::default();
+        let mut app = BinwaveApp::default();
+        app.show_empty_workspace = true;
+        let output = workspace_frame(&mut app, &ctx);
+        let tab = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "Signal" =>
+                Some(text.pos + text.galley.rect.center().to_vec2()),
+            _ => None,
+        }).expect("Signal tab label");
+        workspace_events(&mut app, &ctx, vec![egui::Event::PointerMoved(tab)]);
+        for pressed in [true, false] {
+            workspace_events(&mut app, &ctx, vec![egui::Event::PointerButton {
+                pos: tab,
+                button: egui::PointerButton::Middle,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_none());
+        app.show_view(Pane::Plot);
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_some());
+    }
+    #[test]
+    fn close_icon_appears_when_hovering_tab_label() {
+        let ctx = Context::default();
+        let mut app = BinwaveApp::default();
+        app.show_empty_workspace = true;
+        workspace_frame(&mut app, &ctx);
+        let (surface, node, tab) = app.workspace.dock.find_tab_legacy(&Pane::Plot).unwrap();
+        let id = egui::Id::new("workspace_dock")
+            .with((surface, "surface"))
+            .with((node, "node"))
+            .with((tab.0, "tab"));
+        let pill = ctx.read_response(id).expect("Signal tab response").rect;
+        let close = ctx.read_response(id.with("close-button"))
+            .expect("close target remains clickable").rect;
+        let pointer = egui::pos2(pill.left() + 8., pill.center().y);
+        assert!(!close.contains(pointer));
+        let output = workspace_events(&mut app, &ctx, vec![egui::Event::PointerMoved(pointer)]);
+        let x = close.center();
+        assert!(output.shapes.iter().any(|shape| match &shape.shape {
+            egui::Shape::LineSegment { points, .. } =>
+                points.iter().all(|point| point.distance(x) < 7.),
+            _ => false,
+        }), "hovering the tab label should reveal its close icon");
+    }
+    #[test]
+    fn hovered_close_icon_closes_its_tab() {
+        let ctx = Context::default();
+        let mut app = BinwaveApp::default();
+        app.show_empty_workspace = true;
+        workspace_frame(&mut app, &ctx);
+        let (surface, node, tab) = app.workspace.dock.find_tab_legacy(&Pane::Plot).unwrap();
+        let id = egui::Id::new("workspace_dock")
+            .with((surface, "surface"))
+            .with((node, "node"))
+            .with((tab.0, "tab"));
+        let close = ctx.read_response(id.with("close-button")).unwrap().rect.center();
+        workspace_events(&mut app, &ctx, vec![egui::Event::PointerMoved(close)]);
+        for pressed in [true, false] {
+            workspace_events(&mut app, &ctx, vec![egui::Event::PointerButton {
+                pos: close,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_none());
+    }
+    #[test]
+    fn header_panels_menu_and_search_restore_closed_views() {
+        let ctx = Context::default();
+        crate::theme::install(&ctx);
+        let mut app = BinwaveApp::default();
+        app.show_empty_workspace = true;
+        app.toggle_view(Pane::Hex);
+        workspace_click(&mut app, &ctx, egui_phosphor::regular::DOTS_THREE);
+        workspace_click(&mut app, &ctx, "Panels");
+        workspace_click(&mut app, &ctx, "Hex");
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Hex).is_some());
+        app.toggle_view(Pane::Hex);
+        workspace_events(&mut app, &ctx, vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        app.sidebar_query.clear();
+        workspace_events(&mut app, &ctx, vec![egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }]);
+        assert!(app.sidebar_search_open, "Ctrl+K should open search");
+        workspace_events(&mut app, &ctx, vec![egui::Event::Text("Hex".into())]);
+        assert_eq!(app.sidebar_query, "Hex");
+        let output = workspace_frame(&mut app, &ctx);
+        let result = output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "Hex" =>
+                Some(text.pos + text.galley.rect.center().to_vec2()),
+            _ => None,
+        }).last().expect("Hex search result");
+        workspace_events(&mut app, &ctx, vec![egui::Event::PointerMoved(result)]);
+        for pressed in [true, false] {
+            workspace_events(&mut app, &ctx, vec![egui::Event::PointerButton {
+                pos: result,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Hex).is_some());
+        app.toggle_view(Pane::Plot);
+        workspace_click(&mut app, &ctx, egui_phosphor::regular::DOTS_THREE);
+        workspace_click(&mut app, &ctx, "Reset layout");
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_some());
     }
     fn workspace_click(app: &mut BinwaveApp, ctx: &Context, label: &str) {
         workspace_frame(app, ctx);
@@ -3602,10 +3799,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(top.iter().any(|label| label == "Open a file")
-            && top.iter().any(|label| label == "⋯")
+        assert!(top.iter().any(|label| label.starts_with("Open a file"))
+            && top.iter().any(|label| label == egui_phosphor::regular::DOTS_THREE)
             && !top.iter().any(|label| label == "File"), "{top:?}");
-        workspace_click(&mut app, &ctx, "⋯");
+        workspace_click(&mut app, &ctx, egui_phosphor::regular::DOTS_THREE);
         workspace_click(&mut app, &ctx, "File");
         workspace_click(&mut app, &ctx, "Open sensor demo");
         let deadline = Instant::now() + std::time::Duration::from_secs(5);

@@ -1923,7 +1923,12 @@ impl BinaryWorkspace {
         let can_save = self.can_save_definition() && enabled;
         let busy = self.is_decoding();
         let reason = self.run_disabled_reason().map(str::to_owned);
-        ui.menu_button("v", |ui| {
+        let switch_icon = egui::RichText::new(egui_phosphor::regular::CARET_DOWN)
+            .font(egui::FontId::new(
+                crate::theme::DARK.font.label,
+                egui::FontFamily::Proportional,
+            ));
+        ui.menu_button(switch_icon, |ui| {
             for path in &recent {
                 let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
                 if ui.button(name.as_ref()).on_hover_text(path.display().to_string()).clicked() {
@@ -2972,6 +2977,17 @@ impl BinaryWorkspace {
 
     pub fn decoder_console(&mut self, ui: &mut Ui) {
         self.structure_ui.console(ui, self.language);
+        if let Some(byte) = self.structure_ui.take_console_byte_jump() {
+            if let Ok(start) = usize::try_from(byte) {
+                if start < self.file_len() {
+                    self.hex_editor.select_range(start..start + 1, true);
+                }
+            }
+        }
+    }
+
+    pub fn parsing_map(&mut self, ui: &mut Ui) {
+        self.structure_ui.parsing_map(ui, self.language);
         if let Some(byte) = self.structure_ui.take_console_byte_jump() {
             if let Ok(start) = usize::try_from(byte) {
                 if start < self.file_len() {

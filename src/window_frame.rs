@@ -194,11 +194,9 @@ pub fn show(ui: &mut Ui, content: impl FnOnce(&mut Ui)) {
         .input(|input| input.viewport().maximized.unwrap_or(false));
     let rounded = !maximized && transparent_corners();
     let viewport = ui.max_rect();
-    let inset = if maximized {
-        0
-    } else {
-        t.spacing.card_gap as i8
-    };
+    // The viewport cannot always present transparency. Fill its full extent so
+    // the undecorated window never exposes an unpainted strip at its edges.
+    let inset = 0;
     let frame = egui::Frame::new()
         .fill(t.color.surface.window)
         .stroke(if maximized {

@@ -321,6 +321,10 @@ pub fn dock_style(egui_style: &egui::Style) -> egui_dock::Style {
         se: t.radius.card,
     };
     style.tab.tab_body.inner_margin = Margin::same(t.spacing.card_padding as i8);
+    // The close target remains active; app.rs paints its small icon only when
+    // the pointer is over the tab pill.
+    style.buttons.close_tab_color = Color32::TRANSPARENT;
+    style.buttons.close_tab_active_color = Color32::TRANSPARENT;
     style
 }
 

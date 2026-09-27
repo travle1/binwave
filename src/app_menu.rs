@@ -255,16 +255,43 @@ fn menu_entries(ui: &mut egui::Ui, items: &[Item], selected: &mut Option<(Comman
         }
 }
 
-pub fn overflow_menu(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)> {
+#[derive(Clone, Copy)]
+pub enum OverflowSelection {
+    Command(Command, usize),
+    Panel(Pane),
+}
+
+pub fn overflow_menu(ui: &mut egui::Ui, menus: &[Item], panels: &[(Pane, bool)]) -> Option<OverflowSelection> {
     let mut selected = None;
-    egui::containers::menu::MenuButton::from_button(egui::Button::new("⋯").frame(false)).ui(ui, |ui| {
+    let mut panel = None;
+    let mut reset = false;
+    let icon = egui::RichText::new(egui_phosphor::regular::DOTS_THREE)
+        .font(egui::FontId::new(
+            crate::theme::DARK.size.sidebar_icon,
+            egui::FontFamily::Name("phosphor".into()),
+        ));
+    egui::containers::menu::MenuButton::from_button(egui::Button::new(icon).frame(false)).ui(ui, |ui| {
+        ui.menu_button("Panels", |ui| {
+            for (pane, visible) in panels {
+                let mut checked = *visible;
+                let response = ui.checkbox(&mut checked, pane.title());
+                if response.clicked() {
+                    panel = Some(*pane);
+                    ui.close();
+                }
+            }
+        });
+        if ui.button("Reset layout").clicked() { reset = true; ui.close(); }
+        ui.separator();
         for menu in menus {
             ui.menu_button(&menu.label, |ui| menu_entries(ui, &menu.children, &mut selected));
         }
         ui.separator();
         ui.weak(crate::APP_VERSION);
     });
-    selected
+    panel.map(OverflowSelection::Panel)
+        .or_else(|| reset.then_some(OverflowSelection::Command(Command::Reset, 0)))
+        .or_else(|| selected.map(|(command, argument)| OverflowSelection::Command(command, argument)))
 }
 
 #[cfg(test)]

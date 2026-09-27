@@ -10,7 +10,7 @@ use crate::plot_gpu::GpuPlot;
 use crate::structure::{LazyArray, Node, NumericPlan, ParseOutput, Value};
 use crate::structure_plot::{PlotData, PlotQuality, PlotReader};
 use egui::{Color32, Ui};
-use egui_plot::{Plot, PlotBounds, PlotPoint, PlotTransform, Points};
+use egui_plot::{AxisHints, Plot, PlotBounds, PlotPoint, PlotTransform, Points};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
@@ -1098,9 +1098,18 @@ impl StructureViews {
                         if let TableLine::Navigation(index) = lines[line] {
                             let entry = &navigation[index];
                             let label = format!("{}{}", "  ".repeat(entry.depth), entry.label);
+                            let active = !entry.group && entry.path == self.table_target;
+                            if active {
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_min_size(ui.cursor().min,
+                                        egui::vec2(table_width, row_height)),
+                                    egui::CornerRadius::same(crate::theme::DARK.radius.row),
+                                    crate::theme::DARK.color.surface.active,
+                                );
+                            }
                             ui.horizontal(|ui| {
                                 if table_cell(ui, &label, widths[0], row_height,
-                                    !entry.group && entry.path == self.table_target, true, false)
+                                    false, true, false)
                                     .on_hover_text(&entry.path).clicked() {
                                     navigation_click = Some((entry.path.clone(), entry.group));
                                 }
@@ -1134,11 +1143,11 @@ impl StructureViews {
                             }
                             ui.horizontal(|ui| {
                                 let label = if sample_collection {
-                                    format!("    {}", first + index)
+                                    (first + index).to_string()
                                 } else {
                                     node.name.clone()
                                 };
-                                if table_cell(
+                                if table_cell_aligned(
                                     ui,
                                     &label,
                                     widths[0],
@@ -1146,6 +1155,7 @@ impl StructureViews {
                                     selected == Some(&node.path),
                                     true,
                                     false,
+                                    sample_collection,
                                 )
                                 .on_hover_text(format!(
                                     "Select whole sample\n{}\n0x{:X}..0x{:X}",
@@ -1155,7 +1165,7 @@ impl StructureViews {
                                 {
                                     chosen = Some((node.clone(), node.clone()));
                                 }
-                                if table_cell(
+                                if table_numeric_cell(
                                     ui,
                                     &format!("0x{:X}", node.range.start),
                                     widths[1],
@@ -1168,7 +1178,7 @@ impl StructureViews {
                                 {
                                     chosen = Some((node.clone(), node.clone()));
                                 }
-                                if table_cell(
+                                if table_numeric_cell(
                                     ui,
                                     &node.range.len().to_string(),
                                     widths[2],
@@ -1183,7 +1193,7 @@ impl StructureViews {
                                 }
                                 for name in &columns {
                                     if let Some(field) = field_at(node, name) {
-                                        if table_cell(
+                                        if table_cell_aligned(
                                             ui,
                                             &display(field, 180),
                                             value_width,
@@ -1191,6 +1201,7 @@ impl StructureViews {
                                             selected == Some(&field.path),
                                             true,
                                             false,
+                                            field.value.as_ref().and_then(Value::numeric).is_some(),
                                         )
                                         .on_hover_text(format!(
                                             "{}\n{} · {} bytes · 0x{:X}..0x{:X}\n{}",
@@ -1622,7 +1633,7 @@ impl StructureViews {
             format!("Series {visible_series}/{}", names.len())
         };
         let mut focus_plot_go = false;
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             if ui.button(series_label).clicked() {
                 self.plot_collections_open = true;
                 self.plot_sidebar_series = true;
@@ -1753,6 +1764,12 @@ impl StructureViews {
                     .on_hover_text(format!("0x{:X}..0x{:X} (end exclusive). Whole-sample export includes all interleaved fields.", bytes.start, bytes.end));
             }
         });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak(format!("Samples {}–{} of {}", view.start, view.end.saturating_sub(1), count));
+                if let Some(axis) = &self.plot_axis_series {
+                    ui.weak(format!("Y: {}", short_series_label(axis))).on_hover_text(axis);
+                }
+            });
         });
         if self.plot_go_open {
             ui.horizontal(|ui| {
@@ -1779,9 +1796,6 @@ impl StructureViews {
                 }
                 if sample.is_none() { ui.weak(format!("Enter 0–{}", count - 1)); }
             });
-        }
-        if ui.available_height() > 260. {
-            ui.weak("Drag to pan · wheel or pinch to zoom · click a point to link Hex and Inspector");
         }
         if changed { self.plot_fit_y=true; }
         if let Some(forced) = &force_view {
@@ -1883,22 +1897,14 @@ impl StructureViews {
         }
         log_slow_plot_phase(&mut phase_clock, "schedule plot readers");
         ui.horizontal_wrapped(|ui| {
-            ui.label(format!(
-                "Samples {}–{} of {}",
-                requested.start,
-                requested.end.saturating_sub(1),
-                count
-            ));
-            if let Some(axis) = &self.plot_axis_series {
-                ui.weak(format!("Y axis: {}", short_series_label(axis)))
-                    .on_hover_text(axis);
-            }
             if let Some(data) = self.plot_reader.display_data() {
-                ui.weak(data.quality.label()).on_hover_text(format!(
-                    "Data covers sample indices {}–{}. Dense cycles are shown as amplitude bands; zoom in to see individual samples.",
-                    data.range.start,
-                    data.range.end.saturating_sub(1)
-                ));
+                if data.quality != PlotQuality::Exact {
+                    ui.small(data.quality.label()).on_hover_text(format!(
+                        "Data covers sample indices {}–{}. Zoom in to see individual samples.",
+                        data.range.start,
+                        data.range.end.saturating_sub(1)
+                    ));
+                }
                 if matches!(data.quality, PlotQuality::SampledPreview) {
                     ui.weak("Bands show observed ranges from sampled windows.");
                     if ui.button("Scan for all peaks").clicked() {
@@ -2068,12 +2074,18 @@ impl StructureViews {
         let dot_radius = self.plot_dot_radius.unwrap_or(2.5);
         let mut axis_hover = None;
         let mut gpu_mode = false;
+        let pan_button = if ui.input(|input| input.pointer.button_down(egui::PointerButton::Middle)) {
+            egui::PointerButton::Middle
+        } else {
+            egui::PointerButton::Primary
+        };
         let response = Plot::new(plot_id)
             .id(plot_id)
             .auto_bounds(egui::Vec2b::new(false, false))
             .allow_double_click_reset(false)
             .allow_boxed_zoom(false)
             .allow_drag(egui::Vec2b::new(!self.presentation.is_dragging(), self.plot_free_y && !self.presentation.is_dragging()))
+            .pan_pointer_button(pan_button)
             .allow_zoom(egui::Vec2b::new(true, self.plot_free_y))
             .allow_scroll(false)
             .label_formatter(move |position| {
@@ -2085,7 +2097,12 @@ impl StructureViews {
                 }
             })
             .y_axis_label(if self.presentation.series.is_empty() {"Value"} else {"Display position"})
-            .x_axis_label("Sample index")
+            .custom_x_axes(vec![AxisHints::new_x()
+                .label("Sample index")
+                .label_spacing(egui::Rangef::new(100., 150.))
+                .formatter(|mark, _| format!("{:.0}", mark.value))
+                .tick_label_font(egui::FontId::new(crate::theme::DARK.font.axis,
+                    egui::FontFamily::Proportional))])
             .show(ui, |plot_ui| {
                 if force_view.is_some() || y_fit.is_some() {
                     let old = plot_ui.plot_bounds();
@@ -2236,6 +2253,9 @@ impl StructureViews {
                     }
                 }
             });
+        response.response.clone().on_hover_text(
+            "Drag or middle-drag to pan · Shift+wheel to pan horizontally · wheel or pinch to zoom · click a point to link Hex and Inspector"
+        );
         if gpu_mode { self.plot_gpu.paint(ui.painter(), &response.transform); }
         log_slow_plot_phase(&mut phase_clock, "draw plot");
         self.plot_axis_width = (plot_outer.width() - response.transform.frame().width()).max(0.);
@@ -2941,6 +2961,29 @@ fn table_cell(
     clickable: bool,
     header: bool,
 ) -> egui::Response {
+    table_cell_aligned(ui, text, width, height, selected, clickable, header, false)
+}
+fn table_numeric_cell(
+    ui: &mut Ui,
+    text: &str,
+    width: f32,
+    height: f32,
+    selected: bool,
+    clickable: bool,
+    header: bool,
+) -> egui::Response {
+    table_cell_aligned(ui, text, width, height, selected, clickable, header, true)
+}
+fn table_cell_aligned(
+    ui: &mut Ui,
+    text: &str,
+    width: f32,
+    height: f32,
+    selected: bool,
+    clickable: bool,
+    header: bool,
+    numeric: bool,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(width, height),
         if clickable {
@@ -2957,7 +3000,7 @@ fn table_cell(
         if selected || clickable && response.hovered() {
             ui.painter().rect_filled(
                 rect.shrink(1.),
-                2.,
+                egui::CornerRadius::same(crate::theme::DARK.radius.row),
                 if selected {
                     ui.visuals().selection.bg_fill
                 } else {
@@ -2975,11 +3018,16 @@ fn table_cell(
         } else {
             egui::TextStyle::Monospace.resolve(ui.style())
         };
+        let (position, alignment) = if numeric {
+            (rect.right_center() - egui::vec2(6., 0.), egui::Align2::RIGHT_CENTER)
+        } else {
+            (rect.left_center() + egui::vec2(6., 0.), egui::Align2::LEFT_CENTER)
+        };
         ui.painter()
             .with_clip_rect(rect.shrink2(egui::vec2(6., 0.)))
             .text(
-                rect.left_center() + egui::vec2(6., 0.),
-                egui::Align2::LEFT_CENTER,
+                position,
+                alignment,
                 text,
                 font,
                 color,
@@ -3987,7 +4035,7 @@ actions:
             .iter()
             .find_map(|shape| {
                 if let egui::Shape::Text(text) = &shape.shape {
-                    if text.galley.text().trim() == label && text.pos.x < 100. {
+                    if text.galley.text().trim() == label && text.pos.x < 250. {
                         return Some(text.pos + text.galley.size() * 0.5);
                     }
                 }
@@ -5447,6 +5495,51 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             assert_eq!(views.last_hex_selection, selected);
             assert_eq!(views.desired.as_ref().unwrap().key, page);
         }
+    }
+
+    #[test]
+    fn middle_drag_pans_signal_without_changing_zoom_or_selection() {
+        let (ctx, store, output, mut views) = axis_navigation_fixture();
+        let selected = views.last_hex_selection.clone();
+        let before = *navigation_memory(&ctx, &views, &output).bounds();
+        let from = navigation_memory(&ctx, &views, &output).transform().frame().center();
+        let to = from + egui::vec2(80., 0.);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Middle,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        render_plot(&ctx, &mut views, &output, &store,
+            vec![egui::Event::PointerMoved(from), button(from, true)], egui::Modifiers::NONE);
+        render_plot(&ctx, &mut views, &output, &store,
+            vec![egui::Event::PointerMoved(to)], egui::Modifiers::NONE);
+        render_plot(&ctx, &mut views, &output, &store,
+            vec![button(to, false)], egui::Modifiers::NONE);
+        let after = *navigation_memory(&ctx, &views, &output).bounds();
+        assert!(after.min()[0] < before.min()[0], "middle drag should pan X: {before:?} -> {after:?}");
+        assert!((after.width() - before.width()).abs() < 1e-8);
+        navigation_assert_y(before, after);
+        assert_eq!(views.last_hex_selection, selected);
+    }
+
+    #[test]
+    fn shift_wheel_over_canvas_pans_x_without_zooming() {
+        let (ctx, store, output, mut views) = axis_navigation_fixture();
+        let before = *navigation_memory(&ctx, &views, &output).bounds();
+        let pointer = navigation_memory(&ctx, &views, &output).transform().frame().center();
+        let shift = egui::Modifiers { shift: true, ..Default::default() };
+        axis_navigation_send(&ctx, &mut views, &output, &store, pointer,
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(48., 0.),
+                phase: egui::TouchPhase::Move,
+                modifiers: shift,
+            }, shift);
+        let after = *navigation_memory(&ctx, &views, &output).bounds();
+        assert!(after.min()[0] < before.min()[0]);
+        assert!((after.width() - before.width()).abs() < 1e-8);
+        navigation_assert_y(before, after);
     }
 
     #[test]

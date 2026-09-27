@@ -22,18 +22,24 @@ pub enum Pane {
     Structures,
     Inspector,
     Console,
+    ParsingMap,
     Layout,
     Plot,
     Table,
     Hex,
 }
 impl Pane {
+    pub const PANELS: [Self; 7] = [
+        Self::Plot, Self::Hex, Self::Table, Self::ParsingMap,
+        Self::Layout, Self::Structures, Self::Console,
+    ];
     #[cfg(test)]
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Hex,
         Self::Structures,
         Self::Inspector,
         Self::Console,
+        Self::ParsingMap,
         Self::Layout,
         Self::Plot,
         Self::Table,
@@ -43,6 +49,7 @@ impl Pane {
             Self::Structures => "Structure",
             Self::Inspector => "Inspector",
             Self::Console => "Console",
+            Self::ParsingMap => "Parsing map",
             Self::Layout => "Decoder",
             Self::Plot => "Signal",
             Self::Table => "Samples",
@@ -170,7 +177,7 @@ impl WorkspaceLayout {
         if self.dock.find_tab_legacy(&pane).is_none() {
             match pane {
                 Pane::Layout => unreachable!(),
-                Pane::Structures | Pane::Inspector | Pane::Console => {
+                Pane::Structures | Pane::Inspector | Pane::Console | Pane::ParsingMap => {
                     let companion = if pane == Pane::Structures { Pane::Console } else { Pane::Structures };
                     let target = [Pane::Layout, companion]
                         .into_iter()
@@ -205,7 +212,7 @@ impl WorkspaceLayout {
     /// panes. This puts results below both Plot and Hex in their comparison view.
     fn editor_branch(&self, surface: SurfaceIndex, mut node: NodeIndex) -> NodeIndex {
         while let Some(parent) = node.parent() {
-            let contains_support = [Pane::Layout, Pane::Inspector, Pane::Structures, Pane::Console]
+            let contains_support = [Pane::Layout, Pane::Inspector, Pane::Structures, Pane::Console, Pane::ParsingMap]
                 .into_iter()
                 .filter_map(|pane| self.dock.find_tab_legacy(&pane))
                 .any(|(other_surface, other_node, _)| {
@@ -224,7 +231,7 @@ impl WorkspaceLayout {
         // show_samples is the explicit action that gives the results their own row.
         if let Some((surface, node, _)) = self.editor_location() {
             self.dock[surface][node].append_tab(pane);
-        } else if let Some((surface, node, _)) = [Pane::Layout, Pane::Inspector, Pane::Structures, Pane::Console]
+        } else if let Some((surface, node, _)) = [Pane::Layout, Pane::Inspector, Pane::Structures, Pane::Console, Pane::ParsingMap]
             .into_iter()
             .find_map(|pane| self.dock.find_tab_legacy(&pane))
         {
@@ -373,7 +380,7 @@ mod tests {
         let hex = workspace.dock.find_tab_legacy(&Pane::Hex).unwrap().1;
         assert_ne!(workspace.dock.find_tab_legacy(&Pane::Plot).unwrap().1, hex);
         assert_eq!(workspace.dock.find_tab_legacy(&Pane::Table).unwrap().1, hex);
-        assert_eq!(workspace.dock.iter_all_tabs().count(), Pane::ALL.len() - 1);
+        assert_eq!(workspace.dock.iter_all_tabs().count(), Pane::ALL.len() - 2);
     }
 
     #[test]

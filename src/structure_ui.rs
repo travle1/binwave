@@ -760,6 +760,14 @@ impl StructureWorkspace {
         }
     }
 
+    pub fn parsing_map(&mut self, ui: &mut Ui, language: DecoderLanguage) {
+        let error = (self.last_run_language == Some(language)).then_some(self.error.as_deref()).flatten();
+        let action = crate::decoder_ui::parsing_map_panel(ui, error);
+        if let Some(byte) = action.byte {
+            self.console_byte_jump = Some(byte);
+        }
+    }
+
     pub fn console_error_count(&self) -> usize {
         usize::from(self.error.is_some())
     }

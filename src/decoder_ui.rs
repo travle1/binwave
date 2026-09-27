@@ -336,6 +336,16 @@ fn parsing_map_ui(ui: &mut Ui, map: &ParsingMap, action: &mut ConsoleAction) {
     }
 }
 
+pub fn parsing_map_panel(ui: &mut Ui, error: Option<&str>) -> ConsoleAction {
+    let mut action = ConsoleAction::default();
+    if let Some(map) = error.and_then(parsing_map) {
+        egui::ScrollArea::vertical().show(ui, |ui| parsing_map_ui(ui, &map, &mut action));
+    } else {
+        ui.weak("No parsing map is available. Run a decoder to see the offsets followed before a parse error.");
+    }
+    action
+}
+
 fn parsing_map(error: &str) -> Option<ParsingMap> {
     let mut map = ParsingMap::default();
 
