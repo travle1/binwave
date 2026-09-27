@@ -195,6 +195,11 @@ pub struct BinwaveApp {
     workspace: WorkspaceLayout,
     show_empty_workspace: bool,
     show_decoding_guide: bool,
+    sidebar_open: bool,
+    sidebar_search_open: bool,
+    sidebar_query: String,
+    decoder_library_open: bool,
+    sidebar_settings_open: bool,
     csv_table: CsvTable,
     pending_config: Option<AppConfig>,
     pending_recent_decoder: Option<(std::path::PathBuf, std::path::PathBuf)>,
@@ -251,6 +256,11 @@ impl Default for BinwaveApp {
             workspace: WorkspaceLayout::default(),
             show_empty_workspace: false,
             show_decoding_guide: false,
+            sidebar_open: true,
+            sidebar_search_open: false,
+            sidebar_query: String::new(),
+            decoder_library_open: false,
+            sidebar_settings_open: false,
             csv_table: CsvTable::default(),
             pending_config: None,
             pending_recent_decoder: None,
@@ -291,6 +301,9 @@ impl BinwaveApp {
         let mut app = Self::default();
         app.workspace = WorkspaceLayout::load(cc.storage);
         app.restore_file_locations(cc.storage);
+        app.sidebar_open = cc.storage
+            .and_then(|storage| storage.get_string("sidebar-open"))
+            .as_deref() != Some("false");
         if let Some(width) = cc
             .storage
             .and_then(|storage| storage.get_string("editor-tab-width"))
@@ -1038,6 +1051,7 @@ impl BinwaveApp {
         }
         self.pending_config = None;
         self.pending_recent_decoder = pair.decoder.map(|decoder| (pair.data.clone(), decoder));
+        self.decoder_library_open = false;
         self.binary.open(pair.data, ctx);
     }
 
@@ -1277,6 +1291,12 @@ impl BinwaveApp {
     fn ui_toolbar(&mut self, ui: &mut Ui) {
         use crate::app_menu::{self, Command::*};
         let ctx=ui.ctx().clone();
+        if !self.sidebar_open && ui.button(egui::RichText::new(egui_phosphor::regular::SIDEBAR_SIMPLE)
+            .font(egui::FontId::new(crate::theme::DARK.size.sidebar_icon,
+                egui::FontFamily::Name("phosphor".into()))))
+            .on_hover_text("Show sidebar (Ctrl+B)").clicked() {
+            self.sidebar_open = true;
+        }
         let available=self.commands_available();
         let (undo,redo)=self.binary.menu_history();
         let recent=self.file_locations.recent_pairs().iter().map(Self::recent_label).collect();
@@ -1334,10 +1354,114 @@ impl BinwaveApp {
         }
     }
 
+    fn ui_sidebar(&mut self, root_ui: &mut Ui) {
+        let t = &crate::theme::DARK;
+        let recent = self.file_locations.recent_pairs();
+        let current = self.binary.source_path().map(std::path::Path::to_path_buf);
+        let partial = self.data_partial || self.binary.status().1;
+        let username = std::env::var("USER").or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "User".into());
+        let result = egui::Panel::left("workspace_sidebar")
+            .exact_size(t.size.sidebar_width)
+            .resizable(false)
+            .frame(egui::Frame::new().fill(t.color.surface.sidebar)
+                .inner_margin(egui::Margin::same(t.spacing.card_padding as i8)))
+            .show_collapsible(root_ui, &mut self.sidebar_open, |ui| {
+                crate::sidebar::show(ui, &recent, current.as_deref(), partial, &username)
+            });
+        let ctx = root_ui.ctx().clone();
+        match result.and_then(|result| result.inner) {
+            Some(crate::sidebar::Action::Collapse) => self.sidebar_open = false,
+            Some(crate::sidebar::Action::OpenFile) => self.choose_data_file(&ctx),
+            Some(crate::sidebar::Action::Search) => self.sidebar_search_open = true,
+            Some(crate::sidebar::Action::DecoderLibrary) => self.decoder_library_open = true,
+            Some(crate::sidebar::Action::Recent(index)) => self.open_recent(index, &ctx),
+            Some(crate::sidebar::Action::Settings) => self.sidebar_settings_open = true,
+            None => {}
+        }
+    }
+
+    fn ui_sidebar_search(&mut self, ctx: &Context) {
+        if !self.sidebar_search_open { return; }
+        let mut selected = None;
+        let recent = self.file_locations.recent_pairs();
+        egui::Window::new("Search files")
+            .open(&mut self.sidebar_search_open)
+            .default_width(crate::theme::DARK.size.sidebar_width * 2.)
+            .show(ctx, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.sidebar_query).hint_text("Find a recent file or decoder…"));
+                let query = self.sidebar_query.trim().to_lowercase();
+                for (index, pair) in recent.iter().enumerate() {
+                    let label = Self::recent_label(pair);
+                    if (query.is_empty() || label.to_lowercase().contains(&query))
+                        && ui.button(&label).clicked() {
+                        selected = Some(index);
+                    }
+                }
+            });
+        if let Some(index) = selected {
+            self.sidebar_search_open = false;
+            self.open_recent(index, ctx);
+        }
+    }
+
+    fn ui_sidebar_settings(&mut self, ctx: &Context) {
+        if !self.sidebar_settings_open { return; }
+        egui::Window::new("Settings").open(&mut self.sidebar_settings_open).show(ctx, |ui| {
+            ui.label("BinWave workspace");
+            if ui.button("Show decoding guide").clicked() { self.show_decoding_guide = true; }
+        });
+    }
+
+    fn ui_decoder_library_entry(&mut self, ui: &mut Ui) {
+        let t = &crate::theme::DARK;
+        ui.horizontal(|ui| {
+            ui.heading("Decoder library");
+            if ui.button("Back to workspace").clicked() { self.decoder_library_open = false; }
+            if ui.button("Import decoder…").clicked() {
+                self.decoder = Decoder::Layout;
+                self.binary.choose_definition(ui.ctx());
+                self.decoder_library_open = false;
+            }
+            if ui.button("New decoder").clicked() {
+                self.decoder = Decoder::Layout;
+                self.binary.new_yaml(ui.ctx());
+                self.decoder_library_open = false;
+                self.show_view(Pane::Layout);
+            }
+        });
+        ui.label("Recent decoders");
+        let mut paths = Vec::new();
+        for pair in self.file_locations.recent_pairs() {
+            if let Some(path) = pair.decoder {
+                if !paths.contains(&path) { paths.push(path); }
+            }
+        }
+        if paths.is_empty() { ui.weak("No decoders used yet."); }
+        let mut selected = None;
+        for path in paths {
+            let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+            if ui.add_sized([ui.available_width(), t.size.recent_file_row_height],
+                egui::Button::new(name.as_ref())).on_hover_text(path.display().to_string()).clicked() {
+                selected = Some(path);
+            }
+        }
+        if let Some(path) = selected {
+            self.decoder = Decoder::Layout;
+            self.binary.load_yaml(path, ui.ctx());
+            self.decoder_library_open = false;
+            self.show_view(Pane::Layout);
+        }
+    }
+
     fn ui_workspace(&mut self, root_ui: &mut egui::Ui) {
         let ctx = root_ui.ctx().clone();
         self.poll_workspace(&ctx);
         let open = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+        let toggle_sidebar = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::B);
+        let search_sidebar = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K);
+        if ctx.input_mut(|i| i.consume_shortcut(&toggle_sidebar)) { self.sidebar_open = !self.sidebar_open; }
+        if ctx.input_mut(|i| i.consume_shortcut(&search_sidebar)) { self.sidebar_search_open = true; }
         let save = egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
             egui::Key::S,
@@ -1374,6 +1498,9 @@ impl BinwaveApp {
         for file in ctx.input(|i| i.raw.dropped_files.clone()) {
             self.open_path(file.path().to_path_buf(), &ctx);
         }
+        self.ui_sidebar(root_ui);
+        self.ui_sidebar_search(&ctx);
+        self.ui_sidebar_settings(&ctx);
         egui::Panel::top("workspace_toolbar").show(root_ui, |ui| self.ui_toolbar(ui));
         if self.show_decoding_guide {
             egui::Window::new("Decoding guide").open(&mut self.show_decoding_guide).default_width(540.).resizable(true).show(&ctx, |ui| {
@@ -1410,6 +1537,10 @@ impl BinwaveApp {
         });
         let mut workspace = std::mem::take(&mut self.workspace);
         egui::CentralPanel::default().show(root_ui, |ui| {
+            if self.decoder_library_open {
+                self.ui_decoder_library_entry(ui);
+                return;
+            }
             if !self.binary.has_file() && !self.show_empty_workspace {
                 self.ui_welcome(ui);
                 return;
@@ -1777,6 +1908,7 @@ impl eframe::App for BinwaveApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.workspace.save(storage);
         self.file_locations.save(storage);
+        storage.set_string("sidebar-open", self.sidebar_open.to_string());
         storage.set_string(
             "editor-tab-width",
             self.binary.editor_tab_width().to_string(),
@@ -1973,6 +2105,7 @@ mod tests {
     }
 
     fn workspace_frame(app: &mut BinwaveApp, ctx: &Context) -> egui::FullOutput {
+        crate::theme::install(ctx);
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -1990,6 +2123,7 @@ mod tests {
         ctx: &Context,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
+        crate::theme::install(ctx);
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -2001,6 +2135,23 @@ mod tests {
             },
             |_ctx, ui| app.ui_workspace(ui),
         )
+    }
+    #[test]
+    fn sidebar_shortcut_toggles_without_changing_the_dock() {
+        let ctx = Context::default();
+        let mut app = BinwaveApp::default();
+        let tabs = app.workspace.dock.iter_all_tabs().map(|(_, tab)| *tab).collect::<Vec<_>>();
+        for expected in [false, true] {
+            workspace_events(&mut app, &ctx, vec![egui::Event::Key {
+                key: egui::Key::B,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }]);
+            assert_eq!(app.sidebar_open, expected);
+            assert_eq!(app.workspace.dock.iter_all_tabs().map(|(_, tab)| *tab).collect::<Vec<_>>(), tabs);
+        }
     }
     fn workspace_click(app: &mut BinwaveApp, ctx: &Context, label: &str) {
         workspace_frame(app, ctx);
@@ -2825,9 +2976,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            top,
-            [
+        assert!(
+            top.iter().map(String::as_str).collect::<Vec<_>>().ends_with(&[
                 "File",
                 "Edit",
                 "View",
@@ -2835,7 +2985,8 @@ mod tests {
                 "Tools",
                 "Help",
                 crate::APP_VERSION,
-            ]
+            ]),
+            "{top:?}"
         );
         workspace_click(&mut app, &ctx, "File");
         workspace_click(&mut app, &ctx, "Open sensor demo");
@@ -2867,7 +3018,7 @@ mod tests {
         let (surface, table, _) = app.workspace.dock.find_tab_legacy(&Pane::Table).unwrap();
         let rect = app.workspace.dock[surface][table].rect().unwrap();
         assert!(
-            rect.width() > 600. && rect.height() > 250.,
+            rect.width() > 450. && rect.height() > 250.,
             "Sample table should remain readable beside the decoder: {rect:?}"
         );
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,egui::epaint::Shape::Text(text) if text.galley.text()=="temperature")));

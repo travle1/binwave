@@ -37,6 +37,8 @@ const MAX_RECENT_PAIRS: usize = 8;
 pub struct RecentPair {
     pub data: PathBuf,
     pub decoder: Option<PathBuf>,
+    #[serde(default)]
+    pub opened_at_unix_secs: u64,
 }
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -90,10 +92,10 @@ impl FileLocations {
         let pair = RecentPair {
             data: data.to_path_buf(),
             decoder: decoder.map(Path::to_path_buf),
+            opened_at_unix_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
         };
-        if state.recent_pairs.first() == Some(&pair) {
-            return;
-        }
         state.recent_pairs.retain(|old| old.data != pair.data);
         state.recent_pairs.insert(0, pair);
         state.recent_pairs.truncate(MAX_RECENT_PAIRS);
@@ -403,6 +405,12 @@ mod tests {
         }
         assert_eq!(locations.recent_pairs().len(), MAX_RECENT_PAIRS);
         assert_eq!(locations.recent_pairs()[0].data, PathBuf::from("/data/9.bin"));
+    }
+
+    #[test]
+    fn previous_recent_file_settings_without_open_time_still_load() {
+        let pair: RecentPair = serde_json::from_str(r#"{"data":"/data/example.bin","decoder":null}"#).unwrap();
+        assert_eq!(pair.opened_at_unix_secs, 0);
     }
 
     #[derive(Default)]
