@@ -170,6 +170,10 @@ pub struct StructureViews {
     plot_overlay_builds: usize,
     plot_view: Option<Range<usize>>,
     plot_axis_width: f32,
+    /// Widest Y axis seen for the current axis series; the axis never shrinks
+    /// while panning, so tick label width changes don't move the plot.
+    plot_y_axis_thickness: f32,
+    plot_y_axis_key: Option<(Option<String>, Option<String>, bool)>,
     plot_force_view: Option<Range<usize>>,
     plot_fit_y: bool,
     plot_fit_all_y: bool,
@@ -2319,6 +2323,11 @@ impl StructureViews {
         let dot_radius = self.plot_dot_radius.unwrap_or(2.5);
         let mut axis_hover = None;
         let mut gpu_mode = false;
+        let axis_key = (self.plot_axis_series.clone(), self.plot_axis_group.clone(), axis_uniform);
+        if self.plot_y_axis_key.as_ref() != Some(&axis_key) {
+            self.plot_y_axis_key = Some(axis_key);
+            self.plot_y_axis_thickness = 0.;
+        }
         let response = Plot::new(plot_id)
             .id(plot_id)
             .auto_bounds(egui::Vec2b::new(false, false))
@@ -2347,6 +2356,7 @@ impl StructureViews {
                 }
             })
             .custom_y_axes(vec![AxisHints::new_y()
+                .min_thickness(self.plot_y_axis_thickness)
                 .label(if axis_uniform { "Selected series value" } else { "Display position" })
                 .formatter(move |mark, _| {
                     format!("{:.2}", if axis_uniform { axis_placement.original(mark.value) }
@@ -2617,6 +2627,8 @@ impl StructureViews {
         if gpu_mode { self.plot_gpu.paint(ui.painter(), &response.transform); }
         log_slow_plot_phase(&mut phase_clock, "draw plot");
         self.plot_axis_width = (plot_outer.width() - response.transform.frame().width()).max(0.);
+        self.plot_y_axis_thickness = self.plot_y_axis_thickness
+            .max(response.transform.frame().left() - plot_outer.left());
         if let Some((axis, rect)) = axis_hover {
             ui.interact(
                 rect.intersect(plot_clip),
@@ -5225,6 +5237,28 @@ actions:
         assert!(views.plot_reader.data().unwrap().range.end >= 768);
     }
 
+    #[test]
+    fn y_axis_width_holds_when_tick_labels_get_shorter() {
+        let bytes: Vec<u8> = (0..200_000)
+            .flat_map(|i| if i < 100_000 { 1e9 + i as f64 } else { 0.5 }.to_le_bytes())
+            .collect();
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let output = Program::parse("actions: [{read: {name: samples, type: f64, repeat: until end}}]")
+            .unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        let mut widths = Vec::new();
+        for view in [0..512, 150_000..150_512] {
+            views.plot_view = Some(view.clone());
+            views.plot_force_view = Some(view);
+            views.plot_fit_y = true;
+            settle_plot(&ctx, &mut views, &output, &store);
+            settle_plot(&ctx, &mut views, &output, &store);
+            widths.push(views.plot_axis_width);
+        }
+        assert!(widths[0] > 0.);
+        assert_eq!(widths[1], widths[0], "short tick labels must not narrow the Y axis");
+    }
     #[test]
     fn rendered_point_shift_range_and_hex_selections_share_exact_bytes() {
         let (store, output) = array();
