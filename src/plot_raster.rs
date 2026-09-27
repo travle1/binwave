@@ -39,7 +39,7 @@ impl PlotRaster {
 
     pub fn show(&mut self, ctx: &Context, plot: &mut PlotUi<'_>,
         series: &BTreeMap<String, Arc<Vec<PlotPoint>>>, hidden: &HashSet<String>,
-        data_generation: u64) {
+        data_generation: u64) -> bool {
         let bounds = plot.plot_bounds();
         let frame = plot.response().rect;
         let ppp = ctx.pixels_per_point();
@@ -52,7 +52,7 @@ impl PlotRaster {
         let height = (requested_height as f64 * scale).round().max(1.) as usize;
         if width == 0 || height == 0
             || !bounds.min().iter().chain(bounds.max().iter()).all(|v| v.is_finite())
-            || bounds.width() <= 0. || bounds.height() <= 0. { return; }
+            || bounds.width() <= 0. || bounds.height() <= 0. { return false; }
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.epoch.hash(&mut hasher);
         data_generation.hash(&mut hasher);
@@ -62,6 +62,9 @@ impl PlotRaster {
         for value in bounds.min().into_iter().chain(bounds.max()) { value.to_bits().hash(&mut hasher); }
         let key = hasher.finish();
         let requested_bounds = [bounds.min()[0], bounds.min()[1], bounds.max()[0], bounds.max()[1]];
+        if self.pending.as_ref().is_some_and(|pending| pending.key != key) {
+            self.pending.take().unwrap().cancel.store(true, Ordering::Relaxed);
+        }
         if let Some(pending) = self.pending.take() {
             match pending.receiver.try_recv() {
                 Ok(image) => {
@@ -98,12 +101,15 @@ impl PlotRaster {
                 generation: data_generation, receiver, cancel });
         }
         if let (Some(texture), Some(image_bounds)) = (&self.texture, self.texture_bounds) {
+            if self.key != Some(key) { return false; }
             let center = PlotPoint::new((image_bounds[0] + image_bounds[2]) * 0.5,
                 (image_bounds[1] + image_bounds[3]) * 0.5);
             plot.image(PlotImage::new("Rasterized traces", texture.id(), center,
                 egui::vec2((image_bounds[2] - image_bounds[0]) as f32,
                     (image_bounds[3] - image_bounds[1]) as f32)).allow_hover(false));
+            return true;
         }
+        false
     }
 }
 
@@ -298,16 +304,29 @@ mod tests {
         }
         assert!(raster.texture.is_some(), "background raster did not publish");
         assert_eq!(raster.texture_bounds, Some([0., 0., 10., 10.]));
-        ctx.run(input, |_ctx, ui| {
+        let mut painted_stale = false;
+        ctx.run(input.clone(), |_ctx, ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 egui_plot::Plot::new("raster-worker-test").show(ui, |plot| {
                     plot.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
                         [0., 0.], [10., 10.]));
-                    raster.show(&ctx, plot, &series, &HashSet::new(), 2);
+                    painted_stale = raster.show(&ctx, plot, &series, &HashSet::new(), 2);
                 });
             });
         });
-        assert!(raster.texture.is_some(), "new data must retain the previous image while loading");
+        assert!(!painted_stale, "old pixels must not be drawn for newly decoded data");
+        assert!(raster.texture.is_some(), "the old texture may be retained while loading");
+        let mut painted_previous_zoom = false;
+        ctx.run(input, |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                egui_plot::Plot::new("raster-worker-test").show(ui, |plot| {
+                    plot.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                        [2., 0.], [6., 10.]));
+                    painted_previous_zoom = raster.show(&ctx, plot, &series, &HashSet::new(), 2);
+                });
+            });
+        });
+        assert!(!painted_previous_zoom, "old zoom pixels must not be drawn at new bounds");
         raster.invalidate();
         assert!(raster.texture.is_none());
     }

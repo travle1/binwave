@@ -64,6 +64,9 @@ impl GpuPlot {
     pub fn update(&mut self, ctx: &Context, points: &BTreeMap<String, Arc<Vec<PlotPoint>>>,
         hidden: &HashSet<String>, key: u64) -> bool {
         if !Self::available() { return false; }
+        if self.pending.as_ref().is_some_and(|pending| pending.key != key) {
+            self.pending.take().unwrap().cancel.store(true, Ordering::Relaxed);
+        }
         if let Some(pending) = self.pending.take() {
             match pending.receiver.try_recv() {
                 Ok(prepared) => {
@@ -78,7 +81,7 @@ impl GpuPlot {
             }
         }
         if self.key == Some(key) { return !self.segments.is_empty(); }
-        if self.pending.is_some() { return true; }
+        if self.pending.is_some() { return false; }
         // Cloning Arc handles is cheap even when the decoded arrays are large.
         // Segment reduction runs entirely off the UI thread.
         let visible: Vec<_> = points.iter().filter(|(name, _)| !hidden.contains(*name))
@@ -95,7 +98,7 @@ impl GpuPlot {
             repaint.request_repaint();
         });
         self.pending = Some(PendingUpload { key, receiver, cancel });
-        true
+        false
     }
     pub fn paint(&self, painter: &Painter, transform: &PlotTransform) {
         if self.segments.is_empty() { return; }
@@ -288,7 +291,8 @@ mod tests {
         let points: BTreeMap<_, _> = (0..128).map(|index|
             (format!("trace {index}"), Arc::clone(&samples))).collect();
         let mut gpu = GpuPlot::default();
-        assert!(gpu.update(&ctx, &points, &HashSet::new(), 1));
+        assert!(!gpu.update(&ctx, &points, &HashSet::new(), 1),
+            "vector fallback should paint until the new GPU geometry is ready");
         assert!(gpu.pending.is_some());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while gpu.pending.is_some() && std::time::Instant::now() < deadline {

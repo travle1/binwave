@@ -804,9 +804,28 @@ impl PlotReader {
         (self.data_key.as_ref() == self.desired.as_ref().map(|request| &request.key))
             .then(|| self.data.as_deref()).flatten()
     }
-    /// A prior result remains paintable while the next compatible viewport loads.
+    /// Retain a prior result only when it can represent the new viewport at
+    /// least as accurately. A coarse overview must not masquerade as samples
+    /// after zooming back in while the exact request is still loading.
     pub fn display_data(&self) -> Option<&PlotData> {
-        self.data.as_deref()
+        let data = self.data.as_deref()?;
+        let current = self.data_key.as_ref()?;
+        let Some(desired) = self.desired.as_ref().map(|request| &request.key) else {
+            return Some(data);
+        };
+        if current == desired
+            || (current.revision == desired.revision
+                && current.definition == desired.definition
+                && current.path == desired.path
+                && current.fields == desired.fields
+                && current.range.start <= desired.range.start
+                && current.range.end >= desired.range.end
+                && (data.quality == PlotQuality::Exact
+                    || current.range == desired.range && current.buckets >= desired.buckets)) {
+            Some(data)
+        } else {
+            None
+        }
     }
     pub fn data_generation(&self) -> u64 {
         self.data_generation
@@ -2764,6 +2783,22 @@ actions:
         settle(&mut reader, &ctx);
         assert!(reader.data().unwrap().range.start <= 2000);
         assert!(reader.data().unwrap().range.end >= 3000);
+    }
+    #[test]
+    fn zooming_back_in_does_not_display_coarse_overview_as_exact_samples() {
+        let (store, node) = fixture(20_000, 5_001);
+        let ctx = egui::Context::default();
+        let mut reader = PlotReader::default();
+        reader.request(&ctx, store.view(), node.clone(), 0..20_000, 800, true);
+        settle(&mut reader, &ctx);
+        assert_eq!(reader.data().unwrap().quality, PlotQuality::MinMax);
+        reader.request(&ctx, store.view(), node, 4_900..5_100, 800, true);
+        assert!(reader.display_data().is_none(),
+            "coarse overview should disappear while exact samples load");
+        settle(&mut reader, &ctx);
+        assert_eq!(reader.display_data().unwrap().quality, PlotQuality::Exact);
+        assert!(reader.data().unwrap().series["value"].iter().any(|point|
+            point.index == 5_001 && point.value == 100_000.));
     }
     #[test]
     fn covered_pan_rejects_replaced_source() {

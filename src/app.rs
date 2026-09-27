@@ -2405,13 +2405,17 @@ impl TabViewer for WorkspaceViewer<'_> {
                     egui::Panel::right("hex_embedded_inspector")
                         .resizable(true)
                         .default_size(t.size.inspector_width)
+                        .min_size(240.)
+                        .max_size(340.)
                         .frame(egui::Frame::new()
                             .fill(t.color.surface.raised)
+                            .inner_margin(egui::Margin::same(12))
                             .corner_radius(t.radius.inset))
                         .show(ui, |ui| {
-                            ui.strong("Inspector");
+                            ui.heading("Inspector");
                             ui.separator();
-                            egui::ScrollArea::vertical().show(ui, |ui| self.app.ui_inspector(ui));
+                            egui::ScrollArea::vertical().auto_shrink([false, false])
+                                .show(ui, |ui| self.app.ui_inspector(ui));
                         });
                 }
                 if let Some(range) = self.app.binary.byte_selection() {

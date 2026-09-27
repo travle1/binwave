@@ -148,6 +148,8 @@ pub struct StructureViews {
     plot_sources: std::collections::BTreeSet<String>,
     plot_sources_initialized: bool,
     plot_collections_open: bool,
+    plot_sidebar_series: bool,
+    plot_axis_series: Option<String>,
     plot_collection_filter: String,
     extra_plot_readers: std::collections::BTreeMap<String, PlotReader>,
     group_plot_readers: BTreeMap<String, PlotReader>,
@@ -177,6 +179,7 @@ pub struct StructureViews {
     plot_anchor: Option<usize>,
     plot_jump: usize,
     plot_jump_text: String,
+    plot_go_open: bool,
     plot_range_first: usize,
     plot_range_last: usize,
     plot_action: Option<PlotAction>,
@@ -1405,6 +1408,14 @@ impl StructureViews {
             self.plot_sources_initialized = true;
         }
         let mut changed = false;
+        let mut sidebar_names: Vec<String> = self.plot_catalog.iter()
+            .map(|field| format!("{} / {field}", self.plot_target)).collect();
+        if let Some((_, overlay)) = &self.plot_overlay {
+            sidebar_names.extend(overlay.series.keys().cloned());
+        }
+        sidebar_names.extend(self.plot_hidden.iter().cloned());
+        sidebar_names.sort();
+        sidebar_names.dedup();
         let mut close_collections = false;
         egui::Panel::right("plot_collections_sidebar")
             .default_size(320.0)
@@ -1413,13 +1424,60 @@ impl StructureViews {
             .resizable(true)
             .show_collapsible(ui, &mut self.plot_collections_open, |ui| {
                 ui.horizontal(|ui| {
-                    ui.strong("Collections");
+                    if ui.selectable_label(!self.plot_sidebar_series, "Collections").clicked() {
+                        self.plot_sidebar_series = false;
+                    }
+                    if ui.selectable_label(self.plot_sidebar_series, "Series").clicked() {
+                        self.plot_sidebar_series = true;
+                    }
                     if ui.button("×").on_hover_text("Close collections").clicked() {
                         close_collections = true;
                     }
                 });
-                changed |= plot_collection_choices(ui, &collections, &mut self.plot_sources,
-                    &mut self.plot_collection_filter);
+                ui.separator();
+                if self.plot_sidebar_series {
+                    ui.label("Y axis follows the selected series");
+                    ui.add(egui::TextEdit::singleline(&mut self.plot_field_filter)
+                        .hint_text("Find series…"));
+                    let filter = self.plot_field_filter.trim().to_lowercase();
+                    let matching: Vec<_> = sidebar_names.iter()
+                        .filter(|name| filter.is_empty() || name.to_lowercase().contains(&filter))
+                        .collect();
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Show all").clicked() {
+                            for name in &matching { self.plot_hidden.remove(*name); }
+                            self.plot_fit_y = true;
+                        }
+                        if ui.small_button("Hide all").clicked() {
+                            for name in &matching { self.plot_hidden.insert((*name).clone()); }
+                            self.plot_fit_y = true;
+                        }
+                    });
+                    egui::ScrollArea::vertical().id_salt("plot-series-sidebar")
+                        .show(ui, |ui| {
+                            for name in matching {
+                                ui.push_id(name, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let mut shown = !self.plot_hidden.contains(name);
+                                        if ui.checkbox(&mut shown, "").changed() {
+                                            if shown { self.plot_hidden.remove(name); }
+                                            else { self.plot_hidden.insert(name.clone()); }
+                                            self.plot_fit_y = true;
+                                        }
+                                        let axis = self.plot_axis_series.as_deref() == Some(name);
+                                        if ui.selectable_label(axis, "Y").on_hover_text("Use this series for the Y axis").clicked() {
+                                            self.plot_axis_series = Some(name.clone());
+                                            self.plot_fit_y = true;
+                                        }
+                                        ui.label(short_series_label(name)).on_hover_text(name);
+                                    });
+                                });
+                            }
+                        });
+                } else {
+                    changed |= plot_collection_choices(ui, &collections, &mut self.plot_sources,
+                        &mut self.plot_collection_filter);
+                }
             });
         if close_collections { self.plot_collections_open = false; }
         if changed {
@@ -1548,84 +1606,36 @@ impl StructureViews {
             if known.insert(name.clone()) { names.push(name.clone()); }
         }
         let visible_series = names.iter().filter(|name| !self.plot_hidden.contains(*name)).count();
+        if self.plot_axis_series.as_ref().is_none_or(|axis|
+            !names.contains(axis) || self.plot_hidden.contains(axis)) {
+            self.plot_axis_series = names.iter().find(|name| !self.plot_hidden.contains(*name)).cloned();
+            self.plot_fit_y = true;
+        }
         let series_label = if names.is_empty() {
             "Series".to_owned()
         } else {
             format!("Series {visible_series}/{}", names.len())
         };
+        let mut focus_plot_go = false;
         ui.horizontal_wrapped(|ui| {
-            egui::containers::menu::MenuButton::new(series_label)
-                .config(egui::containers::menu::MenuConfig::new()
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
-                .ui(ui, |ui| {
-                if !names.is_empty() {
-                    ui.strong("Fields shown");
-                    ui.add(egui::TextEdit::singleline(&mut self.plot_field_filter)
-                        .hint_text("Find fields…"));
-                    let filter = self.plot_field_filter.trim().to_lowercase();
-                    let matching: Vec<_> = names.iter()
-                        .filter(|name| filter.is_empty() || name.to_lowercase().contains(&filter))
-                        .collect();
-                    ui.horizontal(|ui| {
-                        let scope = if filter.is_empty() { "all" } else { "matching" };
-                        if ui.add_enabled(!matching.is_empty(), egui::Button::new(format!("Show {scope}"))).clicked() {
-                            for name in &matching { self.plot_hidden.remove(*name); }
-                            self.plot_fit_y = true;
-                        }
-                        if ui.add_enabled(!matching.is_empty(), egui::Button::new(format!("Hide {scope}"))).clicked() {
-                            for name in &matching { self.plot_hidden.insert((*name).clone()); }
-                            self.plot_fit_y = true;
-                        }
-                    });
-                    if matching.is_empty() { ui.weak("No matching fields"); }
-                    let mut tree = SeriesTree::default();
-                    for name in matching {
-                        let (collection_path, field) = name.rsplit_once(" / ")
-                            .unwrap_or(("", name.as_str()));
-                        let label = if field == "value" {
-                            collection_by_path.get(collection_path).map(|node| {
-                                if let Some((_, index)) = sensor_group_key(node) {
-                                    let group = node.name.rsplit_once(".sensor_").map(|(group, _)| group)
-                                        .unwrap_or_else(|| node.name.split_once('[').map_or(node.name.as_str(), |(group, _)| group));
-                                    format!("{group}.Item {index}")
-                                } else {
-                                    node.name.clone()
-                                }
-                            }).unwrap_or_else(|| field.to_owned())
-                        } else {
-                            field.to_owned()
-                        };
-                        tree.insert(&label, name);
-                    }
-                    egui::ScrollArea::vertical().id_salt("plot-visible-fields").max_height(220.).show(ui, |ui| {
-                        if tree.show(ui, &mut self.plot_hidden, "", !filter.is_empty()) {
-                            self.plot_fit_y = true;
-                        }
-                    });
-                }
-                ui.separator();
-                if self.presentation.menu(ui,&ranges) { self.plot_fit_y=true; }
-            });
-            if ui.button("Collections…").clicked() { self.plot_collections_open = !self.plot_collections_open; }
+            if ui.button(series_label).clicked() {
+                self.plot_collections_open = true;
+                self.plot_sidebar_series = true;
+            }
+            if ui.button("Collections…").clicked() {
+                self.plot_collections_open = true;
+                self.plot_sidebar_series = false;
+            }
             if ui.button("Fit").on_hover_text("Show the full sample range and fit the visible fields").clicked() { force_view=Some(0..count); self.plot_fit_y=true; }
-            ui.menu_button("Go to sample…", |ui| {
-                ui.label("Sample index (starts at 0)");
-                if self.plot_jump_text.is_empty() {
+            if ui.button("Go to sample…").clicked() {
+                self.plot_go_open = !self.plot_go_open;
+                if self.plot_go_open && self.plot_jump_text.is_empty() {
                     self.plot_jump_text = self.plot_jump.min(count - 1).to_string();
                 }
-                let entry = ui.add(egui::TextEdit::singleline(&mut self.plot_jump_text)
-                    .desired_width(130.0).hint_text("Sample index"));
-                let sample = self.plot_jump_text.trim().parse::<usize>().ok()
-                    .filter(|index| *index < count);
-                if ui.add_enabled(sample.is_some(), egui::Button::new("Go")).clicked()
-                    || entry.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) && sample.is_some() {
-                    self.plot_jump = sample.unwrap();
-                    force_view=Some(centered_view(self.plot_jump,view.len().min(INITIAL_PLOT_SAMPLES).max(64),count));
-                    if let Some(bytes)=sample_bytes(&node,self.plot_jump..self.plot_jump+1) {picked=Some((bytes,None));}
-                    ui.close();
-                }
-            });
+                focus_plot_go = self.plot_go_open;
+            }
             ui.menu_button("Plot options", |ui| {
+            if self.presentation.menu(ui, &ranges) { self.plot_fit_y = true; }
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let mut keep = crate::structure_plot::keep_decoded_data(&source);
@@ -1739,6 +1749,32 @@ impl StructureViews {
             }
         });
         });
+        if self.plot_go_open {
+            ui.horizontal(|ui| {
+                ui.label("Sample index");
+                let entry = ui.add(egui::TextEdit::singleline(&mut self.plot_jump_text)
+                    .desired_width(140.0).hint_text("0-based index"));
+                if focus_plot_go { entry.request_focus(); }
+                let sample = self.plot_jump_text.trim().parse::<usize>().ok()
+                    .filter(|index| *index < count);
+                let enter = (entry.has_focus() || entry.lost_focus())
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if ui.add_enabled(sample.is_some(), egui::Button::new("Go")).clicked()
+                    || enter && sample.is_some() {
+                    self.plot_jump = sample.unwrap();
+                    force_view = Some(centered_view(self.plot_jump, view.len().min(256).max(64), count));
+                    if let Some(bytes) = sample_bytes(&node, self.plot_jump..self.plot_jump + 1) {
+                        picked = Some((bytes, None));
+                    }
+                    self.plot_go_open = false;
+                }
+                if ui.button("×").on_hover_text("Close Go to sample").clicked()
+                    || entry.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    self.plot_go_open = false;
+                }
+                if sample.is_none() { ui.weak(format!("Enter 0–{}", count - 1)); }
+            });
+        }
         if ui.available_height() > 260. {
             ui.weak("Drag to pan · wheel or pinch to zoom · click a point to link Hex and Inspector");
         }
@@ -1848,6 +1884,10 @@ impl StructureViews {
                 requested.end.saturating_sub(1),
                 count
             ));
+            if let Some(axis) = &self.plot_axis_series {
+                ui.weak(format!("Y axis: {}", short_series_label(axis)))
+                    .on_hover_text(axis);
+            }
             if let Some(data) = self.plot_reader.display_data() {
                 ui.weak(data.quality.label()).on_hover_text(format!(
                     "Data covers sample indices {}–{}. Dense cycles are shown as amplitude bands; zoom in to see individual samples.",
@@ -2003,8 +2043,8 @@ impl StructureViews {
                 numeric_bounds(
                     data.series
                         .iter()
-
-                        .filter(|(name, _)| !hidden.contains(*name))
+                        .filter(|(name, _)| !hidden.contains(*name)
+                            && self.plot_axis_series.as_ref().is_none_or(|axis| axis == *name))
                         .flat_map(|(_, values)| values)
                         .map(|point| point.value),
                 )
@@ -2062,14 +2102,13 @@ impl StructureViews {
                         && visible_trace_count >= 64
                         && self.plot_gpu.update(&plot_ctx, &self.plot_overlay_points, &hidden,
                             overlay_key ^ self.plot_overlay_revision.rotate_left(17));
-                    let raster_mode = !gpu_mode && data.quality != PlotQuality::SampledPreview
+                    let raster_candidate = !gpu_mode && data.quality != PlotQuality::SampledPreview
                         && visible_trace_count >= 16
                         && (data.quality != PlotQuality::Exact
                             || requested.len() > pixel_width);
-                    if raster_mode {
-                        self.plot_raster.show(&plot_ctx, plot_ui, &self.plot_overlay_points,
-                            &hidden, overlay_key ^ self.plot_overlay_revision.rotate_left(17));
-                    }
+                    let raster_mode = raster_candidate && self.plot_raster.show(&plot_ctx, plot_ui,
+                        &self.plot_overlay_points, &hidden,
+                        overlay_key ^ self.plot_overlay_revision.rotate_left(17));
                     for (name, values) in data.series.iter() {
                         if raster_mode || gpu_mode { break; }
                         if hidden.contains(name) {
@@ -2399,16 +2438,18 @@ impl StructureViews {
                         data.into_iter()
                             .flat_map(|data| data.series.iter())
                             .filter(|(name, _)| !hidden.contains(*name))
-                            .flat_map(|(_, values)| values)
-                            .filter_map(|point| {
+                            .flat_map(|(name, values)| values.iter().map(move |point| (name, point)))
+                            .filter_map(|(name, point)| {
                                 let screen = response.transform.position_from_point(
                                     &PlotPoint::new(point.index as f64, point.value),
                                 );
                                 let distance = screen.distance_sq(pointer);
-                                (distance < 144.).then_some((distance, point))
+                                (distance < 144.).then_some((distance, name, point))
                             })
                             .min_by(|a, b| a.0.total_cmp(&b.0));
-                    if let Some((_, point)) = nearest {
+                    if let Some((_, name, point)) = nearest {
+                        self.plot_axis_series = Some(name.clone());
+                        self.plot_fit_y = true;
                         self.plot_anchor = Some(point.index);
                         picked = Some((point.bytes.clone(), Some(point.path.to_string())));
                     } else if let Some(bytes) = sample_bytes(&node, index..index + 1) {
@@ -2478,59 +2519,6 @@ impl StructureViews {
                 color: field_color(&node.path),
             })
             .collect()
-    }
-}
-
-#[derive(Default)]
-struct SeriesTree {
-    leaves: Vec<(String, String)>,
-    children: BTreeMap<String, SeriesTree>,
-}
-impl SeriesTree {
-    fn insert(&mut self, field: &str, full_name: &str) {
-        if let Some((group, rest)) = field.split_once('.') {
-            self.children.entry(group.to_owned()).or_default().insert(rest, full_name);
-        } else {
-            self.leaves.push((field.to_owned(), full_name.to_owned()));
-        }
-    }
-    fn names(&self, out: &mut Vec<String>) {
-        out.extend(self.leaves.iter().map(|(_, name)| name.clone()));
-        for child in self.children.values() { child.names(out); }
-    }
-    fn show(&self, ui: &mut Ui, hidden: &mut HashSet<String>, path: &str, expand: bool) -> bool {
-        let mut changed = false;
-        for (label, name) in &self.leaves {
-            let mut shown = !hidden.contains(name);
-            ui.push_id(name, |ui| {
-                if ui.checkbox(&mut shown, label).on_hover_text(name).changed() {
-                    if shown { hidden.remove(name); } else { hidden.insert(name.clone()); }
-                    changed = true;
-                }
-            });
-        }
-        for (group, child) in &self.children {
-            let group_path = if path.is_empty() { group.clone() } else { format!("{path}.{group}") };
-            let mut names = Vec::new();
-            child.names(&mut names);
-            egui::CollapsingHeader::new(format!("{group} ({})", names.len()))
-                .id_salt(&group_path)
-                .default_open(expand)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Show group").clicked() {
-                            for name in &names { hidden.remove(name); }
-                            changed = true;
-                        }
-                        if ui.small_button("Hide group").clicked() {
-                            for name in &names { hidden.insert(name.clone()); }
-                            changed = true;
-                        }
-                    });
-                    changed |= child.show(ui, hidden, &group_path, expand);
-                });
-        }
-        changed
     }
 }
 
@@ -3035,6 +3023,12 @@ fn ranges_overlap(a: &Range<usize>, b: &Range<usize>) -> bool {
 
 
 
+fn short_series_label(name: &str) -> String {
+    name.rsplit_once(" / ").map_or_else(|| name.to_owned(), |(path, field)| {
+        format!("{} / {field}", path.rsplit('.').next().unwrap_or(path))
+    })
+}
+
 fn centered_view(center: usize, width: usize, count: usize) -> Range<usize> {
     let width = width.max(1).min(count);
     let start = center
@@ -3207,6 +3201,78 @@ mod tests {
     }
 
     #[test]
+    fn go_to_sample_keeps_its_field_open_and_zooms_to_the_entered_index() {
+        let (store, output) = array();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        settle_plot(&ctx, &mut views, &output, &store);
+        views.plot_go_open = true;
+        views.plot_jump_text.clear();
+        let frame = |views: &mut StructureViews, events| {
+            ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                    egui::vec2(1200., 700.))),
+                events,
+                ..Default::default()
+            }, |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    views.plot(ui, &output, store.view());
+                });
+            })
+        };
+        let output_frame = frame(&mut views, vec![]);
+        let label = output_frame.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "Sample index" => Some(text),
+            _ => None,
+        }).expect("Go to sample field should be visible");
+        let field = egui::pos2(label.pos.x + label.galley.rect.width() + 24.,
+            label.pos.y + label.galley.rect.height() / 2.);
+        frame(&mut views, vec![egui::Event::PointerMoved(field)]);
+        frame(&mut views, vec![egui::Event::PointerButton { pos: field,
+            button: egui::PointerButton::Primary, pressed: true,
+            modifiers: egui::Modifiers::NONE }]);
+        frame(&mut views, vec![egui::Event::PointerButton { pos: field,
+            button: egui::PointerButton::Primary, pressed: false,
+            modifiers: egui::Modifiers::NONE }]);
+        assert!(views.plot_go_open, "clicking the field must not close Go to sample");
+        frame(&mut views, vec![egui::Event::Text("400".into())]);
+        assert_eq!(views.plot_jump_text, "400");
+        frame(&mut views, vec![egui::Event::Key { key: egui::Key::Enter,
+            physical_key: None, pressed: true, repeat: false,
+            modifiers: egui::Modifiers::NONE }]);
+        assert_eq!(views.plot_jump, 400);
+        assert!(!views.plot_go_open);
+        let range = views.plot_view.as_ref().unwrap();
+        assert!(range.contains(&400) && range.len() <= 256, "jump must zoom near sample 400: {range:?}");
+    }
+
+    #[test]
+    fn series_controls_live_in_the_signal_sidebar() {
+        let (store, output) = array();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        settle_plot(&ctx, &mut views, &output, &store);
+        views.plot_collections_open = true;
+        views.plot_sidebar_series = true;
+        let frame = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                egui::vec2(1200., 700.))),
+            ..Default::default()
+        }, |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                views.plot(ui, &output, store.view());
+            });
+        });
+        let text: Vec<_> = frame.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+            _ => None,
+        }).collect();
+        assert!(text.iter().any(|label| label == "Y axis follows the selected series"));
+        assert!(egui::containers::panel::PanelState::load(&ctx,
+            egui::Id::new("plot_collections_sidebar")).is_some());
+    }
+
+    #[test]
     fn wide_numeric_collection_starts_with_bounded_visible_fields() {
         let mut yaml = String::from("structures:\n  - name: Record\n    fields:\n");
         for index in 0..128 {
@@ -3244,10 +3310,12 @@ mod tests {
         for _ in 0..20 {render_plot(&ctx,&mut views,&output,&store,vec![],Default::default());std::thread::sleep(std::time::Duration::from_millis(5));}
         let raw=views.extra_plot_readers["measurements"].data().unwrap().series["temperature"][10].value;
         views.presentation.series.insert("measurements / temperature".into(),crate::plot_presentation::Placement {scale:0.5,offset:200.});
+        views.plot_axis_series = Some("measurements / temperature".into());
         views.plot_fit_y=true;
         render_plot(&ctx,&mut views,&output,&store,vec![],Default::default());
         let selected=click_plot(&ctx,&mut views,&output,&store,10.,raw*0.5+200.,false);
         assert_eq!(selected,Some(6240..6244));
+        assert_eq!(views.plot_axis_series.as_deref(), Some("measurements / temperature"));
         assert_eq!(views.extra_plot_readers["measurements"].data().unwrap().series["temperature"][10].value,raw);
         assert!(!store.is_dirty());
     }
@@ -4576,7 +4644,6 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             views.plot_force_view = Some(0..count);
             views.plot_fit_y = true;
             settle_plot(&ctx, &mut views, &output, &store);
-            let rendered = waveform_plot_frame(&ctx, &mut views, &output, &store);
             let data = views.plot_reader.data().unwrap();
             assert!(data.range.start == 0 && data.range.end >= count);
             assert_eq!(data.scanned, data.range.len());
@@ -4584,8 +4651,13 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             if count > 8192 {
                 assert_eq!(data.quality, PlotQuality::MinMax);
             }
-            let transform = navigation_memory(&ctx, &views, &output).transform().clone();
             for name in ["sine", "ramp", "square"] {
+                views.plot_axis_series = Some(format!("{} / {name}", views.plot_target));
+                views.plot_fit_y = true;
+                settle_plot(&ctx, &mut views, &output, &store);
+                let rendered = waveform_plot_frame(&ctx, &mut views, &output, &store);
+                let transform = navigation_memory(&ctx, &views, &output).transform().clone();
+                let data = views.plot_reader.data().unwrap();
                 let values = &data.series[name];
                 assert!(values.windows(2).all(|pair| pair[0].index < pair[1].index));
                 let mut traces = Vec::new();
@@ -4622,6 +4694,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 }
             }
             if count > 5001 {
+                let data = views.plot_reader.data().unwrap();
                 let spike = data.series["square"]
                     .iter()
                     .find(|sample| sample.index == 5001)
@@ -4644,6 +4717,25 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             Some(5001 * 24 + 16..5001 * 24 + 24),
             "selecting a peak inside an amplitude band must retain exact source bytes"
         );
+    }
+
+    #[test]
+    fn selected_series_controls_the_plot_y_axis() {
+        let (store, output) = waveform_plot_fixture();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        settle_plot(&ctx, &mut views, &output, &store);
+        views.plot_axis_series = Some("samples / sine".into());
+        views.plot_fit_y = true;
+        settle_plot(&ctx, &mut views, &output, &store);
+        let sine_bounds = *navigation_memory(&ctx, &views, &output).bounds();
+        views.plot_axis_series = Some("samples / ramp".into());
+        views.plot_fit_y = true;
+        settle_plot(&ctx, &mut views, &output, &store);
+        let ramp_bounds = *navigation_memory(&ctx, &views, &output).bounds();
+        assert!(sine_bounds.min()[1] < -3. && sine_bounds.max()[1] > 3.);
+        assert!(ramp_bounds.min()[1] > 9. && ramp_bounds.max()[1] < 15.,
+            "Y axis must follow its selected series: sine={sine_bounds:?}, ramp={ramp_bounds:?}");
     }
 
     #[test]
