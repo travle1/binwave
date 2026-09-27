@@ -532,24 +532,23 @@ impl HexEditor {
         let navigation_origin = self.selection();
         ui.horizontal_wrapped(|ui| {
             let can_back = self.history_pos > 0;
-            if ui.add_enabled(can_back, egui::Button::new("Back"))
+            if ui.add_enabled(can_back, egui::Button::new("‹"))
                 .on_hover_text(if can_back { "Return to the previous visited byte." } else { "No previous location. Jump to another byte to start navigation history." })
                 .on_disabled_hover_text("No previous location. Jump to another byte to start navigation history.")
                 .clicked() {
                 self.navigate_history(true);
             }
             let can_forward = self.history_pos + 1 < self.history.len();
-            if ui.add_enabled(can_forward, egui::Button::new("Forward"))
+            if ui.add_enabled(can_forward, egui::Button::new("›"))
                 .on_hover_text("Return to the byte you left with Back.")
                 .on_disabled_hover_text("No next location. Use Back first.")
                 .clicked() {
                 self.navigate_history(false);
             }
-            ui.label("Jump");
             let mut jump = egui::TextEdit::singleline(&mut self.jump)
                 .id_salt("hex_jump")
-                .desired_width(120.0)
-                .hint_text("0x100 or +256")
+                .desired_width(150.0)
+                .hint_text("Go to  0x100  or  +256")
                 .show(ui);
             if self.focus_jump {
                 jump.response.request_focus();
@@ -564,7 +563,7 @@ impl HexEditor {
                 || (jump.response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
                 self.jump_to_input(source.len());
             }
-            if ui.toggle_value(&mut self.show_search, "Find").changed() && self.show_search { self.focus_find = true; }
+            if ui.toggle_value(&mut self.show_search, "Find bytes or text").changed() && self.show_search { self.focus_find = true; }
             ui.menu_button("Selection", |ui| {
                 self.selection_menu(ui, &source, &mut actions);
             });
@@ -577,6 +576,8 @@ impl HexEditor {
                 }
                 ui.separator();
                 ui.checkbox(&mut self.show_decoded_fields, "Highlight decoded fields");
+                ui.checkbox(&mut self.edit_mode, "Overwrite");
+                if self.edit_mode { ui.checkbox(&mut self.ascii_input, "Text input"); }
                 ui.weak("Field tints identify decoded bytes. Blue is your selection.
 A gold underline marks search hits; an orange top edge marks edits.");
                 ui.separator();
@@ -593,10 +594,7 @@ A gold underline marks search hits; an orange top edge marks edits.");
                 if let Some(index) = remove { self.bookmarks.remove(index); }
                 if self.bookmarks.is_empty() { ui.weak("Select bytes to name and color a range."); }
             });
-            ui.toggle_value(&mut self.edit_mode, "Overwrite").on_hover_text("Type hexadecimal pairs or ASCII into selected bytes. File length is preserved; undo is available.");
-            if self.edit_mode { ui.checkbox(&mut self.ascii_input, "Text"); }
         });
-        ui.weak("Jump to an offset, or use + / - bytes from the cursor (e.g. +256, -0x10).");
         if self.show_search {
             ui.horizontal_wrapped(|ui| {
                 ui.checkbox(&mut self.search_text, "Text");
@@ -2372,9 +2370,9 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(first_offset(&before), first_offset(&after));
-        assert!(after.iter().any(|text| text == "Back"));
-        assert!(after.iter().any(|text| text == "Forward"));
-        assert!(after.iter().any(|text| text.contains("+ / - bytes")));
+        assert!(after.iter().any(|text| text == "‹"));
+        assert!(after.iter().any(|text| text == "›"));
+        assert!(after.iter().any(|text| text.contains("+256")));
         assert!(!after.iter().any(|text| text.contains("Earlier bytes")
             || text.contains("Later bytes")
             || text.starts_with("Window ")));

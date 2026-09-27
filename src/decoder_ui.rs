@@ -123,9 +123,16 @@ pub fn source_console(
     running: bool,
     source: impl FnOnce(&mut Ui),
 ) -> ConsoleAction {
+    let has_output = !stdout.is_empty() || error.is_some() || running;
+    let console_id = ui.id().with("source_console_open");
+    let requested_open = ui.data_mut(|data| data.get_persisted::<bool>(console_id).unwrap_or(false));
+    let console_open = has_output || requested_open;
     let spacing = 6.0;
-    let (source_height, console_height) =
-        source_console_heights(ui.available_height(), error.is_some());
+    let (source_height, console_height) = if console_open {
+        source_console_heights(ui.available_height(), error.is_some())
+    } else {
+        ((ui.available_height() - 30.0 - spacing).max(0.0), 30.0)
+    };
     let width = ui.available_width();
     ui.allocate_ui(egui::vec2(width, source_height), |ui| {
         ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
@@ -134,7 +141,19 @@ pub fn source_console(
     ui.add_space(spacing);
     ui.allocate_ui(egui::vec2(width, console_height), |ui| {
         ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
-        console(ui, stdout, error, running)
+        if console_open {
+            let action = console(ui, stdout, error, running);
+            if !has_output && ui.button("Hide console").clicked() {
+                ui.data_mut(|data| data.insert_persisted(console_id, false));
+            }
+            action
+        } else {
+            if ui.button("Console").clicked() {
+                ui.data_mut(|data| data.insert_persisted(console_id, true));
+            }
+            ui.weak("No output");
+            ConsoleAction::default()
+        }
     })
     .inner
 }

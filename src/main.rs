@@ -99,8 +99,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             // Keep the existing settings location through the product rename.
             .with_app_id("Plotter Max")
-            .with_inner_size([1280., 850.])
-            .with_min_inner_size([1000., 650.])
+            .with_inner_size(theme::DARK.size.window_default)
+            .with_min_inner_size(theme::DARK.size.window_min)
             .with_decorations(false)
             .with_transparent(true),
         ..Default::default()

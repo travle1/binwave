@@ -476,7 +476,6 @@ impl DirectAuthoring {
         file_size: u64,
     ) -> Option<Edit> {
         let Some(range) = range.filter(|r| r.start < r.end && r.end <= file_size) else {
-            ui.weak("Select bytes, then choose Interpret as.");
             return None;
         };
         let mut result = None;

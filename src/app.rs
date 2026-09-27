@@ -1,6 +1,5 @@
 #[cfg(test)]
 use crate::egui_compat::ContextRun as _;
-#[cfg(test)]
 use crate::workspace_layout::LegacyFindTab as _;
 use crate::binary_ui::{BinaryWorkspace, OpenedFile};
 use crate::cache::LoadProgress;
@@ -1937,6 +1936,40 @@ impl BinwaveApp {
                 .show_leaf_collapse_buttons(false)
                 .tab_context_menus(true)
                 .show_inside(ui, &mut WorkspaceViewer { app: self });
+            if let Some((surface, node, _)) = workspace.dock.find_tab_legacy(&Pane::Layout) {
+                if let Some(rect) = workspace.dock[surface][node].rect() {
+                    if rect.width() >= crate::theme::DARK.size.decoder_header_actions_min_width {
+                        let t = &crate::theme::DARK;
+                        let position = egui::pos2(
+                            rect.right() - t.size.decoder_header_actions_width,
+                            rect.top() + (t.size.card_header_height - t.size.control_height) / 2.0,
+                        );
+                        egui::Area::new(egui::Id::new("decoder_header_actions"))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(position)
+                            .show(ui.ctx(), |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.add_enabled(
+                                        self.binary.commands_available() && self.binary.can_save_definition(),
+                                        egui::Button::new("Save"),
+                                    ).clicked() {
+                                        self.binary.save_definition(ui.ctx());
+                                    }
+                                    if crate::decoder_ui::run_button(
+                                        ui,
+                                        self.binary.commands_available() && self.binary.can_apply_definition(),
+                                        None,
+                                    ).clicked() {
+                                        self.binary.apply_definition(ui.ctx());
+                                    }
+                                    if self.binary.is_decoding() && ui.button("Stop").clicked() {
+                                        self.binary.stop_decoding();
+                                    }
+                                });
+                            });
+                    }
+                }
+            }
         });
         self.workspace = workspace;
         if let Some(message) = self.cache_message.clone() {
@@ -2324,7 +2357,11 @@ struct WorkspaceViewer<'a> {
 impl TabViewer for WorkspaceViewer<'_> {
     type Tab = Pane;
     fn title(&mut self, pane: &mut Pane) -> egui::WidgetText {
-        pane.title().into()
+        if *pane == Pane::Layout {
+            self.app.binary.decoder_tab_title().into()
+        } else {
+            pane.title().into()
+        }
     }
     fn id(&mut self, pane: &mut Pane) -> egui::Id {
         egui::Id::new(*pane)
@@ -3339,7 +3376,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             let shown = text(workspace_frame(&mut app, &ctx));
-            assert!(shown.contains("Script finished"), "{shown}");
+            assert!(shown.contains("Run finished"), "{shown}");
             assert!(!shown.contains("ValueError"));
             assert!(app.displayed_decoder == Decoder::Csv);
             assert_eq!(app.dataset, dataset);

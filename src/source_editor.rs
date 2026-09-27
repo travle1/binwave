@@ -300,16 +300,10 @@ impl YamlLayoutCache {
         if language == DecoderLanguage::Yaml {
             ui.horizontal_wrapped(|ui| {
                 let dark = ui.visuals().dark_mode;
-                let compact = ui.ctx().content_rect().width() < 900.;
-                if !compact { ui.colored_label(if dark { Color32::from_rgb(140,194,238) } else { Color32::from_rgb(25,89,149) }, "Keyword");
-                ui.colored_label(builtin_color(dark), "Built-in type");
-                ui.label("User-defined name"); }
                 ui.menu_button("YAML help", |ui| {
                     ui.set_max_width(330.);
-                    if compact {
-                        ui.colored_label(builtin_color(dark), "Teal: built-in types");
-                        ui.label("Blue: keywords · Normal text: user-defined names");
-                    }
+                    ui.colored_label(builtin_color(dark), "Teal: built-in types");
+                    ui.label("Blue: keywords · Normal text: user-defined names");
                     ui.label("Declare a reusable type with name; use structure to reference it.");
                     ui.code("structures:\n  - name: RecordType\n    fields:\n      - {name: value, type: u16}\nactions:\n  - read: {name: records, type: {structure: RecordType}, repeat: 2}");
                     ui.label("Declarations read no bytes. Actions start reads; fields consume bytes in order. A field using a structure creates nested values.");

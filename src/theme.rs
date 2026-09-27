@@ -84,11 +84,15 @@ pub struct Radii {
     pub pill: u16,
 }
 pub struct Sizes {
+    pub window_default: [f32; 2],
+    pub window_min: [f32; 2],
     pub frame_border: f32,
     pub frame_resize_grab: f32,
     pub sidebar_width: f32,
     pub header_height: f32,
     pub card_header_height: f32,
+    pub decoder_header_actions_width: f32,
+    pub decoder_header_actions_min_width: f32,
     pub tab_height: f32,
     pub control_height: f32,
     pub sidebar_row_height: f32,
@@ -214,11 +218,15 @@ pub const DARK: Theme = Theme {
         pill: 999,
     },
     size: Sizes {
+        window_default: [1600., 1000.],
+        window_min: [1000., 650.],
         frame_border: 1.,
         frame_resize_grab: 6.,
         sidebar_width: 240.,
         header_height: 48.,
         card_header_height: 40.,
+        decoder_header_actions_width: 156.,
+        decoder_header_actions_min_width: 320.,
         tab_height: 28.,
         control_height: 28.,
         sidebar_row_height: 36.,
@@ -278,7 +286,12 @@ pub fn dock_style(egui_style: &egui::Style) -> egui_dock::Style {
     style.tab_bar.bg_fill = t.color.surface.card;
     style.tab_bar.height = t.size.card_header_height;
     style.tab_bar.inner_margin = Margin::same(((t.size.card_header_height - t.size.tab_height) / 2.) as i8);
-    style.tab_bar.corner_radius = CornerRadius::same(t.radius.card);
+    style.tab_bar.corner_radius = CornerRadius {
+        nw: t.radius.card,
+        ne: t.radius.card,
+        sw: 0,
+        se: 0,
+    };
     style.tab_bar.hline_color = t.color.surface.card;
     style.tab.spacing = t.spacing.tab_gap;
     for (tab, fill, text) in [
@@ -297,7 +310,12 @@ pub fn dock_style(egui_style: &egui::Style) -> egui_dock::Style {
     }
     style.tab.tab_body.bg_fill = t.color.surface.card;
     style.tab.tab_body.stroke = Stroke::new(t.size.frame_border, t.color.border.card);
-    style.tab.tab_body.corner_radius = CornerRadius::same(t.radius.card);
+    style.tab.tab_body.corner_radius = CornerRadius {
+        nw: 0,
+        ne: 0,
+        sw: t.radius.card,
+        se: t.radius.card,
+    };
     style.tab.tab_body.inner_margin = Margin::same(t.spacing.card_padding as i8);
     style
 }

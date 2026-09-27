@@ -635,8 +635,6 @@ impl StructureWorkspace {
             }
             ui.selectable_value(&mut self.editor_page, EditorPage::Structures, "Fields");
             ui.selectable_value(&mut self.editor_page, EditorPage::Steps, "Steps");
-            ui.separator();
-            ui.weak(crate::decoder_ui::RUN_LABEL);
         });
         if self.last_run_language != Some(DecoderLanguage::Python)
             && self.editor_page != EditorPage::Yaml

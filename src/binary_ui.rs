@@ -1901,6 +1901,17 @@ impl BinaryWorkspace {
         self.controls_inner(ui, false);
     }
 
+    pub fn decoder_tab_title(&self) -> String {
+        let name = self.yaml_path.as_deref().and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Decoder".into());
+        if self.yaml != self.saved_yaml || self.active_authoring_dirty() {
+            format!("{name} •")
+        } else {
+            name
+        }
+    }
+
     #[cfg(test)]
     pub fn controls(&mut self, ui: &mut Ui) {
         self.controls_inner(ui, true);
@@ -1965,8 +1976,10 @@ impl BinaryWorkspace {
             let can_save = self.can_save_definition() && enabled;
             let busy = self.is_decoding();
             let reason = self.run_disabled_reason().map(str::to_owned);
+            let compact_toolbar = ui.available_width() + 2.0 * crate::theme::DARK.spacing.card_padding
+                < crate::theme::DARK.size.decoder_header_actions_min_width;
             ui.horizontal_wrapped(|ui| {
-                ui.menu_button(format!("{title} ⌄"), |ui| {
+                ui.menu_button("Switch decoder ▾", |ui| {
                     for path in &recent {
                         let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
                         if ui.button(name.as_ref()).on_hover_text(path.display().to_string()).clicked() {
@@ -1978,9 +1991,11 @@ impl BinaryWorkspace {
                     open = ui.button("Open decoder…").clicked();
                     save_as = ui.add_enabled(can_save, egui::Button::new("Save as…")).clicked();
                 });
-                save = ui.add_enabled(can_save, egui::Button::new("Save")).on_hover_text("Save decoder").clicked();
-                run = crate::decoder_ui::run_button(ui, can_run, reason.as_deref()).clicked();
-                if busy { stop = ui.button("Stop").clicked(); }
+                if compact_toolbar {
+                    save = ui.add_enabled(can_save, egui::Button::new("Save")).on_hover_text("Save decoder").clicked();
+                    run = crate::decoder_ui::run_button(ui, can_run, reason.as_deref()).clicked();
+                    if busy { stop = ui.button("Stop").clicked(); }
+                }
             });
             if let Some(path) = choice { self.load_yaml(path, &ctx); }
             if new { if self.is_python() { self.new_python(&ctx); } else { self.new_yaml(&ctx); } }
@@ -2028,13 +2043,15 @@ impl BinaryWorkspace {
             });
         });
         }
-        crate::decoder_ui::status_banner(
-            ui,
-            self.decoder_status(),
-            self.decoder_status_detail(),
-            self.decoder_status_tone(),
-            self.structure_ui.is_parsing() || self.decoding_layout,
-        );
+        if show_language {
+            crate::decoder_ui::status_banner(
+                ui,
+                self.decoder_status(),
+                self.decoder_status_detail(),
+                self.decoder_status_tone(),
+                self.structure_ui.is_parsing() || self.decoding_layout,
+            );
+        }
         if self.active_authoring_dirty() && ui.button("Review field changes").clicked() {
             self.structure_ui.show_authoring_draft();
         }
@@ -5624,7 +5641,7 @@ mod tests {
                 "{jump} must select its decoded field too"
             );
         }
-        click(&mut workspace, &ctx, "Back");
+        click(&mut workspace, &ctx, "‹");
         assert_eq!(workspace.hex_editor.selection(), Some(908..909));
         assert_eq!(
             workspace.selected,
@@ -5636,7 +5653,7 @@ mod tests {
                 .identity(74, 1)
                 .ok()
         );
-        click(&mut workspace, &ctx, "Forward");
+        click(&mut workspace, &ctx, "›");
         assert_eq!(workspace.hex_editor.selection(), Some(896..897));
     }
 }
