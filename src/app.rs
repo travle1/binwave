@@ -1337,7 +1337,8 @@ impl BinwaveApp {
                     .corner_radius(egui::CornerRadius::same(t.radius.pill.min(u8::MAX as u16) as u8))
                     .inner_margin(egui::Margin::symmetric((t.spacing.card_padding / 2.) as i8,
                         t.spacing.sidebar_row_gap as i8))
-                    .show(ui, |ui| { ui.label(egui::RichText::new(badge).size(t.font.label).color(color)); });
+                    .show(ui, |ui| { ui.label(egui::RichText::new(badge).size(t.font.label).color(color)); })
+                    .response.on_hover_text(self.binary.status().0);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 chosen = app_menu::overflow_menu(ui, &menus);
@@ -1497,6 +1498,18 @@ impl BinwaveApp {
     fn ui_workspace(&mut self, root_ui: &mut egui::Ui) {
         let ctx = root_ui.ctx().clone();
         self.poll_workspace(&ctx);
+        let close_tab = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W);
+        if ctx.input_mut(|i| i.consume_shortcut(&close_tab)) {
+            if let Some(path) = self.workspace.dock.focused_leaf() {
+                if let Some(active) = self.workspace.dock[path.surface][path.node]
+                    .get_leaf().map(|leaf| leaf.active) {
+                    self.workspace.dock.remove_tab(egui_dock::TabPath::new(path.surface, path.node, active));
+                    if self.workspace.dock.iter_all_tabs().next().is_none() {
+                        self.show_empty_workspace = true;
+                    }
+                }
+            }
+        }
         let open = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
         let toggle_sidebar = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::B);
         let search_sidebar = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K);
@@ -1550,34 +1563,6 @@ impl BinwaveApp {
                 crate::source_editor::decoding_guide(ui);
             });
         }
-        egui::Panel::bottom("workspace_status").show(root_ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if self.binary.busy() || self.loader_rx.is_some() || self.csv_link_request.is_some()
-                {
-                    ui.spinner();
-                }
-                let (status, error) = self.binary.status();
-                let status = if error || self.displayed_decoder == Decoder::Layout {
-                    status
-                } else {
-                    &self.status
-                };
-                ui.colored_label(
-                    if error {
-                        egui::Color32::LIGHT_RED
-                    } else {
-                        ui.visuals().text_color()
-                    },
-                    status,
-                );
-                if let Some(message) = &self.cache_message {
-                    ui.label(message);
-                    if ui.small_button("Dismiss").clicked() {
-                        self.cache_message = None;
-                    }
-                }
-            });
-        });
         let mut workspace = std::mem::take(&mut self.workspace);
         egui::CentralPanel::default().show(root_ui, |ui| {
             if self.decoder_library_open {
@@ -1591,9 +1576,25 @@ impl BinwaveApp {
             DockArea::new(&mut workspace.dock)
                 .id(egui::Id::new("workspace_dock"))
                 .style(crate::theme::dock_style(ui.style().as_ref()))
+                .show_close_buttons(false)
+                .tab_context_menus(true)
                 .show_inside(ui, &mut WorkspaceViewer { app: self });
         });
         self.workspace = workspace;
+        if let Some(message) = self.cache_message.clone() {
+            let mut open = true;
+            let mut dismiss = false;
+            egui::Window::new("Notice")
+                .open(&mut open)
+                .anchor(egui::Align2::RIGHT_BOTTOM,
+                    egui::vec2(-crate::theme::DARK.spacing.card_gap,
+                        -crate::theme::DARK.spacing.card_gap))
+                .show(&ctx, |ui| {
+                    ui.label(message);
+                    if ui.button("Dismiss").clicked() { dismiss = true; }
+                });
+            if !open || dismiss { self.cache_message = None; }
+        }
         self.poll_csv_links(&ctx);
         if ctx
             .data_mut(|data| data.remove_temp::<bool>(egui::Id::new("welcome_definitions")))
@@ -1995,6 +1996,9 @@ impl TabViewer for WorkspaceViewer<'_> {
             }
             Pane::Layout => self.app.ui_decoder(ui),
             Pane::Hex => {
+                if let Some(range) = self.app.binary.byte_selection() {
+                    ui.weak(format!("Cursor 0x{:X} · {} B selected", range.start, range.len()));
+                }
                 if self.app.displayed_decoder == Decoder::Csv {
                     let highlights = self.app.csv_highlights();
                     self.app.binary.hex_with_source_highlights(ui, &highlights);

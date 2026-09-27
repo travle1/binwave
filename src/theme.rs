@@ -245,14 +245,37 @@ pub const DARK: Theme = Theme {
 pub fn dock_style(egui_style: &egui::Style) -> egui_dock::Style {
     let t = &DARK;
     let mut style = egui_dock::Style::from_egui(egui_style);
+    style.dock_area_padding = Some(Margin::same(t.spacing.card_gap as i8));
+    style.main_surface_border_stroke = Stroke::new(t.size.frame_border, t.color.border.card);
+    style.main_surface_border_rounding = CornerRadius::same(t.radius.card);
     style.separator.width = t.spacing.card_gap;
     style.separator.color_idle = t.color.surface.window;
     style.separator.color_hovered = t.color.border.window;
     style.separator.color_dragged = t.color.accent.base;
     style.tab_bar.bg_fill = t.color.surface.card;
-    style.tab_bar.hline_color = t.color.border.card;
+    style.tab_bar.height = t.size.card_header_height;
+    style.tab_bar.inner_margin = Margin::same(((t.size.card_header_height - t.size.tab_height) / 2.) as i8);
+    style.tab_bar.corner_radius = CornerRadius::same(t.radius.card);
+    style.tab_bar.hline_color = t.color.surface.card;
+    style.tab.spacing = t.spacing.tab_gap;
+    for (tab, fill, text) in [
+        (&mut style.tab.active, t.color.surface.active, t.color.text.primary),
+        (&mut style.tab.focused, t.color.surface.active, t.color.text.primary),
+        (&mut style.tab.active_with_kb_focus, t.color.surface.active, t.color.text.primary),
+        (&mut style.tab.focused_with_kb_focus, t.color.surface.active, t.color.text.primary),
+        (&mut style.tab.inactive, t.color.surface.card, t.color.text.muted),
+        (&mut style.tab.inactive_with_kb_focus, t.color.surface.card, t.color.text.muted),
+        (&mut style.tab.hovered, t.color.surface.control, t.color.text.primary),
+    ] {
+        tab.bg_fill = fill;
+        tab.text_color = text;
+        tab.outline_color = Color32::TRANSPARENT;
+        tab.corner_radius = CornerRadius::same(t.radius.control);
+    }
     style.tab.tab_body.bg_fill = t.color.surface.card;
     style.tab.tab_body.stroke = Stroke::new(t.size.frame_border, t.color.border.card);
+    style.tab.tab_body.corner_radius = CornerRadius::same(t.radius.card);
+    style.tab.tab_body.inner_margin = Margin::same(t.spacing.card_padding as i8);
     style
 }
 
