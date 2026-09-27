@@ -820,9 +820,10 @@ A gold underline marks search hits; an orange top edge marks edits.");
         highlights: &[HexHighlight],
         actions: &mut Vec<HexAction>,
     ) {
-        let font = FontId::monospace(13.0);
+        let theme = &crate::theme::DARK;
+        let font = FontId::monospace(theme.font.hex);
         let char_width = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
-        let row_height = 21.0;
+        let row_height = theme.size.hex_row_height;
         let offset_chars = format!("{:X}", source.len()).len().max(8);
         let offset_width = (offset_chars + 2) as f32 * char_width;
         let cell_width = char_width * 3.0;
@@ -1081,14 +1082,18 @@ A gold underline marks search hits; an orange top edge marks edits.");
                             );
                         }
                     }
-                    let (hex, ascii, color) = if let Some((byte, _)) = byte {
+                    let color = if !selected && byte.is_some_and(|(value, _)| value == 0) {
+                        theme.color.text.zero_byte
+                    } else {
+                        style.text
+                    };
+                    let (hex, ascii) = if let Some((byte, _)) = byte {
                         (
                             format!("{byte:02X}"),
                             crate::byte_display::ascii(byte).to_string(),
-                            style.text,
                         )
                     } else {
-                        ("··".into(), "·".into(), style.text)
+                        ("··".into(), "·".into())
                     };
                     painter.text(
                         egui::pos2(hex_rect.left() + char_width * 0.25, text_y),
@@ -1698,7 +1703,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let width = ctx.fonts_mut(|f| f.glyph_width(&FontId::monospace(13.0), '0'));
+        let width = ctx.fonts_mut(|f| f.glyph_width(&FontId::monospace(crate::theme::DARK.font.hex), '0'));
         let at_byte = |index: usize| row + egui::vec2(width * (11.5 + index as f32 * 3.0), 6.5);
         let press = at_byte(3);
         frame(
@@ -1917,7 +1922,7 @@ mod tests {
             .iter()
             .filter_map(|shape| match &shape.shape {
                 egui::Shape::Rect(rect)
-                    if rect.fill == fill && (rect.rect.height() - 21.0).abs() < 0.1 =>
+                    if rect.fill == fill && (rect.rect.height() - crate::theme::DARK.size.hex_row_height).abs() < 0.1 =>
                 {
                     Some(rect.rect)
                 }
@@ -2332,7 +2337,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut editor = HexEditor::default();
         editor.auto_width = false;
-        editor.pending_scroll = Some((WINDOW_ROWS - 100) as f32 * 21.0);
+        editor.pending_scroll = Some((WINDOW_ROWS - 100) as f32 * crate::theme::DARK.size.hex_row_height);
         let frame = |editor: &mut HexEditor| {
             ctx.run(
                 egui::RawInput {

@@ -1909,8 +1909,8 @@ impl BinaryWorkspace {
     fn controls_inner(&mut self, ui: &mut Ui, show_language: bool) {
         let ctx = ui.ctx().clone();
         let enabled = self.commands_available();
-        ui.horizontal_wrapped(|ui| {
-            if show_language {
+        if show_language {
+            ui.horizontal_wrapped(|ui| {
                 ui.add_enabled_ui(enabled, |ui| {
                     let mut language = self.language;
                     for (value, label) in [
@@ -1922,7 +1922,8 @@ impl BinaryWorkspace {
                     }
                     self.switch_language(language);
                 });
-            }
+            });
+        }
             let name = self
                 .yaml_path
                 .as_deref()
@@ -1942,11 +1943,53 @@ impl BinaryWorkspace {
             } else {
                 name
             };
-            let response = ui.strong(title);
-            if let Some(path) = &self.yaml_path {
-                response.on_hover_text(path.display().to_string());
+        if show_language {
+            let response = ui.strong(title.clone());
+            if let Some(path) = &self.yaml_path { response.on_hover_text(path.display().to_string()); }
+        } else {
+            let mut recent = Vec::new();
+            if let Some(path) = &self.yaml_path { recent.push(path.clone()); }
+            for pair in self.file_locations.recent_pairs() {
+                if let Some(path) = pair.decoder {
+                    if !recent.contains(&path) { recent.push(path); }
+                }
             }
-        });
+            let mut choice = None;
+            let mut new = false;
+            let mut open = false;
+            let mut save_as = false;
+            let mut run = false;
+            let mut save = false;
+            let mut stop = false;
+            let can_run = self.can_apply_definition() && enabled;
+            let can_save = self.can_save_definition() && enabled;
+            let busy = self.is_decoding();
+            let reason = self.run_disabled_reason().map(str::to_owned);
+            ui.horizontal_wrapped(|ui| {
+                ui.menu_button(format!("{title} ⌄"), |ui| {
+                    for path in &recent {
+                        let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                        if ui.button(name.as_ref()).on_hover_text(path.display().to_string()).clicked() {
+                            choice = Some(path.clone()); ui.close();
+                        }
+                    }
+                    if !recent.is_empty() { ui.separator(); }
+                    new = ui.button("New decoder").clicked();
+                    open = ui.button("Open decoder…").clicked();
+                    save_as = ui.add_enabled(can_save, egui::Button::new("Save as…")).clicked();
+                });
+                save = ui.add_enabled(can_save, egui::Button::new("Save")).on_hover_text("Save decoder").clicked();
+                run = crate::decoder_ui::run_button(ui, can_run, reason.as_deref()).clicked();
+                if busy { stop = ui.button("Stop").clicked(); }
+            });
+            if let Some(path) = choice { self.load_yaml(path, &ctx); }
+            if new { if self.is_python() { self.new_python(&ctx); } else { self.new_yaml(&ctx); } }
+            if open { self.choose_definition(&ctx); }
+            if save_as { self.save_definition_as(&ctx); }
+            if save { self.save_definition(&ctx); }
+            if run { self.apply_definition(&ctx); }
+            if stop { self.stop_decoding(); }
+        }
         if show_language {
         ui.add_enabled_ui(enabled, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -1984,14 +2027,6 @@ impl BinaryWorkspace {
                 }
             });
         });
-        } else if let Some(command)=crate::app_menu::decoder_controls(
-            ui,
-            self.can_apply_definition() && enabled,
-            self.is_decoding(),
-            self.run_disabled_reason(),
-            self.can_save_definition() && enabled,
-        ) {
-            match command { crate::app_menu::Command::Apply=>self.apply_definition(&ctx),crate::app_menu::Command::SaveDecoder=>self.save_definition(&ctx),crate::app_menu::Command::SaveDecoderAs=>self.save_definition_as(&ctx),crate::app_menu::Command::Cancel=>self.stop_decoding(),_=>{} }
         }
         crate::decoder_ui::status_banner(
             ui,
@@ -2025,17 +2060,6 @@ impl BinaryWorkspace {
             };
             if ui.button(label).clicked() {
                 progress.cancelled.store(true, Ordering::Relaxed);
-            }
-        }
-        if self.error && self.decode_error.is_none() && self.structure_ui.decode_error().is_none() {
-            ui.colored_label(Color32::LIGHT_RED, &self.message);
-        }
-        if !self.is_python()
-            && (self.applied_language != Some(self.language)
-                || self.structure_ui.decode_error().is_none())
-        {
-            if let Some(error) = &self.decode_error {
-                ui.colored_label(Color32::LIGHT_RED, error);
             }
         }
         if !self.structure_ui.has_published_program()
@@ -2443,22 +2467,25 @@ impl BinaryWorkspace {
                     if self.connect {
                         plot_ui.line(
                             Line::new(&fields[self.y], points.clone())
-                                .color(Color32::from_rgb(70, 165, 220))
+                                .color(crate::theme::DARK.color.accent.base)
+                                .width(crate::theme::DARK.size.plot_line_width)
+                                .fill(0.)
+                                .fill_alpha(crate::theme::DARK.color.accent.soft_alpha)
                                 .name(&fields[self.y]),
                         );
                     }
                     plot_ui.points(
                         Points::new(&fields[self.y], points)
-                            .radius(2.5_f32)
-                            .color(Color32::from_rgb(70, 165, 220))
+                            .radius(crate::theme::DARK.size.plot_point_radius)
+                            .color(crate::theme::DARK.color.accent.base)
                             .name(&fields[self.y]),
                     );
                 }
                 if let Some(sample) = selected_sample {
                     plot_ui.points(
                         Points::new("selected sample", vec![sample.point])
-                            .radius(7.0_f32)
-                            .color(Color32::YELLOW)
+                            .radius(crate::theme::DARK.size.plot_selected_radius)
+                            .color(crate::theme::DARK.color.status.warning)
                             .name(format!(
                                 "record {} @ 0x{:X}",
                                 sample.record, sample.byte_offset
@@ -2725,9 +2752,6 @@ impl BinaryWorkspace {
         ui.add_enabled_ui(enabled, |ui| {
             edit = self.authoring.ui(ui, source, range.map(|r| r.start as u64..r.end as u64), preview.as_deref(), size);
         });
-        if let Some(error) = self.decode_error.as_deref().or_else(|| self.structure_ui.decode_error()) {
-            ui.colored_label(ui.visuals().error_fg_color, error);
-        }
         match edit {
             Some(crate::direct_authoring::Edit::Commit(source)) => {
                 self.yaml = source;
@@ -2915,6 +2939,20 @@ impl BinaryWorkspace {
     }
 
     pub fn structures(&mut self, ui: &mut Ui) {
+        if let Some(error) = self.structure_ui.decode_error()
+            .or(self.decode_error.as_deref())
+            .or_else(|| self.error.then_some(self.message.as_str())) {
+            let t = &crate::theme::DARK;
+            egui::Frame::new()
+                .fill(t.color.status.danger.gamma_multiply(t.color.status.warning_soft_alpha))
+                .stroke(egui::Stroke::new(t.size.frame_border, t.color.status.danger))
+                .corner_radius(t.radius.control)
+                .inner_margin(t.spacing.card_padding as i8)
+                .show(ui, |ui| {
+                    ui.colored_label(t.color.status.danger, "Decode issue");
+                    ui.label(error);
+                });
+        }
         self.direct_controls(ui, true);
         if self.structure_ui.has_output() {
             let mut edit = None;

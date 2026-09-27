@@ -1996,6 +1996,20 @@ impl TabViewer for WorkspaceViewer<'_> {
             }
             Pane::Layout => self.app.ui_decoder(ui),
             Pane::Hex => {
+                let t = &crate::theme::DARK;
+                if ui.available_width() >= t.size.inspector_min_host_width {
+                    egui::Panel::right("hex_embedded_inspector")
+                        .resizable(true)
+                        .default_size(t.size.inspector_width)
+                        .frame(egui::Frame::new()
+                            .fill(t.color.surface.raised)
+                            .corner_radius(t.radius.inset))
+                        .show(ui, |ui| {
+                            ui.strong("Inspector");
+                            ui.separator();
+                            egui::ScrollArea::vertical().show(ui, |ui| self.app.ui_inspector(ui));
+                        });
+                }
                 if let Some(range) = self.app.binary.byte_selection() {
                     ui.weak(format!("Cursor 0x{:X} · {} B selected", range.start, range.len()));
                 }
@@ -2007,11 +2021,18 @@ impl TabViewer for WorkspaceViewer<'_> {
                 }
             }
             Pane::Plot => {
-                if self.app.displayed_decoder == Decoder::Csv {
-                    self.app.ui_plot(ui);
-                } else {
-                    self.app.binary.plot(ui);
-                }
+                let t = &crate::theme::DARK;
+                egui::Frame::new()
+                    .fill(t.color.surface.window)
+                    .corner_radius(t.radius.well)
+                    .inner_margin(t.spacing.card_padding as i8)
+                    .show(ui, |ui| {
+                        if self.app.displayed_decoder == Decoder::Csv {
+                            self.app.ui_plot(ui);
+                        } else {
+                            self.app.binary.plot(ui);
+                        }
+                    });
             }
             Pane::Table => {
                 if self.app.displayed_decoder == Decoder::Csv {
@@ -3187,18 +3208,17 @@ mod tests {
                 .collect();
             let (surface, node, _) = app.workspace.dock.find_tab_legacy(&Pane::Hex).unwrap();
             assert!(app.workspace.dock[surface][node].rect().unwrap().width() > 400.);
-            let (surface, node, _) = app.workspace.dock.find_tab_legacy(&Pane::Inspector).unwrap();
-            assert!(app.workspace.dock[surface][node].rect().unwrap().width() > 400.);
+            assert!(app.workspace.dock.find_tab_legacy(&Pane::Inspector).is_none());
             let (surface, node, _) = app.workspace.dock.find_tab_legacy(&Pane::Hex).unwrap();
             let hex_rect = app.workspace.dock[surface][node].rect().unwrap();
             assert!(hex_rect.height() > 250.);
             assert!(app.workspace.dock.find_tab_legacy(&Pane::Layout).is_some());
             let (plot_surface, plot_node, _) = app.workspace.dock.find_tab_legacy(&Pane::Plot).unwrap();
             let plot_rect = app.workspace.dock[plot_surface][plot_node].rect().unwrap();
-            assert!(plot_rect.height() > hex_rect.height());
+            assert!(plot_rect.height() > 200.);
             assert!(plot_rect.bottom() <= hex_rect.top());
             assert!(app.workspace.dock.find_tab_legacy(&Pane::Table).is_none());
-            for pane in [Pane::Hex, Pane::Layout, Pane::Structures, Pane::Inspector] {
+            for pane in [Pane::Hex, Pane::Layout, Pane::Structures, Pane::Plot] {
                 assert!(
                     labels.iter().any(|text| text == pane.title()),
                     "missing {}",
@@ -3262,7 +3282,7 @@ mod tests {
         workspace_frame(&mut app, &ctx);
         assert!(!app.binary.showing_byte_preview());
         assert!(!app.binary.is_decoding());
-        assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_none());
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_some());
         assert!(app.workspace.dock.find_tab_legacy(&Pane::Hex).is_some());
         assert!(app.workspace.dock.find_tab_legacy(&Pane::Layout).is_some());
     }
@@ -3668,7 +3688,7 @@ mod tests {
                 .collect()
         };
         // Raw data starts with bytes and meaning. Source controls are one tab away.
-        workspace_click(&mut app, &ctx, "Definition");
+        workspace_click(&mut app, &ctx, "Decoder");
         let opened_output = workspace_frame(&mut app, &ctx);
         let (surface, node, _) = app.workspace.dock.find_tab_legacy(&Pane::Layout).unwrap();
         let decoder_rect = app.workspace.dock[surface][node].rect().unwrap();
@@ -3680,7 +3700,7 @@ mod tests {
             "the decoder should open directly in its source editor"
         );
         let opened = labels(opened_output);
-        for label in ["Definition", crate::decoder_ui::RUN_LABEL, "YAML"] {
+        for label in ["Decoder", crate::decoder_ui::RUN_LABEL, "YAML"] {
             assert!(opened.iter().any(|text| text == label), "missing {label}");
         }
         assert!(!opened.iter().any(|text| text.contains("All definitions")));
@@ -3711,7 +3731,7 @@ mod tests {
         let (_, samples, _) = app.workspace.dock.find_tab_legacy(&Pane::Table).unwrap();
         assert_ne!(editor, samples);
         workspace_click(&mut app, &ctx, "View");
-        workspace_click(&mut app, &ctx, "Plot");
+        workspace_click(&mut app, &ctx, "Signal");
         assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_some());
         let plotted = labels(workspace_frame(&mut app, &ctx));
         assert!(plotted.iter().any(|text| text.contains("structures:")));
@@ -3744,9 +3764,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        for label in ["Python", crate::decoder_ui::RUN_LABEL, "Console", "decoder.py"] {
+        for label in ["Python", crate::decoder_ui::RUN_LABEL, "Console"] {
             assert!(labels.contains(&label), "missing {label}");
         }
+        assert!(labels.iter().any(|label| label.contains("decoder.py")));
         assert!(!labels.contains(&"Fields") && !labels.contains(&"Steps"));
         assert!(!app.binary.is_decoding());
         assert!(app.binary.showing_byte_preview());
@@ -3765,7 +3786,7 @@ mod tests {
         let (_, table, _) = app.workspace.dock.find_tab_legacy(&Pane::Table).unwrap();
         assert_ne!(editor, table);
         workspace_click(&mut app, &ctx, "View");
-        workspace_click(&mut app, &ctx, "Plot");
+        workspace_click(&mut app, &ctx, "Signal");
         assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_some());
     }
 

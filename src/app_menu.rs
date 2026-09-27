@@ -285,6 +285,7 @@ pub fn native_bar(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)>
     });
     selected
 }
+#[cfg(target_arch = "wasm32")]
 pub fn decoder_controls(
     ui: &mut egui::Ui,
     enabled: bool,
