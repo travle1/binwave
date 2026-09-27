@@ -54,6 +54,11 @@ const table=JSON.parse(session.table(path,String(size/2-2)));
 assert.equal(table.rows.length,2);
 assert.equal(table.rows[1].start,String(size-2));
 assert.equal(table.rows[1].cells.value.number,65535,'Sparse edit appears in decoded values');
+const treePage=JSON.parse(session.tree_page(path,String(size/2-2)));
+assert.equal(treePage.nodes.length,2);
+assert.equal(treePage.nodes[1].start,String(size-2));
+assert.equal(treePage.count,String(size/2));
+assert.equal(treePage.page_size,64);
 const plot=JSON.parse(session.plot(path,String(size/2-2),String(size/2),800));
 assert.deepEqual(plot.series[0].points,[[size/2-2,65020],[size/2-1,65535]]);
 const overview=JSON.parse(session.plot(path,'0',String(size/2),800));
@@ -131,6 +136,9 @@ assert.equal(partialBlocks.nodes[0].count, '2');
 assert.equal(partialBlocks.nodes[0].children[0].path, 'blocks[0]');
 assert.equal(partialBlocks.nodes[0].children[0].children[0].count, '129');
 assert.equal(partialBlocks.nodes[0].children[0].children[0].children[0].value, '1');
+const nestedTreePage=JSON.parse(partialSession.tree_page('blocks[0].samples','0'));
+assert.equal(nestedTreePage.count,'129');
+assert.equal(nestedTreePage.nodes[0].value,'1');
 partialSession.free();
 
 // The shipped beginner pair must produce the documented plot and byte links.

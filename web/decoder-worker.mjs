@@ -42,6 +42,8 @@ self.onmessage = async ({data: m}) => {
             self.postMessage({type:'encoded', request:m.request, result:JSON.parse(session.encode(m.start, m.end, m.value))});
         } else if (m.type === 'table') {
             self.postMessage({type:'table', result:JSON.parse(session.table(m.path, m.start))});
+        } else if (m.type === 'tree_page') {
+            self.postMessage({type:'tree_page', result:JSON.parse(session.tree_page(m.path, m.start))});
         } else if (m.type === 'plot') {
             self.postMessage({type:'plot', request:m.request, reset:m.reset, result:JSON.parse(m.paths ? session.plot_many(JSON.stringify(m.paths), m.start, m.end, m.width) : session.plot(m.path, m.start, m.end, m.width))});
         } else throw Error('Unknown decoding request');

@@ -12,6 +12,8 @@ mod binary;
 mod binary_ui;
 #[cfg(target_arch = "wasm32")]
 mod browser;
+#[cfg(target_arch = "wasm32")]
+mod browser_tree;
 #[cfg(any(test, target_arch = "wasm32"))]
 mod browser_viewport;
 #[cfg(target_arch = "wasm32")]
@@ -52,6 +54,7 @@ mod plot_raster;
 #[cfg(not(target_arch = "wasm32"))]
 mod plot_gpu;
 mod plot_presentation;
+mod plot_series;
 #[cfg(not(target_arch = "wasm32"))]
 mod plotting;
 #[cfg(not(target_arch = "wasm32"))]

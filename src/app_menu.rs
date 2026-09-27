@@ -36,6 +36,7 @@ pub enum Command {
     Plot,
     Samples,
     Inspector,
+    TogglePane,
     Reset,
     PlotWorkspace,
     Auto,
@@ -82,6 +83,8 @@ pub struct Item {
     pub command: Option<Command>,
     pub argument: usize,
     pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked: Option<bool>,
     pub children: Vec<Item>,
 }
 impl Item {
@@ -91,6 +94,7 @@ impl Item {
             command: Some(command),
             argument: 0,
             enabled,
+            checked: None,
             children: vec![],
         }
     }
@@ -100,6 +104,7 @@ impl Item {
             command: None,
             argument: 0,
             enabled: true,
+            checked: None,
             children,
         }
     }

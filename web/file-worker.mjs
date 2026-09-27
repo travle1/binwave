@@ -55,7 +55,7 @@ self.onmessage = async ({data: m}) => {
             self.postMessage({type: 'opened', ...metadata(), demo:m.demo === true});
         } else {
             if (!source) throw Error('Open a file first');
-            if (['decode', 'decode_python', 'table', 'plot', 'probe', 'pick', 'inspect', 'encode'].includes(m.type)) {
+            if (['decode', 'decode_python', 'table', 'tree_page', 'plot', 'probe', 'pick', 'inspect', 'encode'].includes(m.type)) {
                 await decoding(m);
             } else if (m.type === 'read') {
                 if (m.length > PAGE_SIZE) throw Error('Preview exceeds 64 KiB');

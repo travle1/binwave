@@ -48,6 +48,25 @@ fn find<'a>(nodes: &'a [Node], path: &str) -> Option<&'a Node> {
     }
     None
 }
+fn resolve_tree_node(nodes: &[Node], path: &str, source: &ByteView) -> Result<Option<Node>> {
+    for node in nodes {
+        if node.path == path { return Ok(Some(node.clone())); }
+        if let Some(found) = resolve_tree_node(&node.children, path, source)? { return Ok(Some(found)); }
+        if let Some(array) = &node.lazy {
+            if let Some(remainder) = path.strip_prefix(&node.path).and_then(|rest| rest.strip_prefix('[')) {
+                if let Some((index, _)) = remainder.split_once(']') {
+                    if let Ok(index) = index.parse::<u64>() {
+                        if index < array.count {
+                            let item = page(node, source, index, 1)?;
+                            if let Some(found) = resolve_tree_node(&item, path, source)? { return Ok(Some(found)); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
 fn collections(nodes: &[Node], result: &mut Vec<Value>) {
     for node in nodes {
         if let Some(array) = &node.lazy {
@@ -237,6 +256,23 @@ impl DecoderSession {
                 json!({"index":(start+i as u64).to_string(),"start":node.range.start.to_string(),
                     "end":node.range.end.to_string(),"cells":fields})
             }).collect::<Vec<_>>()}))
+        })().map_err(js_error)
+    }
+    pub fn tree_page(&self, path: &str, start: &str) -> Result<String, JsValue> {
+        (|| -> Result<String> {
+            let output = self.output.as_ref().context("Apply a decoder first")?;
+            let node = resolve_tree_node(&output.nodes, path, &self.source)?
+                .context("Structure node not found")?;
+            let start = start.parse::<u64>()?;
+            let count = node.lazy.as_ref().map(|array| array.count)
+                .unwrap_or(node.children.len() as u64);
+            ensure!(start < count, "Structure index outside collection");
+            let page_size = node.lazy.as_ref().map(|array| {
+                if array.stride == 0 { 16 } else { (1024 * 1024 / array.stride).clamp(1, 64) }
+            }).unwrap_or(64);
+            let nodes = page(&node, &self.source, start, page_size)?;
+            json_result(json!({"path":path,"start":start.to_string(),"count":count.to_string(),"page_size":page_size,
+                "nodes":nodes.iter().map(describe).collect::<Vec<_>>() }))
         })().map_err(js_error)
     }
     pub fn plot_many(&self, paths: &str, first: &str, last: &str, width: u32) -> Result<String, JsValue> {

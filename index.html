@@ -3,58 +3,29 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Binwave — Browser Preview</title>
+  <title>BinWave</title>
   <base data-trunk-public-url>
   <link data-trunk rel="rust" data-bin="binwave">
   <link data-trunk rel="copy-dir" href="web">
   <link data-trunk rel="copy-dir" href="node_modules/pyodide" data-target-path="pyodide">
   <link data-trunk rel="copy-dir" href="samples/decoders/yaml" data-target-path="decoders">
   <link data-trunk rel="copy-dir" href="samples/quickstart" data-target-path="examples">
-  <style>
-    html, body { margin: 0; height: 100%; overflow: hidden; background: #202020; color: #eee; font: 14px system-ui; }
-    body { display: flex; flex-direction: column; height: 100dvh; }
-    header { flex-shrink: 0; position: relative; z-index: 10; padding: 6px 12px; border-bottom: 1px solid #3b3b3b; }
-    .menu-row { display:flex; align-items:center; min-height:32px; gap:14px; }
-    .brand { font-weight:600; font-size:16px; }
-    #app-menus { display:flex; gap:4px; }
-    #app-version { margin-left:auto; color:#999; font-size:12px; white-space:nowrap; }
-    button, summary { -webkit-appearance:none; appearance:none; font:inherit; color:#eee; }
-    button { background:#292929; border:1px solid #484848; border-radius:3px; padding:6px 10px; }
-    button:disabled { color:#777; }
-    button:focus-visible, summary:focus-visible { outline:2px solid #61cbd6; outline-offset:-2px; }
-    summary { cursor:pointer; list-style:none; padding:7px 10px; border-radius:3px; white-space:nowrap; }
-    summary::-webkit-details-marker { display:none; }
-    summary:hover, details[open]>summary, .menu-items button:hover:not(:disabled) { background:#383838; }
-    .app-menu { position:relative; }
-    .menu-items { display:grid; gap:2px; padding:5px; background:#242424; border:1px solid #484848; border-radius:4px; }
-    .app-menu>.menu-items { position:absolute; left:0; top:calc(100% + 4px); min-width:220px; max-height:70dvh; overflow:auto; box-shadow:0 5px 16px #0006; }
-    details:not([open])>.menu-items { display:none; }
-    .menu-items button { border:0; border-radius:2px; text-align:left; background:transparent; min-height:30px; white-space:normal; }
-    .submenu>summary:after { content:' +'; color:#999; }
-    .submenu[open]>summary:after { content:' -'; }
-    .submenu>.menu-items { border:0; border-left:1px solid #484848; margin-left:10px; }
-    #file-context { font-size:12px; color:#aaa; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
-    #file-context:empty { display:none; }
-    #status { margin:0; padding:3px 12px; color:#aaa; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:12px; }
-    #workspace { position:relative; flex:1; min-height:0; width:100%; }
-    @media (max-width: 899px) {
-      header { padding:4px max(8px, env(safe-area-inset-right)) 4px max(8px, env(safe-area-inset-left)); }
-      .brand { display:none; }
-      #app-menus { flex:1; justify-content:space-between; }
-      #app-version { margin-left:0; }
-      summary, .menu-items button { min-height:40px; box-sizing:border-box; display:flex; align-items:center; }
-      .app-menu>.menu-items { position:fixed; left:8px; right:8px; top:50px; width:auto; min-width:0; }
-      #workspace { padding-bottom:env(safe-area-inset-bottom); box-sizing:border-box; }
-    }
-    #binwave:not([hidden]) { display: block; }
-    #graphics-error { max-width: 680px; margin: 48px auto; padding: 24px; background: #292929; border-radius: 8px; }
-    #graphics-error pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #bbb; }
-  </style>
+  <link rel="stylesheet" href="web/theme.css">
 </head>
 <body>
+  <aside id="sidebar" aria-label="Main navigation">
+    <div class="sidebar-head"><span class="brand-mark" aria-hidden="true">~</span><strong>BinWave</strong><button id="collapse-sidebar" class="icon-button" title="Collapse sidebar (Ctrl+B)" aria-label="Collapse sidebar">◧</button></div>
+    <button id="sidebar-open" class="sidebar-action"><span aria-hidden="true">▣</span>Open file<span class="shortcut">Ctrl O</span></button>
+    <button id="sidebar-search" class="sidebar-action"><span aria-hidden="true">⌕</span>Search<span class="shortcut">Ctrl K</span></button>
+    <button id="sidebar-library" class="sidebar-action"><span aria-hidden="true">◇</span>Decoder library</button>
+    <div id="recent-heading" class="sidebar-heading" hidden>Today</div>
+    <div id="recent-files" class="recent-files"></div>
+    <div class="sidebar-spacer"></div>
+    <div class="sidebar-user"><span class="avatar">T</span><span>BinWave</span><span id="app-version" aria-label="Application version"></span></div>
+  </aside>
+  <div id="app-content">
   <header aria-label="Application commands">
-    <div class="menu-row"><span class="brand">Binwave</span><nav id="app-menus" aria-label="Main menu"></nav><span id="app-version" aria-label="Application version"></span></div>
-    <div id="file-context"></div>
+    <div class="menu-row"><button id="expand-sidebar" class="icon-button" title="Show sidebar (Ctrl+B)" aria-label="Show sidebar" hidden>◧</button><button id="header-open" class="icon-button" title="Open file (Ctrl+O)" aria-label="Open file" hidden>▣</button><div id="file-heading"><button id="file-title" type="button" title="Open file">No file open <span class="chevron" aria-hidden="true">⌄</span></button><span id="file-context"></span></div><span id="decode-badge" hidden></span><div class="header-spacer"></div><button id="header-export" disabled>↧&nbsp; Export</button><nav id="app-menus" aria-label="More commands"></nav></div>
   </header>
   <div hidden aria-hidden="true">
     <button id="open" disabled>Open file...</button><input type="file" id="file">
@@ -73,8 +44,12 @@
       <details><summary>Technical details</summary><pre id="graphics-detail"></pre></details>
     </section>
   </main>
-  <p id="status" role="status">Starting Binwave...</p>
+  <p id="status" role="status" class="sr-only">Starting BinWave...</p>
+  </div>
+  <dialog id="search-dialog" aria-label="Search commands"><div class="dialog-header"><strong>Search commands</strong><button id="search-close" aria-label="Close search">×</button></div><input id="search-input" type="search" placeholder="Search commands and panels…" autocomplete="off"><div id="search-results"></div></dialog>
+  <dialog id="decoder-library" aria-label="Decoder library"><div class="dialog-header"><strong>Decoder library</strong><button id="library-close" aria-label="Close library">×</button></div><div class="library-toolbar"><input id="library-search" type="search" placeholder="Search decoders" autocomplete="off"><button id="library-import">Import…</button><button id="library-new">+ New decoder</button></div><div class="library-layout"><div id="library-items" role="listbox" aria-label="Bundled decoders"></div><div class="library-details"><h2 id="library-name">Choose a decoder</h2><p id="library-description">Select an example to preview its YAML, then open it in the workspace.</p><button id="library-open" disabled>Open in workspace</button><pre id="library-preview"></pre></div></div></dialog>
   <script src="web/menu.js"></script>
   <script src="web/bridge.js"></script>
+  <script src="web/shell.js"></script>
 </body>
 </html>

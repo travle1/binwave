@@ -507,7 +507,7 @@ fn verify_generated_waveform_plot_ranges() {
                 assert_eq!(point.value, expected, "sample {}, {name}", point.index);
                 let offset = node.range.start + point.index * STRIDE as usize + offsets[*name];
                 assert_eq!(point.bytes, offset..offset + *width as usize);
-                assert_eq!(point.path, format!("{}[{}].{name}", node.path, point.index));
+                assert_eq!(point.path.to_string(), format!("{}[{}].{name}", node.path, point.index));
                 checked += 1;
             }
         }

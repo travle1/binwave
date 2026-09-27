@@ -98,6 +98,7 @@ pub struct BrowserApp {
     undo: bool,
     redo: bool,
     language: crate::source_editor::DecoderLanguage,
+    decoder_name: String,
     other_draft: String,
     applied_language: crate::source_editor::DecoderLanguage,
     yaml: String,
@@ -109,18 +110,33 @@ pub struct BrowserApp {
     decoder_error: Option<String>,
     editor: crate::source_editor::YamlLayoutCache,
     decoded: serde_json::Value,
+    tree_pages: std::collections::HashMap<String, serde_json::Value>,
+    tree_expanded: std::collections::HashSet<String>,
+    tree_selected: Option<String>,
+    tree_page_path: Option<String>,
+    tree_page_index: String,
     table: serde_json::Value,
     plot: serde_json::Value,
     collection: String,
     plot_sources: std::collections::BTreeSet<String>,
     plot_sources_initialized: bool,
     table_start: u64,
+    table_jump: String,
     first: String,
     last: String,
     pending: std::collections::VecDeque<serde_json::Value>,
     hidden: std::collections::BTreeSet<String>,
     presentation: crate::plot_presentation::Presentation,
-    plot_jump: u64,
+    plot_sidebar_open: bool,
+    plot_sidebar_series: bool,
+    plot_filter: String,
+    plot_axis_series: Option<String>,
+    plot_axis_group: Option<String>,
+    plot_groups_expanded: std::collections::HashSet<String>,
+    plot_groups_collapsed: std::collections::HashSet<String>,
+    plot_axis_panning: bool,
+    plot_jump: String,
+    plot_jump_open: bool,
     fit_plot_y: bool,
     decoding: bool,
     reveal_results: bool,
@@ -136,6 +152,7 @@ pub struct BrowserApp {
 }
 impl BrowserApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        crate::theme::install(&cc.egui_ctx);
         browser_ready();
         let saved_yaml = cc.storage.and_then(|s| s.get_string("browser-decoder-yaml"))
             .filter(|s| s.len() <= 256 * 1024)
@@ -198,6 +215,7 @@ impl BrowserApp {
             undo: false,
             redo: false,
             language,
+            decoder_name: "decoder.yaml".into(),
             other_draft,
             applied_language: crate::source_editor::DecoderLanguage::Yaml,
             yaml: active_draft,
@@ -209,18 +227,33 @@ impl BrowserApp {
             decoder_error: None,
             editor,
             decoded: Default::default(),
+            tree_pages: Default::default(),
+            tree_expanded: Default::default(),
+            tree_selected: None,
+            tree_page_path: None,
+            tree_page_index: "0".into(),
             table: Default::default(),
             plot: Default::default(),
             collection: String::new(),
             plot_sources: Default::default(),
             plot_sources_initialized: false,
             table_start: 0,
+            table_jump: "0".into(),
             first: "0".into(),
             last: "0".into(),
             pending: Default::default(),
             hidden: Default::default(),
             presentation: Default::default(),
-            plot_jump: 0,
+            plot_sidebar_open: true,
+            plot_sidebar_series: true,
+            plot_filter: String::new(),
+            plot_axis_series: None,
+            plot_axis_group: None,
+            plot_groups_expanded: Default::default(),
+            plot_groups_collapsed: Default::default(),
+            plot_axis_panning: false,
+            plot_jump: "0".into(),
+            plot_jump_open: false,
             fit_plot_y: false,
             decoding: false,
             reveal_results: false,
@@ -292,6 +325,7 @@ impl BrowserApp {
                                 .into();
                         if event.demo {
                             self.switch_language(crate::source_editor::DecoderLanguage::Yaml);
+                            self.decoder_name = format!("{}.yaml", self.name.trim_end_matches(".bin"));
                             self.yaml = if self.name == crate::demos::Demo::Advanced.name() {
                                 crate::demos::Demo::Advanced.yaml()
                             } else { crate::demos::Demo::Simple.yaml() }.into();
@@ -326,6 +360,7 @@ impl BrowserApp {
                 "menu" => if let Some(command)=event.command { self.menu_action(command,event.argument); },
                 "decoder-source" => {
                     if event.source.len() <= 256 * 1024 {
+                        self.decoder_name = event.name.clone();
                         self.switch_language(if event.name.to_ascii_lowercase().ends_with(".py") {
                             crate::source_editor::DecoderLanguage::Python
                         } else { crate::source_editor::DecoderLanguage::Yaml });
@@ -490,6 +525,11 @@ impl BrowserApp {
                         self.table = event.result;
                     }
                 }
+                "tree_page" => {
+                    if let Some(path) = event.result["path"].as_str() {
+                        self.tree_pages.insert(path.to_owned(), event.result);
+                    }
+                }
                 "plot" => {
                     if event.request == self.plot_request.to_string() {
                         self.reset_plot = event.reset;
@@ -540,7 +580,20 @@ impl BrowserApp {
             ui.small("512 synthetic samples · 2 KB");
             return;
         }
-        self.direct_controls(ui, Pane::Hex);
+        let embedded_inspector = !self.stacked && ui.available_width() >= crate::theme::DARK.size.inspector_min_host_width;
+        if embedded_inspector {
+            egui::Panel::right("browser_hex_inspector")
+                .default_size(crate::theme::DARK.size.inspector_width)
+                .min_size(220.)
+                .max_size(360.)
+                .resizable(true)
+                .show(ui, |ui| {
+                    ui.strong("Inspector");
+                    self.direct_controls(ui, Pane::Hex);
+                    egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui));
+                });
+        }
+        if !embedded_inspector { self.direct_controls(ui, Pane::Hex); }
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(self.offset > 0, egui::Button::new("Previous page"))
@@ -876,21 +929,28 @@ impl BrowserApp {
                 }
             });
         }
-        ui.separator();
-        ui.label("Extraction range (start inclusive, end exclusive):");
-        ui.text_edit_singleline(&mut self.range_start);
-        ui.text_edit_singleline(&mut self.range_end);
-        if ui.button("Set extraction range").clicked() {
-            match (parse_offset(&self.range_start), parse_offset(&self.range_end)) {
-                (Some(start), Some(end)) if start <= end && end <= self.size => {
-                    self.selection_anchor = Some(start);
-                    self.set_hex_range(start, end);
-                    self.status = format!("Extraction range {start}..{end} set. Use Extract selection above.");
+        egui::CollapsingHeader::new("Extraction range")
+            .default_open(false).show(ui, |ui| {
+                ui.weak("Start inclusive · end exclusive");
+                ui.horizontal(|ui| {
+                    ui.label("Start");
+                    ui.add(egui::TextEdit::singleline(&mut self.range_start).desired_width(100.));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("End");
+                    ui.add(egui::TextEdit::singleline(&mut self.range_end).desired_width(100.));
+                });
+                if ui.button("Set range").clicked() {
+                    match (parse_offset(&self.range_start), parse_offset(&self.range_end)) {
+                        (Some(start), Some(end)) if start <= end && end <= self.size => {
+                            self.selection_anchor = Some(start);
+                            self.set_hex_range(start, end);
+                            self.status = format!("Extraction range {start}..{end} set. Use Extract selection above.");
+                        }
+                        _ => self.status = "Extraction range must be inside the file.".into(),
+                    }
                 }
-                _ => self.status = "Extraction range must be inside the file.".into(),
-            }
-        }
-        ui.label("Edits are sparse: up to 65,536 byte positions and 4,096 undo steps. Unsaved edits are lost on reload.");
+            });
     }
     fn decoder_empty(&self) -> bool {
         match self.language {
@@ -902,6 +962,8 @@ impl BrowserApp {
         if self.language == language { return; }
         std::mem::swap(&mut self.yaml, &mut self.other_draft);
         self.language = language;
+        let stem = self.decoder_name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or("decoder");
+        self.decoder_name = format!("{stem}.{}", if language == crate::source_editor::DecoderLanguage::Python { "py" } else { "yaml" });
         self.editor = Default::default();
         self.sent_yaml = None;
         self.reset_decoder();
@@ -935,8 +997,13 @@ impl BrowserApp {
         self.probe_request = self.probe_request.wrapping_add(1);
         self.decoder_error = None;
         self.decoded = Default::default();
+        self.tree_pages.clear();
+        self.tree_expanded.clear();
+        self.tree_selected = None;
+        self.tree_page_path = None;
         self.table = Default::default();
         self.plot = Default::default();
+        self.plot_visible = None;
         self.pending.clear();
         self.collection.clear();
         self.plot_sources.clear();
@@ -1071,14 +1138,25 @@ impl BrowserApp {
     }
     fn menu_action(&mut self, command: crate::app_menu::Command, argument: usize) {
         use crate::app_menu::Command::*;
+        if command == TogglePane {
+            if let Some(&pane) = Pane::PANELS.get(argument) {
+                if let Some(path) = self.layout.dock.find_tab(&pane) {
+                    self.layout.dock.remove_tab(path);
+                } else {
+                    self.layout.reveal(pane);
+                    self.mobile_target = Some(pane);
+                }
+            }
+            return;
+        }
         if let Some(pane)=command.pane() { self.layout.reveal(pane); self.mobile_target=Some(pane); return; }
         if let Some(action)=command.editor_action() { self.editor.command(action); self.layout.reveal(Pane::Layout); self.mobile_target=Some(Pane::Layout); return; }
         match command {
             SimpleDemo=>self.open_simple_demo(),
             AdvancedDemo=>self.open_demo(crate::demos::Demo::Advanced),
             SaveDecoder | SaveDecoderAs=>save_decoder(&self.yaml, if self.language == crate::source_editor::DecoderLanguage::Python { "python" } else { "yaml" }),
-            NewDecoder=>{self.switch_language(crate::source_editor::DecoderLanguage::Yaml);self.yaml="endian: little\nactions: []\n".into();self.reset_decoder();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
-            Python=>{self.switch_language(crate::source_editor::DecoderLanguage::Python);self.yaml=crate::source_editor::DecoderLanguage::Python.starter().into();self.reset_decoder();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
+            NewDecoder=>{self.switch_language(crate::source_editor::DecoderLanguage::Yaml);self.decoder_name="decoder.yaml".into();self.yaml="endian: little\nactions: []\n".into();self.reset_decoder();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
+            Python=>{self.switch_language(crate::source_editor::DecoderLanguage::Python);self.decoder_name="decoder.py".into();self.yaml=crate::source_editor::DecoderLanguage::Python.starter().into();self.reset_decoder();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
             PythonExample=>{self.switch_language(crate::source_editor::DecoderLanguage::Python);self.yaml=crate::source_editor::DecoderLanguage::Python.byte_preview().into();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
             Apply=>self.apply_decoder(),
             Example=>if let Some((_,yaml))=crate::source_editor::YAML_EXAMPLES.get(argument) {self.switch_language(crate::source_editor::DecoderLanguage::Yaml);self.yaml=(*yaml).into();self.layout.reveal(Pane::Layout);self.mobile_target=Some(Pane::Layout);},
@@ -1106,88 +1184,57 @@ impl BrowserApp {
         open_embedded_demo(demo.bytes(), self.language != crate::source_editor::DecoderLanguage::Yaml || self.yaml != demo.yaml(), demo.name());
     }
     fn decoder(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let mut language = self.language;
-            ui.selectable_value(&mut language, crate::source_editor::DecoderLanguage::Yaml, "YAML");
-            ui.selectable_value(&mut language, crate::source_editor::DecoderLanguage::Python, "Python");
-            self.switch_language(language);
-        });
         let disabled_reason = if self.decoding {
             Some("A decoder is already running. Stop it before starting another run.")
         } else if self.name.is_empty() {
             Some("Open a data file first. The decoder runs against the open file.")
         } else if self.decoder_empty() {
             Some("Enter decoder source or open a decoder file first.")
-        } else {
-            None
-        };
-        let can_run = disabled_reason.is_none();
-        if let Some(command)=crate::app_menu::decoder_controls(
-            ui, can_run, self.decoding, disabled_reason, !self.yaml.trim().is_empty()) {
-            self.menu_action(command,0);
-        }
+        } else { None };
+        let mut run = false;
+        let mut save = false;
+        let mut stop = false;
+        ui.horizontal(|ui| {
+            ui.strong(&self.decoder_name).on_hover_text("Current decoder source");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                run = crate::decoder_ui::run_button(ui, disabled_reason.is_none(), disabled_reason).clicked();
+                save = ui.add_enabled(!self.yaml.trim().is_empty(), egui::Button::new("Save"))
+                    .on_hover_text("Download this decoder source").clicked();
+                if self.decoding { stop = ui.button("Stop").clicked(); }
+            });
+        });
+        if run { self.apply_decoder(); }
+        if save { save_decoder(&self.yaml, if self.language == crate::source_editor::DecoderLanguage::Python { "python" } else { "yaml" }); }
+        if stop { self.menu_action(crate::app_menu::Command::Cancel, 0); }
+        ui.horizontal(|ui| {
+            let mut language = self.language;
+            ui.selectable_value(&mut language, crate::source_editor::DecoderLanguage::Yaml, "YAML");
+            ui.selectable_value(&mut language, crate::source_editor::DecoderLanguage::Python, "Python");
+            self.switch_language(language);
+        });
         if self.size == 0 {
-            if ui.button("Open simple demo").clicked() {
-                self.open_simple_demo();
-            }
-            ui.label("512 samples · 2 KB · opens and plots automatically");
+            if ui.button("Open simple demo").clicked() { self.open_simple_demo(); }
+            ui.weak("512 synthetic samples · 2 KB");
         }
         let current = !self.decoded.is_null()
             && self.yaml == self.applied_yaml
             && self.language == self.applied_language;
-        let (headline, detail, tone) = if self.decoder_error.is_some() {
-            if self.decoded["partial"].as_bool() == Some(true) {
-                ("Run stopped", "Decoded structure now shows the completed prefix from this run. Compare its last values with the Console and Hex offset.", crate::decoder_ui::StatusTone::Error)
-            } else {
-                ("Run failed", "Use the Console below to inspect the error and jump to its source line.", crate::decoder_ui::StatusTone::Error)
-            }
+        let (headline, detail, color) = if self.decoder_error.is_some() {
+            ("Run stopped · see Console", self.decoder_error.as_deref().unwrap_or(""), crate::theme::DARK.color.status.danger)
         } else if self.decoding {
-            ("Running decoder…", "The last successful results remain visible while this run completes.", crate::decoder_ui::StatusTone::Ready)
-        } else if self.name.is_empty() {
-            ("Open a data file", "Step 1: open a local file. Step 2: edit the decoder. Step 3: press ▶ Run (F5).", crate::decoder_ui::StatusTone::Neutral)
-        } else if self.decoder_empty() {
-            ("Add decoder source", "Start from the runnable example or open a decoder, then press ▶ Run (F5).", crate::decoder_ui::StatusTone::Neutral)
+            ("Running decoder…", "The last results remain visible.", crate::theme::DARK.color.accent.base)
         } else if current {
-            ("Results are current", "Decoded structure, Plot, Samples, Inspector, and Hex now use this run.", crate::decoder_ui::StatusTone::Success)
+            ("Results are current", "Structure, Signal, Samples, Inspector and Hex use this run.", crate::theme::DARK.color.status.success)
+        } else if self.name.is_empty() {
+            ("Open a data file to run this decoder", "Use Open file in the sidebar.", crate::theme::DARK.color.text.muted)
         } else {
-            ("Ready to run", "Press ▶ Run (F5) to update Decoded structure, Plot, Samples, Inspector, and Hex.", crate::decoder_ui::StatusTone::Ready)
+            ("Ready to run", "Press Run (F5) to update the workspace.", crate::theme::DARK.color.text.muted)
         };
-        crate::decoder_ui::status_banner(ui, headline, detail, tone, self.decoding);
-        if !self.decoded.is_null() && (self.yaml != self.applied_yaml || self.language != self.applied_language) {
-            ui.colored_label(ui.visuals().warn_fg_color, "Previous results remain visible. Press ▶ Run (F5) to test these edits.");
-        }
+        ui.colored_label(color, headline).on_hover_text(detail);
         if self.language == crate::source_editor::DecoderLanguage::Python {
-            ui.weak("Python runs locally in this browser. Scripts are not sandboxed from the network.");
+            ui.weak("Python runs locally in this browser. Scripts can access the network.");
         }
-        let stdout = if self.language == crate::source_editor::DecoderLanguage::Python {
-            self.python_stdout.as_str()
-        } else {
-            ""
-        };
-        let action = crate::decoder_ui::source_console(
-            ui,
-            stdout,
-            self.decoder_error.as_deref(),
-            self.decoding,
-            |ui| self.editor.editor(ui, &mut self.yaml, self.language),
-        );
-        if action.copy {
-            let mut text = stdout.to_owned();
-            if let Some(error) = &self.decoder_error {
-                if !text.is_empty() { text.push('\n'); }
-                text.push_str(error);
-            }
-            copy_text(&text);
-        }
-        if let Some(line) = action.line { self.editor.go_to_line(line); }
-        if let Some(byte) = action.byte {
-            if self.size > 0 {
-                let start = byte.min(self.size - 1);
-                self.select_range(start, (start + 1).min(self.size));
-                self.layout.reveal(Pane::Hex);
-                self.mobile_target = Some(Pane::Hex);
-            }
-        }
+        self.editor.editor(ui, &mut self.yaml, self.language);
         source_editor_focus(self.editor.focused());
     }
     fn collection_picker(&mut self, ui: &mut egui::Ui) {
@@ -1234,12 +1281,14 @@ impl BrowserApp {
                 self.table_start += 128;
                 self.request_table();
             }
-            let max = self.count().saturating_sub(1);
-            let changed = ui
-                .add(egui::DragValue::new(&mut self.table_start).range(0..=max))
-                .changed();
-            if changed {
-                self.request_table();
+            ui.label("Go to sample");
+            let enter = ui.add_sized([86., 24.], egui::TextEdit::singleline(&mut self.table_jump)).lost_focus()
+                && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if ui.button("Go").clicked() || enter {
+                if let Some(index) = parse_offset(&self.table_jump).filter(|index| *index < self.count()) {
+                    self.table_start = index;
+                    self.request_table();
+                } else { self.status = "Enter a sample index inside this collection.".into(); }
             }
         });
         let mut selection = None;
@@ -1285,80 +1334,196 @@ impl BrowserApp {
         }
     }
     fn structures(&mut self, ui: &mut egui::Ui) {
-        self.direct_controls(ui, Pane::Structures);
-        ui.weak("Expand an item to inspect its fields. Click a row to highlight its bytes in Hex; hover a number for decimal, hex, and binary.");
+        ui.horizontal(|ui| {
+            ui.weak("Decoded structure");
+            ui.small_button("i").on_hover_text("Expand an item to inspect its fields. Click a row to highlight its bytes in Hex. Hover a number for decimal, hex, and binary.");
+        });
         if self.decoded["partial"].as_bool() == Some(true) {
-            ui.colored_label(ui.visuals().error_fg_color, format!("Partial decode through byte {} · values below are from the failed run", self.decoded["consumed"].as_str().unwrap_or("0")));
-        }
-        fn tree(ui: &mut egui::Ui, node: &serde_json::Value, selection: &mut Option<(u64, u64)>, authoring: &mut crate::direct_authoring::DirectAuthoring, source: &str, editable: bool, edit: &mut Option<crate::direct_authoring::Edit>, preview_path: Option<&str>) {
-            let range = node["start"].as_str().and_then(parse_offset).zip(node["end"].as_str().and_then(parse_offset));
-            ui.push_id(node["path"].as_str().unwrap_or(""), |ui| {
-                ui.horizontal(|ui| {
-                    if let Some((start, end)) = range {
-                        let name = node["name"].as_str().unwrap_or("");
-                        let label = node["label"].as_str().unwrap_or(name);
-                        let (response, change) = if editable && node["path"].as_str() == Some(name) { authoring.name_ui(ui, source, name, start..end) } else { (ui.selectable_label(false, label), None) };
-                        let tooltip = node["numeric_tooltip"].as_str().map(str::to_owned).unwrap_or_else(|| format!("{} · bytes {}..{}", node["kind"].as_str().unwrap_or(""), start, end));
-                        let response = response.on_hover_text(tooltip);
-                        if response.clicked() { *selection = Some((start,end)); }
-                        if change.is_some() { *edit = change; }
-                    }
-                    if ui.selectable_label(false, format!("· {}", node["summary"].as_str().unwrap_or("")))
-                        .on_hover_text(node["numeric_tooltip"].as_str().unwrap_or_else(|| node["kind"].as_str().unwrap_or("")))
-                        .clicked() { *selection = range; }
-                });
-            });
-            if node["children"].as_array().is_some_and(|c| c.is_empty()) && node["count"].is_null() { return; }
-            let label = "Contents";
-            let path = node["path"].as_str().unwrap_or("");
-            egui::CollapsingHeader::new(label)
-                .default_open(authoring.editing(node["name"].as_str().unwrap_or("")) || preview_path.is_some_and(|preview| preview == path || preview.starts_with(&format!("{path}.")) || preview.starts_with(&format!("{path}[")) || path.starts_with(&format!("{preview}[0]"))))
-                .id_salt(path)
+            egui::Frame::group(ui.style()).fill(crate::theme::DARK.color.surface.raised)
                 .show(ui, |ui| {
-                    if let Some(message) = node["preview_error"].as_str() {
-                        ui.colored_label(ui.visuals().error_fg_color, message);
-                    }
-                    if ui
-                        .button(format!(
-                            "Bytes {}..{}",
-                            node["start"].as_str().unwrap_or(""),
-                            node["end"].as_str().unwrap_or("")
-                        ))
-                        .clicked()
-                    {
-                        *selection = node["start"]
-                            .as_str()
-                            .and_then(parse_offset)
-                            .zip(node["end"].as_str().and_then(parse_offset));
-                    }
-                    if let Some(count) = node["count"].as_str() {
-                        ui.label(format!(
-                            "{count} records · select collection in Samples or Plot"
-                        ));
-                    }
-                    if let Some(children) = node["children"].as_array() {
-                        for child in children {
-                            tree(ui, child, selection, authoring, source, editable, edit, preview_path);
-                        }
-                    }
+                    ui.colored_label(crate::theme::DARK.color.status.warning, "Partial decode");
+                    ui.label(self.decoder_error.as_deref().unwrap_or("The decoder stopped before the end of the file."));
                 });
         }
-        let mut selection = None;
-        let mut edit = None;
-        egui::ScrollArea::both().show(ui, |ui| {
-            if let Some(nodes) = self.decoded["nodes"].as_array() {
-                for node in nodes {
-                    tree(ui, node, &mut selection, &mut self.authoring, &self.yaml, self.language == crate::source_editor::DecoderLanguage::Yaml, &mut edit, self.decoded["partial_preview_path"].as_str());
+        if let Some(path) = self.tree_page_path.clone().filter(|path| self.tree_expanded.contains(path)) {
+            let page = self.tree_pages.get(&path);
+            let start = page.and_then(|p| p["start"].as_str()).and_then(parse_offset).unwrap_or(0);
+            let count = page.and_then(|p| p["count"].as_str()).and_then(parse_offset).unwrap_or(0);
+            let displayed = page.and_then(|p| p["nodes"].as_array()).map_or(0, |nodes| nodes.len() as u64);
+            let page_size = page.and_then(|p| p["page_size"].as_u64()).unwrap_or(64);
+            let mut next = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(format!("{}–{} / {}", start, start.saturating_add(displayed).min(count), count));
+                if ui.add_enabled(start > 0, egui::Button::new("Previous")).clicked() { next = Some(start.saturating_sub(page_size)); }
+                if ui.add_enabled(start.saturating_add(displayed) < count, egui::Button::new("Next")).clicked() { next = Some(start.saturating_add(displayed.max(1))); }
+                ui.label("Go to index");
+                ui.add_sized([72., 24.], egui::TextEdit::singleline(&mut self.tree_page_index));
+                if ui.button("Go").clicked() {
+                    next = parse_offset(&self.tree_page_index).filter(|index| *index < count);
+                }
+            });
+            if let Some(next) = next {
+                self.queue(serde_json::json!({"type":"tree_page","path":path,"start":next.to_string()}));
+            }
+        }
+        let action = crate::browser_tree::show(ui, &self.decoded, &self.tree_expanded, &self.tree_pages, self.tree_selected.as_deref());
+        if let Some((path, open, lazy)) = action.toggle {
+            if open {
+                self.tree_expanded.insert(path.clone());
+                let needs_page = lazy && self.tree_pages.get(&path).is_none();
+                if needs_page {
+                    self.tree_page_path = Some(path.clone());
+                    self.tree_page_index = "0".into();
+                    self.queue(serde_json::json!({"type":"tree_page","path":path,"start":"0"}));
                 }
             } else {
-                ui.label("Select bytes in Hex and name a field; its decoded value will appear here.");
+                self.tree_expanded.remove(&path);
             }
-        });
-        if let Some(crate::direct_authoring::Edit::Commit(source)) = edit { self.yaml = source; self.apply_decoder(); self.inline_decode = true; }
-        if let Some((start, end)) = selection {
-            self.select_range(start, end);
-            self.authoring_pane = Pane::Structures;
         }
+        if let Some((path, start, end)) = action.select {
+            self.tree_selected = Some(path);
+            if start < end { self.select_range(start, end); }
+        }
+    }
+    fn console(&mut self, ui: &mut egui::Ui) {
+        let action = crate::decoder_ui::console(ui, &self.python_stdout,
+            self.decoder_error.as_deref(), self.decoding);
+        if action.copy {
+            let mut output = self.python_stdout.clone();
+            if let Some(error) = &self.decoder_error {
+                if !output.is_empty() { output.push('\n'); }
+                output.push_str(error);
+            }
+            ui.ctx().copy_text(output);
+        }
+        if action.byte.is_some() { self.layout.reveal(Pane::Hex); }
+        if let Some(byte) = action.byte { self.reveal_hex_selection(byte); }
+        if action.line.is_some() { self.layout.show_decoder(); }
+        if let Some(line) = action.line { self.editor.go_to_line(line); }
+    }
+    fn parsing_map(&mut self, ui: &mut egui::Ui) {
+        let action = crate::decoder_ui::parsing_map_panel(ui, self.decoder_error.as_deref());
+        if let Some(byte) = action.byte {
+            self.layout.reveal(Pane::Hex);
+            self.reveal_hex_selection(byte);
+        }
+    }
+    fn plot_sidebar(&mut self, ui: &mut egui::Ui, names: &[String]) -> bool {
+        let mut sources_changed = false;
+        let mut close = false;
+        egui::Panel::right("browser_plot_series_sidebar")
+            .default_size(260.).min_size(220.).max_size(380.).resizable(true)
+            .show_collapsible(ui, &mut self.plot_sidebar_open, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(!self.plot_sidebar_series, "Collections").clicked() {
+                        self.plot_sidebar_series = false;
+                    }
+                    if ui.selectable_label(self.plot_sidebar_series, "Series").clicked() {
+                        self.plot_sidebar_series = true;
+                    }
+                    if ui.button("×").on_hover_text("Close sidebar").clicked() { close = true; }
+                });
+                ui.separator();
+                if !self.plot_sidebar_series {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for item in self.decoded["collections"].as_array().into_iter().flatten() {
+                            let path = item["path"].as_str().unwrap_or("");
+                            let mut enabled = self.plot_sources.contains(path);
+                            if ui.checkbox(&mut enabled, path).changed() {
+                                if enabled { self.plot_sources.insert(path.into()); }
+                                else { self.plot_sources.remove(path); }
+                                sources_changed = true;
+                            }
+                        }
+                    });
+                    return;
+                }
+                if let Some(group) = &self.plot_axis_group {
+                    ui.label(format!("Y axis: {} group", crate::plot_series::group_label(group)))
+                        .on_hover_text(group);
+                } else if let Some(series) = &self.plot_axis_series {
+                    ui.label(format!("Y axis: {}", series.rsplit('.').next().unwrap_or(series)))
+                        .on_hover_text(series);
+                }
+                ui.add(egui::TextEdit::singleline(&mut self.plot_filter).hint_text("Find series…"));
+                let filter = self.plot_filter.trim().to_lowercase();
+                let matching: Vec<_> = names.iter().filter(|name|
+                    filter.is_empty() || name.to_lowercase().contains(&filter)).map(String::as_str).collect();
+                ui.horizontal(|ui| {
+                    if ui.small_button("Show all").clicked() {
+                        for name in &matching { self.hidden.remove(*name); }
+                        self.fit_plot_y = true;
+                    }
+                    if ui.small_button("Hide all").clicked() {
+                        for name in &matching { self.hidden.insert((*name).to_owned()); }
+                        self.fit_plot_y = true;
+                    }
+                });
+                egui::ScrollArea::vertical().id_salt("browser-plot-series")
+                    .show(ui, |ui| {
+                        for (group, entries) in crate::plot_series::grouped(matching) {
+                            let open = !filter.is_empty()
+                                || (entries.len() <= 32 && !self.plot_groups_collapsed.contains(&group))
+                                || self.plot_groups_expanded.contains(&group);
+                            let visible = entries.iter().filter(|(_, name)| !self.hidden.contains(*name)).count();
+                            ui.push_id(&group, |ui| {
+                                ui.horizontal(|ui| {
+                                    let arrow = ui.add_sized([18.,18.], egui::Button::new(""));
+                                    let c = arrow.rect.center();
+                                    let (a,b,d) = if open {
+                                        (egui::pos2(c.x-4.,c.y-2.),egui::pos2(c.x,c.y+2.),egui::pos2(c.x+4.,c.y-2.))
+                                    } else {
+                                        (egui::pos2(c.x-2.,c.y-4.),egui::pos2(c.x+2.,c.y),egui::pos2(c.x-2.,c.y+4.))
+                                    };
+                                    let stroke=egui::Stroke::new(1.5,ui.visuals().weak_text_color());
+                                    ui.painter().line_segment([a,b],stroke);
+                                    ui.painter().line_segment([b,d],stroke);
+                                    if arrow.clicked() {
+                                        if open { self.plot_groups_expanded.remove(&group); self.plot_groups_collapsed.insert(group.clone()); }
+                                        else { self.plot_groups_collapsed.remove(&group); self.plot_groups_expanded.insert(group.clone()); }
+                                    }
+                                    let label = format!("{}  {visible}/{}", crate::plot_series::group_label(&group), entries.len());
+                                    if ui.selectable_label(self.plot_axis_group.as_deref() == Some(group.as_str()), label)
+                                        .on_hover_text(format!("{group}\nClick to use the group for the Y axis")).clicked() {
+                                        self.plot_axis_group = Some(group.clone());
+                                    }
+                                    let all_shown = visible == entries.len();
+                                    if ui.small_button(if all_shown { "Hide" } else { "Show" }).clicked() {
+                                        for (_, name) in &entries {
+                                            if all_shown { self.hidden.insert((*name).to_owned()); }
+                                            else { self.hidden.remove(*name); }
+                                        }
+                                        if all_shown && self.plot_axis_group.as_deref() == Some(group.as_str()) {
+                                            self.plot_axis_group = None;
+                                        }
+                                        self.fit_plot_y = true;
+                                    }
+                                });
+                                if open {
+                                    for (label, name) in entries {
+                                        ui.push_id(name, |ui| { ui.horizontal(|ui| {
+                                            ui.add_space(16.);
+                                            let mut shown = !self.hidden.contains(name);
+                                            if ui.checkbox(&mut shown, "").changed() {
+                                                if shown { self.hidden.remove(name); }
+                                                else { self.hidden.insert(name.to_owned()); }
+                                                self.fit_plot_y = true;
+                                            }
+                                            let active = self.plot_axis_group.is_none()
+                                                && self.plot_axis_series.as_deref() == Some(name);
+                                            if ui.selectable_label(active, label).on_hover_text(name).clicked() {
+                                                self.plot_axis_series = Some(name.to_owned());
+                                                self.plot_axis_group = None;
+                                            }
+                                        }); });
+                                    }
+                                }
+                            });
+                        }
+                    });
+            });
+        if close { self.plot_sidebar_open = false; }
+        sources_changed
     }
     fn decoded_plot(&mut self, ui: &mut egui::Ui) {
         if !self.decoded.is_null() && (self.yaml != self.applied_yaml || self.language != self.applied_language) {
@@ -1383,60 +1548,66 @@ impl BrowserApp {
         let visible_series = series.iter().filter(|channel| {
             !self.hidden.contains(channel["name"].as_str().unwrap_or(""))
         }).count();
-        ui.horizontal_wrapped(|ui| {
-            ui.menu_button(format!("Series {visible_series}/{}", series.len()), |ui| {
-                ui.strong("Collections");
-                egui::ScrollArea::vertical().max_height(180.).show(ui, |ui| {
-                    for item in self.decoded["collections"].as_array().into_iter().flatten() {
-                        let path=item["path"].as_str().unwrap_or("");
-                        let mut enabled=self.plot_sources.contains(path);
-                        if ui.checkbox(&mut enabled,path).changed() {
-                            if enabled {self.plot_sources.insert(path.into());} else {self.plot_sources.remove(path);}
-                            changed=true;
-                        }
-                    }
-                });
-                ui.separator();
-                ui.strong("Fields shown");
-                egui::ScrollArea::vertical().max_height(220.).show(ui, |ui| {
-                    for channel in &series {
-                        let name=channel["name"].as_str().unwrap_or("");
-                        let mut enabled=!self.hidden.contains(name);
-                        if ui.checkbox(&mut enabled,name).changed() {
-                            if enabled {self.hidden.remove(name);} else {self.hidden.insert(name.into());}
-                        }
-                    }
-                });
-                if self.presentation.menu(ui,&ranges) {self.fit_plot_y=true;}
-            });
+        let names: Vec<String> = series.iter().filter_map(|channel|
+            channel["name"].as_str().map(str::to_owned)).collect();
+        if self.plot_axis_series.as_ref().is_none_or(|name| !names.contains(name)) {
+            self.plot_axis_series = names.iter().find(|name| !self.hidden.contains(*name)).cloned();
+            self.fit_plot_y = true;
+        }
+        if self.plot_axis_group.as_ref().is_some_and(|group|
+            !names.iter().any(|name| crate::plot_series::group_key(name) == *group)) {
+            self.plot_axis_group = None;
+        }
+        let axis_names = crate::plot_series::axis_targets(&names,
+            self.plot_axis_group.as_deref(), self.plot_axis_series.as_deref());
+        ui.horizontal(|ui| {
+            if ui.button(format!("Series {visible_series}/{}", series.len())).clicked() {
+                self.plot_sidebar_open = true;
+                self.plot_sidebar_series = true;
+            }
+            if ui.button("Collections…").clicked() {
+                self.plot_sidebar_open = true;
+                self.plot_sidebar_series = false;
+            }
             if ui.button("Fit").on_hover_text("Show the full sample range and fit the visible fields").clicked() { self.first="0".into();self.last=self.plot_count().to_string();self.request_plot(1200); }
-            ui.menu_button("Go to sample…", |ui| {
-                ui.label("Sample index (starts at 0)");
-                let last=self.plot_count().saturating_sub(1);
-                ui.add(egui::DragValue::new(&mut self.plot_jump).range(0..=last));
-                if ui.button("Go").clicked() {
-                    let count=self.plot_count();let start=self.plot_jump.saturating_sub(128);
-                    self.first=start.to_string();self.last=start.saturating_add(256).min(count).to_string();
-                    self.request_plot(1200);ui.close();
+            if ui.button("Go to sample…").clicked() { self.plot_jump_open = !self.plot_jump_open; }
+            if self.plot_jump_open {
+                let entry=ui.add(egui::TextEdit::singleline(&mut self.plot_jump).desired_width(86.)
+                    .hint_text("Sample index"));
+                let enter=entry.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if ui.button("Go").clicked() || enter {
+                    let count=self.plot_count();
+                    if let Some(index) = parse_offset(&self.plot_jump).filter(|index| *index < count) {
+                        let start = index.saturating_sub(128);
+                        self.first=start.to_string();self.last=start.saturating_add(256).min(count).to_string();
+                        self.request_plot(1200);
+                        self.plot_jump_open = false;
+                    } else { self.status = "Enter a sample index inside this collection.".into(); }
                 }
-            });
+            }
             ui.menu_button("Plot options", |ui| {
-                ui.label("Drag a trace vertically to position it.");
-                ui.label("Drag empty space to pan; scroll or pinch to zoom.");
+                ui.label("Drag to pan; scroll or pinch to zoom.");
+                if self.presentation.menu(ui,&ranges) {self.fit_plot_y=true;}
                 if ui.button("Inspect selected bytes").clicked() {self.layout.reveal(Pane::Inspector);self.mobile_target=Some(Pane::Inspector);ui.close();}
                 ui.weak("Use Open data → Extract selection to export bytes.");
             });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak(format!("Samples {}–{} of {}", self.first, self.last, self.plot_count()));
+            });
         });
+        if !self.stacked && self.plot_sidebar_open {
+            changed |= self.plot_sidebar(ui, &names);
+        }
         if changed {
             self.first="0".into();self.last=self.plot_count().min(512).to_string();
             self.plot=Default::default();self.viewport.reset();
             if self.plot_count()>0 {self.request_plot(1200);}
         }
         if self.plot_sources.is_empty() {ui.label("Use Series to add collections.");return;}
-        if ui.available_height() > 260. {
-            ui.weak("Drag to pan · wheel or pinch to zoom · click a point to link bytes · Shift-click to select a range");
+        let reduced = self.plot["quality"].as_str().is_some_and(|quality| quality != "Exact samples");
+        if reduced {
+            ui.weak(self.plot["quality"].as_str().unwrap_or("Reduced samples"));
         }
-        ui.weak(format!("{} · {} records inspected",self.plot["quality"].as_str().unwrap_or("Reading samples"),self.plot["scanned"]));
         {
             for channel in &mut series {
                 let p=self.presentation.placement(channel["name"].as_str().unwrap_or(""));
@@ -1444,28 +1615,55 @@ impl BrowserApp {
                 if let Some(bands)=channel["bands"].as_array_mut() {for band in bands {for i in [2,3] {if let Some(v)=band[i].as_f64(){band[i]=serde_json::json!(p.display(v));}}}}
             }
             let placements=self.presentation.series.clone();
+            let axis_placement = axis_names.first().map(|name|self.presentation.placement(name)).unwrap_or_default();
+            let axis_uniform = axis_names.iter().all(|name| {
+                let p=self.presentation.placement(name);
+                p.scale == axis_placement.scale && p.offset == axis_placement.offset
+            });
             let fit_y=std::mem::take(&mut self.fit_plot_y).then(|| {
-                let values=series.iter().filter(|c|!self.hidden.contains(c["name"].as_str().unwrap_or("")))
+                let values=series.iter().filter(|c|{
+                    let name=c["name"].as_str().unwrap_or("");
+                    !self.hidden.contains(name) && (axis_names.is_empty() || axis_names.iter().any(|axis| axis == name))
+                })
                     .flat_map(|c|c["points"].as_array().into_iter().flatten()).filter_map(|p|p[1].as_f64()).filter(|v|v.is_finite());
                 values.fold((f64::INFINITY,f64::NEG_INFINITY),|(min,max),v|(min.min(v),max.max(v)))
             });
 
-            let mut plot = egui_plot::Plot::new("decoded-plot-overlay").x_axis_label("Sample index")
-                .allow_scroll(!self.stacked)
-                .allow_drag(!self.presentation.is_dragging())
-                .y_axis_label(if self.presentation.series.is_empty() {"Value"} else {"Display position"})
+            let plot = egui_plot::Plot::new("decoded-plot-overlay").x_axis_label("Sample index")
+                .allow_scroll(false)
+                .allow_drag(egui::Vec2b::new(true,false))
+                .allow_zoom(false)
+                .allow_axis_zoom_drag(false)
+                .custom_y_axes(vec![egui_plot::AxisHints::new_y()
+                    .label(if axis_uniform {"Selected series value"} else {"Display position"})
+                    .formatter(move |mark,_|format!("{:.2}",if axis_uniform {axis_placement.original(mark.value)} else {mark.value}))])
                 .label_formatter(move |hover| {
                     if let egui_plot::HoverPosition::NearDataPoint { plot_name, position, .. } = hover {
                         let p=placements.get(*plot_name).copied().unwrap_or_default();
                         Some(format!("{plot_name}\nSample: {:.0}\nValue: {}", position.x, p.original(position.y)))
                     } else { None }
                 });
-            if std::mem::take(&mut self.reset_plot) { plot = plot.reset(); }
+            let reset_bounds = std::mem::take(&mut self.reset_plot) || self.plot_visible.is_none();
+            let plot_ctx = ui.ctx().clone();
+            let plot_outer = ui.available_rect_before_wrap();
+            let plot_clip = ui.clip_rect();
+            let plot_layer = ui.layer_id();
             let response = plot
             .show(ui, |plot| {
-                if let Some((min,max))=fit_y.filter(|(min,max)|min.is_finite()&&max.is_finite()) {
-                    let old=plot.plot_bounds();let pad=((max-min)*0.05).max(0.1);
-                    plot.set_plot_bounds(egui_plot::PlotBounds::from_min_max([old.min()[0],min-pad],[old.max()[0],max+pad]));
+                if reset_bounds {
+                    if let (Some(first),Some(last))=(parse_offset(&self.first),parse_offset(&self.last)) {
+                        if first < last { plot.set_plot_bounds_x(first as f64..=last as f64); }
+                    }
+                }
+                let y_range = fit_y.or_else(|| reset_bounds.then(|| {
+                    series.iter().filter(|c| !self.hidden.contains(c["name"].as_str().unwrap_or("")))
+                        .flat_map(|c| c["points"].as_array().into_iter().flatten())
+                        .filter_map(|p| p[1].as_f64()).filter(|v| v.is_finite())
+                        .fold((f64::INFINITY,f64::NEG_INFINITY), |(min,max),v| (min.min(v),max.max(v)))
+                }));
+                if let Some((min,max))=y_range.filter(|(min,max)|min.is_finite()&&max.is_finite()) {
+                    let pad=((max-min)*0.05).max(0.1);
+                    plot.set_plot_bounds_y(min-pad..=max+pad);
                 }
                 for channel in &series {
                     let name = channel["name"].as_str().unwrap_or("");
@@ -1477,6 +1675,63 @@ impl BrowserApp {
                     let bands: Vec<[f64;4]> = serde_json::from_value(channel["bands"].clone()).unwrap_or_default();
                     crate::plot_trace::decoded_channel(plot, name, crate::plot_trace::series_color(name), points,
                         self.plot["estimated"].as_bool().unwrap_or(false).then_some(bands.as_slice()));
+                }
+                if !self.stacked && plot.response().contains_pointer() {
+                    let (wheel, pinch, shift)=plot_ctx.input(|input| {
+                        (input.smooth_scroll_delta, input.zoom_delta_2d(), input.modifiers.shift)
+                    });
+                    let delta=if wheel.y != 0. {wheel.y} else {wheel.x};
+                    if shift && delta != 0. {
+                        let width=plot.plot_bounds().width();
+                        plot.translate_bounds(egui::vec2((-(delta as f64)*width/500.) as f32,0.));
+                    } else {
+                        let factor=if pinch.x != 1. {pinch.x} else {(delta.clamp(-240.,240.)*0.0025).exp()};
+                        if factor != 1. {
+                            if let Some(center)=plot.pointer_coordinate() {
+                                plot.zoom_bounds(egui::vec2(factor,1.),center);
+                            }
+                        }
+                    }
+                }
+                if !self.stacked && !axis_names.is_empty() {
+                    let inner=plot.response().rect;
+                    let axis=egui::Rect::from_min_max(
+                        egui::pos2(plot_outer.left(),inner.top()),egui::pos2(inner.left(),inner.bottom()));
+                    let axis=axis.intersect(plot_clip);
+                    let (pressed,down,delta,origin,pointer,shift,wheel,pinch)=plot_ctx.input(|input| {
+                        let wheel=input.raw.events.iter().filter_map(|event| {
+                            if let egui::Event::MouseWheel {unit,delta,..}=event {
+                                let scale=match unit {egui::MouseWheelUnit::Point=>1.,egui::MouseWheelUnit::Line=>48.,egui::MouseWheelUnit::Page=>240.};
+                                Some(*delta*scale)
+                            } else {None}
+                        }).fold(egui::Vec2::ZERO,|sum,delta|sum+delta);
+                        (input.pointer.button_pressed(egui::PointerButton::Primary),
+                            input.pointer.button_down(egui::PointerButton::Primary),
+                            input.pointer.delta(),input.pointer.press_origin(),input.pointer.hover_pos(),
+                            input.modifiers.shift,wheel,input.zoom_delta_2d().y)
+                    });
+                    if pressed { self.plot_axis_panning=origin.is_some_and(|pos|axis.contains(pos)); }
+                    if !down { self.plot_axis_panning=false; }
+                    else if self.plot_axis_panning && !pressed && delta.y != 0. {
+                        let amount=-(delta.y as f64)*plot.plot_bounds().height()/inner.height().max(1.) as f64;
+                        for name in &axis_names {self.presentation.pan_series(name,amount);}
+                        plot_ctx.request_repaint();
+                    }
+                    if pointer.is_some_and(|pos|axis.contains(pos)
+                        && plot_ctx.rect_contains_pointer(plot_layer,axis)) {
+                        let delta=if shift {wheel.x+wheel.y} else if wheel.y!=0. {wheel.y} else {wheel.x};
+                        let center=pointer.map(|pos|egui_plot::PlotTransform::new(inner,plot.plot_bounds(),false)
+                            .value_from_position(pos).y).unwrap_or(0.);
+                        if shift && delta!=0. {
+                            let amount=-(f64::from(delta)/120.).clamp(-1.,1.)*plot.plot_bounds().height();
+                            for name in &axis_names {self.presentation.pan_series(name,amount);}
+                            plot_ctx.request_repaint();
+                        } else if pinch!=1. || delta!=0. {
+                            let factor=if pinch!=1. {f64::from(pinch)} else {f64::from((delta*0.012).clamp(-1.,1.).exp())};
+                            for name in &axis_names {self.presentation.zoom_series(name,factor,center);}
+                            plot_ctx.request_repaint();
+                        }
+                    }
                 }
             });
             if let Some((first, end)) = self.selected_samples.filter(|(first, end)| first < end) {
@@ -1501,11 +1756,9 @@ impl BrowserApp {
                     egui::Stroke::new(1_f32, ui.visuals().selection.stroke.color),
                 );
             }
-            self.presentation.drag(ui,&response.transform,series.iter().filter(|c|!self.hidden.contains(c["name"].as_str().unwrap_or("")))
-                .flat_map(|c|c["points"].as_array().into_iter().flatten().filter_map(move |p|Some((c["name"].as_str()?.to_owned(),[p[0].as_f64()?,p[1].as_f64()?])))));
             self.plot_visible = Some([response.transform.bounds().min()[0], response.transform.bounds().max()[0]]);
             let now = ui.input(|i| i.time);
-            let interacting = (!self.presentation.is_dragging() && (response.response.dragged() || response.response.drag_stopped())) ||
+            let interacting = (response.response.dragged() || response.response.drag_stopped()) ||
                 (response.response.hovered() && ui.input(|i| (!self.stacked && i.smooth_scroll_delta != egui::Vec2::ZERO) || i.zoom_delta() != 1.0));
             if interacting {
                 let bounds = response.transform.bounds();
@@ -1608,10 +1861,16 @@ impl eframe::App for BrowserApp {
             }
             self.reveal_results = false;
         }
-        let menus=crate::app_menu::menus(&crate::app_menu::State {
+        let mut menus=crate::app_menu::menus(&crate::app_menu::State {
             available:!self.decoding, file:!self.name.is_empty(), selection:parse_offset(&self.range_start).zip(parse_offset(&self.range_end)).is_some_and(|(a,b)| a<b),
             undo:self.undo, redo:self.redo, save_decoder:!self.yaml.trim().is_empty(), apply:!self.decoding && !self.name.is_empty() && !self.decoder_empty(), busy:self.decoding, ..Default::default()
         });
+        let panels = Pane::PANELS.iter().enumerate().map(|(index, pane)| crate::app_menu::Item {
+            label:pane.title().into(), command:Some(crate::app_menu::Command::TogglePane),
+            argument:index, enabled:true, checked:Some(self.layout.dock.find_tab(pane).is_some()), children:vec![],
+        }).collect();
+        menus.insert(0,crate::app_menu::Item {label:"Panels".into(),command:None,argument:0,enabled:true,checked:None,children:panels});
+        menus.insert(1,crate::app_menu::Item {label:"Reset layout".into(),command:Some(crate::app_menu::Command::Reset),argument:0,enabled:true,checked:None,children:vec![]});
         publish_menus(&serde_json::to_string(&menus).unwrap(), &if self.name.is_empty() { String::new() } else { format!("{} · {} bytes{}",self.name,self.size,if self.dirty {" · unsaved changes"}else{""}) }, &self.status, crate::APP_VERSION);
         if self.stacked {
             egui::CentralPanel::default().show(root_ui, |ui| {
@@ -1647,7 +1906,14 @@ impl eframe::App for BrowserApp {
             // Desktop docking remains independently arranged while mobile stacks
             // the same pane implementations into one scrollable column.
             let mut layout = std::mem::take(&mut self.layout);
-            DockArea::new(&mut layout.dock).show_inside(root_ui, self);
+            DockArea::new(&mut layout.dock)
+                .id(egui::Id::new("workspace_dock"))
+                .style(crate::theme::dock_style(root_ui.style().as_ref()))
+                .show_close_buttons(true)
+                .show_leaf_close_all_buttons(false)
+                .show_leaf_collapse_buttons(false)
+                .tab_context_menus(true)
+                .show_inside(root_ui, self);
             self.layout = layout;
         }
         if self.sent_yaml.as_ref() != Some(&self.yaml) {
@@ -1688,7 +1954,8 @@ impl TabViewer for BrowserApp {
             Pane::Plot => self.decoded_plot(ui),
             Pane::Table => self.samples(ui),
             Pane::Structures => self.structures(ui),
-            Pane::Console => self.decoder(ui),
+            Pane::Console => self.console(ui),
+            Pane::ParsingMap => self.parsing_map(ui),
         }
     }
 }

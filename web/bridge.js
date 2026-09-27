@@ -8,6 +8,7 @@
     let decoderSource = '', decoderLanguage = 'yaml', rustStatus = '';
     let ignoreDecoder = false, operation = '';
     let size = '0', selectedStart = '0', selectedEnd = '0';
+    const recentFiles = [];
     const status = document.getElementById('status');
     const open = document.getElementById('open');
     const save = document.getElementById('save');
@@ -26,6 +27,13 @@
     }
     function submit(m) {
         if (busy || failed) return false;
+        if (m.type === 'open' && m.file) {
+            const previous = recentFiles.findIndex(entry => entry.file === m.file);
+            if (previous >= 0) recentFiles.splice(previous, 1);
+            recentFiles.unshift({file:m.file, handle:m.handle, demo:m.demo});
+            recentFiles.length = Math.min(recentFiles.length, 8);
+            window.binwaveShell?.recent(recentFiles.map(entry => entry.file.name));
+        }
         busy = true;
         operation = m.type;
         if (['decode', 'decode_python'].includes(m.type)) ignoreDecoder = false;
@@ -36,7 +44,7 @@
     }
     worker.onmessage = ({data}) => {
         if (data.type === 'ready') { busy = false; controls(); return; }
-        if (ignoreDecoder && (['decoded', 'decode_failed'].includes(data.type) || (data.type === 'error' && ['decode','decode_python','table','plot','probe','pick','inspect','encode'].includes(operation)))) return;
+        if (ignoreDecoder && (['decoded', 'decode_failed','tree_page'].includes(data.type) || (data.type === 'error' && ['decode','decode_python','table','tree_page','plot','probe','pick','inspect','encode'].includes(operation)))) return;
         if (data.type === 'progress') { status.textContent = `Exported ${data.done} / ${data.total} bytes`; return; }
         if (['opened', 'edited', 'exported'].includes(data.type)) {
             dirty = data.dirty; size = data.size; opened = true;
@@ -186,6 +194,7 @@
             if(message!==rustStatus){rustStatus=message;status.textContent=message;}
             const context=document.getElementById('file-context');
             if(context.textContent!==file)context.textContent=file;
+            window.binwaveShell?.update(file, message);
             const displayedVersion=document.getElementById('app-version');
             if(displayedVersion.textContent!==version)displayedVersion.textContent=version;
             const direct={open_file:open,open_decoder:openDecoder,save_copy:save,extract,cancel};
@@ -193,12 +202,12 @@
                 if(direct[command]) { if(!direct[command].disabled)direct[command].onclick(); }
                 else if(command==='save_decoder')window.binwave.saveDecoder(decoderSource, decoderLanguage);
                 else { if(events.length>=16)events.shift();events.push({type:'menu',command,argument}); }
-            }, (command,enabled)=>direct[command] ? !direct[command].disabled : enabled && graphicsReady && !failed && (!busy || ['code','hex','structures','plot','samples','inspector','auto','stacked','docked','help'].includes(command)));
+            }, (command,enabled)=>direct[command] ? !direct[command].disabled : enabled && graphicsReady && !failed && (!busy || ['code','hex','structures','plot','samples','inspector','toggle_pane','reset','auto','stacked','docked','help'].includes(command)));
         },
         clearDecoder() {
             ignoreDecoder = true;
             for (let i = events.length - 1; i >= 0; i--) {
-                if (['decoded','decode_failed','table','plot','probe','pick'].includes(events[i].type) || (events[i].type === 'error' && ['decode','decode_python','table','plot','probe','pick'].includes(events[i].operation))) events.splice(i,1);
+                if (['decoded','decode_failed','table','tree_page','plot','probe','pick'].includes(events[i].type) || (events[i].type === 'error' && ['decode','decode_python','table','tree_page','plot','probe','pick'].includes(events[i].operation))) events.splice(i,1);
             }
             status.textContent = 'No fields yet. Select bytes to begin.';
         },
@@ -237,6 +246,22 @@
             if (!Object.hasOwn(expected, name) || bytes.length !== expected[name]) throw Error('Invalid bundled demo size');
             const file = new File([bytes], name, {type:'application/octet-stream'});
             return submit({type:'open', file, demo:true});
+        },
+        async reopenRecent(index) {
+            const entry = recentFiles[index];
+            if (!entry || busy || failed || !graphicsReady) return false;
+            if (dirty && !confirm('Discard unsaved byte edits and open another file?')) return false;
+            const file = entry.handle ? await entry.handle.getFile() : entry.file;
+            return submit({type:'open', file, handle:entry.handle, demo:entry.demo});
+        },
+        loadDecoderSource(name, source) {
+            if (busy || failed || !graphicsReady || source.length > 256 * 1024 || source.includes('\0')) return false;
+            const old = events.findIndex(e => e.type === 'decoder-source');
+            if (old >= 0) events.splice(old, 1);
+            if (events.length >= 16) events.shift();
+            events.push({type:'decoder-source', name, source});
+            status.textContent = `Decoder loaded: ${name} · press Run (F5)`;
+            return true;
         },
         poll() {
             const event = events.shift();
