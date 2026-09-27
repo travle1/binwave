@@ -170,6 +170,31 @@ assert.equal(JSON.parse(simple.probe('samples', '2048', '2049')).first, null);
 simple.free();
 console.log('Shipped simple wave: 512 float32 samples, eight sine cycles and exact byte links passed.');
 
+// Nested fixed-size arrays must be available across their parent records in
+// the browser, matching the desktop collection browser without whole-file reads.
+const nestedBytes = new Uint8Array(129 * 129 * 2);
+const nestedView = new DataView(nestedBytes.buffer);
+for (let i = 0; i < 129 * 129; i++) nestedView.setUint16(i * 2, i, true);
+globalThis.binwaveDecoder = {read(start, length) {
+    return nestedBytes.slice(Number(start), Number(start) + length);
+}};
+const nested = new bindings.DecoderSession(String(nestedBytes.length));
+const nestedDecoded = JSON.parse(nested.decode(`endian: little
+structures:
+  - name: Block
+    fields:
+      - {name: samples, type: u16, repeat: 129}
+actions:
+  - read: {name: blocks, type: {structure: Block}, repeat: 129}
+`));
+assert.deepEqual(nestedDecoded.collections.map(c => [c.path, c.count]),
+    [['blocks', '129'], ['blocks.samples', String(129 * 129)]]);
+assert.deepEqual(JSON.parse(nested.plot('blocks.samples', '129', '133', 800)).series[0].points,
+    Array.from({length: 4}, (_, i) => [129 + i, 129 + i]));
+assert.equal(JSON.parse(nested.table('blocks.samples', '5')).rows[0].cells.value.number, 5);
+assert.equal(JSON.parse(nested.pick('blocks.samples', '5')).start, '10');
+nested.free();
+
 // Optional generated PWAV fixture: run the user's real schema through WASM,
 // then check both a resolvable waveform and the estimated overview bands.
 if (process.argv[2]) {

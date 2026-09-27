@@ -8,7 +8,7 @@ extern "C" {
 }
 
 use crate::byte_store::ByteView;
-use crate::structure::{Node, ParseOutput, Program};
+use crate::structure::{LazyArray, Node, ParseOutput, Program};
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -48,6 +48,9 @@ fn find<'a>(nodes: &'a [Node], path: &str) -> Option<&'a Node> {
     }
     None
 }
+fn collection_node<'a>(nodes: &'a [Node], flattened: &'a BTreeMap<String, Node>, path: &str) -> Option<&'a Node> {
+    find(nodes, path).or_else(|| flattened.get(path))
+}
 fn resolve_tree_node(nodes: &[Node], path: &str, source: &ByteView) -> Result<Option<Node>> {
     for node in nodes {
         if node.path == path { return Ok(Some(node.clone())); }
@@ -79,12 +82,70 @@ fn collections(nodes: &[Node], result: &mut Vec<Value>) {
         }
     }
 }
+/// Expose fixed-size child arrays across their parent records, just as the
+/// desktop collection browser does. Only the first parent is decoded; the
+/// resulting LazyArray describes the rest without reading the file.
+fn flattened_collections(nodes: &[Node], source: &ByteView) -> BTreeMap<String, Node> {
+    fn parents<'a>(nodes: &'a [Node], found: &mut Vec<&'a Node>) {
+        for node in nodes {
+            if node.lazy.as_ref().is_some_and(|array| array.count > 0) {
+                found.push(node);
+            }
+            parents(&node.children, found);
+        }
+    }
+    fn descend(parent: &Node, row: &Node, source: &ByteView, found: &mut BTreeMap<String, Node>) {
+        for child in &row.children {
+            if let Some(flat) = LazyArray::flattened_child(parent, child) {
+                found.insert(flat.path.clone(), flat);
+            }
+            if let Some(groups) = &child.lazy {
+                if groups.count > 0 {
+                    if let Ok(first) = groups.page(source, &AtomicBool::new(false), 0, 1) {
+                        if let Some(group_item) = first.first() {
+                            for inner in &group_item.children {
+                                let count = inner.lazy.as_ref().map_or(inner.children.len() as u64, |array| array.count);
+                                if count > 0 && count <= 4096 {
+                                    for index in 0..count {
+                                        if found.len() >= 4096 { break; }
+                                        if let Some(flat) = LazyArray::flattened_group_sensor(parent, child, inner, index) {
+                                            found.insert(flat.path.clone(), flat);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            descend(parent, child, source, found);
+        }
+    }
+    let mut candidates = Vec::new();
+    parents(nodes, &mut candidates);
+    candidates.sort_by_key(|node| std::cmp::Reverse(node.lazy.as_ref().map_or(0, |array| array.count)));
+    let mut found = BTreeMap::new();
+    for parent in candidates.into_iter().take(128) {
+        if found.len() >= 4096 { break; }
+        let Some(array) = &parent.lazy else { continue; };
+        if let Ok(first) = array.page(source, &AtomicBool::new(false), 0, 1) {
+            if let Some(row) = first.first() {
+                descend(parent, row, source, &mut found);
+            }
+        }
+    }
+    found
+}
 fn last_lazy_path(nodes: &[Node]) -> Option<&str> {
     nodes.iter().rev().find_map(|node| last_lazy_path(&node.children).or_else(|| node.lazy.as_ref().map(|_| node.path.as_str())))
 }
-fn decoded_json(output: &ParseOutput, partial_error: Option<&str>) -> Result<String> {
+fn decoded_json(output: &ParseOutput, partial_error: Option<&str>, flattened: &BTreeMap<String, Node>) -> Result<String> {
     let mut arrays = Vec::new();
     if partial_error.is_none() { collections(&output.nodes, &mut arrays); }
+    if partial_error.is_none() {
+        arrays.extend(flattened.values().filter_map(|node| node.lazy.as_ref().map(|array|
+            json!({"path":node.path,"count":array.count.to_string()}))));
+    }
     let preview_path = partial_error.and_then(|_| last_lazy_path(&output.nodes));
     let nodes: Vec<_> = output.nodes.iter().map(describe).collect();
     json_result(json!({"nodes":nodes,"partial_preview_path":preview_path,
@@ -132,6 +193,7 @@ fn page(node: &Node, source: &ByteView, start: u64, count: u64) -> Result<Vec<No
 pub struct DecoderSession {
     source: ByteView,
     output: Option<ParseOutput>,
+    flattened: BTreeMap<String, Node>,
 }
 #[wasm_bindgen]
 impl DecoderSession {
@@ -145,6 +207,7 @@ impl DecoderSession {
                     .map_err(|_| JsValue::from_str("Invalid file size"))?,
             },
             output: None,
+            flattened: BTreeMap::new(),
         })
     }
     pub fn decode(&mut self, yaml: &str) -> Result<String, JsValue> {
@@ -169,8 +232,11 @@ impl DecoderSession {
             if error.is_none() && !name.is_empty() {
                 crate::direct_authoring::Interpretation { name: name.into(), range: start.parse()?..end.parse()? }.validate(&output)?;
             }
-            let result = decoded_json(&output, error.as_deref())?;
+            let flattened = if error.is_none() { flattened_collections(&output.nodes, &self.source) }
+                else { BTreeMap::new() };
+            let result = decoded_json(&output, error.as_deref(), &flattened)?;
             self.output = Some(output);
+            self.flattened = flattened;
             Ok(result)
         })()
         .map_err(js_error)
@@ -179,7 +245,7 @@ impl DecoderSession {
     pub fn probe(&self, path: &str, start: &str, end: &str) -> Result<String, JsValue> {
         (|| -> Result<String> {
             let output = self.output.as_ref().context("Apply a decoder first")?;
-            let node = find(&output.nodes, path).context("Collection not found")?;
+            let node = collection_node(&output.nodes, &self.flattened, path).context("Collection not found")?;
             let range = start.parse::<u64>()?..end.parse::<u64>()?;
             let samples = crate::structure_selection::sample_indices_for_bytes(node, &range);
             json_result(json!({"path":path,"first":samples.as_ref().map(|r| r.start.to_string()),
@@ -189,7 +255,7 @@ impl DecoderSession {
 
     pub fn pick(&self, path: &str, index: &str) -> Result<String, JsValue> {
         (|| -> Result<String> {
-            let node = find(&self.output.as_ref().context("Apply a decoder first")?.nodes, path)
+            let node = collection_node(&self.output.as_ref().context("Apply a decoder first")?.nodes, &self.flattened, path)
                 .context("Unknown collection")?;
             let index = index.parse::<u64>()?;
             let end = index.checked_add(1).context("Sample index overflow")?;
@@ -203,7 +269,7 @@ impl DecoderSession {
     /// Select an inclusive range of collection records without materializing them.
     pub fn pick_range(&self, path: &str, first: &str, last: &str) -> Result<String, JsValue> {
         (|| -> Result<String> {
-            let node = find(&self.output.as_ref().context("Apply a decoder first")?.nodes, path)
+            let node = collection_node(&self.output.as_ref().context("Apply a decoder first")?.nodes, &self.flattened, path)
                 .context("Unknown collection")?;
             let first = first.parse::<u64>()?;
             let last = last.parse::<u64>()?;
@@ -248,7 +314,7 @@ impl DecoderSession {
 
     pub fn table(&self, path: &str, start: &str) -> Result<String, JsValue> {
         (|| {
-            let node = find(&self.output.as_ref().context("Apply a decoder first")?.nodes, path).context("Unknown collection")?;
+            let node = collection_node(&self.output.as_ref().context("Apply a decoder first")?.nodes, &self.flattened, path).context("Unknown collection")?;
             let start = start.parse::<u64>()?;
             let rows = page(node, &self.source, start, 128)?;
             json_result(json!({"path":path,"start":start.to_string(),"rows":rows.iter().enumerate().map(|(i,node)| {
@@ -299,7 +365,7 @@ impl DecoderSession {
     }
     pub fn plot(&self, path: &str, first: &str, last: &str, width: u32) -> Result<String, JsValue> {
         (|| {
-            let node = find(&self.output.as_ref().context("Apply a decoder first")?.nodes, path).context("Unknown collection")?;
+            let node = collection_node(&self.output.as_ref().context("Apply a decoder first")?.nodes, &self.flattened, path).context("Unknown collection")?;
             let total = node.lazy.as_ref().map_or(node.children.len() as u64, |a| a.count);
             let start = first.parse::<u64>()?.min(total);
             let end = last.parse::<u64>()?.min(total);

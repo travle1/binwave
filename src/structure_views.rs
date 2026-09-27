@@ -172,6 +172,7 @@ pub struct StructureViews {
     plot_axis_width: f32,
     plot_force_view: Option<Range<usize>>,
     plot_fit_y: bool,
+    plot_fit_all_y: bool,
     plot_free_y: bool,
     plot_dot_radius: Option<f32>,
     plot_range_fill_percent: Option<u32>,
@@ -225,6 +226,7 @@ impl StructureViews {
         // reset() still starts fresh for a different file or definition.
         self.plot_force_view = self.plot_view.clone();
         self.plot_fit_y = true;
+        self.plot_fit_all_y = false;
         self.plot_paused = false;
         self.plot_anchor = None;
         self.table_anchor = None;
@@ -1563,6 +1565,18 @@ impl StructureViews {
                     } else {
                         ui.weak("Select a series for the Y axis");
                     }
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Fit selected Y")
+                            .on_hover_text("Fit the selected series or group; keep the sample range").clicked() {
+                            self.plot_fit_y = true;
+                            self.plot_fit_all_y = false;
+                        }
+                        if ui.small_button("Fit all Y")
+                            .on_hover_text("Fit every visible series; keep the sample range").clicked() {
+                            self.plot_fit_all_y = true;
+                            self.plot_fit_y = false;
+                        }
+                    });
                     ui.add(egui::TextEdit::singleline(&mut self.plot_field_filter)
                         .hint_text("Find series…"));
                     let filter = self.plot_field_filter.trim().to_lowercase();
@@ -1815,7 +1829,7 @@ impl StructureViews {
                 self.plot_collections_open = true;
                 self.plot_sidebar_series = false;
             }
-            if ui.button("Fit").on_hover_text("Show the full sample range and fit the visible fields").clicked() { force_view=Some(0..count); self.plot_fit_y=true; }
+            if ui.button("Fit").on_hover_text("Show the full sample range and fit all visible series").clicked() { force_view=Some(0..count); self.plot_fit_all_y=true; self.plot_fit_y=false; }
             if ui.button("Go to sample…").clicked() {
                 self.plot_go_open = !self.plot_go_open;
                 if self.plot_go_open && self.plot_jump_text.is_empty() {
@@ -1882,7 +1896,8 @@ impl StructureViews {
             {
                 self.plot_range_fill_percent = Some(range_fill);
             }
-            if ui.button("Fit Y").clicked() {self.plot_fit_y=true;ui.close();}
+            if ui.button("Fit selected Y").clicked() {self.plot_fit_y=true;self.plot_fit_all_y=false;ui.close();}
+            if ui.button("Fit all visible Y").clicked() {self.plot_fit_all_y=true;self.plot_fit_y=false;ui.close();}
             if ui.add_enabled(selected_samples.is_some(),egui::Button::new("Fit selection")).clicked() {
                 if let Some(samples)=&selected_samples {force_view=Some(padded_selection(samples,count));self.plot_fit_y=true;}
                 ui.close();
@@ -2233,17 +2248,23 @@ impl StructureViews {
         let data = self.plot_overlay.as_ref().map(|(_, data)| data);
         let plot_id = egui::Id::new(("decoded_structure_plot", "overlay", output.revision));
         let hidden = self.plot_hidden.clone();
-        let y_fit = if self.plot_fit_y && self.plot_range_zoom.is_none() {
+        let y_fit = if (self.plot_fit_y || self.plot_fit_all_y) && self.plot_range_zoom.is_none() {
             data.and_then(|data| {
                 numeric_bounds(
                     data.series
                         .iter()
                         .filter(|(name, _)| {
                             !hidden.contains(*name)
-                                && (axis_names.is_empty() || axis_names.contains(name))
+                                && (self.plot_fit_all_y || axis_names.is_empty() || axis_names.contains(name))
                         })
                         .flat_map(|(_, values)| values)
-                        .map(|point| point.value),
+                        .map(|point| point.value)
+                        .chain(data.envelopes.iter()
+                            .filter(|(name, _)| {
+                                !hidden.contains(*name)
+                                    && (self.plot_fit_all_y || axis_names.is_empty() || axis_names.contains(name))
+                            })
+                            .flat_map(|(_, bands)| bands.iter().flat_map(|band| [band.min.value, band.max.value]))),
                 )
             })
         } else {
@@ -2251,6 +2272,7 @@ impl StructureViews {
         };
         if y_fit.is_some() && data.is_some_and(|data| data.complete) {
             self.plot_fit_y = false;
+            self.plot_fit_all_y = false;
         }
         let mut wheel_zoomed = false;
         let plot_ctx = ui.ctx().clone();
@@ -2389,6 +2411,7 @@ impl StructureViews {
                     max[0] += x;
                     plot_ui.set_plot_bounds(PlotBounds::from_min_max(min, max));
                     self.plot_fit_y = false;
+                    self.plot_fit_all_y = false;
                     plot_ctx.request_repaint();
                 }
                 let axis_rects = [
@@ -2447,6 +2470,7 @@ impl StructureViews {
                             plot_ui.set_plot_bounds(PlotBounds::from_min_max(min, max));
                         }
                         self.plot_fit_y = false;
+                        self.plot_fit_all_y = false;
                         plot_ctx.request_repaint();
                     }
                 }
@@ -2573,6 +2597,7 @@ impl StructureViews {
             || response.response.hovered() && ui.input(|input| input.zoom_delta() != 1.0)
         {
             self.plot_fit_y = false;
+            self.plot_fit_all_y = false;
         }
         let bounds = response.transform.bounds();
         let actual = viewport_samples(bounds.min()[0], bounds.max()[0], count);
@@ -2606,6 +2631,7 @@ impl StructureViews {
                     transform: response.transform,
                 });
                 self.plot_fit_y = false;
+                self.plot_fit_all_y = false;
             }
         }
         if let Some(zoom) = self.plot_range_zoom {
@@ -2641,6 +2667,7 @@ impl StructureViews {
                             zoom.transform.bounds().max()[1],
                         ));
                         self.plot_fit_y = false;
+                        self.plot_fit_all_y = false;
                         ui.ctx().request_repaint();
                     }
                 } else {
@@ -5372,6 +5399,28 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
         assert!(sine_bounds.min()[1] < -3. && sine_bounds.max()[1] > 3.);
         assert!(ramp_bounds.min()[1] > 9. && ramp_bounds.max()[1] < 15.,
             "Y axis must follow its selected series: sine={sine_bounds:?}, ramp={ramp_bounds:?}");
+    }
+
+    #[test]
+    fn fit_all_visible_series_keeps_the_sample_range() {
+        let (store, output) = waveform_plot_fixture();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        settle_plot(&ctx, &mut views, &output, &store);
+        views.plot_force_view = Some(900..1100);
+        views.plot_axis_series = Some("samples / sine".into());
+        views.plot_fit_y = true;
+        settle_plot(&ctx, &mut views, &output, &store);
+        let selected = *navigation_memory(&ctx, &views, &output).bounds();
+
+        views.plot_fit_all_y = true;
+        views.plot_fit_y = false;
+        settle_plot(&ctx, &mut views, &output, &store);
+        let all = *navigation_memory(&ctx, &views, &output).bounds();
+        assert_eq!(all.min()[0], selected.min()[0]);
+        assert_eq!(all.max()[0], selected.max()[0]);
+        assert!(all.min()[1] <= selected.min()[1]);
+        assert!(all.max()[1] > 12., "all visible series should include ramp: {all:?}");
     }
 
     #[test]

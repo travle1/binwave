@@ -138,6 +138,7 @@ pub struct BrowserApp {
     plot_jump: String,
     plot_jump_open: bool,
     fit_plot_y: bool,
+    fit_all_plot_y: bool,
     decoding: bool,
     reveal_results: bool,
     reveal_decoder: bool,
@@ -255,6 +256,7 @@ impl BrowserApp {
             plot_jump: "0".into(),
             plot_jump_open: false,
             fit_plot_y: false,
+            fit_all_plot_y: false,
             decoding: false,
             reveal_results: false,
             reveal_decoder: false,
@@ -1084,7 +1086,7 @@ impl BrowserApp {
             self.request_table();
             if !self.plot_sources_initialized {
                 self.plot_sources_initialized = true;
-                self.plot_sources.extend(self.decoded["collections"].as_array().into_iter().flatten().filter_map(|c| c["path"].as_str().map(str::to_owned)));
+                self.plot_sources.insert(self.collection.clone());
                 self.first = "0".into();
                 self.last = self.plot_count().min(512).to_string();
                 self.viewport.reset();
@@ -1445,6 +1447,16 @@ impl BrowserApp {
                     ui.label(format!("Y axis: {}", series.rsplit('.').next().unwrap_or(series)))
                         .on_hover_text(series);
                 }
+                ui.horizontal(|ui| {
+                    if ui.small_button("Fit selected Y").on_hover_text("Fit the selected series or group; keep the sample range").clicked() {
+                        self.fit_plot_y = true;
+                        self.fit_all_plot_y = false;
+                    }
+                    if ui.small_button("Fit all Y").on_hover_text("Fit every visible series; keep the sample range").clicked() {
+                        self.fit_all_plot_y = true;
+                        self.fit_plot_y = false;
+                    }
+                });
                 ui.add(egui::TextEdit::singleline(&mut self.plot_filter).hint_text("Find series…"));
                 let filter = self.plot_filter.trim().to_lowercase();
                 let matching: Vec<_> = names.iter().filter(|name|
@@ -1569,7 +1581,7 @@ impl BrowserApp {
                 self.plot_sidebar_open = true;
                 self.plot_sidebar_series = false;
             }
-            if ui.button("Fit").on_hover_text("Show the full sample range and fit the visible fields").clicked() { self.first="0".into();self.last=self.plot_count().to_string();self.request_plot(1200); }
+            if ui.button("Fit").on_hover_text("Show the full sample range and fit all visible series").clicked() { self.first="0".into();self.last=self.plot_count().to_string();self.fit_all_plot_y=true;self.request_plot(1200); }
             if ui.button("Go to sample…").clicked() { self.plot_jump_open = !self.plot_jump_open; }
             if self.plot_jump_open {
                 let entry=ui.add(egui::TextEdit::singleline(&mut self.plot_jump).desired_width(86.)
@@ -1588,6 +1600,8 @@ impl BrowserApp {
             ui.menu_button("Plot options", |ui| {
                 ui.label("Drag to pan; scroll or pinch to zoom.");
                 if self.presentation.menu(ui,&ranges) {self.fit_plot_y=true;}
+                if ui.button("Fit selected Y").clicked() { self.fit_plot_y=true; self.fit_all_plot_y=false; ui.close(); }
+                if ui.button("Fit all visible Y").clicked() { self.fit_all_plot_y=true; self.fit_plot_y=false; ui.close(); }
                 if ui.button("Inspect selected bytes").clicked() {self.layout.reveal(Pane::Inspector);self.mobile_target=Some(Pane::Inspector);ui.close();}
                 ui.weak("Use Open data → Extract selection to export bytes.");
             });
@@ -1620,12 +1634,16 @@ impl BrowserApp {
                 let p=self.presentation.placement(name);
                 p.scale == axis_placement.scale && p.offset == axis_placement.offset
             });
-            let fit_y=std::mem::take(&mut self.fit_plot_y).then(|| {
+            let fit_selected=std::mem::take(&mut self.fit_plot_y);
+            let fit_all=std::mem::take(&mut self.fit_all_plot_y);
+            let fit_y=(fit_selected || fit_all).then(|| {
                 let values=series.iter().filter(|c|{
                     let name=c["name"].as_str().unwrap_or("");
-                    !self.hidden.contains(name) && (axis_names.is_empty() || axis_names.iter().any(|axis| axis == name))
+                    !self.hidden.contains(name) && (fit_all || axis_names.is_empty() || axis_names.iter().any(|axis| axis == name))
                 })
-                    .flat_map(|c|c["points"].as_array().into_iter().flatten()).filter_map(|p|p[1].as_f64()).filter(|v|v.is_finite());
+                    .flat_map(|c|c["points"].as_array().into_iter().flatten().filter_map(|p|p[1].as_f64())
+                        .chain(c["bands"].as_array().into_iter().flatten().flat_map(|band| [band[2].as_f64(), band[3].as_f64()].into_iter().flatten())))
+                    .filter(|v|v.is_finite());
                 values.fold((f64::INFINITY,f64::NEG_INFINITY),|(min,max),v|(min.min(v),max.max(v)))
             });
 
@@ -1657,8 +1675,9 @@ impl BrowserApp {
                 }
                 let y_range = fit_y.or_else(|| reset_bounds.then(|| {
                     series.iter().filter(|c| !self.hidden.contains(c["name"].as_str().unwrap_or("")))
-                        .flat_map(|c| c["points"].as_array().into_iter().flatten())
-                        .filter_map(|p| p[1].as_f64()).filter(|v| v.is_finite())
+                        .flat_map(|c| c["points"].as_array().into_iter().flatten().filter_map(|p| p[1].as_f64())
+                            .chain(c["bands"].as_array().into_iter().flatten().flat_map(|band| [band[2].as_f64(), band[3].as_f64()].into_iter().flatten())))
+                        .filter(|v| v.is_finite())
                         .fold((f64::INFINITY,f64::NEG_INFINITY), |(min,max),v| (min.min(v),max.max(v)))
                 }));
                 if let Some((min,max))=y_range.filter(|(min,max)|min.is_finite()&&max.is_finite()) {
