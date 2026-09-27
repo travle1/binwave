@@ -60,6 +60,8 @@ pub struct HexEditor {
     auto_width: bool,
     window_start: usize,
     pending_scroll: Option<f32>,
+    /// Grid's horizontal scroll offset last frame, so the column header follows it.
+    horizontal_scroll: f32,
     visible_range: Option<Range<usize>>,
     jump: String,
     focus_jump: bool,
@@ -110,6 +112,7 @@ impl Default for HexEditor {
             auto_width: true,
             window_start: 0,
             pending_scroll: None,
+            horizontal_scroll: 0.0,
             visible_range: None,
             jump: String::new(),
             focus_jump: false,
@@ -874,13 +877,17 @@ A gold underline marks search hits; an orange top edge marks edits.");
         let hex_end = offset_width + self.bytes_per_row as f32 * cell_width;
         let ascii_start = hex_end + ascii_gutter;
         let content_width = row_width(self.bytes_per_row);
+        // Keep the header to the visible width: a wider allocation would widen
+        // everything below it, drawing rows over a docked Inspector. It scrolls
+        // horizontally with the grid instead.
         let (header, _) = ui.allocate_exact_size(
-            egui::vec2(content_width.max(ui.available_width()), row_height),
+            egui::vec2(ui.available_width(), row_height),
             Sense::hover(),
         );
         let header_painter = ui.painter_at(header);
+        let header_left = header.left() - self.horizontal_scroll;
         header_painter.text(
-            header.left_center(),
+            egui::pos2(header_left, header.center().y),
             egui::Align2::LEFT_CENTER,
             "Offset",
             font.clone(),
@@ -889,7 +896,7 @@ A gold underline marks search hits; an orange top edge marks edits.");
         for column in 0..self.bytes_per_row {
             let cell = egui::Rect::from_min_size(
                 egui::pos2(
-                    header.left() + offset_width + column as f32 * cell_width,
+                    header_left + offset_width + column as f32 * cell_width,
                     header.top(),
                 ),
                 egui::vec2(cell_width, row_height),
@@ -903,7 +910,7 @@ A gold underline marks search hits; an orange top edge marks edits.");
             );
         }
         header_painter.text(
-            egui::pos2(header.left() + ascii_start, header.center().y),
+            egui::pos2(header_left + ascii_start, header.center().y),
             egui::Align2::LEFT_CENTER,
             "Text",
             font.clone(),
@@ -1158,6 +1165,7 @@ A gold underline marks search hits; an orange top edge marks edits.");
                 });
             }
         }
+        self.horizontal_scroll = output.state.offset.x;
         // Recenter only near a local scroll boundary. Keep the same absolute
         // first visible row and fractional pixel position, so wheel scrolling
         // continues through arbitrarily large files without exposing paging.
@@ -1936,6 +1944,43 @@ mod tests {
         assert_eq!(editor.selection(), Some(2..6));
     }
 
+    #[test]
+    fn fixed_width_rows_stay_left_of_a_docked_inspector() {
+        let (_dir, source) = fixture();
+        let ctx = egui::Context::default();
+        let mut editor = HexEditor::default();
+        editor.bytes_per_row = 16;
+        editor.auto_width = false;
+        let mut frame = || ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(780.0, 600.0))),
+                ..Default::default()
+            },
+            |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::Panel::right("inspector").exact_size(340.).show(ui, |ui| { ui.label("Inspector"); });
+                    editor.ui(ui, Some(source.clone()), &[]);
+                });
+            },
+        );
+        let mut output = frame();
+        for _ in 0..50 {
+            if output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == "00000000")) { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            output = frame();
+        }
+        let text_rects: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some((text.galley.text().to_owned(),
+                text.galley.rect.translate(text.pos.to_vec2()).intersect(shape.clip_rect))),
+            _ => None,
+        }).collect();
+        let inspector = text_rects.iter().find(|(text, _)| text == "Inspector").unwrap().1.left();
+        let overlapping: Vec<_> = text_rects.iter()
+            .filter(|(text, rect)| text != "Inspector" && rect.is_positive() && rect.right() > inspector)
+            .map(|(text, _)| text.clone()).collect();
+        assert!(overlapping.is_empty(), "hex text drawn over the inspector: {overlapping:?}");
+    }
     #[test]
     fn rendered_view_fills_height_and_reads_a_bounded_page_asynchronously() {
         let (_dir, source) = fixture();
