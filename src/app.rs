@@ -1443,11 +1443,25 @@ impl BinwaveApp {
                 ui.label(egui::RichText::new(format!("{}{change} · {}{}",
                     crate::format::size(len),
                     self.binary.default_byte_order().unwrap_or("byte order unspecified"),
-                    if self.binary.is_dirty() { " · unsaved changes" } else { "" }))
+                    if self.binary.decoder_unsaved() { " · decoder not saved" } else { "" }))
                     .size(t.font.small).color(t.color.text.muted))
                     .on_hover_text(if change.is_empty() { crate::format::exact_bytes(len) } else {
                         format!("{} (saved: {})", crate::format::exact_bytes(len), crate::format::exact_bytes(saved))
                     });
+                if self.binary.bytes_unsaved() {
+                    // Edits live in memory until Save bytes; say so where people look.
+                    let color = t.color.status.warning;
+                    let chip = egui::Frame::new().fill(color.gamma_multiply(t.color.status.warning_badge_alpha))
+                        .corner_radius(egui::CornerRadius::same(t.radius.pill.min(u8::MAX as u16) as u8))
+                        .inner_margin(egui::Margin::symmetric((t.spacing.card_padding / 2.) as i8,
+                            t.spacing.sidebar_row_gap as i8))
+                        .show(ui, |ui| { ui.label(egui::RichText::new("Not saved").size(t.font.label).color(color)); })
+                        .response.interact(egui::Sense::click());
+                    let chip = chip.on_hover_text(format!(
+                        "Edits are kept in memory ({} used); {} on disk is unchanged.\nClick or press Ctrl+Shift+S to save.",
+                        crate::format::size(self.binary.edit_memory() as u64), self.binary.file_name()));
+                    if chip.clicked() { export = true; }
+                }
                 let partial = self.data_partial || self.binary.status().1;
                 let (badge, color) = if self.binary.is_decoding() { ("Decoding", t.color.accent.base) }
                     else if partial { ("Partial decode", t.color.status.warning) }

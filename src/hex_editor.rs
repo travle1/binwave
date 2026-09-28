@@ -27,6 +27,12 @@ pub struct HexHighlight {
 pub enum HexAction {
     Replace { offset: usize, bytes: Vec<u8> },
     Insert { offset: usize, bytes: Vec<u8> },
+    /// `pattern` repeated `count` times, inserted before `offset`.
+    InsertRepeated { offset: usize, pattern: Vec<u8>, count: usize },
+    /// Overwrite the range with `pattern`, repeated to fill it.
+    Fill { range: Range<usize>, pattern: Vec<u8> },
+    /// Choose a file and insert its bytes before this offset.
+    InsertFile(usize),
     Delete(Range<usize>),
     Undo,
     Redo,
@@ -97,8 +103,10 @@ pub struct HexEditor {
     insert_mode: bool,
     /// False while a decoder reads fixed offsets, so the length must not change.
     can_resize: bool,
-    /// The bytes row inserts instead of overwriting the selection.
-    replace_inserts: bool,
+    /// What the bytes row does with the bytes typed into it.
+    row: BytesRow,
+    /// How many times the bytes row repeats an insert.
+    repeat: String,
     ascii_input: bool,
     high_nibble: Option<u8>,
     transfer_rx: Option<mpsc::Receiver<Result<String, String>>>,
@@ -151,7 +159,8 @@ impl Default for HexEditor {
             edit_mode: false,
             insert_mode: false,
             can_resize: true,
-            replace_inserts: false,
+            row: BytesRow::Replace,
+            repeat: "1".into(),
             ascii_input: false,
             high_nibble: None,
             transfer_rx: None,
@@ -184,14 +193,13 @@ impl HexEditor {
     }
 
     pub fn show_replace(&mut self) {
-        self.show_replace = true;
-        self.replace_inserts = false;
-        self.focus_replace = true;
+        self.show_bytes_row(BytesRow::Replace);
     }
 
-    pub fn show_insert(&mut self) {
+    fn show_bytes_row(&mut self, row: BytesRow) {
         self.show_replace = true;
-        self.replace_inserts = true;
+        self.row = row;
+        self.repeat = "1".into();
         self.focus_replace = true;
     }
 
@@ -759,29 +767,32 @@ impl HexEditor {
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.replacement)
                         .desired_width(200.0)
-                        .hint_text(if self.replace_inserts { "Bytes to insert" } else { "Replacement bytes" }),
+                        .hint_text(match self.row {
+                            BytesRow::Replace => "Replacement bytes",
+                            BytesRow::Insert => "Bytes to insert",
+                            BytesRow::Fill => "Pattern",
+                        }),
                 );
                 if self.focus_replace {
                     response.request_focus();
                     self.focus_replace = false;
                 }
-                let label = if self.replace_inserts { "Insert bytes" } else { "Overwrite bytes" };
-                if ui.button(label).clicked() {
-                    let result = if self.replace_inserts {
-                        typed_bytes(&self.replacement, self.replace_text).map(|bytes| {
-                            let offset = self.selection().map_or(0, |range| range.start);
-                            (offset, bytes)
-                        })
-                    } else {
-                        replacement_bytes(&self.replacement, self.replace_text, self.selection(), source.len())
-                    };
-                    match result {
-                        Ok((offset, bytes)) => {
-                            actions.push(if self.replace_inserts {
-                                HexAction::Insert { offset, bytes }
-                            } else {
-                                HexAction::Replace { offset, bytes }
-                            });
+                let mut apply = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                if self.row == BytesRow::Insert {
+                    ui.label("×");
+                    let count = ui.add(egui::TextEdit::singleline(&mut self.repeat).desired_width(64.0))
+                        .on_hover_text("How many times to repeat the bytes.");
+                    apply |= count.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                }
+                let label = match self.row {
+                    BytesRow::Replace => "Overwrite bytes",
+                    BytesRow::Insert => "Insert bytes",
+                    BytesRow::Fill => "Fill selection",
+                };
+                if ui.button(label).clicked() || apply {
+                    match self.bytes_row_action(source.len()) {
+                        Ok(action) => {
+                            actions.push(action);
                             self.show_replace = false;
                             self.replacement.clear();
                         }
@@ -838,6 +849,30 @@ impl HexEditor {
         });
     }
 
+    fn bytes_row_action(&self, len: usize) -> Result<HexAction, String> {
+        match self.row {
+            BytesRow::Replace => replacement_bytes(&self.replacement, self.replace_text, self.selection(), len)
+                .map(|(offset, bytes)| HexAction::Replace { offset, bytes }),
+            BytesRow::Insert => {
+                let pattern = typed_bytes(&self.replacement, self.replace_text)?;
+                let count = self.repeat.trim().replace([',', '_'], "").parse::<usize>()
+                    .ok().filter(|&count| count > 0)
+                    .ok_or("Repeat a whole number of times, 1 or more.")?;
+                let offset = self.selection().map_or(0, |range| range.start);
+                Ok(if count == 1 {
+                    HexAction::Insert { offset, bytes: pattern }
+                } else {
+                    HexAction::InsertRepeated { offset, pattern, count }
+                })
+            }
+            BytesRow::Fill => {
+                let range = self.selection().ok_or("Select bytes to fill.")?;
+                let pattern = typed_bytes(&self.replacement, self.replace_text)?;
+                Ok(HexAction::Fill { range, pattern })
+            }
+        }
+    }
+
     /// Overwrite | Insert. Clicking the active mode stops editing.
     fn edit_mode_switch(&mut self, ui: &mut egui::Ui) {
         let t = &crate::theme::DARK;
@@ -847,7 +882,7 @@ impl HexEditor {
                 ui.spacing_mut().item_spacing.x = 0.;
                 let overwrite = self.edit_mode && !self.insert_mode;
                 if ui.add(egui::Button::selectable(overwrite, "Overwrite"))
-                    .on_hover_text("Type hex digits (or text) over the selected bytes.")
+                    .on_hover_text("Type or paste hex digits (or text) over the selected bytes. Edits stay in memory until you save.")
                     .clicked()
                 {
                     self.edit_mode = !overwrite;
@@ -856,7 +891,7 @@ impl HexEditor {
                 }
                 let insert = self.edit_mode && self.insert_mode;
                 if ui.add_enabled(self.can_resize, egui::Button::selectable(insert, "Insert"))
-                    .on_hover_text("Type to insert bytes before the cursor. Delete and Backspace remove bytes; the Insert key switches modes.")
+                    .on_hover_text("Type or paste to insert bytes before the cursor. Delete and Backspace remove bytes; the Insert key switches modes. Edits stay in memory until you save.")
                     .on_disabled_hover_text("This decoder reads fixed offsets, so bytes can't be inserted or deleted.")
                     .clicked()
                 {
@@ -909,11 +944,27 @@ impl HexEditor {
         });
         let resize_blocked = "This decoder reads fixed offsets, so bytes can't be inserted or deleted.";
         if ui.add_enabled(self.can_resize, egui::Button::new("Insert bytes…"))
-            .on_hover_text("Insert bytes before the selection.")
+            .on_hover_text("Insert bytes, or a pattern repeated N times, before the selection.")
             .on_disabled_hover_text(resize_blocked)
             .clicked()
         {
-            self.show_insert();
+            self.show_bytes_row(BytesRow::Insert);
+            ui.close();
+        }
+        if ui.add_enabled(self.can_resize, egui::Button::new("Insert file…"))
+            .on_hover_text("Insert another file's bytes before the selection. They stay on disk until you save.")
+            .on_disabled_hover_text(resize_blocked)
+            .clicked()
+        {
+            actions.push(HexAction::InsertFile(self.selection().map_or(0, |range| range.start)));
+            ui.close();
+        }
+        if ui.add_enabled(self.selection().is_some(), egui::Button::new("Fill selection…"))
+            .on_hover_text("Repeat a pattern across the selected bytes.")
+            .on_disabled_hover_text("Select bytes to fill.")
+            .clicked()
+        {
+            self.show_bytes_row(BytesRow::Fill);
             ui.close();
         }
         let selected = self.selection();
@@ -1427,6 +1478,33 @@ impl HexEditor {
                         self.move_caret(target, modifiers.shift);
                     }
                 }
+                egui::Event::Paste(clipboard) => {
+                    let Some(at) = self.selection().filter(|_| self.edit_mode).map(|range| range.start) else {
+                        self.status = "Choose Overwrite or Insert to paste bytes.".into();
+                        continue;
+                    };
+                    self.status.clear();
+                    match pasted_bytes(&clipboard, self.ascii_input) {
+                        Ok(bytes) if bytes.is_empty() => {}
+                        Ok(bytes) if bytes.len() > COPY_LIMIT => {
+                            self.status = "Paste at most 1 MiB at once. Use Insert file… for more.".into();
+                        }
+                        Ok(bytes) if self.insert_mode && self.can_resize => {
+                            actions.push(HexAction::Insert { offset: at, bytes });
+                        }
+                        Ok(bytes) if at + bytes.len() <= source.len() => {
+                            let next = (at + bytes.len()).min(source.len() - 1);
+                            actions.push(HexAction::Replace { offset: at, bytes });
+                            self.move_caret(next, false);
+                        }
+                        Ok(bytes) => {
+                            self.status = format!("The clipboard holds {}; only {} fit before the end of the file.",
+                                crate::format::exact_bytes(bytes.len() as u64),
+                                crate::format::exact_bytes((source.len() - at) as u64));
+                        }
+                        Err(error) => self.status = error,
+                    }
+                }
                 egui::Event::Text(text) if self.edit_mode && self.insert_mode && self.anchor.is_some() => {
                     // The host shifts the cursor past the inserted bytes once they land.
                     let bytes = if self.ascii_input {
@@ -1669,6 +1747,23 @@ fn parse_hex(input: &str) -> Result<Vec<u8>, String> {
                 .map_err(|_| "Use hexadecimal digits 0–9 and A–F.".to_owned())
         })
         .collect()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum BytesRow {
+    Replace,
+    Insert,
+    Fill,
+}
+
+/// Clipboard bytes: text as UTF-8 in the Text column; hex elsewhere, accepting
+/// `74 72`, `7472` and `0x74, 0x72`.
+fn pasted_bytes(clipboard: &str, text: bool) -> Result<Vec<u8>, String> {
+    if text {
+        return Ok(clipboard.as_bytes().to_vec());
+    }
+    let cleaned = clipboard.replace("0x", " ").replace("0X", " ").replace([',', ';'], " ");
+    parse_hex(&cleaned).map_err(|_| "The clipboard isn't hex bytes. Click the Text column to paste it as text.".into())
 }
 
 fn typed_bytes(input: &str, text: bool) -> Result<Vec<u8>, String> {
@@ -2483,7 +2578,7 @@ mod tests {
         let (_dir, source) = fixture();
         let ctx = egui::Context::default();
         let mut editor = HexEditor::default();
-        let mut press = |editor: &mut HexEditor, event: egui::Event| {
+        let press = |editor: &mut HexEditor, event: egui::Event| {
             let mut actions = Vec::new();
             let _ = ctx.run(egui::RawInput { events: vec![event], ..Default::default() }, |_ctx, ui| {
                 egui::CentralPanel::default().show(ui, |ui| editor.keyboard(ui, &source, 500.0, 21.0, &mut actions));
@@ -2517,6 +2612,60 @@ mod tests {
         assert!(press(&mut editor, key(Key::Delete)).is_empty());
         press(&mut editor, key(Key::Insert));
         assert!(!editor.insert_mode, "fixed-offset decoders keep the length");
+    }
+
+    #[test]
+    fn paste_follows_the_edit_mode_and_the_column() {
+        let (_dir, source) = fixture();
+        let ctx = egui::Context::default();
+        let mut editor = HexEditor::default();
+        let paste = |editor: &mut HexEditor, text: &str| {
+            let mut actions = Vec::new();
+            let _ = ctx.run(egui::RawInput { events: vec![egui::Event::Paste(text.into())], ..Default::default() },
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| editor.keyboard(ui, &source, 500.0, 21.0, &mut actions));
+                });
+            actions
+        };
+        editor.select_range(4..6, false);
+        assert!(paste(&mut editor, "AB").is_empty());
+        assert!(editor.status.contains("Overwrite or Insert"), "{}", editor.status);
+        editor.edit_mode = true;
+        let actions = paste(&mut editor, "0x74, 0x72");
+        assert!(matches!(&actions[..], [HexAction::Replace { offset: 4, bytes }, HexAction::Selection(_)]
+            if bytes == &[0x74, 0x72]), "{actions:?}");
+        assert!(editor.status.is_empty());
+        assert_eq!(editor.selection(), Some(6..7));
+        assert!(paste(&mut editor, "not hex").is_empty());
+        assert!(editor.status.contains("Text column"), "{}", editor.status);
+        editor.insert_mode = true;
+        editor.ascii_input = true;
+        let actions = paste(&mut editor, "hi");
+        assert!(matches!(&actions[..], [HexAction::Insert { offset: 6, bytes }] if bytes == b"hi"), "{actions:?}");
+        editor.insert_mode = false;
+        editor.ascii_input = false;
+        editor.select_range(source.len() - 1..source.len(), false);
+        assert!(paste(&mut editor, "01 02").is_empty());
+        assert!(editor.status.contains("only 1 byte fit"), "{}", editor.status);
+    }
+
+    #[test]
+    fn bytes_row_inserts_repeated_patterns_and_fills_selections() {
+        let mut editor = HexEditor::default();
+        editor.select_range(8..16, false);
+        editor.show_bytes_row(BytesRow::Insert);
+        editor.replacement = "DE AD".into();
+        editor.repeat = "1,000".into();
+        assert!(matches!(editor.bytes_row_action(64),
+            Ok(HexAction::InsertRepeated { offset: 8, pattern, count: 1000 }) if pattern == [0xDE, 0xAD]));
+        editor.repeat = "0".into();
+        assert!(editor.bytes_row_action(64).is_err());
+        editor.repeat = "1".into();
+        assert!(matches!(editor.bytes_row_action(64), Ok(HexAction::Insert { offset: 8, .. })));
+        editor.show_bytes_row(BytesRow::Fill);
+        editor.replacement = "00".into();
+        assert!(matches!(editor.bytes_row_action(64),
+            Ok(HexAction::Fill { range, pattern }) if range == (8..16) && pattern == [0]));
     }
 
     #[test]

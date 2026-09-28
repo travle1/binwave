@@ -48,6 +48,8 @@ enum FileDialogAction {
     Open,
     LoadYaml,
     Save(SaveContent),
+    /// Insert the chosen file's bytes before this offset.
+    InsertFile(usize),
 }
 
 enum SaveContent {
@@ -637,6 +639,18 @@ impl BinaryWorkspace {
     }
     fn cell_dirty(&self) -> bool {
         self.edit_text != self.edit_original
+    }
+    /// Byte edits held in memory that are not written to disk yet.
+    pub fn bytes_unsaved(&self) -> bool {
+        self.bytes.as_ref().is_some_and(ByteStore::is_dirty)
+            || self.document.as_ref().is_some_and(BinaryDocument::is_dirty)
+            || self.cell_dirty()
+    }
+    pub fn decoder_unsaved(&self) -> bool {
+        self.yaml != self.saved_yaml || self.other_draft.dirty() || self.structure_ui.authoring_dirty()
+    }
+    pub fn edit_memory(&self) -> usize {
+        self.bytes.as_ref().map_or(0, |store| store.view().edit_memory())
     }
     fn unsaved(&self) -> bool {
         self.bytes.as_ref().is_some_and(ByteStore::is_dirty)
@@ -1315,8 +1329,7 @@ impl BinaryWorkspace {
         }
         if self.save_choice {
             let t = &crate::theme::DARK;
-            let name = self.source.as_deref().and_then(Path::file_name)
-                .map_or("the file".into(), |name| name.to_string_lossy().into_owned());
+            let name = self.file_name();
             let sizes = self.bytes.as_ref().map(|store| {
                 let view = store.view();
                 (view.original_len() as u64, view.len() as u64)
@@ -1342,14 +1355,14 @@ impl BinaryWorkspace {
                         if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                             choice = Some(None);
                         }
-                        if ui.button("Save as new file…")
+                        if ui.button("Save to a new file…")
                             .on_hover_text(format!("Write the edited bytes to a new file and continue there. {name} stays unchanged."))
                             .clicked()
                         {
                             choice = Some(Some(false));
                         }
                         if ui.button(format!("Replace {name}"))
-                            .on_hover_text("Write a complete copy next to it, then swap it in. This can't be undone.")
+                            .on_hover_text(format!("Rewrite {name} on disk: a complete copy is written next to it, then swapped in. This can't be undone."))
                             .clicked()
                         {
                             choice = Some(Some(true));
@@ -1405,6 +1418,15 @@ impl BinaryWorkspace {
             #[cfg(test)]
             FileDialogAction::Open => self.open(path, ctx),
             FileDialogAction::LoadYaml => self.load_yaml(path, ctx),
+            FileDialogAction::InsertFile(offset) => match FileSource::open(&path) {
+                Ok(source) => {
+                    let message = format!("Inserted {} ({}) at {}.", path.file_name().unwrap_or_default().to_string_lossy(),
+                        crate::format::size(source.len as u64), crate::format::offset(offset as u64));
+                    let source = Arc::new(source);
+                    self.edit_bytes(ctx, message, true, |store| store.insert_file(offset, source));
+                }
+                Err(error) => self.report(Err(error)),
+            },
             FileDialogAction::Save(content) => {
                 // The native save picker already asks before replacing an existing
                 // file. Do not ask a second time after the user accepts it.
@@ -1671,7 +1693,7 @@ impl BinaryWorkspace {
         self.source = Some(path.clone());
         self.after_byte_change(ctx, true);
         self.bytes_changed = false;
-        self.report(Ok(format!("Saved {}", path.display())));
+        self.report(Ok(format!("Saved to {}. Now editing it.", path.display())));
     }
     pub fn can_save_definition(&self) -> bool {
         !self.yaml.trim().is_empty() && !self.active_authoring_dirty()
@@ -2993,27 +3015,39 @@ impl BinaryWorkspace {
                         )));
                         continue;
                     }
-                    if let Some(store) = &mut self.bytes {
-                        match store.replace(offset, &bytes) {
-                            Ok(_) => {
-                                self.after_byte_change(ctx, true);
-                                self.report(Ok(
-                                    "Bytes replaced. Undo restores their previous values.".into(),
-                                ));
-                            }
-                            Err(error) => self.report(Err(error)),
-                        }
+                    let message = format!("Overwrote {}.", crate::format::exact_bytes(bytes.len() as u64));
+                    self.edit_bytes(ctx, message, false, |store| store.replace(offset, &bytes));
+                }
+                HexAction::InsertRepeated { offset, pattern, count } => {
+                    let message = format!("Inserted {} × {} at {}.", crate::format::exact_bytes(pattern.len() as u64),
+                        crate::format::count(count as u64), crate::format::offset(offset as u64));
+                    self.edit_bytes(ctx, message, true, |store| store.insert_pattern(offset, &pattern, count));
+                }
+                HexAction::Fill { range, pattern } => {
+                    if !self.can_resize() && range.len() > crate::byte_store::PATCH_LIMIT {
+                        self.report(Err(anyhow::anyhow!("This decoder reads fixed offsets; fill at most {} at once.",
+                            crate::format::size(crate::byte_store::PATCH_LIMIT as u64))));
+                        continue;
+                    }
+                    let message = format!("Filled {}.", crate::format::byte_range(range.start as u64, range.end as u64));
+                    self.edit_bytes(ctx, message, false, |store| store.fill(range, &pattern));
+                }
+                HexAction::InsertFile(offset) => {
+                    if self.commands_available() && self.can_resize() {
+                        let dialog = self.dialog_template.clone().set_title("Insert file");
+                        let dialog = self.file_locations.configure(FileKind::Data, dialog);
+                        self.file_dialog.begin_open(dialog, FileDialogAction::InsertFile(offset), ctx);
                     }
                 }
                 HexAction::Insert { offset, bytes } => {
                     let message = format!("Inserted {} at {}.", crate::format::exact_bytes(bytes.len() as u64),
                         crate::format::offset(offset as u64));
-                    self.change_length(ctx, message, |store| store.insert(offset, &bytes));
+                    self.edit_bytes(ctx, message, true, |store| store.insert(offset, &bytes));
                 }
                 HexAction::Delete(range) => {
                     let message = format!("Deleted {} ({}).", crate::format::exact_bytes(range.len() as u64),
                         crate::format::byte_range(range.start as u64, range.end as u64));
-                    self.change_length(ctx, message, |store| store.delete(range));
+                    self.edit_bytes(ctx, message, true, |store| store.delete(range));
                 }
                 HexAction::Undo => self.history(ctx, false),
                 HexAction::Redo => self.history(ctx, true),
@@ -3060,10 +3094,13 @@ impl BinaryWorkspace {
         self.document.is_none() || self.structure_ui.has_published_program()
     }
 
-    fn change_length(
+    /// Apply one byte edit and keep every panel in step. The first edit says where
+    /// edits live, since nothing reaches the disk until Save bytes.
+    fn edit_bytes(
         &mut self,
         ctx: &Context,
         message: String,
+        resizes: bool,
         edit: impl FnOnce(&mut ByteStore) -> Result<Range<usize>>,
     ) {
         if !self.commands_available() {
@@ -3073,23 +3110,34 @@ impl BinaryWorkspace {
             self.report(Err(anyhow::anyhow!("Commit or cancel the table value before editing bytes.")));
             return;
         }
-        if !self.can_resize() {
+        if resizes && !self.can_resize() {
             self.report(Err(anyhow::anyhow!(
                 "This decoder reads fixed offsets, so bytes can't be inserted or deleted."
             )));
             return;
         }
         let Some(store) = &mut self.bytes else { return };
-        let before = store.view().len();
+        let (before, was_dirty) = (store.view().len(), store.is_dirty());
         match edit(store) {
             Ok(range) => {
                 let after = store.view().len();
                 self.shift_offsets(range.start, before, after);
                 self.after_byte_change(ctx, true);
-                self.report(Ok(format!("{message} Undo reverses it.")));
+                self.report(Ok(if was_dirty {
+                    format!("{message} Undo reverses it.")
+                } else {
+                    format!("{message} Edited in memory; {} is unchanged until you save (Ctrl+Shift+S).",
+                        self.file_name())
+                }));
             }
             Err(error) => self.report(Err(error)),
         }
+    }
+
+    /// The open file's name, for messages about it.
+    pub fn file_name(&self) -> String {
+        self.source.as_deref().and_then(Path::file_name)
+            .map_or("the file".into(), |name| name.to_string_lossy().into_owned())
     }
 
     /// Keep Hex and the decoded panels on the same bytes after the length changes at `at`.
@@ -5139,6 +5187,29 @@ mod tests {
         assert_eq!(workspace.bytes.as_ref().unwrap().view().read(0, 4).unwrap(), [3, 10, 20, 30]);
         settle(&mut workspace, &ctx);
         assert!(workspace.structure_ui.has_program(), "the decoder runs again on the saved file");
+    }
+
+    #[test]
+    fn patterns_fills_and_inserted_files_edit_in_memory_until_saved() {
+        let ctx = Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.raw");
+        let part = dir.path().join("part.raw");
+        std::fs::write(&path, [1, 2, 3, 4]).unwrap();
+        std::fs::write(&part, b"PART").unwrap();
+        let mut workspace = BinaryWorkspace::default();
+        workspace.open(path.clone(), &ctx);
+        settle(&mut workspace, &ctx);
+        workspace.hex_actions(vec![HexAction::InsertRepeated { offset: 2, pattern: vec![0xAA], count: 3 }], &ctx);
+        assert!(workspace.status().0.contains("Edited in memory"), "{}", workspace.status().0);
+        assert!(workspace.bytes_unsaved());
+        workspace.hex_actions(vec![HexAction::Fill { range: 0..2, pattern: vec![9] }], &ctx);
+        workspace.finish_file_dialog(FileDialogAction::InsertFile(7), Some(part.clone()), &ctx, true);
+        let view = workspace.bytes.as_ref().unwrap().view();
+        assert_eq!(view.read(0, 16).unwrap(), [9, 9, 0xAA, 0xAA, 0xAA, 3, 4, b'P', b'A', b'R', b'T']);
+        assert_eq!(std::fs::read(&path).unwrap(), [1, 2, 3, 4], "nothing is written before saving");
+        workspace.history(&ctx, false);
+        assert_eq!(workspace.file_len(), 7);
     }
 
     #[test]

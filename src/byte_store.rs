@@ -15,6 +15,8 @@ use std::sync::{
 
 static REVISION: AtomicU64 = AtomicU64::new(1);
 pub const READ_LIMIT: usize = 1024 * 1024;
+/// Views that address the original directly accept at most this many edited bytes.
+pub const PATCH_LIMIT: usize = 16 * 1024 * 1024;
 fn revision() -> u64 {
     REVISION.fetch_add(1, Ordering::Relaxed)
 }
@@ -106,16 +108,21 @@ impl Origin {
     }
 }
 
-/// A run of the edited file: bytes from the original, or bytes the user typed.
+/// A run of the edited file: bytes from the original, bytes the user typed, a
+/// repeated pattern, or part of another file. Patterns and files are never
+/// expanded in memory; reads and saves produce their bytes on demand.
 #[derive(Clone, Debug)]
 enum Piece {
     Base { start: usize, len: usize },
     Added(Arc<[u8]>),
+    /// `pattern` repeated from `phase` for `len` bytes.
+    Pattern { pattern: Arc<[u8]>, phase: usize, len: usize },
+    File { source: Arc<FileSource>, start: usize, len: usize },
 }
 impl Piece {
     fn len(&self) -> usize {
         match self {
-            Self::Base { len, .. } => *len,
+            Self::Base { len, .. } | Self::Pattern { len, .. } | Self::File { len, .. } => *len,
             Self::Added(bytes) => bytes.len(),
         }
     }
@@ -123,6 +130,14 @@ impl Piece {
         match self {
             Self::Base { start, .. } => Self::Base { start: start + from, len: to - from },
             Self::Added(bytes) => Self::Added(bytes[from..to].into()),
+            Self::Pattern { pattern, phase, .. } => Self::Pattern {
+                pattern: pattern.clone(),
+                phase: (phase + from) % pattern.len(),
+                len: to - from,
+            },
+            Self::File { source, start, .. } => {
+                Self::File { source: source.clone(), start: start + from, len: to - from }
+            }
         }
     }
 }
@@ -221,6 +236,14 @@ impl Pieces {
             let same = match (x, y) {
                 (Piece::Base { start: s, .. }, Piece::Base { start: t, .. }) => s == t,
                 (Piece::Added(p), Piece::Added(q)) => p[..n] == q[..n],
+                (
+                    Piece::Pattern { pattern: p, phase: i, .. },
+                    Piece::Pattern { pattern: q, phase: j, .. },
+                ) => p == q && i == j,
+                (
+                    Piece::File { source: f, start: i, .. },
+                    Piece::File { source: g, start: j, .. },
+                ) => Arc::ptr_eq(f, g) && i == j,
                 _ => false,
             };
             if !same {
@@ -272,19 +295,17 @@ impl ByteView {
         self.origin.as_ref().map(|origin| origin.path.as_path())
     }
     pub fn read(&self, offset: usize, length: usize) -> Result<Vec<u8>> {
-        self.read_with(offset, length, |start, len| self.base.read(start, len))
+        self.read_with(offset, length, false)
     }
     /// Use within a plot scan bracketed by `validate` calls. The final
     /// validation discards results if the source changed during the scan.
     pub(crate) fn read_validated(&self, offset: usize, length: usize) -> Result<Vec<u8>> {
-        self.read_with(offset, length, |start, len| self.base.read_validated(start, len))
+        self.read_with(offset, length, true)
     }
-    fn read_with(
-        &self,
-        offset: usize,
-        length: usize,
-        read: impl Fn(usize, usize) -> Result<Vec<u8>>,
-    ) -> Result<Vec<u8>> {
+    fn read_with(&self, offset: usize, length: usize, validated: bool) -> Result<Vec<u8>> {
+        let read = |start, len| {
+            if validated { self.base.read_validated(start, len) } else { self.base.read(start, len) }
+        };
         ensure!(length <= READ_LIMIT, "read exceeds the 1 MiB chunk limit");
         ensure!(offset <= self.len(), "byte offset is outside the file");
         let length = length.min(self.len() - offset);
@@ -303,9 +324,31 @@ impl ByteView {
                     bytes.extend_from_slice(&chunk);
                 }
                 Piece::Added(added) => bytes.extend_from_slice(&added[from..to]),
+                Piece::Pattern { pattern, phase, .. } => {
+                    bytes.extend((from..to).map(|i| pattern[(phase + i) % pattern.len()]));
+                }
+                Piece::File { source, start: file, .. } => {
+                    let (at, len) = (file + from, to - from);
+                    let chunk = if validated {
+                        source.read_validated_range(at, len)?
+                    } else {
+                        source.read_range(at, len)?
+                    };
+                    ensure!(chunk.len() == len, "inserted file ended during read");
+                    bytes.extend_from_slice(&chunk);
+                }
             }
         }
         Ok(bytes)
+    }
+    /// Memory the edits hold: typed bytes and pattern sources. Inserted files
+    /// and the original stay on disk.
+    pub fn edit_memory(&self) -> usize {
+        self.pieces.list.iter().map(|piece| match piece {
+            Piece::Added(bytes) => bytes.len(),
+            Piece::Pattern { pattern, .. } => pattern.len(),
+            Piece::Base { .. } | Piece::File { .. } => 0,
+        }).sum()
     }
     /// Which bytes in `offset..offset + length` were typed or inserted.
     pub fn edited(&self, offset: usize, length: usize) -> Vec<bool> {
@@ -314,37 +357,57 @@ impl ByteView {
         for (start, piece) in self.pieces.covering(offset, length) {
             let from = offset.max(start) - start;
             let to = (offset + length).min(start + piece.len()) - start;
-            flags.extend(std::iter::repeat_n(matches!(piece, Piece::Added(_)), to - from));
+            flags.extend(std::iter::repeat_n(!matches!(piece, Piece::Base { .. }), to - from));
         }
         flags
     }
     /// Overwritten bytes by offset, for views that address the original file
-    /// directly. None once inserts or deletes have shifted offsets.
+    /// directly. None once inserts or deletes have shifted offsets, or when the
+    /// edits cover more than `PATCH_LIMIT` bytes.
     pub fn overwrite_patches(&self) -> Option<BTreeMap<usize, u8>> {
+        if self.len() != self.base.len() {
+            return None;
+        }
         let mut patches = BTreeMap::new();
-        for (start, piece) in self.pieces.starts.iter().zip(&self.pieces.list) {
-            match piece {
-                Piece::Base { start: base, .. } if base != start => return None,
-                Piece::Base { .. } => {}
-                Piece::Added(bytes) => {
-                    if start + bytes.len() > self.base.len() {
-                        return None;
+        let mut edited = 0;
+        for (&start, piece) in self.pieces.starts.iter().zip(&self.pieces.list) {
+            if let Piece::Base { start: base, .. } = piece {
+                if *base != start {
+                    return None;
+                }
+                continue;
+            }
+            edited += piece.len();
+            if edited > PATCH_LIMIT {
+                return None;
+            }
+            let mut offset = start;
+            while offset < start + piece.len() {
+                let length = READ_LIMIT.min(start + piece.len() - offset);
+                let (value, original) =
+                    (self.read(offset, length).ok()?, self.base.read(offset, length).ok()?);
+                for (i, (&value, &was)) in value.iter().zip(&original).enumerate() {
+                    if value != was {
+                        patches.insert(offset + i, value);
                     }
-                    for (chunk, index) in bytes.chunks(READ_LIMIT).zip((0..).step_by(READ_LIMIT)) {
-                        let original = self.base.read(start + index, chunk.len()).ok()?;
-                        for (i, (&value, &was)) in chunk.iter().zip(&original).enumerate() {
-                            if value != was {
-                                patches.insert(start + index + i, value);
-                            }
-                        }
-                    }
+                }
+                offset += length;
+            }
+        }
+        Some(patches)
+    }
+    pub fn validate(&self) -> Result<()> {
+        self.base.validate()?;
+        let mut checked: Vec<&Arc<FileSource>> = vec![];
+        for piece in &self.pieces.list {
+            if let Piece::File { source, .. } = piece {
+                if !checked.iter().any(|seen| Arc::ptr_eq(seen, source)) {
+                    source.validate().context("an inserted file changed; insert it again")?;
+                    checked.push(source);
                 }
             }
         }
-        (self.len() == self.base.len()).then_some(patches)
-    }
-    pub fn validate(&self) -> Result<()> {
-        self.base.validate()
+        Ok(())
     }
     fn stream(&self, range: Range<usize>, output: &mut impl Write) -> Result<()> {
         let mut offset = range.start;
@@ -478,7 +541,7 @@ impl ByteStore {
             source.bytes().len() == self.view.base.len(),
             "snapshot length changed"
         );
-        self.view.validate()?;
+        self.view.base.validate()?;
         self.view.base = Base::Snapshot(source);
         Ok(())
     }
@@ -495,7 +558,8 @@ impl ByteStore {
         insert: Vec<Piece>,
         written: Option<Range<usize>>,
     ) -> Result<()> {
-        self.view.validate()?;
+        // Only the original: undoing a file insert must work after that file changes.
+        self.view.base.validate()?;
         self.history
             .try_reserve(1)
             .context("not enough memory for edit history")?;
@@ -555,6 +619,32 @@ impl ByteStore {
         self.record(offset, 0, vec![Piece::Added(bytes.into())], None)?;
         Ok(offset..offset + bytes.len())
     }
+    /// Insert `pattern` repeated `count` times, without expanding it in memory.
+    pub fn insert_pattern(&mut self, offset: usize, pattern: &[u8], count: usize) -> Result<Range<usize>> {
+        ensure!(!pattern.is_empty() && count > 0, "nothing to insert");
+        ensure!(pattern.len() <= READ_LIMIT, "a pattern holds at most 1 MiB");
+        ensure!(offset <= self.view.len(), "insert position is outside the file");
+        let len = pattern.len().checked_mul(count).context("the repeated pattern is too large")?;
+        self.record(offset, 0, vec![Piece::Pattern { pattern: pattern.into(), phase: 0, len }], None)?;
+        Ok(offset..offset + len)
+    }
+    /// Overwrite a range with a repeated pattern; the length stays the same.
+    pub fn fill(&mut self, range: Range<usize>, pattern: &[u8]) -> Result<Range<usize>> {
+        ensure!(!pattern.is_empty() && !range.is_empty(), "nothing to fill");
+        ensure!(pattern.len() <= READ_LIMIT, "a pattern holds at most 1 MiB");
+        ensure!(range.end <= self.view.len(), "fill range is outside the file");
+        let piece = Piece::Pattern { pattern: pattern.into(), phase: 0, len: range.len() };
+        self.record(range.start, range.len(), vec![piece], Some(range.clone()))?;
+        Ok(range)
+    }
+    /// Insert another file's bytes. They stay on disk until the edited file is saved.
+    pub fn insert_file(&mut self, offset: usize, source: Arc<FileSource>) -> Result<Range<usize>> {
+        ensure!(source.len > 0, "the chosen file is empty");
+        ensure!(offset <= self.view.len(), "insert position is outside the file");
+        let len = source.len;
+        self.record(offset, 0, vec![Piece::File { source, start: 0, len }], None)?;
+        Ok(offset..offset + len)
+    }
     /// Remove a range, shifting every later byte. Returns the empty range left behind.
     pub fn delete(&mut self, range: Range<usize>) -> Result<Range<usize>> {
         ensure!(!range.is_empty(), "nothing to delete");
@@ -567,7 +657,7 @@ impl ByteStore {
         if !self.can_undo() {
             return Ok(None);
         }
-        self.view.validate()?;
+        self.view.base.validate()?;
         let edit = self.history[self.cursor - 1].clone();
         self.apply(edit.offset, Edit::size(&edit.inserted), &edit.removed);
         self.cursor -= 1;
@@ -578,7 +668,7 @@ impl ByteStore {
         if !self.can_redo() {
             return Ok(None);
         }
-        self.view.validate()?;
+        self.view.base.validate()?;
         let edit = self.history[self.cursor].clone();
         self.apply(edit.offset, Edit::size(&edit.removed), &edit.inserted);
         self.cursor += 1;
@@ -821,5 +911,67 @@ mod tests {
         assert!(changed.view().replace_source().is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"changed!");
         assert!(ByteStore::from_snapshot(Original::from_bytes(b"x").unwrap()).view().replace_source().is_err());
+    }
+
+    #[test]
+    fn patterns_repeat_without_expanding_and_fills_keep_the_length() {
+        let mut store = ByteStore::from_snapshot(Original::from_bytes(b"abcdefgh").unwrap());
+        assert_eq!(store.insert_pattern(2, &[0xDE, 0xAD], 3).unwrap(), 2..8);
+        assert_eq!(store.view().read(0, 32).unwrap(), b"ab\xDE\xAD\xDE\xAD\xDE\xADcdefgh");
+        assert_eq!(store.view().read(3, 3).unwrap(), [0xAD, 0xDE, 0xAD], "reads start mid-pattern");
+        store.delete(3..4).unwrap();
+        assert_eq!(store.view().read(2, 5).unwrap(), [0xDE, 0xDE, 0xAD, 0xDE, 0xAD]);
+        store.undo().unwrap();
+        store.undo().unwrap();
+        assert_eq!(store.fill(1..7, b"xy").unwrap(), 1..7);
+        assert_eq!(store.view().read(0, 8).unwrap(), b"axyxyxyh");
+        assert_eq!(store.view().edited(0, 8), [false, true, true, true, true, true, true, false]);
+        assert_eq!(store.undo().unwrap(), Some(1..7));
+        assert!(!store.is_dirty());
+        assert!(store.insert_pattern(0, &[], 3).is_err());
+        assert!(store.insert_pattern(0, &[1], 0).is_err());
+        assert!(store.fill(4..9, &[1]).is_err());
+
+        let mut large = ByteStore::from_snapshot(Original::from_bytes(&[7; 16]).unwrap());
+        large.insert_pattern(8, &[0], 1 << 30).unwrap();
+        large.fill(0..4, b"\xFF").unwrap();
+        let view = large.view();
+        assert_eq!(view.len(), (1 << 30) + 16);
+        assert!(view.edit_memory() < 16, "a 1 GiB pattern is not expanded");
+        assert_eq!(view.read(view.len() - 10, 10).unwrap(), [0, 0, 7, 7, 7, 7, 7, 7, 7, 7]);
+        assert!(view.overwrite_patches().is_none());
+    }
+
+    #[test]
+    fn fills_report_overwritten_bytes_to_fixed_offset_views() {
+        let mut store = ByteStore::from_snapshot(Original::from_bytes(&[0, 1, 2, 3]).unwrap());
+        store.fill(0..4, &[1]).unwrap();
+        assert_eq!(store.view().overwrite_patches().unwrap(), BTreeMap::from([(0, 1), (2, 1), (3, 1)]));
+    }
+
+    #[test]
+    fn inserted_files_stay_on_disk_and_saves_refuse_once_they_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("part.bin");
+        std::fs::write(&part, b"PART").unwrap();
+        let source = Arc::new(FileSource::open(&part).unwrap());
+        let mut store = ByteStore::from_snapshot(Original::from_bytes(b"abcd").unwrap());
+        assert_eq!(store.insert_file(2, source.clone()).unwrap(), 2..6);
+        assert_eq!(store.view().read(0, 16).unwrap(), b"abPARTcd");
+        assert_eq!(store.view().edit_memory(), 0);
+        store.delete(3..5).unwrap();
+        let output = dir.path().join("out.bin");
+        store.view().export(0..6, &output, false).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"abPTcd");
+        std::fs::write(&part, b"changed").unwrap();
+        let error = store.view().export(0..6, &dir.path().join("late.bin"), false).unwrap_err();
+        assert!(format!("{error:#}").contains("inserted file changed"), "{error:#}");
+        store.undo().unwrap();
+        store.undo().unwrap();
+        assert_eq!(store.view().read(0, 16).unwrap(), b"abcd", "undo works after the file changed");
+        store.view().validate().unwrap();
+        let empty = dir.path().join("empty.bin");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(store.insert_file(0, Arc::new(FileSource::open(&empty).unwrap())).is_err());
     }
 }
