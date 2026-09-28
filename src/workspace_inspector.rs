@@ -47,7 +47,8 @@ impl FieldInfo {
 
 /// The Inspector docked inside Hex. Its body scrolls both ways, so a long value
 /// scrolls inside the panel instead of widening it over the Hex grid.
-pub fn docked_panel(ui: &mut Ui, id: &str, header: impl FnOnce(&mut Ui), body: impl FnOnce(&mut Ui)) {
+pub fn docked_panel<T>(ui: &mut Ui, id: &str, state: &mut T,
+    header: impl FnOnce(&mut T, &mut Ui), body: impl FnOnce(&mut T, &mut Ui)) {
     let t = &crate::theme::DARK;
     egui::Panel::right(id.to_owned())
         .resizable(true)
@@ -59,9 +60,19 @@ pub fn docked_panel(ui: &mut Ui, id: &str, header: impl FnOnce(&mut Ui), body: i
             .inner_margin(egui::Margin::same(t.spacing.card_padding as i8))
             .corner_radius(t.radius.inset))
         .show(ui, |ui| {
-            header(ui);
-            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, body);
+            header(state, ui);
+            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| body(state, ui));
         });
+}
+
+/// The Inspector title with its ⋯ menu on the right.
+pub fn header(ui: &mut Ui, menu: impl FnOnce(&mut Ui)) {
+    ui.horizontal(|ui| {
+        ui.heading("Inspector");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            crate::theme::more_menu(ui, menu);
+        });
+    });
 }
 
 pub fn empty_selection(ui: &mut Ui, has_file: bool, has_decoded: bool) {

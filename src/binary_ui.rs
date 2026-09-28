@@ -2774,43 +2774,49 @@ impl BinaryWorkspace {
         self.hex_actions(actions, ui.ctx());
     }
 
-    fn direct_controls(&mut self, ui: &mut Ui, in_structure: bool) {
-        if in_structure != self.author_in_structure { return; }
-        if self.is_python() { return; }
-        let range = self.hex_editor.selection();
-        let preview = range.clone().and_then(|r| self.hex_editor.interpretation_preview(r));
+    /// What the Interpret control needs, when it belongs in this place.
+    #[allow(clippy::type_complexity)]
+    #[allow(dead_code)] // The Interpret control is hidden for now; kept for when it returns.
+    fn interpret_inputs(&self, in_structure: bool) -> Option<(String, Range<u64>, Option<Vec<u8>>, u64, bool)> {
+        if in_structure != self.author_in_structure || self.is_python() { return None; }
+        let range = self.hex_editor.selection()?;
+        let preview = self.hex_editor.interpretation_preview(range.clone());
         let placeholder = self.yaml_path.is_none() && !self.yaml_is_example && self.yaml == self.saved_yaml
             && ((self.yaml == DecoderLanguage::Yaml.starter() && self.applied_yaml.is_none())
                 || self.yaml == DecoderLanguage::Yaml.byte_preview());
-        let source = if placeholder { "endian: little\nactions: []\n" } else { &self.yaml };
+        let source = if placeholder { "endian: little\nactions: []\n".to_owned() } else { self.yaml.clone() };
         let enabled = self.commands_available() && !self.is_decoding() && !self.active_authoring_dirty() && !self.cell_dirty();
-        let size = self.file_len() as u64;
-        let mut edit = None;
-        ui.add_enabled_ui(enabled, |ui| {
-            edit = self.authoring.ui(ui, source, range.map(|r| r.start as u64..r.end as u64), preview.as_deref(), size);
-        });
+        Some((source, range.start as u64..range.end as u64, preview, self.file_len() as u64, enabled))
+    }
+
+    #[allow(dead_code)] // The Interpret control is hidden for now; kept for when it returns.
+    fn apply_authoring_edit(&mut self, edit: Option<crate::direct_authoring::Edit>, ctx: &Context) {
         match edit {
             Some(crate::direct_authoring::Edit::Commit(source)) => {
                 self.yaml = source;
                 let empty = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&self.yaml).ok().is_some_and(|v| v["actions"].as_sequence().is_some_and(|a| a.is_empty()));
                 if empty { self.structure_ui.clear_program(); self.applied_yaml = None; self.submitted_decoder = None; }
-                else { self.validate_layout(ui.ctx()); self.structure_ui.keep_navigation(); }
+                else { self.validate_layout(ctx); self.structure_ui.keep_navigation(); }
             }
             Some(crate::direct_authoring::Edit::Interpret(source, interpretation)) => {
                 if let Some(bytes) = &self.bytes {
                     self.direct_pending = Some((self.yaml.clone(), interpretation.clone()));
                     self.submitted_decoder = Some((DecoderLanguage::Yaml, source.clone()));
-                    self.structure_ui.apply_interpretation(&source, bytes.view(), ui.ctx(), interpretation);
+                    self.structure_ui.apply_interpretation(&source, bytes.view(), ctx, interpretation);
                     self.structure_ui.keep_navigation();
                 }
             }
-            Some(crate::direct_authoring::Edit::Code) => { self.show_yaml(); self.reveal_definition = true; }
             None => {}
         }
     }
 
+    /// Show the decoder source at the selected field.
+    pub fn edit_decoder(&mut self) {
+        self.show_yaml();
+        self.reveal_definition = true;
+    }
+
     pub fn hex(&mut self, ui: &mut Ui) {
-        self.direct_controls(ui, false);
         self.hex_editor.set_python_mode(self.is_python());
         let mut highlights = self.structure_ui.highlights();
         if !self.interpretation_stale && !self.structure_ui.has_published_program() {

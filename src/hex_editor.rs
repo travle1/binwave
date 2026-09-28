@@ -57,7 +57,6 @@ pub struct HexEditor {
     caret: usize,
     reveal: bool,
     bytes_per_row: usize,
-    auto_width: bool,
     window_start: usize,
     pending_scroll: Option<f32>,
     /// Grid's horizontal scroll offset last frame, so the column header follows it.
@@ -109,7 +108,6 @@ impl Default for HexEditor {
             caret: 0,
             reveal: false,
             bytes_per_row: 16,
-            auto_width: true,
             window_start: 0,
             pending_scroll: None,
             horizontal_scroll: 0.0,
@@ -184,6 +182,7 @@ impl HexEditor {
     }
 
     /// Reuse the asynchronous page cache; never read a file on the UI thread.
+    #[allow(dead_code)] // The Interpret control is hidden for now; kept for when it returns.
     pub fn interpretation_preview(&self, range: Range<usize>) -> Option<Vec<u8>> {
         let page = self.page.as_ref()?;
         if self.revision != Some(page.revision) { return None; }
@@ -524,6 +523,17 @@ impl HexEditor {
         source: Option<ByteView>,
         highlights: &[HexHighlight],
     ) -> Vec<HexAction> {
+        self.ui_with_tools(ui, source, highlights, &mut |_| {})
+    }
+
+    /// `tools` adds controls (such as Interpret) to the toolbar row, after Find.
+    pub fn ui_with_tools(
+        &mut self,
+        ui: &mut egui::Ui,
+        source: Option<ByteView>,
+        highlights: &[HexHighlight],
+        tools: &mut dyn FnMut(&mut egui::Ui),
+    ) -> Vec<HexAction> {
         let mut actions = Vec::new();
         let Some(source) = source else {
             ui.centered_and_justified(|ui| {
@@ -533,6 +543,16 @@ impl HexEditor {
         };
         self.poll(ui, &source);
         let navigation_origin = self.selection();
+        // 16 bytes per row by default; 32 is a remembered setting.
+        let wide_id = egui::Id::new("hex_32_bytes_per_row");
+        let mut wide = ui.ctx().data_mut(|data| *data.get_persisted_mut_or(wide_id, false));
+        let per_row = if wide { 32 } else { 16 };
+        if self.bytes_per_row != per_row {
+            self.bytes_per_row = per_row;
+            self.reveal = true;
+        }
+        let shown_highlights = if self.show_decoded_fields { highlights } else { &[] };
+        self.readout(ui, &source, shown_highlights);
         ui.horizontal_wrapped(|ui| {
             let can_back = self.history_pos > 0;
             if ui.add_enabled(can_back, egui::Button::new("‹"))
@@ -562,27 +582,21 @@ impl HexEditor {
                 jump.state.store(ui.ctx(), jump.response.id);
                 self.focus_jump = false;
             }
-            if ui.add_enabled(source.len() > 0, egui::Button::new("Go")).clicked()
-                || (jump.response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
+            if jump.response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && source.len() > 0 {
                 self.jump_to_input(source.len());
             }
-            if ui.toggle_value(&mut self.show_search, "Find bytes or text").changed() && self.show_search { self.focus_find = true; }
-            ui.menu_button("Selection", |ui| {
+            if ui.toggle_value(&mut self.show_search, "Find").changed() && self.show_search { self.focus_find = true; }
+            tools(ui);
+            ui.toggle_value(&mut self.edit_mode, "Overwrite")
+                .on_hover_text("Type hex digits (or text) over the selected bytes.");
+            crate::theme::more_menu(ui, |ui| {
                 self.selection_menu(ui, &source, &mut actions);
-            });
-            ui.menu_button("View", |ui| {
-                ui.checkbox(&mut self.auto_width, "Fit bytes to width");
-                for width in [8, 16, 32] {
-                    if ui.selectable_label(!self.auto_width && self.bytes_per_row == width, format!("{width} bytes per row")).clicked() {
-                        self.bytes_per_row = width; self.auto_width = false; self.reveal = true;
-                    }
-                }
                 ui.separator();
+                if ui.checkbox(&mut wide, "32 bytes per row").changed() {
+                    ui.ctx().data_mut(|data| data.insert_persisted(wide_id, wide));
+                }
                 ui.checkbox(&mut self.show_decoded_fields, "Highlight decoded fields");
-                ui.checkbox(&mut self.edit_mode, "Overwrite");
-                if self.edit_mode { ui.checkbox(&mut self.ascii_input, "Text input"); }
-                ui.weak("Field tints identify decoded bytes. Blue is your selection.
-A gold underline marks search hits; an orange top edge marks edits.");
+                if self.edit_mode { ui.checkbox(&mut self.ascii_input, "Overwrite with text"); }
                 ui.separator();
                 ui.label("Saved ranges");
                 let mut visit = None;
@@ -713,46 +727,14 @@ A gold underline marks search hits; an orange top edge marks edits.");
                 }
             });
         }
-        let highlights = if self.show_decoded_fields {
-            highlights
-        } else {
-            &[]
-        };
+        let highlights = shown_highlights;
         let selection = self.selection();
         if selection != navigation_origin {
             if let Some(range) = &selection {
                 actions.push(HexAction::Selection(range.clone()));
             }
+            ui.ctx().request_repaint();
         }
-        ui.horizontal_wrapped(|ui| {
-            if let Some(range) = &selection {
-                if range.len() == 1 {
-                    ui.monospace(format!("Cursor 0x{:X} · byte {}", self.caret, crate::format::count(self.caret)));
-                } else {
-                    ui.monospace(format!(
-                        "Cursor 0x{:X} · {} selected",
-                        self.caret, crate::format::byte_range(range.start as u64, range.end as u64)
-                    ));
-                }
-            } else {
-                ui.weak(format!(
-                    "{} · select bytes to inspect or define a structure",
-                    crate::format::size(source.len() as u64)
-                )).on_hover_text(crate::format::exact_bytes(source.len() as u64));
-            }
-            if let Some(field) = narrowest_highlight(highlights.iter(), self.caret) {
-                let label = field.name.rsplit_once('.').map_or(field.name.as_str(), |(_, name)| name);
-                ui.label(RichText::new(label).color(field.color))
-                    .on_hover_text(format!("{}\nDecoded field · {}\nField tint does not change your byte selection.",
-                        field.name, crate::format::byte_range(field.range.start as u64, field.range.end as u64)));
-            }
-            if self.high_nibble.is_some() {
-                ui.colored_label(Color32::YELLOW, "Type the second hex digit");
-            }
-            if !self.status.is_empty() {
-                ui.colored_label(Color32::from_rgb(229, 183, 101), &self.status);
-            }
-        });
         ui.separator();
         if source.len() == 0 {
             ui.centered_and_justified(|ui| {
@@ -762,6 +744,32 @@ A gold underline marks search hits; an orange top edge marks edits.");
         }
         self.bytes_ui(ui, &source, highlights, &mut actions);
         actions
+    }
+
+    /// The Hex card's one readout: `Cursor 0x6B · 16 bytes · entries[1].name`.
+    fn readout(&self, ui: &mut egui::Ui, source: &ByteView, highlights: &[HexHighlight]) {
+        ui.horizontal_wrapped(|ui| {
+            if let Some(range) = self.selection() {
+                ui.monospace(format!("Cursor 0x{:X} · {}", self.caret,
+                    crate::format::plural(range.len(), "byte", "bytes")))
+                    .on_hover_text(crate::format::byte_range(range.start, range.end));
+            } else {
+                ui.weak(format!("{} · select bytes to inspect", crate::format::size(source.len())))
+                    .on_hover_text(crate::format::exact_bytes(source.len()));
+            }
+            if let Some(field) = narrowest_highlight(highlights.iter(), self.caret) {
+                ui.weak("·");
+                ui.label(RichText::new(short_field_name(&field.name)).monospace().color(field.color))
+                    .on_hover_text(format!("{}\nDecoded field · {}\nField tint does not change your byte selection.",
+                        field.name, crate::format::byte_range(field.range.start, field.range.end)));
+            }
+            if self.high_nibble.is_some() {
+                ui.colored_label(crate::theme::DARK.color.status.warning, "Type the second hex digit");
+            }
+            if !self.status.is_empty() {
+                ui.colored_label(crate::theme::DARK.color.status.warning, &self.status);
+            }
+        });
     }
 
     fn selection_menu(
@@ -834,9 +842,6 @@ A gold underline marks search hits; an orange top edge marks edits.");
         let row_width = |columns: usize| {
             offset_width + columns as f32 * (cell_width + char_width) + ascii_gutter + 8.0
         };
-        let scrollbar = &ui.spacing().scroll;
-        let scrollbar_width =
-            scrollbar.bar_width + scrollbar.bar_inner_margin + scrollbar.bar_outer_margin;
         // A decoder/plot selection can request a reveal while the user is already
         // pressing a byte in the currently visible grid. In that frame the click
         // must target the bytes under the pointer, not a newly scrolled viewport.
@@ -849,16 +854,6 @@ A gold underline marks search hits; an orange top edge marks edits.");
         if pointer_in_grid {
             self.reveal = false;
             self.pending_scroll = None;
-        }
-        if self.auto_width && !pointer_in_grid {
-            let previous = self.bytes_per_row;
-            self.bytes_per_row = [32, 16, 8]
-                .into_iter()
-                .find(|n| row_width(*n) + scrollbar_width <= ui.available_width())
-                .unwrap_or(8);
-            if self.bytes_per_row != previous {
-                self.reveal = true;
-            }
         }
         let total_rows = source.len().div_ceil(self.bytes_per_row);
         let caret_row = self.caret / self.bytes_per_row;
@@ -1529,6 +1524,13 @@ fn replacement_bytes(
     Ok((selection.start, bytes))
 }
 
+/// `sections[1].payload.entries[1].name` → `entries[1].name`: from the innermost collection on.
+fn short_field_name(name: &str) -> &str {
+    name.rfind('[')
+        .and_then(|bracket| name[..bracket].rfind('.'))
+        .map_or(name, |dot| &name[dot + 1..])
+}
+
 pub(crate) fn window_start(caret_row: usize, total_rows: usize) -> usize {
     if total_rows <= WINDOW_ROWS {
         0
@@ -1944,13 +1946,64 @@ mod tests {
         assert_eq!(editor.selection(), Some(2..6));
     }
 
+    fn hex_frame(ctx: &egui::Context, editor: &mut HexEditor, source: &ByteView, highlights: &[HexHighlight])
+        -> egui::FullOutput {
+        ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 600.0))),
+            ..Default::default()
+        }, |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| { editor.ui(ui, Some(source.clone()), highlights); });
+        })
+    }
+
+    #[test]
+    fn hex_card_has_one_readout_above_a_single_toolbar_row() {
+        let (_dir, source) = fixture();
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut editor = HexEditor::default();
+        editor.select_range(0x60..0x70, false);
+        let field = HexHighlight { range: 0x60..0x70, name: "sections[0].payload.entries[1].name".into(),
+            color: Color32::LIGHT_BLUE };
+        let _ = hex_frame(&ctx, &mut editor, &source, std::slice::from_ref(&field));
+        let output = hex_frame(&ctx, &mut editor, &source, std::slice::from_ref(&field));
+        let texts: Vec<(String, egui::Rect)> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some((text.galley.text().to_owned(), text.galley.rect.translate(text.pos.to_vec2()))),
+            _ => None,
+        }).collect();
+        let find = |label: &str| texts.iter().find(|(text, _)| text == label).map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("missing {label} in {:?}", texts.iter().map(|(t, _)| t).collect::<Vec<_>>()));
+        let readouts: Vec<_> = texts.iter().filter(|(text, _)| text.starts_with("Cursor")).collect();
+        assert_eq!(readouts.len(), 1, "one cursor readout: {readouts:?}");
+        assert_eq!(readouts[0].0, "Cursor 0x6F · 16 bytes");
+        find("entries[1].name");
+        assert!(!texts.iter().any(|(text, _)| text == "Go"), "Enter jumps; there is no Go button");
+        assert!(!texts.iter().any(|(text, _)| text.contains('⋯')), "⋯ is painted, not a missing glyph");
+        let row = find("Find").center().y;
+        for label in ["‹", "›", "Overwrite"] {
+            assert!((find(label).center().y - row).abs() < 2., "{label} is not on the toolbar row");
+        }
+        assert!(readouts[0].1.bottom() <= find("Find").top(), "the readout heads the card");
+    }
+
+    #[test]
+    fn rows_hold_sixteen_bytes_unless_thirty_two_is_chosen() {
+        let (_dir, source) = fixture();
+        let ctx = egui::Context::default();
+        let mut editor = HexEditor::default();
+        hex_frame(&ctx, &mut editor, &source, &[]);
+        assert_eq!(editor.bytes_per_row, 16);
+        ctx.data_mut(|data| data.insert_persisted(egui::Id::new("hex_32_bytes_per_row"), true));
+        hex_frame(&ctx, &mut editor, &source, &[]);
+        assert_eq!(editor.bytes_per_row, 32);
+    }
+
     #[test]
     fn fixed_width_rows_stay_left_of_a_docked_inspector() {
         let (_dir, source) = fixture();
         let ctx = egui::Context::default();
         let mut editor = HexEditor::default();
         editor.bytes_per_row = 16;
-        editor.auto_width = false;
         // A selection inside a named field makes the long cursor readout appear.
         editor.select_range(0x18..0x20, false);
         let field = HexHighlight { range: 0x18..0x20, name: "sections[2].payload.records[104].chirp".into(),
@@ -1962,7 +2015,7 @@ mod tests {
             },
             |_ctx, ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    crate::workspace_inspector::docked_panel(ui, "inspector", |ui| { ui.label("Inspector"); }, |ui| {
+                    crate::workspace_inspector::docked_panel(ui, "inspector", &mut (), |_, ui| { ui.label("Inspector"); }, |_, ui| {
                         // Inspector values can be wider than the panel, e.g. a full-precision f32.
                         ui.add(egui::Label::new(egui::RichText::new("f32  -27110105000000000000000000000000000000.0").monospace())
                             .wrap_mode(egui::TextWrapMode::Extend));
@@ -2130,7 +2183,6 @@ mod tests {
         let (_dir, source) = fixture();
         let ctx = egui::Context::default();
         let mut editor = HexEditor::default();
-        editor.auto_width = false;
         let frame = |editor: &mut HexEditor, events: Vec<egui::Event>| {
             ctx.run(
                 egui::RawInput {
@@ -2387,7 +2439,6 @@ mod tests {
         .view();
         let ctx = egui::Context::default();
         let mut editor = HexEditor::default();
-        editor.auto_width = false;
         editor.pending_scroll = Some((WINDOW_ROWS - 100) as f32 * crate::theme::DARK.size.hex_row_height);
         let frame = |editor: &mut HexEditor| {
             ctx.run(

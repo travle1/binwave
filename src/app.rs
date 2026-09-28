@@ -2482,13 +2482,17 @@ impl TabViewer for WorkspaceViewer<'_> {
             Pane::Hex => {
                 let t = &crate::theme::DARK;
                 if ui.available_width() >= t.size.inspector_min_host_width {
-                    crate::workspace_inspector::docked_panel(ui, "hex_embedded_inspector",
-                        |ui| { ui.heading("Inspector"); ui.separator(); },
-                        |ui| self.app.ui_inspector(ui));
-                }
-                if let Some(range) = self.app.binary.byte_selection() {
-                    ui.weak(format!("Cursor 0x{:X} · {} selected", range.start,
-                        crate::format::plural(range.len() as u64, "byte", "bytes")));
+                    crate::workspace_inspector::docked_panel(ui, "hex_embedded_inspector", &mut *self.app,
+                        |app, ui| {
+                            crate::workspace_inspector::header(ui, |ui| {
+                                if ui.button("Edit decoder").clicked() {
+                                    app.binary.edit_decoder();
+                                    ui.close();
+                                }
+                            });
+                            ui.separator();
+                        },
+                        |app, ui| app.ui_inspector(ui));
                 }
                 if self.app.displayed_decoder == Decoder::Csv {
                     let highlights = self.app.csv_highlights();
@@ -4247,7 +4251,10 @@ mod tests {
             }],
         );
         let output = workspace_frame(&mut app, &ctx);
-        assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Text(text) if text.galley.text() == "Cursor 0x100 · byte 256")),"Ctrl+G must focus the navigation input and move the selected byte");
+        assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Text(text) if text.galley.text() == "Cursor 0x100 · 1 byte")),"Ctrl+G must focus the navigation input and move the selected byte");
+        let readouts = output.shapes.iter().filter(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text().starts_with("Cursor "))).count();
+        assert_eq!(readouts, 1, "the Hex card has one cursor readout");
     }
 
     #[test]
@@ -4479,7 +4486,6 @@ mod tests {
         let (_, editor, _) = app.workspace.dock.find_tab_legacy(&Pane::Layout).unwrap();
         let (_, samples, _) = app.workspace.dock.find_tab_legacy(&Pane::Table).unwrap();
         assert_ne!(editor, samples);
-        workspace_click(&mut app, &ctx, "View");
         workspace_click(&mut app, &ctx, "Signal");
         assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_some());
         let plotted = labels(workspace_frame(&mut app, &ctx));
@@ -4534,7 +4540,6 @@ mod tests {
         let (_, editor, _) = app.workspace.dock.find_tab_legacy(&Pane::Layout).unwrap();
         let (_, table, _) = app.workspace.dock.find_tab_legacy(&Pane::Table).unwrap();
         assert_ne!(editor, table);
-        workspace_click(&mut app, &ctx, "View");
         workspace_click(&mut app, &ctx, "Signal");
         assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_some());
     }

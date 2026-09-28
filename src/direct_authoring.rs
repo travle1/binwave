@@ -25,6 +25,7 @@ pub fn results_current(source: &str, applied: &str) -> bool {
     source == applied && !empty_draft(source)
 }
 
+#[allow(dead_code)] // The Interpret control is hidden for now; kept for when it returns.
 const TYPES: &[&str] = &[
     "string", "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64", "bytes",
 ];
@@ -39,6 +40,7 @@ fn width(kind: &str) -> Option<u64> {
 }
 
 /// Interpret only a bounded prefix, preserving integer precision and byte order.
+#[allow(dead_code)] // The Interpret control is hidden for now; kept for when it returns.
 pub fn preview(bytes: &[u8], kind: &str, big: bool) -> String {
     let bytes = &bytes[..bytes.len().min(64)];
     if kind == "string" {
@@ -341,6 +343,7 @@ impl Interpretation {
         Ok(())
     }
 }
+#[allow(dead_code)] // The Interpret control is hidden for now; kept for when it returns.
 pub fn structures(source: &str) -> Vec<String> {
     serde_yaml_ng::from_str::<Value>(source)
         .ok()
@@ -350,6 +353,7 @@ pub fn structures(source: &str) -> Vec<String> {
         .filter_map(|s| s["name"].as_str().map(str::to_owned))
         .collect()
 }
+#[allow(dead_code)] // The Interpret control is hidden for now; kept for when it returns.
 fn fresh_name(source: &str) -> String {
     let value = serde_yaml_ng::from_str::<Value>(source).unwrap_or_default();
     for i in 1.. {
@@ -369,8 +373,8 @@ fn fresh_name(source: &str) -> String {
 }
 pub enum Edit {
     Commit(String),
+    #[allow(dead_code)] // The Interpret control is hidden for now; kept for when it returns.
     Interpret(String, Interpretation),
-    Code,
 }
 #[derive(Default)]
 pub struct DirectAuthoring {
@@ -467,6 +471,7 @@ impl DirectAuthoring {
             (response, None)
         }
     }
+    #[allow(dead_code)] // The Interpret control is hidden for now; kept for when it returns.
     pub fn ui(
         &mut self,
         ui: &mut Ui,
@@ -481,12 +486,7 @@ impl DirectAuthoring {
         let mut result = None;
         let mut chosen = None;
         ui.horizontal_wrapped(|ui| {
-            ui.weak(format!(
-                "{} at 0x{:X}",
-                crate::format::exact_bytes(range.end - range.start),
-                range.start
-            ));
-            ui.menu_button("Interpret as", |ui| {
+            ui.menu_button("Interpret", |ui| {
                 let big = serde_yaml_ng::from_str::<Value>(source)
                     .ok()
                     .is_some_and(|v| v["endian"].as_str() == Some("big"));
@@ -513,10 +513,7 @@ impl DirectAuthoring {
                         }
                     }
                 }
-            });
-            if ui.small_button("Edit decoder").clicked() {
-                result = Some(Edit::Code);
-            }
+            }).response.on_hover_text("Decode the selected bytes as a type, adding it to the decoder");
         });
         if let Some(kind) = chosen {
             let name = existing(source, &range)
@@ -658,7 +655,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(labels.contains(&"Interpret as"));
+        assert!(labels.contains(&"Interpret"));
         assert!(!labels.contains(&"Add field"));
         assert!(!labels
             .iter()
@@ -726,7 +723,7 @@ mod tests {
         };
         frame(&mut editor, &mut source, vec![]);
         let out = frame(&mut editor, &mut source, vec![]);
-        click(&mut editor, &mut source, position(&out, "Interpret as"));
+        click(&mut editor, &mut source, position(&out, "Interpret"));
         let out = frame(&mut editor, &mut source, vec![]);
         click(&mut editor, &mut source, position(&out, "string   \"DEMO\""));
         assert!(
@@ -736,7 +733,7 @@ mod tests {
         assert!(source.contains("type: string"));
         assert_eq!(source.matches("- read:").count(), 1);
         let out = frame(&mut editor, &mut source, vec![]);
-        click(&mut editor, &mut source, position(&out, "Interpret as"));
+        click(&mut editor, &mut source, position(&out, "Interpret"));
         let out = frame(&mut editor, &mut source, vec![]);
         assert!(position(&out, "Your structures").x < 360.);
         click(&mut editor, &mut source, position(&out, "Header"));

@@ -171,6 +171,7 @@ impl StructureWorkspace {
         self.explicit_apply_pending = false;
         self.decoded_ready = false;
     }
+    #[allow(dead_code)] // The Interpret control is hidden for now; kept for when it returns.
     pub fn apply_interpretation(&mut self, yaml: &str, source: ByteView, ctx: &Context, check: crate::direct_authoring::Interpretation) -> bool {
         self.interpretation_check = Some(check);
         let result = self.apply(yaml, source, ctx);

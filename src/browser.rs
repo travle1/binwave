@@ -92,6 +92,10 @@ pub struct BrowserApp {
     probe_request: u64,
     range_start: String,
     range_end: String,
+    /// Extraction form buffers: an inclusive last byte, refreshed when the selection changes.
+    extract_start: String,
+    extract_last: String,
+    extract_seen: (String, String),
     replacement: String,
     status: String,
     dirty: bool,
@@ -209,6 +213,9 @@ impl BrowserApp {
             probe_request: 0,
             range_start: "0".into(),
             range_end: "0".into(),
+            extract_start: String::new(),
+            extract_last: String::new(),
+            extract_seen: (String::new(), String::new()),
             replacement: String::new(),
             status: "Use Open file above to inspect a local file. Files stay on your computer."
                 .into(),
@@ -582,13 +589,17 @@ impl BrowserApp {
         }
         let embedded_inspector = !self.stacked && ui.available_width() >= crate::theme::DARK.size.inspector_min_host_width;
         if embedded_inspector {
-            // The header and body both need `self`; the header runs first, then the body.
-            let this = std::cell::RefCell::new(&mut *self);
-            crate::workspace_inspector::docked_panel(ui, "browser_hex_inspector",
-                |ui| { ui.strong("Inspector"); this.borrow_mut().direct_controls(ui, Pane::Hex); },
-                |ui| this.borrow_mut().inspector(ui));
+            crate::workspace_inspector::docked_panel(ui, "browser_hex_inspector", self,
+                |this, ui| {
+                    crate::workspace_inspector::header(ui, |ui| {
+                        if ui.button("Edit decoder").clicked() {
+                            this.reveal_decoder = true;
+                            ui.close();
+                        }
+                    });
+                },
+                |this, ui| this.inspector(ui));
         }
-        if !embedded_inspector { self.direct_controls(ui, Pane::Hex); }
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(self.offset > 0, egui::Button::new("Previous page"))
@@ -789,6 +800,7 @@ impl BrowserApp {
         self.hex_visible = visible_bytes;
         self.hex_columns = columns;
     }
+    #[allow(dead_code)] // The Interpret control is hidden for now; kept for when it returns.
     fn direct_controls(&mut self, ui: &mut egui::Ui, pane: Pane) {
         if pane != self.authoring_pane || self.language == crate::source_editor::DecoderLanguage::Python { return; }
         let range = parse_offset(&self.range_start).zip(parse_offset(&self.range_end)).map(|(a,b)| a..b);
@@ -817,7 +829,6 @@ impl BrowserApp {
                     "name": interpretation.name, "start": interpretation.range.start.to_string(), "end": interpretation.range.end.to_string()
                 }}));
             },
-            Some(crate::direct_authoring::Edit::Code) => self.reveal_decoder = true,
             None => {}
         }
     }
@@ -928,18 +939,27 @@ impl BrowserApp {
         }
         egui::CollapsingHeader::new("Extraction range")
             .default_open(false).show(ui, |ui| {
-                ui.weak("Start inclusive · end exclusive");
+                let seen = (self.range_start.clone(), self.range_end.clone());
+                if seen != self.extract_seen {
+                    let start = parse_offset(&self.range_start).unwrap_or(0);
+                    let last = parse_offset(&self.range_end).map_or(start, |end| end.saturating_sub(1).max(start));
+                    self.extract_start = start.to_string();
+                    self.extract_last = last.to_string();
+                    self.extract_seen = seen;
+                }
                 ui.horizontal(|ui| {
                     ui.label("Start");
-                    ui.add(egui::TextEdit::singleline(&mut self.range_start).desired_width(100.));
+                    ui.add(egui::TextEdit::singleline(&mut self.extract_start).desired_width(100.));
                 });
                 ui.horizontal(|ui| {
-                    ui.label("End");
-                    ui.add(egui::TextEdit::singleline(&mut self.range_end).desired_width(100.));
+                    ui.label("Last byte");
+                    ui.add(egui::TextEdit::singleline(&mut self.extract_last).desired_width(100.))
+                        .on_hover_text("The range includes both the start and the last byte.");
                 });
                 if ui.button("Set range").clicked() {
-                    match (parse_offset(&self.range_start), parse_offset(&self.range_end)) {
-                        (Some(start), Some(end)) if start <= end && end <= self.size => {
+                    let end = parse_offset(&self.extract_last).and_then(|last| last.checked_add(1));
+                    match (parse_offset(&self.extract_start), end) {
+                        (Some(start), Some(end)) if start < end && end <= self.size => {
                             self.selection_anchor = Some(start);
                             self.set_hex_range(start, end);
                             self.status = format!("Extraction range {} set. Use Extract selection above.",

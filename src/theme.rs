@@ -105,6 +105,10 @@ pub struct Sizes {
     pub table_row_height: f32,
     pub hex_row_height: f32,
     pub inspector_width: f32,
+    /// The painted ⋯ button: square size, dot radius and spacing.
+    pub more_button: f32,
+    pub more_dot: f32,
+    pub more_dot_gap: f32,
     pub inspector_min_width: f32,
     pub inspector_max_width: f32,
     /// Table panel: row height and initial column widths (# is sized for 7 digits,
@@ -255,6 +259,9 @@ pub const DARK: Theme = Theme {
         table_row_height: 24.,
         hex_row_height: 24.,
         inspector_width: 280.,
+        more_button: 24.,
+        more_dot: 1.5,
+        more_dot_gap: 5.,
         inspector_min_width: 240.,
         inspector_max_width: 340.,
         table_row: 24.,
@@ -351,6 +358,19 @@ pub fn dock_style(egui_style: &egui::Style) -> egui_dock::Style {
     style.buttons.close_tab_color = Color32::TRANSPARENT;
     style.buttons.close_tab_active_color = Color32::TRANSPARENT;
     style
+}
+
+/// A "more" (⋯) menu button. The dots are painted, since the interface font has
+/// no ⋯ glyph and some views draw without the icon font installed.
+pub fn more_menu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+    let button = egui::Button::new("").min_size(egui::vec2(DARK.size.more_button, DARK.size.more_button));
+    let (response, _) = egui::containers::menu::MenuButton::from_button(button).ui(ui, add_contents);
+    let color = ui.style().interact(&response).text_color();
+    let center = response.rect.center();
+    for step in [-1., 0., 1.] {
+        ui.painter().circle_filled(center + egui::vec2(step * DARK.size.more_dot_gap, 0.), DARK.size.more_dot, color);
+    }
+    response.on_hover_text("More actions")
 }
 
 pub fn install(ctx: &Context) {
