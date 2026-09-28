@@ -45,6 +45,25 @@ impl FieldInfo {
     }
 }
 
+/// The Inspector docked inside Hex. Its body scrolls both ways, so a long value
+/// scrolls inside the panel instead of widening it over the Hex grid.
+pub fn docked_panel(ui: &mut Ui, id: &str, header: impl FnOnce(&mut Ui), body: impl FnOnce(&mut Ui)) {
+    let t = &crate::theme::DARK;
+    egui::Panel::right(id.to_owned())
+        .resizable(true)
+        .default_size(t.size.inspector_width)
+        .min_size(t.size.inspector_min_width)
+        .max_size(t.size.inspector_max_width)
+        .frame(egui::Frame::new()
+            .fill(t.color.surface.raised)
+            .inner_margin(egui::Margin::same(t.spacing.card_padding as i8))
+            .corner_radius(t.radius.inset))
+        .show(ui, |ui| {
+            header(ui);
+            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, body);
+        });
+}
+
 pub fn empty_selection(ui: &mut Ui, has_file: bool, has_decoded: bool) {
     let (title, detail) = if !has_file {
         (

@@ -105,6 +105,8 @@ pub struct Sizes {
     pub table_row_height: f32,
     pub hex_row_height: f32,
     pub inspector_width: f32,
+    pub inspector_min_width: f32,
+    pub inspector_max_width: f32,
     /// Table panel: row height and initial column widths (# is sized for 7 digits,
     /// Size for 10+).
     pub table_row: f32,
@@ -253,6 +255,8 @@ pub const DARK: Theme = Theme {
         table_row_height: 24.,
         hex_row_height: 24.,
         inspector_width: 280.,
+        inspector_min_width: 240.,
+        inspector_max_width: 340.,
         table_row: 24.,
         table_index_column: 60.,
         table_offset_column: 104.,

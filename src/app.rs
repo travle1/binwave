@@ -2482,21 +2482,9 @@ impl TabViewer for WorkspaceViewer<'_> {
             Pane::Hex => {
                 let t = &crate::theme::DARK;
                 if ui.available_width() >= t.size.inspector_min_host_width {
-                    egui::Panel::right("hex_embedded_inspector")
-                        .resizable(true)
-                        .default_size(t.size.inspector_width)
-                        .min_size(240.)
-                        .max_size(340.)
-                        .frame(egui::Frame::new()
-                            .fill(t.color.surface.raised)
-                            .inner_margin(egui::Margin::same(12))
-                            .corner_radius(t.radius.inset))
-                        .show(ui, |ui| {
-                            ui.heading("Inspector");
-                            ui.separator();
-                            egui::ScrollArea::vertical().auto_shrink([false, false])
-                                .show(ui, |ui| self.app.ui_inspector(ui));
-                        });
+                    crate::workspace_inspector::docked_panel(ui, "hex_embedded_inspector",
+                        |ui| { ui.heading("Inspector"); ui.separator(); },
+                        |ui| self.app.ui_inspector(ui));
                 }
                 if let Some(range) = self.app.binary.byte_selection() {
                     ui.weak(format!("Cursor 0x{:X} · {} selected", range.start,

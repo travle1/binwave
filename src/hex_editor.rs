@@ -1951,15 +1951,23 @@ mod tests {
         let mut editor = HexEditor::default();
         editor.bytes_per_row = 16;
         editor.auto_width = false;
+        // A selection inside a named field makes the long cursor readout appear.
+        editor.select_range(0x18..0x20, false);
+        let field = HexHighlight { range: 0x18..0x20, name: "sections[2].payload.records[104].chirp".into(),
+            color: Color32::LIGHT_BLUE };
         let mut frame = || ctx.run(
             egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(780.0, 600.0))),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(740.0, 600.0))),
                 ..Default::default()
             },
             |_ctx, ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    egui::Panel::right("inspector").exact_size(340.).show(ui, |ui| { ui.label("Inspector"); });
-                    editor.ui(ui, Some(source.clone()), &[]);
+                    crate::workspace_inspector::docked_panel(ui, "inspector", |ui| { ui.label("Inspector"); }, |ui| {
+                        // Inspector values can be wider than the panel, e.g. a full-precision f32.
+                        ui.add(egui::Label::new(egui::RichText::new("f32  -27110105000000000000000000000000000000.0").monospace())
+                            .wrap_mode(egui::TextWrapMode::Extend));
+                    });
+                    editor.ui(ui, Some(source.clone()), std::slice::from_ref(&field));
                 });
             },
         );
@@ -1977,7 +1985,8 @@ mod tests {
         }).collect();
         let inspector = text_rects.iter().find(|(text, _)| text == "Inspector").unwrap().1.left();
         let overlapping: Vec<_> = text_rects.iter()
-            .filter(|(text, rect)| text != "Inspector" && rect.is_positive() && rect.right() > inspector)
+            .filter(|(text, rect)| text != "Inspector" && !text.starts_with("f32")
+                && rect.is_positive() && rect.right() > inspector)
             .map(|(text, _)| text.clone()).collect();
         assert!(overlapping.is_empty(), "hex text drawn over the inspector: {overlapping:?}");
     }

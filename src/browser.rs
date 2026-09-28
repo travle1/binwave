@@ -582,16 +582,11 @@ impl BrowserApp {
         }
         let embedded_inspector = !self.stacked && ui.available_width() >= crate::theme::DARK.size.inspector_min_host_width;
         if embedded_inspector {
-            egui::Panel::right("browser_hex_inspector")
-                .default_size(crate::theme::DARK.size.inspector_width)
-                .min_size(220.)
-                .max_size(360.)
-                .resizable(true)
-                .show(ui, |ui| {
-                    ui.strong("Inspector");
-                    self.direct_controls(ui, Pane::Hex);
-                    egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui));
-                });
+            // The header and body both need `self`; the header runs first, then the body.
+            let this = std::cell::RefCell::new(&mut *self);
+            crate::workspace_inspector::docked_panel(ui, "browser_hex_inspector",
+                |ui| { ui.strong("Inspector"); this.borrow_mut().direct_controls(ui, Pane::Hex); },
+                |ui| this.borrow_mut().inspector(ui));
         }
         if !embedded_inspector { self.direct_controls(ui, Pane::Hex); }
         ui.horizontal_wrapped(|ui| {
