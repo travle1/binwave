@@ -9,6 +9,7 @@ function harness(){
         replaceChildren(...nodes){this.children=nodes;}
         contains(node){return node===this||this.children.some(c=>c.contains(node));}
         focus(){this.focused=true;}
+        setAttribute(name,value){this[name]=value;}
         get firstElementChild(){return this.children[0];}
     }
     const root=new Element(),listeners={},window={};
@@ -24,16 +25,18 @@ test('menu state updates preserve the open menu and disable stale actions',()=>{
     const h=harness();
     const model=[group('Open data',[item('Open file...','open_file')]),group('View',[item('Hex','hex')])];
     h.render(model);
-    const menu=h.root.children[0],button=menu.children[1].children[0];
+    const menu=h.root.children[0],button=menu.children[1].children[0].children[1].children[0];
     menu.open=true;h.render(model);
     assert.equal(h.root.children[0],menu);assert.equal(menu.open,true);
     model[0].children[0].enabled=false;h.render(model);button.onclick();assert.equal(h.calls.length,0);
     model[0].children[0].enabled=true;h.render(model);button.onclick();
     assert.deepEqual(h.calls,[['open_file',0]]);assert.equal(menu.open,false);
 });
-test('one top menu stays open; Escape restores focus; outside click closes',()=>{
+test('overflow menu closes on Escape with focus restored and on outside click',()=>{
     const h=harness();h.render([group('Edit',[item('Copy','copy')]),group('View',[item('Hex','hex')])]);
-    const [a,b]=h.root.children;a.open=true;b.open=true;b.ontoggle();assert.equal(a.open,false);
-    h.listeners.keydown({key:'Escape'});assert.equal(b.open,false);assert.equal(b.firstElementChild.focused,true);
-    a.open=true;h.listeners.click({target:{}});assert.equal(a.open,false);
+    assert.equal(h.root.children.length,1);
+    const menu=h.root.children[0];menu.open=true;
+    assert.equal(menu.firstElementChild['aria-label'],'More commands');
+    h.listeners.keydown({key:'Escape'});assert.equal(menu.open,false);assert.equal(menu.firstElementChild.focused,true);
+    menu.open=true;h.listeners.click({target:{}});assert.equal(menu.open,false);
 });

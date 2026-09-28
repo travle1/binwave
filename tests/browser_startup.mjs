@@ -23,20 +23,23 @@ function bridge(allowReplace = true, clipboardRead = async () => 'name: café') 
         },
         currentScript: {src: 'http://localhost:8080/web/bridge.js'},
         getElementById(id) {
-            if (!elements.has(id)) elements.set(id, {disabled: false, hidden: true, textContent: ''});
+            if (!elements.has(id)) elements.set(id, {disabled: false, hidden: true, textContent: '', setAttribute(name,value) { this[name] = value; }});
             return elements.get(id);
         },
     };
     const menuState = {};
     const listeners = {};
-    const window = {addEventListener(name, callback) { listeners[name] = callback; }, location: {href: 'http://localhost:8080/'}};
+    const savedSettings = new Map();
+    const window = {localStorage:{getItem:key => savedSettings.get(key) ?? null, setItem:(key, value) => savedSettings.set(key, value)}, addEventListener(name, callback) { listeners[name] = callback; }, location: {href: 'http://localhost:8080/'}};
     window.binwaveMenus={refresh(){},render(model,dispatch,allow){Object.assign(menuState,{model,dispatch,allow});}};
     class Worker { constructor() { worker = this; } postMessage(message) { commands.push(message); } }
     const navigator = {clipboard: {readText: clipboardRead, writeText: async () => {}}};
-    vm.runInNewContext(readFileSync(new URL('../web/bridge.js', import.meta.url), 'utf8'), {
-        document, window, navigator, Worker, URL:BrowserURL, File, Blob, setTimeout() {}, confirm: () => allowReplace,
-    });
-    return {menuState,listeners, created, savedBlob: () => savedBlob, receive: data => worker.onmessage({data}), commands, app: window.binwave, get: id => document.getElementById(id)};
+    const context = vm.createContext({document, window, navigator, Worker, URL:BrowserURL, File, Blob, setTimeout() {}, confirm: () => allowReplace});
+    vm.runInContext(readFileSync(new URL('../web/cache-settings.js', import.meta.url), 'utf8'), context);
+    vm.runInContext(readFileSync(new URL('../web/bridge.js', import.meta.url), 'utf8'), context);
+    const initialCacheSettings = commands.shift();
+    assert.equal(initialCacheSettings.cacheBytes, 1024 ** 3);
+    return {savedSettings,menuState,listeners, created, savedBlob: () => savedBlob, receive: data => worker.onmessage({data}), commands, app: window.binwave, get: id => document.getElementById(id)};
 }
 
 test('file opening waits until the graphics workspace is ready', () => {
@@ -262,4 +265,28 @@ test('advanced demo opens bundled data with its identity and replacement guard',
     cancelled.app.ready();
     assert.equal(cancelled.app.openDemo(new Uint8Array(8080), true, 'advanced_wave.bin'), false);
     assert.equal(cancelled.commands.length, 0);
+});
+
+
+test('renderer diagnostics distinguish retained WebGPU traces from the shared WebGL fallback', () => {
+    const {app, get} = bridge();
+    app.graphicsBackend('WebGPU', true);
+    assert.equal(get('binwave')['data-graphics-backend'], 'WebGPU');
+    assert.equal(get('binwave')['data-trace-renderer'], 'retained-gpu');
+    app.graphicsBackend('WebGL2', false);
+    assert.equal(get('binwave')['data-trace-renderer'], 'cached-mesh');
+});
+
+ test('RAM cache settings support GiB budgets and update active workers without a file command', () => {
+    const {app, commands, savedSettings} = bridge();
+    assert.equal(app.cacheBudgetMiB(), 1024);
+    app.setCacheBudgetMiB('8192');
+    assert.equal(app.cacheBudgetMiB(), 8192);
+    assert.equal(savedSettings.get('binwave-file-cache-mib'), '8192');
+    assert.equal(commands.at(-1).type, 'cache_settings');
+    assert.equal(commands.at(-1).cacheBytes, 8 * 1024 ** 3);
+    assert.throws(() => app.setCacheBudgetMiB('-1'));
+    assert.equal(app.cacheBudgetMiB(), 8192);
+    app.setCacheBudgetMiB('0');
+    assert.equal(commands.at(-1).cacheBytes, 0);
 });

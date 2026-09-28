@@ -1,4 +1,6 @@
 import {FileBackend, PAGE_SIZE} from './file-backend.mjs';
+import './cache-settings.js';
+let cacheBytes = globalThis.binwaveCacheSettings.DEFAULT_BYTES;
 let source = null;
 let busy = false;
 let cancelled = false;
@@ -19,7 +21,7 @@ async function decoding(m) {
             rejectDecoder = reject;
             worker.onmessage = ({data}) => data.type === 'error' ? reject(Error(data.message)) : resolve(data);
             worker.onerror = e => reject(Error(e.message || 'Decoder worker failed'));
-            worker.postMessage(candidate ? {...m, file:source.file, patches:Array.from(source.patches)} : m);
+            worker.postMessage(candidate ? {...m, cacheBytes, file:source.file, patches:Array.from(source.patches)} : m);
         });
         await source.validate();
         if (candidate) { decoder?.terminate(); decoder = worker; }
@@ -34,6 +36,13 @@ async function decoding(m) {
 const metadata = () => ({name: source.file.name, size: source.size.toString(), dirty: source.dirty,
     undo: source.undo.length > 0, redo: source.redo.length > 0, exportable: !!source.handle});
 self.onmessage = async ({data: m}) => {
+    if (m.type === 'cache_settings') {
+        if (!Number.isSafeInteger(m.cacheBytes) || m.cacheBytes < 0) return;
+        cacheBytes = m.cacheBytes;
+        decoder?.postMessage(m);
+        if (pendingDecoder && pendingDecoder !== decoder) pendingDecoder.postMessage(m);
+        return;
+    }
     if (m.type === 'cancel') {
         cancelled = true;
         if (rejectDecoder) {

@@ -1,6 +1,30 @@
 // Browser chrome uses the same commands as the egui workspace. File pickers
 // remain in bridge.js so their click handlers keep browser user activation.
 (() => {
+    const settings = document.getElementById('settings-dialog');
+    const cacheInput = document.getElementById('file-cache-mib');
+    const cacheError = document.getElementById('cache-settings-error');
+    document.getElementById('sidebar-settings').onclick = () => {
+        cacheInput.value = window.binwave.cacheBudgetMiB();
+        cacheError.hidden = true;
+        if (!settings.open) settings.showModal();
+        cacheInput.focus();
+    };
+    document.getElementById('settings-close').onclick = () => settings.close();
+    document.getElementById('cache-settings-default').onclick = () => {
+        cacheInput.value = globalThis.binwaveCacheSettings.DEFAULT_BYTES / globalThis.binwaveCacheSettings.MIB;
+        cacheError.hidden = true;
+    };
+    document.getElementById('cache-settings-form').onsubmit = event => {
+        event.preventDefault();
+        try {
+            window.binwave.setCacheBudgetMiB(cacheInput.value);
+            settings.close();
+        } catch (error) {
+            cacheError.textContent = error.message;
+            cacheError.hidden = false;
+        }
+    };
     const sidebar = document.getElementById('sidebar');
     const expand = document.getElementById('expand-sidebar');
     const headerOpen = document.getElementById('header-open');

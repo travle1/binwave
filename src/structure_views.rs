@@ -1,7 +1,8 @@
 //! Shared selection and bounded, asynchronous pages for decoded structure views.
+use crate::plot_trace::{PlacedPoints, placed_points};
 #[cfg(test)]
 use crate::egui_compat::ContextRun as _;
-use crate::structure_selection::{covering, sample_indices_for_bytes, sample_bytes};
+use crate::structure_selection::{covering, sample_indices_for_bytes, sample_bytes, matching_collection};
 use crate::byte_store::ByteView;
 use crate::hex_editor::HexHighlight;
 use crate::plot_trace::{decoded_channel_borrowed, TraceMeshCache};
@@ -133,6 +134,7 @@ pub struct StructureViews {
     source_revision: Option<u64>,
     repaint_context: Option<egui::Context>,
     plot_reader: PlotReader,
+    ram_cache_bytes: Option<usize>,
     presentation: crate::plot_presentation::Presentation,
     plot_hidden: HashSet<String>,
     plot_field_filter: String,
@@ -198,7 +200,18 @@ impl Drop for StructureViews {
 
 impl StructureViews {
     pub fn reset(&mut self) {
+        let budget = self.ram_cache_bytes;
         *self = Self::default();
+        self.ram_cache_bytes = budget;
+    }
+    pub fn set_ram_cache_budget(&mut self, bytes: usize) {
+        if self.ram_cache_bytes == Some(bytes) { return; }
+        self.ram_cache_bytes = Some(bytes);
+        let count = 1 + self.group_plot_readers.len() + self.extra_plot_readers.len();
+        let per_reader = bytes / count;
+        self.plot_reader.set_cache_budget(per_reader);
+        for reader in self.group_plot_readers.values_mut() { reader.set_cache_budget(per_reader); }
+        for reader in self.extra_plot_readers.values_mut() { reader.set_cache_budget(per_reader); }
     }
     pub fn take_plot_action(&mut self) -> Option<PlotAction> {
         self.plot_action.take()
@@ -1096,9 +1109,8 @@ impl StructureViews {
             if let Some(range) = &self.last_hex_selection {
                 let selected_virtual = self.flattened_collections.iter().find(|node|
                     node.path == self.table_target && sample_indices_for_bytes(node, range).is_some());
-                if let Some(collection) = selected_virtual
-                    .or_else(|| self.flattened_collections.iter()
-                        .find(|node| sample_indices_for_bytes(node, range).is_some()))
+                if let Some(collection) = matching_collection(
+                    self.flattened_collections.iter(), &self.table_target, range)
                     .or_else(|| containing_collection(&output.nodes, range)) {
                     if !self.plot_sources.contains(&collection.path) && self.plot_sources_initialized {
                         if selected_virtual.is_none() { return; }
@@ -1440,7 +1452,7 @@ impl StructureViews {
         let reader_count = 1 + grouped_plans.len().saturating_sub(usize::from(primary_group.is_some()))
             + self.plot_sources.iter().filter(|path| *path != &self.plot_target
                 && !grouped_paths.contains(*path)).count();
-        let reader_budget = crate::structure_plot::group_buffer_bytes() / reader_count.max(1);
+        let reader_budget = self.ram_cache_bytes.unwrap_or_else(crate::structure_plot::group_buffer_bytes) / reader_count.max(1);
         self.plot_reader.set_cache_budget(reader_budget);
         for reader in self.group_plot_readers.values_mut() { reader.set_cache_budget(reader_budget); }
         for reader in self.extra_plot_readers.values_mut() { reader.set_cache_budget(reader_budget); }
@@ -2710,26 +2722,7 @@ fn plot_collection_choices(ui: &mut Ui, collections: &[&Node], samples: Option<&
 }
 
 fn sensor_group_key(node: &Node) -> Option<(String, usize)> {
-    let (group_name, _) = node.name.split_once(" across ")?;
-    // Contiguous definitions expose one named sample array per sensor.
-    // Keep the complete parent path as identity so equal channel names in
-    // different sections do not merge in the picker.
-    if let Some((prefix, sensor)) = node.path.rsplit_once(".sensor_") {
-        let index = sensor.parse::<usize>().ok()?;
-        let (named_parent, named_sensor) = group_name.rsplit_once(".sensor_")?;
-        if named_sensor.parse::<usize>().ok()? != index || !prefix.ends_with(named_parent) {
-            return None;
-        }
-        return Some((format!("{prefix}.sensors"), index));
-    }
-    let (name, named_index) = group_name.rsplit_once('[')?;
-    let named_index = named_index.strip_suffix(']')?.parse::<usize>().ok()?;
-    let (prefix, rest) = node.path.rsplit_once('[')?;
-    let (index, suffix) = rest.split_once(']')?;
-    if !suffix.starts_with('.') { return None; }
-    let index = index.parse::<usize>().ok()?;
-    if index != named_index || !prefix.ends_with(name) { return None; }
-    Some((format!("{prefix}{suffix}"), index))
+    crate::plot_series::collection_group(&node.name, &node.path)
 }
 
 fn grouped_numeric_plans(
@@ -2744,28 +2737,15 @@ fn grouped_numeric_plans(
     }
     let mut grouped = BTreeMap::new();
     for (key, mut members) in candidates {
-        // A logical channel may draw sensors from different physical regions.
-        // Merge only byte-compatible neighbors; others still plot independently.
         members.sort_by_key(|(_, plan)| plan.offset(0).unwrap_or(usize::MAX));
-        let mut run: Vec<(&Node, NumericPlan)> = Vec::new();
-        let mut runs = Vec::new();
-        for member in members {
-            let mut trial = run.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>();
-            trial.push(member.1.clone());
-            if !run.is_empty() && (collection_count(run[0].0) != collection_count(member.0)
-                || NumericPlan::combine(&trial).is_none()) {
-                runs.push(std::mem::take(&mut run));
-            }
-            run.push(member);
-        }
-        if !run.is_empty() { runs.push(run); }
+        let nodes: Vec<Node> = members.into_iter().map(|(node, _)| node.clone()).collect();
+        let runs = crate::structure_plot::compatible_numeric_groups(&nodes);
         let multiple_runs = runs.len() > 1;
-        for (index, run) in runs.into_iter().enumerate() {
-            if run.len() < 2 { continue; }
-            let Some(plan) = NumericPlan::combine(&run.iter().map(|(_, plan)| plan.clone()).collect::<Vec<_>>()) else { continue; };
-            let paths = run.iter().map(|(node, _)| node.path.clone()).collect();
+        for (index, (node, plan, paths)) in runs.into_iter().enumerate() {
+            if paths.len() < 2 { continue; }
+            let Some(plan) = plan else { continue; };
             let run_key = if multiple_runs { format!("{key}#{index}") } else { key.clone() };
-            grouped.insert(run_key, (run[0].0.clone(), plan, paths));
+            grouped.insert(run_key, (node, plan, paths));
         }
     }
     grouped
@@ -2839,41 +2819,6 @@ fn update_group_overlay(
         if hidden.contains(name) { continue; }
         overlay.envelopes.insert(name.clone(), bands.clone());
     }
-}
-/// A trace's display-space points and the stored points and placement they came from.
-struct PlacedPoints {
-    source: Arc<Vec<PlotPoint>>,
-    placement: (u64, u64),
-    points: Arc<Vec<PlotPoint>>,
-}
-/// Display-space points for every visible trace. Only traces whose stored points or
-/// placement changed are recomputed, and only their cached meshes are dropped.
-fn placed_points(
-    cache: &mut HashMap<String, PlacedPoints>,
-    meshes: &TraceMeshCache,
-    stored: &BTreeMap<String, Arc<Vec<PlotPoint>>>,
-    hidden: &HashSet<String>,
-    presentation: &crate::plot_presentation::Presentation,
-) -> BTreeMap<String, Arc<Vec<PlotPoint>>> {
-    cache.retain(|name, _| stored.contains_key(name));
-    stored.iter().filter(|(name, _)| !hidden.contains(*name)).map(|(name, source)| {
-        let placement = presentation.placement(name);
-        let key = (placement.scale.to_bits(), placement.offset.to_bits());
-        let current = cache.get(name)
-            .filter(|entry| entry.placement == key && Arc::ptr_eq(&entry.source, source));
-        if let Some(entry) = current {
-            return (name.clone(), Arc::clone(&entry.points));
-        }
-        meshes.remove(name);
-        let points = if key == (1f64.to_bits(), 0f64.to_bits()) {
-            Arc::clone(source)
-        } else {
-            Arc::new(source.iter().map(|point| PlotPoint::new(point.x, placement.display(point.y))).collect())
-        };
-        cache.insert(name.clone(), PlacedPoints { source: Arc::clone(source), placement: key,
-            points: Arc::clone(&points) });
-        (name.clone(), points)
-    }).collect()
 }
 fn plot_series_color(name: &str) -> Color32 {
     crate::plot_trace::series_color(name)
@@ -3460,6 +3405,22 @@ fn paint_tree_columns(ui: &Ui, rect: egui::Rect, widths: [f32; 6], texts: [&str;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ram_cache_budget_survives_reset_and_trims_every_reader() {
+        let mut views = StructureViews::default();
+        views.group_plot_readers.insert("group".into(), PlotReader::default());
+        views.extra_plot_readers.insert("synthetic".into(), PlotReader::default());
+        views.set_ram_cache_budget(0);
+        assert_eq!(views.plot_reader.group_buffer_stats().0, 0);
+        for reader in views.group_plot_readers.values().chain(views.extra_plot_readers.values()) {
+            assert_eq!(reader.group_buffer_stats().0, 0);
+        }
+        views.reset();
+        assert_eq!(views.ram_cache_bytes, Some(0));
+        views.set_ram_cache_budget(2 * 1024 * 1024 * 1024);
+        assert_eq!(views.ram_cache_bytes, Some(2 * 1024 * 1024 * 1024));
+    }
+
     #[test]
     fn plot_series_groups_keep_sensor_identity() {
         let names = [

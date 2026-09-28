@@ -3,10 +3,8 @@ use egui::{Color32, Id, Rect, Shape, Ui};
 use egui_plot::{Line, PlotBounds, PlotGeometry, PlotItem, PlotItemBase, PlotPoint, PlotTransform};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Mutex;
-#[cfg(not(target_arch = "wasm32"))]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, BTreeMap};
 
 /// Stable series colors do not depend on selection order or the number of traces.
 pub fn series_color(name: &str) -> Color32 {
@@ -14,24 +12,7 @@ pub fn series_color(name: &str) -> Color32 {
     egui::epaint::Hsva::new((hash % 65536) as f32 / 65536., 0.55 + ((hash >> 16) % 20) as f32 / 100., 0.9, 1.).into()
 }
 
-/// Render a decoded channel consistently across platform shells. Estimated
-/// bands describe observed ranges, never a continuous path across unread data.
-#[cfg(target_arch = "wasm32")]
-pub fn decoded_channel(
-    plot: &mut egui_plot::PlotUi,
-    name: &str,
-    color: Color32,
-    points: Vec<[f64; 2]>,
-    estimated_bands: Option<&[[f64; 4]]>,
-) {
-    if let Some(bands) = estimated_bands {
-        draw_bands(plot, name, color, bands);
-    } else {
-        plot.add(AdaptiveTrace::new(points, name, color));
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
+/// Render decoded channels through the same mesh and envelope path on both shells.
 pub fn decoded_channel_borrowed<'a>(
     plot: &mut egui_plot::PlotUi<'a>,
     name: &str,
@@ -51,7 +32,6 @@ pub fn decoded_channel_borrowed<'a>(
 
 /// A preview's windows share one plot item and one mesh per trace. Creating a
 /// polygon and two lines for every window overwhelms the UI with many traces.
-#[cfg(not(target_arch = "wasm32"))]
 struct AmplitudeBands<'a> {
     base: PlotItemBase,
     color: Color32,
@@ -60,7 +40,6 @@ struct AmplitudeBands<'a> {
     bounds: PlotBounds,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl<'a> AmplitudeBands<'a> {
     fn new(name: &str, color: Color32, points: &'a [PlotPoint], bands: &[[f64; 4]]) -> Self {
         let mut bounds = PlotBounds::NOTHING;
@@ -74,7 +53,6 @@ impl<'a> AmplitudeBands<'a> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl PlotItem for AmplitudeBands<'_> {
     fn shapes(&self, _ui: &Ui, transform: &PlotTransform, shapes: &mut Vec<Shape>) {
         let frame = *transform.frame();
@@ -117,37 +95,14 @@ impl PlotItem for AmplitudeBands<'_> {
     fn base_mut(&mut self) -> &mut PlotItemBase { &mut self.base }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn draw_bands(plot: &mut egui_plot::PlotUi, name: &str, color: Color32, bands: &[[f64; 4]]) {
-        for &[left, right, low, high] in bands {
-            if ![left, right, low, high].iter().all(|x| x.is_finite()) || left >= right || low > high {
-                continue;
-            }
-            // Flat polygons have no area and can tessellate to non-finite vertices.
-            if low < high {
-                plot.polygon(egui_plot::Polygon::new(name, vec![
-                    [left, low], [right, low], [right, high], [left, high],
-                ]).name(name).fill_color(color.gamma_multiply(0.23))
-                    .stroke(egui::Stroke::new(0_f32, color)));
-            }
-            for (i, value) in [low, high].into_iter().enumerate() {
-                if i == 1 && low == high { continue; }
-                plot.line(Line::new(name, vec![[left, value], [right, value]])
-                    .name(name).color(color).width(0.8_f32));
-            }
-        }
-}
-
 const MIN_CYCLE_PIXELS: f64 = 4.0;
 const MAX_COLUMNS: usize = 16_384;
 // egui-wgpu allocates one vertex/index buffer for the entire frame. Budget
 // across traces, not per trace, to stay below the device's buffer-size limit.
 const MAX_LINE_POINTS_TOTAL: usize = 200_000;
-#[cfg(not(target_arch = "wasm32"))]
 const MAX_MESH_COLUMNS_TOTAL: usize = 500_000;
 const ENVELOPE_RADIUS: usize = 2;
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct MeshKey {
     bounds: [u64; 4],
@@ -160,7 +115,6 @@ struct MeshKey {
     outlined_envelope: bool,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl MeshKey {
     fn new(transform: &PlotTransform, pixels_per_point: f32, color: Color32,
         line_limit: usize, column_limit: usize, highlighted: bool, outlined_envelope: bool) -> Self {
@@ -179,11 +133,9 @@ impl MeshKey {
 
 /// Screen-space meshes are reused while the data and plot transform are unchanged.
 /// The owner clears this cache whenever decoded plot data changes.
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 pub struct TraceMeshCache(Mutex<HashMap<String, (MeshKey, Arc<egui::epaint::Mesh>)>>);
 
-#[cfg(not(target_arch = "wasm32"))]
 impl TraceMeshCache {
     pub fn clear(&self) { self.0.lock().unwrap().clear(); }
     pub fn remove(&self, name: &str) { self.0.lock().unwrap().remove(name); }
@@ -202,11 +154,10 @@ pub struct AdaptiveTrace<'a> {
     line_point_limit: usize,
     mesh_column_limit: usize,
     outlined_envelope: bool,
-    #[cfg(not(target_arch = "wasm32"))]
-    mesh_cache: Option<Arc<TraceMeshCache>>,
+        mesh_cache: Option<Arc<TraceMeshCache>>,
 }
 
-#[cfg(any(test, target_arch = "wasm32"))]
+#[cfg(test)]
 impl AdaptiveTrace<'static> {
     pub fn new(points: Vec<[f64; 2]>, name: impl Into<String>, color: Color32) -> Self {
         Self {
@@ -214,13 +165,11 @@ impl AdaptiveTrace<'static> {
             line_point_limit: MAX_LINE_POINTS_TOTAL,
             mesh_column_limit: MAX_COLUMNS,
             outlined_envelope: false,
-            #[cfg(not(target_arch = "wasm32"))]
-            mesh_cache: None,
+                        mesh_cache: None,
         }
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl<'a> AdaptiveTrace<'a> {
     pub fn borrowed_with_series_count(points: &'a [PlotPoint], name: impl Into<String>, color: Color32, visible_series: usize) -> Self {
         let count = visible_series.max(1);
@@ -244,11 +193,9 @@ impl PlotItem for AdaptiveTrace<'_> {
             return;
         };
         let pixels_per_point = ui.ctx().pixels_per_point();
-        #[cfg(not(target_arch = "wasm32"))]
-        let key = MeshKey::new(transform, pixels_per_point, self.color(),
+                let key = MeshKey::new(transform, pixels_per_point, self.color(),
             self.line_point_limit, self.mesh_column_limit, self.highlighted(), self.outlined_envelope);
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(mesh) = self.mesh_cache.as_ref().and_then(|cache| cache.get(self.name(), key)) {
+                if let Some(mesh) = self.mesh_cache.as_ref().and_then(|cache| cache.get(self.name(), key)) {
             shapes.push(Shape::Mesh(mesh));
             return;
         }
@@ -273,8 +220,7 @@ impl PlotItem for AdaptiveTrace<'_> {
             }
             if !mesh.is_empty() {
                 let mesh: Arc<egui::epaint::Mesh> = mesh.into();
-                #[cfg(not(target_arch = "wasm32"))]
-                if let Some(cache) = &self.mesh_cache { cache.insert(self.name(), key, mesh.clone()); }
+                                if let Some(cache) = &self.mesh_cache { cache.insert(self.name(), key, mesh.clone()); }
                 shapes.push(Shape::Mesh(mesh));
             }
         } else {
@@ -732,4 +678,40 @@ mod tests {
         trace.highlight();
         assert!(trace.highlighted());
     }
+}
+
+/// A trace's display-space points and the stored points and placement they came from.
+pub(crate) struct PlacedPoints {
+    source: Arc<Vec<PlotPoint>>,
+    placement: (u64, u64),
+    pub(crate) points: Arc<Vec<PlotPoint>>,
+}
+/// Display-space points for every visible trace. Only traces whose stored points or
+/// placement changed are recomputed, and only their cached meshes are dropped.
+pub(crate) fn placed_points(
+    cache: &mut HashMap<String, PlacedPoints>,
+    meshes: &TraceMeshCache,
+    stored: &BTreeMap<String, Arc<Vec<PlotPoint>>>,
+    hidden: &HashSet<String>,
+    presentation: &crate::plot_presentation::Presentation,
+) -> BTreeMap<String, Arc<Vec<PlotPoint>>> {
+    cache.retain(|name, _| stored.contains_key(name));
+    stored.iter().filter(|(name, _)| !hidden.contains(*name)).map(|(name, source)| {
+        let placement = presentation.placement(name);
+        let key = (placement.scale.to_bits(), placement.offset.to_bits());
+        let current = cache.get(name)
+            .filter(|entry| entry.placement == key && Arc::ptr_eq(&entry.source, source));
+        if let Some(entry) = current {
+            return (name.clone(), Arc::clone(&entry.points));
+        }
+        meshes.remove(name);
+        let points = if key == (1f64.to_bits(), 0f64.to_bits()) {
+            Arc::clone(source)
+        } else {
+            Arc::new(source.iter().map(|point| PlotPoint::new(point.x, placement.display(point.y))).collect())
+        };
+        cache.insert(name.clone(), PlacedPoints { source: Arc::clone(source), placement: key,
+            points: Arc::clone(&points) });
+        (name.clone(), points)
+    }).collect()
 }

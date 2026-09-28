@@ -52,10 +52,10 @@ mod plot_index;
 mod plot_trace;
 #[cfg(not(target_arch = "wasm32"))]
 mod plot_raster;
-#[cfg(not(target_arch = "wasm32"))]
 mod plot_gpu;
 mod plot_presentation;
 mod plot_series;
+mod collection_navigation;
 #[cfg(not(target_arch = "wasm32"))]
 mod plotting;
 #[cfg(not(target_arch = "wasm32"))]
@@ -153,7 +153,17 @@ fn main() {
                 return;
             };
             match runner.start(canvas, options,
-                Box::new(|cc| Ok(Box::new(browser::BrowserApp::new(cc))))).await {
+                Box::new(move |cc| {
+                    if let Some(state) = &cc.wgpu_render_state {
+                        // Storage-buffer shaders need WebGPU; WebGL keeps the
+                        // shared adaptive trace fallback.
+                        if state.device.limits().max_storage_buffers_per_shader_stage >= 2 {
+                            plot_gpu::configure(state.target_format);
+                        }
+                    }
+                    browser::graphics_backend(name, plot_gpu::GpuPlot::available());
+                    Ok(Box::new(browser::BrowserApp::new(cc)))
+                })).await {
                 Ok(()) => return,
                 Err(error) => {
                     failures.push(format!("{name}: {error:?}"));

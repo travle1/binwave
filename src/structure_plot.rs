@@ -33,37 +33,13 @@ const CACHE_ENTRIES: Address = 3;
 #[cfg(not(target_arch = "wasm32"))]
 const GROUP_TILE_SAMPLES: Address = 4096;
 #[cfg(not(target_arch = "wasm32"))]
-const DEFAULT_GROUP_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_GROUP_BUFFER_BYTES: usize = 1024 * 1024 * 1024;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn group_buffer_bytes() -> usize {
-    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| {
-        let configured = std::env::var("BINWAVE_PLOT_CACHE_MB").ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .map(|mb| mb.clamp(64, 4096).saturating_mul(1024 * 1024));
-        #[cfg(target_os = "linux")]
-        let available = std::fs::read_to_string("/proc/meminfo").ok()
-            .and_then(|text| text.lines().find_map(|line| {
-                let kb = line.strip_prefix("MemAvailable:")?
-                    .split_whitespace().next()?.parse::<usize>().ok()?;
-                Some(kb.saturating_mul(1024))
-            }));
-        #[cfg(windows)]
-        let available = {
-            use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-            let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-            status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-            (unsafe { GlobalMemoryStatusEx(&mut status) } != 0)
-                .then(|| usize::try_from(status.ullAvailPhys).unwrap_or(usize::MAX))
-        };
-        #[cfg(not(any(target_os = "linux", windows)))]
-        let available: Option<usize> = None;
-        let bytes = configured.or_else(|| available.map(|bytes|
-            (bytes / 32).clamp(128 * 1024 * 1024, 1024 * 1024 * 1024)
-        )).unwrap_or(DEFAULT_GROUP_BUFFER_BYTES);
-        log::info!("Plot RAM tile/summary budget: {} MiB shared by active readers", bytes / (1024 * 1024));
-        bytes
-    })
+    std::env::var("BINWAVE_PLOT_CACHE_MB").ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|mib| mib.checked_mul(1024 * 1024))
+        .unwrap_or(DEFAULT_GROUP_BUFFER_BYTES)
 }
 #[cfg(not(target_arch = "wasm32"))]
 const GROUP_SUMMARY_SAMPLES: Address = 1024;
@@ -1076,7 +1052,6 @@ fn display_buckets(pixel_width: Address) -> Address {
         * 64
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn request_resolution(
     range: &Range<Address>, pixel_width: Address, field_count: Option<usize>,
 ) -> (Address, Address) {
@@ -1084,9 +1059,9 @@ fn request_resolution(
     // buckets once that budget is reached, so they should reuse the same scan.
     let buckets = field_count.map_or(display_buckets(pixel_width), |count| {
         display_buckets(pixel_width)
-            .min((MAX_TOTAL_NUMERIC_POINTS / count.max(1)).max(1))
+            .min((MAX_TOTAL_NUMERIC_POINTS / count.max(1) as Address).max(1))
     });
-    let exact = if range.len() > MAX_EXACT_LIMIT {
+    let exact = if range.end - range.start > MAX_EXACT_LIMIT {
         MAX_EXACT_LIMIT
     } else {
         exact_limit(pixel_width)
@@ -1112,7 +1087,7 @@ fn query_resolution(view: &Range<Address>, query: &Range<Address>,
     pixel_width: Address, field_count: Option<usize>) -> (Address, Address) {
     let (base_buckets, base_exact) = request_resolution(view, pixel_width, field_count);
     let field_cap = field_count.map_or(MAX_BUCKETS, |count|
-        (MAX_TOTAL_NUMERIC_POINTS / count.max(1)).max(1).min(MAX_BUCKETS));
+        (MAX_TOTAL_NUMERIC_POINTS / count.max(1) as Address).max(1).min(MAX_BUCKETS));
     let buckets = base_buckets.saturating_mul(query.len())
         .div_ceil(view.len().max(1)).clamp(1, field_cap);
     let exact = if view.len() <= base_exact { query.len() } else { base_exact };
@@ -2164,34 +2139,68 @@ fn read_numeric(
 /// Shared viewport query used by native thread workers and browser Web Workers.
 #[cfg(any(test, target_arch = "wasm32"))]
 pub(crate) fn read_for_viewport(
-    source: ByteView,
-    node: Node,
-    range: Range<Address>,
-    pixel_width: Address,
+    source: ByteView, node: Node, range: Range<Address>, pixel_width: Address,
 ) -> Result<PlotData> {
-    let count = node
-        .lazy
-        .as_ref()
-        .map_or(node.children.len() as Address, |a| a.count);
+    let plan = node.lazy.as_ref().and_then(|array| array.numeric_plan());
+    read_viewport_plan(source, node, plan, range, pixel_width)
+}
+
+/// Coalesce compatible projections before reading bytes, using the same numeric
+/// plans and reduction policy as native grouped readers. Incompatible layouts
+/// retain their own query rather than assuming a common record stride.
+#[cfg(any(test, target_arch = "wasm32"))]
+pub(crate) fn read_for_collections(
+    source: ByteView, nodes: &[Node], range: Range<Address>, pixel_width: Address,
+) -> Result<Vec<(Vec<String>, PlotData)>> {
+    compatible_numeric_groups(nodes).into_iter().map(|(node, plan, paths)| {
+        let data = read_viewport_plan(source.clone(), node, plan, range.clone(), pixel_width)?;
+        Ok((paths, data))
+    }).collect()
+}
+
+/// Shared grouping policy for native reader scheduling and browser workers.
+pub(crate) fn compatible_numeric_groups(nodes: &[Node]) -> Vec<(Node, Option<NumericPlan>, Vec<String>)> {
+    let mut groups: Vec<(Node, Vec<NumericPlan>, Vec<String>)> = Vec::new();
+    for node in nodes {
+        let plan = node.lazy.as_ref().and_then(|array| array.numeric_plan());
+        if let Some(plan) = plan {
+            let count = node.lazy.as_ref().map(|a| a.count);
+            if let Some((_, plans, paths)) = groups.iter_mut().find(|(first, plans, _)| {
+                if first.lazy.as_ref().map(|a| a.count) != count || plans.is_empty() { return false; }
+                let mut candidates = plans.clone(); candidates.push(plan.clone());
+                NumericPlan::combine(&candidates).is_some()
+            }) {
+                plans.push(plan); paths.push(node.path.clone()); continue;
+            }
+            groups.push((node.clone(), vec![plan], vec![node.path.clone()]));
+        } else {
+            groups.push((node.clone(), Vec::new(), vec![node.path.clone()]));
+        }
+    }
+    groups.into_iter().map(|(node, plans, paths)| {
+        let plan = if plans.len() > 1 { NumericPlan::combine(&plans) } else { plans.into_iter().next() };
+        (node, plan, paths)
+    }).collect()
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn read_viewport_plan(
+    source: ByteView, node: Node, numeric_plan: Option<NumericPlan>,
+    range: Range<Address>, pixel_width: Address,
+) -> Result<PlotData> {
+    let fields = numeric_plan.as_ref().map(|plan| plan.fields.len());
+    let count = node.lazy.as_ref().map_or(node.children.len() as Address, |a| a.count);
     let start = range.start.min(count);
     let range = start..range.end.max(start).min(count);
+    let (buckets, exact_limit) = request_resolution(&range, pixel_width, fields);
     let request = Request {
-        key: Key {
-            revision: source.revision,
-            definition: identity(&node),
-            path: node.path.clone(),
-            range,
-            buckets: display_buckets(pixel_width),
-            exact_limit: exact_limit(pixel_width),
-            refine: false,
-            fields: None,
-        },
-        source,
-        node,
-        numeric_plan: None,
+        key: Key { revision: source.revision, definition: identity(&node),
+            path: node.path.clone(), range, buckets, exact_limit,
+            refine: false, fields: None },
+        source, node, numeric_plan,
         #[cfg(not(target_arch = "wasm32"))]
         group_tiles: None,
-        partial_updates: true,
+        partial_updates: false,
     };
     read_plot(&request, &AtomicBool::new(false), |_| {})
 }
@@ -2889,6 +2898,13 @@ actions:
         assert_eq!(plan.fields.len(), 4);
         assert_eq!(plan.fields[3].name, "sensors.[2]");
         let data = read_for_viewport(store.view(), flat.clone(), 255..257, 800).unwrap();
+        let shared = read_for_collections(store.view(), &[flat.clone()], 255..257, 800).unwrap();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].1.quality, data.quality);
+        for (name, points) in &data.series {
+            assert_eq!(shared[0].1.series[name].iter().map(|p| (p.index, p.value, p.bytes.clone())).collect::<Vec<_>>(),
+                points.iter().map(|p| (p.index, p.value, p.bytes.clone())).collect::<Vec<_>>());
+        }
         let points = &data.series["sensors.[2]"];
         assert_eq!(points.iter().map(|point| point.value).collect::<Vec<_>>(), [11., 22.]);
         assert_eq!(points[0].bytes, first..first + 2);

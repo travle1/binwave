@@ -27,6 +27,15 @@ fn json_result(value: Value) -> Result<String> {
     );
     Ok(text)
 }
+fn plot_channel(path: &str, name: &str, points: &[crate::structure_plot::PlotSample],
+    envelopes: Option<&Vec<crate::structure_plot::PlotEnvelope>>, estimated: bool) -> Value {
+    let bands: Vec<[f64; 4]> = if estimated { envelopes.into_iter().flatten().map(|band| [
+        band.range.start as f64 - 0.5, band.range.end as f64 - 0.5, band.min.value, band.max.value,
+    ]).collect() } else { Vec::new() };
+    json!({"name":name,"path":path,
+        "bytes":points.iter().map(|p|[p.bytes.start.to_string(),p.bytes.end.to_string()]).collect::<Vec<_>>(),
+        "points":points.iter().map(|p|[p.index as f64,p.value]).collect::<Vec<_>>(),"bands":bands})
+}
 fn js_error(error: anyhow::Error) -> JsValue {
     JsValue::from_str(&format!("{error:#}"))
 }
@@ -144,7 +153,8 @@ fn decoded_json(output: &ParseOutput, partial_error: Option<&str>, flattened: &B
     if partial_error.is_none() { collections(&output.nodes, &mut arrays); }
     if partial_error.is_none() {
         arrays.extend(flattened.values().filter_map(|node| node.lazy.as_ref().map(|array|
-            json!({"path":node.path,"count":array.count.to_string()}))));
+            json!({"path":node.path,"name":node.name,"count":array.count.to_string(),
+                "group":crate::plot_series::collection_group(&node.name, &node.path)}))));
     }
     let preview_path = partial_error.and_then(|_| last_lazy_path(&output.nodes));
     let nodes: Vec<_> = output.nodes.iter().map(describe).collect();
@@ -174,6 +184,14 @@ fn cells(node: &Node, prefix: &str, out: &mut BTreeMap<String, Value>) {
             format!("{prefix}.{}", child.name)
         };
         cells(child, &key, out);
+    }
+}
+fn cell_columns(node: &Node, prefix: &str, columns: &mut Vec<String>) {
+    if columns.len() >= 64 { return; }
+    if node.value.is_some() { columns.push(if prefix.is_empty() { "value".into() } else { prefix.into() }); }
+    for child in &node.children {
+        let key = if prefix.is_empty() { child.name.clone() } else { format!("{prefix}.{}", child.name) };
+        cell_columns(child, &key, columns);
     }
 }
 fn page(node: &Node, source: &ByteView, start: u64, count: u64) -> Result<Vec<Node>> {
@@ -245,9 +263,19 @@ impl DecoderSession {
     pub fn probe(&self, path: &str, start: &str, end: &str) -> Result<String, JsValue> {
         (|| -> Result<String> {
             let output = self.output.as_ref().context("Apply a decoder first")?;
-            let node = collection_node(&output.nodes, &self.flattened, path).context("Collection not found")?;
             let range = start.parse::<u64>()?..end.parse::<u64>()?;
-            let samples = crate::structure_selection::sample_indices_for_bytes(node, &range);
+            let mut candidates = Vec::new();
+            fn collect<'a>(nodes: &'a [Node], result: &mut Vec<&'a Node>) {
+                for node in nodes {
+                    if node.lazy.is_some() { result.push(node); }
+                    collect(&node.children, result);
+                }
+            }
+            collect(&output.nodes, &mut candidates);
+            let node = crate::structure_selection::matching_collection(self.flattened.values(), path, &range)
+                .or_else(|| crate::structure_selection::matching_collection(candidates, path, &range));
+            let samples = node.and_then(|node| crate::structure_selection::sample_indices_for_bytes(node, &range));
+            let path = node.map_or(path, |node| node.path.as_str());
             json_result(json!({"path":path,"first":samples.as_ref().map(|r| r.start.to_string()),
                 "end":samples.map(|r| r.end.to_string())}))
         })().map_err(js_error)
@@ -317,7 +345,9 @@ impl DecoderSession {
             let node = collection_node(&self.output.as_ref().context("Apply a decoder first")?.nodes, &self.flattened, path).context("Unknown collection")?;
             let start = start.parse::<u64>()?;
             let rows = page(node, &self.source, start, 128)?;
-            json_result(json!({"path":path,"start":start.to_string(),"rows":rows.iter().enumerate().map(|(i,node)| {
+            let mut columns = Vec::new();
+            if let Some(row) = rows.first() { cell_columns(row, "", &mut columns); }
+            json_result(json!({"path":path,"start":start.to_string(),"columns":columns,"rows":rows.iter().enumerate().map(|(i,node)| {
                 let mut fields = BTreeMap::new(); cells(node,"", &mut fields);
                 json!({"index":(start+i as u64).to_string(),"start":node.range.start.to_string(),
                     "end":node.range.end.to_string(),"cells":fields})
@@ -342,28 +372,49 @@ impl DecoderSession {
         })().map_err(js_error)
     }
     pub fn plot_many(&self, paths: &str, first: &str, last: &str, width: u32) -> Result<String, JsValue> {
-        let paths: Vec<String> = serde_json::from_str(paths).map_err(|e| js_error(e.into()))?;
-        let mut series = Vec::new();
-        let mut scanned = 0u64;
-        let mut estimated = false;
-        let mut seen = std::collections::BTreeSet::new();
-        for path in paths {
-            if !seen.insert(path.clone()) { continue; }
-            let result: Value = serde_json::from_str(&self.plot(&path, first, last, width)?).map_err(|e| js_error(e.into()))?;
-            scanned += result["scanned"].as_u64().unwrap_or(0);
-            estimated |= result["estimated"].as_bool().unwrap_or(false);
-            if let Some(channels) = result["series"].as_array() {
-                for channel in channels {
-                    let mut channel = channel.clone();
-                    channel["name"] = json!(format!("{} / {}", path, channel["name"].as_str().unwrap_or("value")));
+        (|| -> Result<String> {
+            let output = self.output.as_ref().context("Apply a decoder first")?;
+            let paths: Vec<String> = serde_json::from_str(paths)?;
+            let mut seen = std::collections::BTreeSet::new();
+            let nodes: Vec<Node> = paths.iter().filter(|path| seen.insert((*path).clone()))
+                .map(|path| collection_node(&output.nodes, &self.flattened, path)
+                    .cloned().context("Unknown collection")).collect::<Result<_>>()?;
+            let range = first.parse::<u64>()?..last.parse::<u64>()?;
+            ensure!(range.start <= range.end, "Invalid plot range");
+            let results = crate::structure_plot::read_for_collections(self.source.clone(), &nodes, range, u64::from(width))?;
+            let mut series = Vec::new();
+            let mut scanned = 0;
+            let mut estimated = false;
+            let mut reduced = false;
+            for (paths, data) in results {
+                scanned += data.scanned;
+                estimated |= data.quality == crate::structure_plot::PlotQuality::SampledPreview;
+                reduced |= data.quality != crate::structure_plot::PlotQuality::Exact;
+                for (name, points) in &data.series {
+                    let (path, field) = if paths.len() == 1 { (paths[0].as_str(), name.as_str()) }
+                        else { paths.iter().find_map(|path| name.strip_prefix(&format!("{path} / "))
+                            .map(|field| (path.as_str(), field))).context("Grouped field lost its collection")? };
+                    let mut channel = plot_channel(path, field, points, data.envelopes.get(name),
+                        data.quality == crate::structure_plot::PlotQuality::SampledPreview);
+                    channel["name"] = json!(format!("{path} / {field}"));
                     series.push(channel);
                 }
             }
-        }
-        json_result(json!({"series":series,"scanned":scanned,"estimated":estimated,
-            "quality":if estimated {"Estimated range · zoom in for detail"} else {"Exact samples"}})).map_err(js_error)
+            // Plot geometry has a separate bound from schema/table messages.
+            // Resolution is controlled by the shared native query policy.
+            let text = serde_json::to_string(&json!({"series":series,"scanned":scanned,"estimated":estimated,
+                "quality":if estimated {"Estimated range · zoom in for detail"} else if reduced {"Reduced · min/max retained"} else {"Exact samples"}}))?;
+            ensure!(text.len() <= 64 * 1024 * 1024, "Plot response exceeds 64 MiB; select fewer collections");
+            Ok(text)
+        })().map_err(js_error)
     }
+
     pub fn plot(&self, path: &str, first: &str, last: &str, width: u32) -> Result<String, JsValue> {
+        self.plot_budget(path, first, last, width)
+    }
+}
+impl DecoderSession {
+    fn plot_budget(&self, path: &str, first: &str, last: &str, width: u32) -> Result<String, JsValue> {
         (|| {
             let node = collection_node(&self.output.as_ref().context("Apply a decoder first")?.nodes, &self.flattened, path).context("Unknown collection")?;
             let total = node.lazy.as_ref().map_or(node.children.len() as u64, |a| a.count);
@@ -372,17 +423,11 @@ impl DecoderSession {
             ensure!(start <= end, "Invalid plot range");
             let data = crate::structure_plot::read_for_viewport(self.source.clone(), node.clone(), start..end, u64::from(width))?;
             let estimated = data.quality == crate::structure_plot::PlotQuality::SampledPreview;
-            let series: Vec<Value> = data.series.iter().map(|(name,points)| {
-                let bands: Vec<[f64;4]> = if estimated {
-                    data.envelopes.get(name).into_iter().flatten().map(|band|[
-                        band.range.start as f64 - 0.5, band.range.end as f64 - 0.5,
-                        band.min.value, band.max.value,
-                    ]).collect()
-                } else { Vec::new() };
-                json!({"name":name,"path":path,"bytes":points.iter().map(|p|[p.bytes.start.to_string(),p.bytes.end.to_string()]).collect::<Vec<_>>(),"points":points.iter().map(|point|[point.index as f64,point.value]).collect::<Vec<_>>(),"bands":bands})
-            }).collect();
+            let series: Vec<Value> = data.series.iter().map(|(name, points)|
+                plot_channel(path, name, points, data.envelopes.get(name), estimated)).collect();
             json_result(json!({"path":path,"start":start.to_string(),"end":end.to_string(),
-                "scanned":data.scanned,"quality":data.quality.label(),"estimated":estimated,"series":series}))
+                "scanned":data.scanned,"quality":data.quality.label(),"estimated":estimated,
+                "reduced":data.quality != crate::structure_plot::PlotQuality::Exact,"series":series}))
         })().map_err(js_error)
     }
 }

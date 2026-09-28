@@ -22,6 +22,7 @@
     <div id="recent-heading" class="sidebar-heading" hidden>Today</div>
     <div id="recent-files" class="recent-files"></div>
     <div class="sidebar-spacer"></div>
+    <button id="sidebar-settings" class="sidebar-action"><span class="phosphor" aria-hidden="true">&#xE272;</span>Settings</button>
     <div class="sidebar-user"><span class="avatar">B</span><span>BinWave</span><span id="app-version" aria-label="Application version"></span></div>
   </aside>
   <div id="app-content">
@@ -49,6 +50,17 @@
   </div>
   <dialog id="search-dialog" aria-label="Search commands"><div class="dialog-header"><strong>Search commands</strong><button id="search-close" aria-label="Close search">×</button></div><input id="search-input" type="search" placeholder="Search commands and panels…" autocomplete="off"><div id="search-results"></div></dialog>
   <dialog id="decoder-library" aria-label="Decoder library"><div class="dialog-header"><strong>Decoder library</strong><button id="library-close" aria-label="Close library">×</button></div><div class="library-toolbar"><input id="library-search" type="search" placeholder="Search decoders" autocomplete="off"><button id="library-import">Import…</button><button id="library-new">+ New decoder</button></div><div class="library-layout"><div id="library-items" role="listbox" aria-label="Bundled decoders"></div><div class="library-details"><h2 id="library-name">Choose a decoder</h2><p id="library-description">Select an example to preview its YAML, then open it in the workspace.</p><button id="library-open" disabled>Open in workspace</button><pre id="library-preview"></pre></div></div></dialog>
+  <dialog id="settings-dialog" aria-label="Settings">
+    <div class="dialog-header"><strong>Settings</strong><button id="settings-close" aria-label="Close settings">×</button></div>
+    <form id="cache-settings-form">
+      <label class="settings-field" for="file-cache-mib">RAM cache <span class="phosphor" aria-hidden="true" title="Maximum RAM retained for recently read file bytes. Grows on demand; older bytes are evicted when full. Does not limit file size. 0 disables caching.">&#xE2CE;</span></label>
+      <div class="settings-input"><input id="file-cache-mib" type="number" min="0" step="1" required aria-describedby="cache-settings-note"><span>MiB</span></div>
+      <p id="cache-settings-note">Session RAM only. Preference saved in this browser.</p>
+      <p id="cache-settings-error" role="alert" hidden></p>
+      <div class="settings-actions"><button id="cache-settings-default" type="button">Reset to 1 GiB</button><button type="submit">Apply</button></div>
+    </form>
+  </dialog>
+  <script src="web/cache-settings.js"></script>
   <script src="web/menu.js"></script>
   <script src="web/bridge.js"></script>
   <script src="web/shell.js"></script>

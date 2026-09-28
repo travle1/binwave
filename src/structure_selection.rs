@@ -22,6 +22,16 @@ pub(crate) fn sample_indices_for_bytes(node: &Node, bytes: &Range<Address>) -> O
 }
 
 
+/// Prefer the active projection when it contains the bytes, otherwise locate
+/// the most specific matching collection. Both shells use this routing policy.
+pub(crate) fn matching_collection<'a>(
+    collections: impl IntoIterator<Item = &'a Node>, preferred: &str,
+    bytes: &Range<Address>,
+) -> Option<&'a Node> {
+    collections.into_iter().filter(|node| sample_indices_for_bytes(node, bytes).is_some())
+        .min_by_key(|node| (node.path != preferred, node.range.end - node.range.start))
+}
+
 pub(crate) fn sample_bytes(node: &Node, samples: Range<Address>) -> Option<Range<Address>> {
     if samples.is_empty() || samples.end > node.lazy.as_ref().map_or(node.children.len() as Address, |a| a.count) {
         return None;

@@ -1,11 +1,13 @@
-//! Native GPU trace renderer. Decoded window data is uploaded only when it changes;
+//! Shared native/WebGPU trace renderer. Decoded window data is uploaded only when it changes;
 //! viewport navigation updates a small uniform buffer in the paint callback.
 use crate::plot_trace::series_color;
 use eframe::{egui_wgpu, wgpu};
 use egui::{Context, Painter, Rect};
 use egui_plot::{PlotPoint, PlotTransform};
 use std::collections::{BTreeMap, HashSet};
-use std::sync::{mpsc::{self, Receiver, TryRecvError}, Arc, OnceLock};
+use std::sync::{mpsc::{Receiver, TryRecvError}, Arc, OnceLock};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use wgpu::util::DeviceExt;
 
@@ -93,18 +95,36 @@ impl GpuPlot {
         let visible: Vec<_> = points.iter().filter(|(name, _)| !hidden.contains(*name))
             .map(|(name, values)| (name.clone(), Arc::clone(values))).collect();
         if visible.is_empty() { self.segments = Arc::new(Vec::new()); self.key = Some(key); return false; }
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = cancel.clone();
-        let repaint = ctx.clone();
-        std::thread::spawn(move || {
-            if let Some(prepared) = prepare_segments(&visible, &worker_cancel) {
-                let _ = sender.send(prepared);
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Browser queries already reduce points off-thread. Prepare the
+            // retained upload once per result, never per navigation frame.
+            let _ = ctx;
+            if let Some(prepared) = prepare_segments(&visible, &AtomicBool::new(false)) {
+                self.x_origin = prepared.x_origin;
+                self.y_origin = prepared.y_origin;
+                self.segments = Arc::new(prepared.segments);
+                self.series = Arc::new(prepared.series);
+                self.key = Some(key);
+                self.generation = NEXT_UPLOAD.fetch_add(1, Ordering::Relaxed);
             }
-            repaint.request_repaint();
-        });
-        self.pending = Some(PendingUpload { key, receiver, cancel });
-        false
+            return !self.segments.is_empty();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let worker_cancel = cancel.clone();
+            let repaint = ctx.clone();
+            std::thread::spawn(move || {
+                if let Some(prepared) = prepare_segments(&visible, &worker_cancel) {
+                    let _ = sender.send(prepared);
+                }
+                repaint.request_repaint();
+            });
+            self.pending = Some(PendingUpload { key, receiver, cancel });
+            false
+        }
     }
     /// Series offset and scale are applied by the shader, so panning or zooming
     /// a trace vertically only updates this small per-series buffer.
@@ -322,7 +342,7 @@ impl egui_wgpu::CallbackTrait for TraceCallback {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     #[test]
     fn crowded_plot_prepares_off_ui_thread_without_falling_back() {

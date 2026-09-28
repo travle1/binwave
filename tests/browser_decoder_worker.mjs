@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {readFile} from 'node:fs/promises';
 const source=(await readFile(new URL('../web/file-worker.mjs',import.meta.url),'utf8'))
-    .replace(/^import .*\n/,'').replaceAll('import.meta.url',JSON.stringify('https://localhost/web/file-worker.mjs'));
+    .replace(/^import .*\n/gm,'').replaceAll('import.meta.url',JSON.stringify('https://localhost/web/file-worker.mjs'));
+const awaitedSettings = await readFile(new URL('../web/cache-settings.js',import.meta.url),'utf8');
 function harness() {
     const workers=[],messages=[];
     class FileBackend {
@@ -16,12 +17,14 @@ function harness() {
         terminate(){this.terminated=true;}
         postMessage(m) {
             this.commands.push(m);
-            if(m.yaml==='slow')return;
+            if(m.yaml==='slow' || m.type==='cache_settings')return;
             queueMicrotask(()=>this.onmessage({data:m.yaml==='invalid' ? {type:'error',message:'Invalid YAML'} : {type:['decode','decode_python'].includes(m.type)?'decoded':m.type,result:{path:m.path}}}));
         }
     }
     const self={postMessage:m=>messages.push(m)};
-    vm.runInNewContext(source,{FileBackend,Worker,self,URL,PAGE_SIZE:65536,performance});
+    const context = vm.createContext({FileBackend,Worker,self,URL,PAGE_SIZE:65536,performance});
+    vm.runInContext(awaitedSettings, context);
+    vm.runInContext(source, context);
     return {workers,messages,send: m=>self.onmessage({data:m})};
 }
 test('failed candidate preserves the previous decoder; edits invalidate it',async()=>{
@@ -72,4 +75,21 @@ test('cancelling a candidate terminates work and retains the prior session',asyn
     assert.match(h.messages.at(-2).message,/cancelled/);
     await h.send({type:'plot',path:'samples',start:'0',end:'10',width:800});
     assert.equal(h.workers[0].commands.at(-1).type,'plot');
+});
+
+test('RAM budget updates reach retained, pending, and future decoder sessions', async () => {
+    const h = harness();
+    await h.send({type:'cache_settings', cacheBytes:2 * 1024**3});
+    await h.send({type:'open',file:{name:'synthetic.bin',size:1024}});
+    await h.send({type:'decode',yaml:'valid'});
+    assert.equal(h.workers[0].commands[0].cacheBytes, 2 * 1024**3);
+    const pending = h.send({type:'decode',yaml:'slow'});
+    await new Promise(resolve => setImmediate(resolve));
+    await h.send({type:'cache_settings',cacheBytes:0});
+    assert.equal(h.workers[0].commands.at(-1).cacheBytes, 0);
+    assert.equal(h.workers[1].commands.at(-1).cacheBytes, 0);
+    await h.send({type:'cancel'});
+    await pending;
+    await h.send({type:'decode_python',script:'pass'});
+    assert.equal(h.workers.at(-1).commands[0].cacheBytes, 0);
 });

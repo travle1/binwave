@@ -5,7 +5,7 @@ import {readFile} from 'node:fs/promises';
 import {openSync, closeSync, fstatSync, readSync} from 'node:fs';
 import {pathToFileURL} from 'node:url';
 import {resolve} from 'node:path';
-import {DecoderSource} from '../web/decoder-source.mjs';
+import {DecoderSource, DECODER_PAGE_SIZE, DECODER_CACHE_BYTES} from '../web/decoder-source.mjs';
 const html=await readFile('dist/web/index.html','utf8');
 const js=html.match(/rel="modulepreload" href="\.\/([^"]+)"/)[1];
 const wasm=html.match(/href="\.\/([^"]+\.wasm)"/)[1];
@@ -73,7 +73,7 @@ assert.throws(()=>session.decode('invalid: definition'));
 assert.throws(()=>session.decode('structures: {Sample: {fields: []}}\nactions: [{skip: 0}]'));
 assert.throws(()=>session.decode('actions: [{read: {name: x, type: Sample}}]'));
 assert.equal(JSON.parse(session.table(path,String(size/2-1))).rows[0].cells.value.number,65535,'Failed apply retains successful session');
-assert.ok(source.cache.size<=4);
+assert.ok(source.cache.size * DECODER_PAGE_SIZE <= DECODER_CACHE_BYTES);
 assert.throws(()=>source.read('0',1024**2+1));
 assert.equal(JSON.parse(session.probe(path, String(size-1), String(size))).first, String(size/2-1));
 assert.equal(JSON.parse(session.pick(path, String(size/2-1))).start, String(size-2));
@@ -194,6 +194,80 @@ assert.deepEqual(JSON.parse(nested.plot('blocks.samples', '129', '133', 800)).se
 assert.equal(JSON.parse(nested.table('blocks.samples', '5')).rows[0].cells.value.number, 5);
 assert.equal(JSON.parse(nested.pick('blocks.samples', '5')).start, '10');
 nested.free();
+
+// Group metadata must use the same collection identity as desktop, retaining
+// individual paths for exact byte links and sorting indices numerically.
+const groupBytes = new Uint8Array(129 * 129 * 12 * 2);
+globalThis.binwaveDecoder = {read(start, length) {
+    return groupBytes.slice(Number(start), Number(start) + length);
+}};
+const groupedSession = new bindings.DecoderSession(String(groupBytes.length));
+const groupedDecoded = JSON.parse(groupedSession.decode(`endian: little
+structures:
+  - name: Sensor
+    fields:
+      - {name: values, type: u16, repeat: 12}
+  - name: Block
+    fields:
+      - {name: channels, type: {structure: Sensor}, repeat: 129}
+actions:
+  - read: {name: blocks, type: {structure: Block}, repeat: 129}
+`));
+const members = groupedDecoded.collections.filter(c => c.group);
+assert.equal(members.length, 12);
+assert.ok(members.every(c => c.group[0] === 'blocks.channels.values' && c.count === String(129 * 129)));
+assert.deepEqual(members.map(c => c.group[1]).sort((a,b)=>a-b), Array.from({length:12},(_,i)=>i));
+assert.equal(JSON.parse(groupedSession.pick('blocks.channels[10].values', '4')).start, '116');
+groupedSession.free();
+console.log('Browser collections: shared desktop group identities and individual sensor byte links passed.');
+
+// Wide groups must fit the response limit while keeping every trace and its
+// extrema. A closer view returns exact samples and original byte links.
+const wideBytes = new Uint8Array(129 * 129 * 528 * 2);
+const wideView = new DataView(wideBytes.buffer);
+for(let sample=0; sample<129*129; sample++) {
+    for(let sensor=0; sensor<528; sensor++) wideView.setUint16((sample*528+sensor)*2, sample%512===17 ? 60000 : sensor, true);
+}
+let wideReads = 0;
+globalThis.binwaveDecoder = {read(start,length) {wideReads++; return wideBytes.slice(Number(start),Number(start)+length);}};
+const wideSession = new bindings.DecoderSession(String(wideBytes.length));
+const wideDecoded = JSON.parse(wideSession.decode(`endian: little
+structures:
+  - name: Sample
+    fields:
+      - {name: values, type: u16, repeat: 528}
+  - name: Block
+    fields:
+      - {name: channels, type: {structure: Sample}, repeat: 129}
+actions:
+  - read: {name: blocks, type: {structure: Block}, repeat: 129}
+`));
+const widePaths = wideDecoded.collections.filter(c=>c.group).map(c=>c.path);
+wideReads = 0;
+const wideReply = wideSession.plot_many(JSON.stringify(widePaths),'0','512',1200);
+assert.ok(wideReply.length < 64*1024*1024);
+assert.ok(wideReads <= 8, `Compatible sensors must share reads; got ${wideReads}`);
+const widePlot = JSON.parse(wideReply);
+assert.equal(widePlot.series.length,528);
+assert.match(widePlot.quality,/min\/max/);
+assert.ok(widePlot.series.every(s=>s.points.some(p=>p[1]===60000)));
+const widePoints = widePlot.series.reduce((sum,s)=>sum+s.points.length,0);
+assert.ok(widePoints > 65536, 'Browser must not apply its former demo-only point cap');
+assert.ok(widePoints <= 400000, 'Use the shared native extrema allowance');
+assert.equal(widePlot.scanned, 512, 'Scan records once, not once per sensor');
+const wideDetail = JSON.parse(wideSession.plot_many(JSON.stringify(widePaths),'16','20',1200));
+assert.equal(wideDetail.quality,'Exact samples');
+assert.ok(wideDetail.series.every(s=>s.points.length===4));
+for (const s of wideDetail.series) {
+    const sensor = Number(s.path.match(/\[(\d+)\]/)[1]);
+    assert.deepEqual(s.bytes[0], [String((16*528+sensor)*2), String((16*528+sensor)*2+2)]);
+}
+const reverse = JSON.parse(wideSession.probe(widePaths[0], String((16*528+10)*2), String((16*528+10)*2+2)));
+assert.equal(reverse.path, wideDecoded.collections.find(c=>c.group?.[1]===10).path, 'Hex probes must route to the matching sensor');
+assert.equal(reverse.first, '16');
+assert.deepEqual(JSON.parse(wideSession.table(widePaths[10],'16000')).rows[0].index, '16000');
+wideSession.free();
+console.log('Wide browser plots: 528 traces, retained extrema, exact zoom and distant table pages passed.');
 
 // Optional generated PWAV fixture: run the user's real schema through WASM,
 // then check both a resolvable waveform and the estimated overview bands.

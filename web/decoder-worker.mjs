@@ -1,11 +1,15 @@
 import {DecoderSource} from './decoder-source.mjs';
 import {runPythonDecoder} from './python-runtime.mjs';
-let session;
+let session, source;
 self.onmessage = async ({data: m}) => {
     try {
+        if (m.type === 'cache_settings') {
+            source?.setCacheBudget(m.cacheBytes);
+            return;
+        }
         if (m.type === 'decode' || m.type === 'decode_python') {
             const reader = new FileReaderSync();
-            const source = new DecoderSource(m.file, m.patches, blob => reader.readAsArrayBuffer(blob));
+            source = new DecoderSource(m.file, m.patches, blob => reader.readAsArrayBuffer(blob), m.cacheBytes);
             self.binwaveDecoder = {read: (start, length) => source.read(start, length)};
             const bindings = await import(m.runtime.js);
             await bindings.default({module_or_path: m.runtime.wasm});

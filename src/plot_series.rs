@@ -40,6 +40,30 @@ pub fn grouped<'a>(names: impl IntoIterator<Item = &'a str>) -> BTreeMap<String,
     groups
 }
 
+pub fn collection_group(name: &str, path: &str) -> Option<(String, usize)> {
+    let (group_name, _) = name.split_once(" across ")?;
+    // Contiguous definitions expose one named sample array per sensor.
+    // Keep the complete parent path as identity so equal channel names in
+    // different sections do not merge in the picker.
+    if let Some((prefix, sensor)) = path.rsplit_once(".sensor_") {
+        let index = sensor.parse::<usize>().ok()?;
+        let (named_parent, named_sensor) = group_name.rsplit_once(".sensor_")?;
+        if named_sensor.parse::<usize>().ok()? != index || !prefix.ends_with(named_parent) {
+            return None;
+        }
+        return Some((format!("{prefix}.sensors"), index));
+    }
+    let (name, named_index) = group_name.rsplit_once('[')?;
+    let named_index = named_index.strip_suffix(']')?.parse::<usize>().ok()?;
+    let (prefix, rest) = path.rsplit_once('[')?;
+    let (index, suffix) = rest.split_once(']')?;
+    if !suffix.starts_with('.') { return None; }
+    let index = index.parse::<usize>().ok()?;
+    if index != named_index || !prefix.ends_with(name) { return None; }
+    Some((format!("{prefix}{suffix}"), index))
+}
+
+
 pub fn axis_targets(names: &[String], group: Option<&str>, series: Option<&str>) -> Vec<String> {
     if let Some(group) = group {
         names.iter().filter(|name| group_key(name) == group).cloned().collect()
@@ -51,6 +75,16 @@ pub fn axis_targets(names: &[String], group: Option<&str>, series: Option<&str>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collection_groups_preserve_parent_identity_and_sensor_index() {
+        assert_eq!(collection_group("Channel[10] across blocks", "sections[0].blocks.Channel[10].values"),
+            Some(("sections[0].blocks.Channel.values".into(), 10)));
+        assert_eq!(collection_group("Channel.sensor_2 across blocks", "sections[1].blocks.Channel.sensor_2"),
+            Some(("sections[1].blocks.Channel.sensors".into(), 2)));
+        assert_eq!(collection_group("records", "sections[0].records"), None);
+        assert_eq!(collection_group("Channel[2] across blocks", "blocks.Channel[3].values"), None);
+    }
 
     #[test]
     fn indexed_traces_group_by_collection_in_numeric_order() {

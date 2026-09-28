@@ -146,3 +146,50 @@ test('edit and history limits are independent of source size', async () => {
     await assert.rejects(source.replace(String(MAX_EDITS), 1), /edit limit/);
     assert.equal(source.patches.size, MAX_EDITS);
 });
+
+test('decoder workers reuse bounded session tiles and evict least recently used pages', async () => {
+    const {DecoderSource, DECODER_PAGE_SIZE, DECODER_CACHE_BYTES} = await import('../web/decoder-source.mjs');
+    let reads = 0;
+    const file = {size: 64 * DECODER_PAGE_SIZE, slice(start, end) {
+        assert.ok(end - start <= READ_LIMIT);
+        return {start, end};
+    }, arrayBuffer() { throw Error('No whole-file copy'); }};
+    const budget = 4 * DECODER_PAGE_SIZE;
+    assert.equal(DECODER_CACHE_BYTES, 1024 ** 3);
+    const source = new DecoderSource(file, [[4n, 19]], ({start, end}) => {
+        reads++;
+        return new Uint8Array(end-start).buffer;
+    }, budget);
+    assert.equal(source.read('4', 1)[0], 19);
+    source.read('100', 4000);
+    assert.equal(reads, 1, 'Nearby queries share their file tile');
+    const pages = budget / DECODER_PAGE_SIZE;
+    for (let page = 1; page < pages; page++) source.read(String(page * DECODER_PAGE_SIZE), 1);
+    source.read('4', 1); // Touch the first page before filling the next.
+    source.read(String(pages * DECODER_PAGE_SIZE), 1);
+    assert.ok(source.cache.has(0n));
+    assert.ok(!source.cache.has(BigInt(DECODER_PAGE_SIZE)));
+    assert.ok([...source.cache.values()].reduce((sum, page) => sum + page.byteLength, 0) <= budget);
+    source.setCacheBudget(DECODER_PAGE_SIZE);
+    assert.equal(source.cache.size, 1);
+    assert.equal(source.cachedBytes, DECODER_PAGE_SIZE);
+    source.setCacheBudget(0);
+    assert.equal(source.cachedBytes, 0);
+    assert.equal(source.read('4', 1)[0], 19);
+    assert.equal(source.cache.size, 0);
+});
+
+test('default decoder cache retains more than the former 32 MiB ceiling', async () => {
+    const {DecoderSource, DECODER_PAGE_SIZE} = await import('../web/decoder-source.mjs');
+    const file = {size: 64 * DECODER_PAGE_SIZE, slice(start, end) { return {start, end}; }};
+    let reads = 0;
+    const source = new DecoderSource(file, [], ({start, end}) => {
+        reads++;
+        return new Uint8Array(end - start).buffer;
+    });
+    assert.equal(source.cachedBytes, 0, 'Budget is not an upfront allocation');
+    for (let page = 0; page < 40; page++) source.read(String(page * DECODER_PAGE_SIZE), 1);
+    source.read('0', 1);
+    assert.equal(reads, 40, 'First tile survives reads beyond the old cap');
+    assert.equal(source.cachedBytes, 40 * DECODER_PAGE_SIZE);
+});

@@ -32,6 +32,8 @@ extern "C" {
     pub fn startup_error(message: &str);
     #[wasm_bindgen(js_namespace = binwave, js_name = ready)]
     fn browser_ready();
+    #[wasm_bindgen(js_namespace = binwave, js_name = graphicsBackend)]
+    pub fn graphics_backend(name: &str, retained_traces: bool);
     #[wasm_bindgen(catch, js_namespace = binwave, js_name = freshCanvas)]
     pub fn fresh_canvas() -> Result<(), JsValue>;
     #[wasm_bindgen(js_namespace = binwave, js_name = openDemo)]
@@ -90,6 +92,12 @@ pub struct BrowserApp {
     value_request: u64,
     plot_visible: Option<[f64; 2]>,
     probe_request: u64,
+    plot_gpu: crate::plot_gpu::GpuPlot,
+    gpu_points: std::collections::BTreeMap<String, std::sync::Arc<Vec<egui_plot::PlotPoint>>>,
+    gpu_revision: u64,
+    plot_channels: std::sync::Arc<Vec<serde_json::Value>>,
+    trace_meshes: std::sync::Arc<crate::plot_trace::TraceMeshCache>,
+    placed_points: std::collections::HashMap<String, crate::plot_trace::PlacedPoints>,
     range_start: String,
     range_end: String,
     /// Extraction form buffers: an inclusive last byte, refreshed when the selection changes.
@@ -126,6 +134,12 @@ pub struct BrowserApp {
     plot_sources_initialized: bool,
     table_start: u64,
     table_jump: String,
+    table_pages: std::collections::BTreeMap<u64, serde_json::Value>,
+    table_window: u64,
+    table_scroll: f32,
+    table_pending_scroll: Option<f32>,
+    table_reveal: Option<u64>,
+    table_memory: std::collections::HashMap<String, (u64, f32, String, Option<u64>)>,
     first: String,
     last: String,
     pending: std::collections::VecDeque<serde_json::Value>,
@@ -134,6 +148,7 @@ pub struct BrowserApp {
     plot_sidebar_open: bool,
     plot_sidebar_series: bool,
     plot_filter: String,
+    plot_collection_filter: String,
     plot_axis_series: Option<String>,
     plot_axis_group: Option<String>,
     plot_groups_expanded: std::collections::HashSet<String>,
@@ -211,6 +226,7 @@ impl BrowserApp {
             value_request: 0,
             plot_visible: None,
             probe_request: 0,
+            plot_gpu: Default::default(), gpu_points: Default::default(), gpu_revision: 0, plot_channels: Default::default(), trace_meshes: Default::default(), placed_points: Default::default(),
             range_start: "0".into(),
             range_end: "0".into(),
             extract_start: String::new(),
@@ -247,6 +263,8 @@ impl BrowserApp {
             plot_sources_initialized: false,
             table_start: 0,
             table_jump: "0".into(),
+            table_pages: Default::default(), table_window: 0, table_scroll: 0.,
+            table_pending_scroll: None, table_reveal: None, table_memory: Default::default(),
             first: "0".into(),
             last: "0".into(),
             pending: Default::default(),
@@ -255,6 +273,7 @@ impl BrowserApp {
             plot_sidebar_open: true,
             plot_sidebar_series: true,
             plot_filter: String::new(),
+            plot_collection_filter: String::new(),
             plot_axis_series: None,
             plot_axis_group: None,
             plot_groups_expanded: Default::default(),
@@ -398,8 +417,9 @@ impl BrowserApp {
                     self.decoding = false;
                     self.inline_decode = false;
                     self.decoded = event.result;
+                    self.table_pages.clear();
                     self.table = Default::default();
-                    self.plot = Default::default();
+                    self.plot = Default::default(); self.plot_channels = Default::default();
                     self.collection.clear();
                     self.plot_sources.clear();
                     self.reveal_results = true;
@@ -429,9 +449,10 @@ impl BrowserApp {
                     self.decoder_error = None;
                     self.decoding = false;
                     self.decoded = event.result;
+                    self.table_pages.clear();
                     if self.decoded["noData"].as_bool() == Some(true) {
                         self.table = Default::default();
-                        self.plot = Default::default();
+                        self.plot = Default::default(); self.plot_channels = Default::default();
                         self.collection.clear();
                         self.plot_sources.clear();
                         self.status = "Python script ran, but registered no decoded fields.".into();
@@ -440,7 +461,7 @@ impl BrowserApp {
                     self.plot_sources.retain(|p| self.decoded["collections"].as_array().into_iter().flatten().any(|c| c["path"].as_str()==Some(p)));
 
                     self.table = Default::default();
-                    self.plot = Default::default();
+                    self.plot = Default::default(); self.plot_channels = Default::default();
                     let inline = std::mem::take(&mut self.inline_decode);
                     self.reveal_results |= !inline;
                     let path = self.samples_path().unwrap_or_default();
@@ -482,8 +503,17 @@ impl BrowserApp {
                     }
                 }
                 "probe" => {
-                    if event.request == self.probe_request.to_string()
-                        && event.result["path"].as_str() == Some(&self.collection) {
+                    if event.request == self.probe_request.to_string() {
+                        if event.result["first"].as_str().is_some() {
+                            if let Some(path) = event.result["path"].as_str() {
+                                if path != self.collection {
+                                    self.select_collection(path.to_owned());
+                                    if let Some((start, end)) = parse_offset(&self.range_start).zip(parse_offset(&self.range_end)) {
+                                        self.request_inspect(start, end);
+                                    }
+                                }
+                            }
+                        }
                         self.selected_sample = event.result["first"].as_str().and_then(parse_offset);
                         self.selected_samples = self.selected_sample.zip(
                             event.result["end"].as_str().and_then(parse_offset)
@@ -529,6 +559,12 @@ impl BrowserApp {
                 }
                 "table" => {
                     if event.result["path"].as_str() == Some(&self.collection) {
+                        let start = event.result["start"].as_str().and_then(parse_offset).unwrap_or(0);
+                        self.table_pages.insert(start, event.result.clone());
+                        while self.table_pages.len() > 24 {
+                            let key = self.table_pages.keys().copied().find(|key| *key != start).unwrap();
+                            self.table_pages.remove(&key);
+                        }
                         self.table = event.result;
                     }
                 }
@@ -540,7 +576,22 @@ impl BrowserApp {
                 "plot" => {
                     if event.request == self.plot_request.to_string() {
                         self.reset_plot = event.reset;
-                        self.plot = event.result;
+                        self.plot_gpu.invalidate();
+                        self.trace_meshes.clear();
+                        self.placed_points.clear();
+                        self.gpu_revision = self.gpu_revision.wrapping_add(1);
+                        self.gpu_points = event.result["series"].as_array().into_iter().flatten().map(|channel| {
+                            let name = channel["name"].as_str().unwrap_or("").to_owned();
+                            let points = channel["points"].as_array().into_iter().flatten().filter_map(|p|
+                                Some(egui_plot::PlotPoint::new(p[0].as_f64()?, p[1].as_f64()?))).collect();
+                            (name, std::sync::Arc::new(points))
+                        }).collect();
+                        let mut result = event.result;
+                        self.plot_channels = std::sync::Arc::new(match result["series"].take() {
+                            serde_json::Value::Array(series) => series,
+                            _ => Vec::new(),
+                        });
+                        self.plot = result;
                     }
                 }
                 "error" => {
@@ -1020,7 +1071,9 @@ impl BrowserApp {
         self.tree_selected = None;
         self.tree_page_path = None;
         self.table = Default::default();
-        self.plot = Default::default();
+        self.table_pages.clear(); self.table_memory.clear();
+        self.plot = Default::default(); self.plot_channels = Default::default();
+        self.gpu_points.clear(); self.placed_points.clear(); self.trace_meshes.clear(); self.plot_gpu.invalidate();
         self.plot_visible = None;
         self.pending.clear();
         self.collection.clear();
@@ -1100,15 +1153,20 @@ impl BrowserApp {
             .filter_map(|c| c["count"].as_str()?.parse::<u64>().ok()).max().unwrap_or(0)
     }
     fn select_collection(&mut self, path: String) {
+        self.table_memory.insert(self.collection.clone(), (self.table_window, self.table_scroll, self.table_jump.clone(), self.selected_sample));
         self.selected_sample = None;
         self.selected_samples = None;
         self.plot_anchor = None;
         self.probe_request = self.probe_request.wrapping_add(1);
         self.collection = path;
         self.table_start = 0;
+        self.table_pages.clear();
         self.table = Default::default();
+        let (window, scroll, jump, selected) = self.table_memory.get(&self.collection).cloned().unwrap_or((0, 0., "0".into(), None));
+        self.table_window = window; self.table_scroll = scroll; self.table_jump = jump;
+        self.selected_sample = selected; self.table_pending_scroll = Some(scroll);
         if !self.collection.is_empty() {
-            self.request_table();
+            self.request_table_page(self.table_window + (self.table_scroll / crate::theme::DARK.size.table_row).max(0.) as u64);
             if !self.plot_sources_initialized {
                 self.plot_sources_initialized = true;
                 self.plot_sources.insert(self.collection.clone());
@@ -1120,7 +1178,16 @@ impl BrowserApp {
         }
     }
     fn request_table(&mut self) {
-        self.queue(serde_json::json!({"type":"table","path":self.collection,"start":self.table_start.to_string()}));
+        let index = self.selected_sample.unwrap_or(self.table_start);
+        self.table_window = index.saturating_sub(2048).min(self.count().saturating_sub(4096));
+        self.table_reveal = Some(index);
+        self.request_table_page(index);
+    }
+    fn request_table_page(&mut self, index: u64) {
+        let start = index / 128 * 128;
+        if !self.table_pages.contains_key(&start) {
+            self.queue(serde_json::json!({"type":"table","path":self.collection,"start":start.to_string()}));
+        }
     }
     fn request_plot(&mut self, width: u32) {
         self.viewport.reset();
@@ -1149,7 +1216,7 @@ impl BrowserApp {
         self.selected_sample = None;
         self.selected_samples = None;
         self.probe_request = self.probe_request.wrapping_add(1);
-        if !self.collection.is_empty() {
+        if !self.decoded.is_null() {
             self.queue(serde_json::json!({"type":"probe","path":self.collection,
                 "start":start.to_string(),"end":end.to_string(),"request":self.probe_request.to_string()}));
         }
@@ -1264,109 +1331,148 @@ impl BrowserApp {
         self.editor.editor(ui, &mut self.yaml, self.language);
         source_editor_focus(self.editor.focused());
     }
-    /// Collections in decoder order with their counts, as on the desktop Table.
+    /// The same grouped collection model used by the desktop Table.
     fn collection_picker(&mut self, ui: &mut egui::Ui) {
+        let collections: Vec<_> = self.decoded["collections"].as_array().into_iter().flatten().map(|item| {
+            let path = item["path"].as_str().unwrap_or("");
+            crate::collection_navigation::Collection {
+                path: path.into(), name: item["name"].as_str().unwrap_or(path.rsplit('.').next().unwrap_or(path)).into(),
+                count: item["count"].as_str().and_then(parse_offset).unwrap_or(0),
+                group: item["group"][0].as_str().zip(item["group"][1].as_u64())
+                    .map(|(key, index)| (key.into(), index as usize)),
+            }
+        }).collect();
+        let chips = crate::collection_navigation::chips(&collections, false);
         let mut selected = self.collection.clone();
-        let samples = self.samples_path();
         ui.horizontal_wrapped(|ui| {
-            let Some(arrays) = self.decoded["collections"].as_array() else {
-                ui.weak("Run a decoder to list its collections.");
-                return;
-            };
-            for a in arrays {
-                let path = a["path"].as_str().unwrap_or("");
-                let count = a["count"].as_str().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-                let name = path.rsplit('.').next().unwrap_or(path);
-                let mut chars = name.chars();
-                let name: String = chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect());
-                let noun = if samples.as_deref() == Some(path) {
-                    crate::format::plural(count, "sample", "samples")
-                } else {
-                    crate::format::plural(count, "item", "items")
-                };
-                ui.selectable_value(&mut selected, path.into(), format!("{name} ({})", crate::format::count(count)))
-                    .on_hover_text(format!("{path}\n{noun}"));
-            }
-        });
-        if selected != self.collection {
-            self.select_collection(selected);
-        }
-    }
-    fn samples(&mut self, ui: &mut egui::Ui) {
-        self.collection_picker(ui);
-        let samples = self.samples_path().as_deref() == Some(self.collection.as_str());
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(self.table_start > 0, egui::Button::new("Previous 128"))
-                .clicked()
-            {
-                self.table_start = self.table_start.saturating_sub(128);
-                self.request_table();
-            }
-            if ui
-                .add_enabled(
-                    self.table_start.saturating_add(128) < self.count(),
-                    egui::Button::new("Next 128"),
-                )
-                .clicked()
-            {
-                self.table_start += 128;
-                self.request_table();
-            }
-            ui.label(if samples { "Go to sample" } else { "Go to item" });
-            let enter = ui.add_sized([86., 24.], egui::TextEdit::singleline(&mut self.table_jump)).lost_focus()
-                && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            if ui.button("Go").clicked() || enter {
-                if let Some(index) = parse_offset(&self.table_jump).filter(|index| *index < self.count()) {
-                    self.table_start = index;
-                    self.request_table();
-                } else {
-                    self.status = if samples { "Enter a sample index inside this collection." }
-                        else { "Enter an item index inside this collection." }.into();
+            for chip in &chips {
+                let active = chip.target == selected || chip.contains(&selected);
+                if ui.selectable_label(active, &chip.label).on_hover_text(&chip.hover).clicked() && !active {
+                    selected = chip.target.clone();
                 }
             }
         });
-        let mut selection = None;
-        egui::ScrollArea::both().show(ui, |ui| {
-            if let Some(rows) = self.table["rows"].as_array() {
-                let columns: std::collections::BTreeSet<_> = rows
-                    .iter()
-                    .filter_map(|r| r["cells"].as_object())
-                    .flat_map(|m| m.keys())
-                    .collect();
-                egui::Grid::new("decoded-samples")
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.strong(if samples { "Sample" } else { "Item" });
-                        for key in &columns {
-                            ui.strong(*key);
+        if let Some(chip) = chips.iter().find(|chip| chip.contains(&selected)) {
+            let channel = chip.channels.iter().find(|c| c.members.iter().any(|(_, path)| *path == selected)).unwrap();
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(chip.label.split(" (").next().unwrap_or(&chip.label));
+                ui.weak("›");
+                egui::ComboBox::from_id_salt("browser-table-channel").selected_text(&channel.label).show_ui(ui, |ui| {
+                    for option in &chip.channels {
+                        if ui.selectable_label(option.label == channel.label, &option.label).clicked() {
+                            selected = option.members[0].1.clone();
                         }
-                        ui.end_row();
-                        for row in rows {
-                            ui.monospace(row["index"].as_str().unwrap_or(""));
-                            for key in &columns {
-                                let cell = &row["cells"][*key];
-                                if ui
-                                    .selectable_label(self.selected_sample == row["index"].as_str().and_then(parse_offset), cell["text"].as_str().unwrap_or("—"))
-                                    .on_hover_text("Select in Hex and Signal")
-                                    .clicked()
-                                {
-                                    selection = cell["start"]
-                                        .as_str()
-                                        .and_then(parse_offset)
-                                        .zip(cell["end"].as_str().and_then(parse_offset));
-                                }
+                    }
+                });
+                if channel.members.len() > 1 {
+                    ui.weak("›");
+                    let index = channel.members.iter().find(|(_, path)| *path == self.collection).and_then(|(index, _)| *index).unwrap_or(0);
+                    egui::ComboBox::from_id_salt("browser-table-member").selected_text(format!("[{index}]")).show_ui(ui, |ui| {
+                        for (index, path) in &channel.members {
+                            if ui.selectable_label(*path == self.collection, format!("[{}]", index.unwrap_or(0))).clicked() {
+                                selected = path.clone();
                             }
-                            ui.end_row();
                         }
                     });
-            } else {
-                ui.label(if self.decoded.is_null() { "Press ▶ Run (F5) to fill this table." } else { "No collections yet. Your decoded fields are in Structure." });
+                }
+            });
+        }
+        if selected != self.collection {
+            let grouped = chips.iter().any(|chip| chip.contains(&selected));
+            self.select_collection(selected.clone());
+            if grouped {
+                self.plot_sources.clear(); self.plot_sources.insert(selected);
+                self.plot = Default::default(); self.plot_channels = Default::default();
+                self.first = "0".into(); self.last = self.plot_count().min(512).to_string();
+                self.request_plot(1200);
+            }
+        }
+    }
+    fn samples(&mut self, ui: &mut egui::Ui) {
+        use egui_extras::{Column, TableBuilder};
+        self.collection_picker(ui);
+        let samples = self.samples_path().as_deref() == Some(self.collection.as_str());
+        let count = self.count();
+        ui.horizontal(|ui| {
+            ui.weak(crate::format::plural(count, if samples { "sample" } else { "item" }, if samples { "samples" } else { "items" }));
+            ui.label("Go to #");
+            let entry = ui.add(egui::TextEdit::singleline(&mut self.table_jump).desired_width(96.));
+            if entry.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                if let Some(index) = parse_offset(&self.table_jump).filter(|index| *index < count) {
+                    self.table_start = index;
+                    self.request_table();
+                } else { self.status = "Enter an index inside this collection.".into(); }
             }
         });
-        if let Some((start, end)) = selection {
-            self.select_range(start, end);
+        let columns: Vec<String> = self.table["columns"].as_array().into_iter().flatten()
+            .filter_map(|column| column.as_str().map(str::to_owned)).collect();
+        let mut missing = None;
+        let mut selection = None;
+        let window = self.table_window.min(count.saturating_sub(1));
+        let rows = count.saturating_sub(window).min(4096) as usize;
+        let pitch = crate::theme::DARK.size.table_row + ui.spacing().item_spacing.y;
+        let scroll = egui::ScrollArea::horizontal().id_salt(("browser-table-columns", &self.collection))
+            .show(ui, |ui| {
+                let mut builder = TableBuilder::new(ui).id_salt(("browser-table-rows", &self.collection))
+                    .striped(true).resizable(true).sense(egui::Sense::click())
+                    .column(Column::initial(crate::theme::DARK.size.table_index_column).at_least(40.).clip(true))
+                    .column(Column::initial(crate::theme::DARK.size.table_offset_column).at_least(60.).clip(true))
+                    .column(Column::initial(crate::theme::DARK.size.table_size_column).at_least(56.).clip(true));
+                for _ in &columns { builder = builder.column(Column::initial(crate::theme::DARK.size.table_field_column).at_least(40.).clip(true)); }
+                if let Some(offset) = self.table_pending_scroll.take() { builder = builder.vertical_scroll_offset(offset); }
+                if let Some(index) = self.table_reveal.take() { builder = builder.scroll_to_row(index.saturating_sub(window) as usize, Some(egui::Align::Center)); }
+                builder.header(crate::theme::DARK.size.table_row, |mut header| {
+                    for name in ["#", "Offset", "Size"].into_iter().chain(columns.iter().map(String::as_str)) {
+                        header.col(|ui| { ui.add(egui::Label::new(egui::RichText::new(name).strong()).truncate()).on_hover_text(name); });
+                    }
+                }).body(|body| { body.rows(crate::theme::DARK.size.table_row, rows, |mut row| {
+                    let index = window + row.index() as u64;
+                    let page = index / 128 * 128;
+                    let data = self.table_pages.get(&page).and_then(|page| page["rows"].as_array())
+                        .and_then(|rows| rows.get((index % 128) as usize));
+                    row.set_selected(self.selected_sample == Some(index));
+                    let numeric = |ui: &mut egui::Ui, value: String| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.monospace(value); });
+                    };
+                    row.col(|ui| numeric(ui, crate::format::count(index)));
+                    row.col(|ui| { if let Some(data) = data {
+                        numeric(ui, crate::format::offset(data["start"].as_str().and_then(parse_offset).unwrap_or(0)));
+                    } else { ui.weak("…"); } });
+                    row.col(|ui| { if let Some(data) = data {
+                        let size = data["end"].as_str().and_then(parse_offset).unwrap_or(0)
+                            .saturating_sub(data["start"].as_str().and_then(parse_offset).unwrap_or(0));
+                        numeric(ui, crate::format::size(size));
+                    } });
+                    for column in &columns {
+                        let (_, response) = row.col(|ui| { if let Some(data) = data {
+                            let cell = &data["cells"][column];
+                            if cell["number"].as_f64().is_some() { numeric(ui, crate::format::count(cell["text"].as_str().unwrap_or("—"))); }
+                            else { ui.monospace(cell["text"].as_str().unwrap_or("—")); }
+                        } });
+                        if response.clicked() { if let Some(data) = data {
+                            let cell = &data["cells"][column];
+                            selection = cell["start"].as_str().and_then(parse_offset).zip(cell["end"].as_str().and_then(parse_offset));
+                        } }
+                    }
+                    if data.is_none() { missing.get_or_insert(index); }
+                    if row.response().clicked() && selection.is_none() { if let Some(data) = data {
+                        selection = data["start"].as_str().and_then(parse_offset).zip(data["end"].as_str().and_then(parse_offset));
+                    } }
+                }); })
+            }).inner;
+        self.table_scroll = scroll.state.offset.y;
+        if let Some(index) = missing { self.request_table_page(index); }
+        let local = (self.table_scroll / pitch).max(0.) as u64;
+        if !ui.input(|input| input.pointer.primary_down()) {
+            if local > 3072 && window + 4096 < count {
+                self.table_window = (window + 2048).min(count.saturating_sub(4096));
+                self.table_pending_scroll = Some(self.table_scroll - (self.table_window - window) as f32 * pitch);
+            } else if local < 1024 && window > 0 {
+                self.table_window = window.saturating_sub(2048);
+                self.table_pending_scroll = Some(self.table_scroll + (window - self.table_window) as f32 * pitch);
+            }
         }
+        if let Some((start, end)) = selection { self.select_range(start, end); }
     }
     fn structures(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -1461,15 +1567,82 @@ impl BrowserApp {
                 });
                 ui.separator();
                 if !self.plot_sidebar_series {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for item in self.decoded["collections"].as_array().into_iter().flatten() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} selected", crate::format::count(self.plot_sources.len())));
+                        if ui.add_enabled(!self.plot_sources.is_empty(), egui::Button::new("Clear selection")).clicked() {
+                            self.plot_sources.clear();
+                            sources_changed = true;
+                        }
+                    });
+                    ui.add(egui::TextEdit::singleline(&mut self.plot_collection_filter).hint_text("Find collections or items…"));
+                    let query = self.plot_collection_filter.trim().to_lowercase();
+                    let mut singles = Vec::new();
+                    let mut groups: std::collections::BTreeMap<&str, Vec<(u64, &serde_json::Value)>> = Default::default();
+                    for item in self.decoded["collections"].as_array().into_iter().flatten() {
+                        if let (Some(group), Some(index)) = (item["group"][0].as_str(), item["group"][1].as_u64()) {
+                            groups.entry(group).or_default().push((index, item));
+                        } else { singles.push(item); }
+                    }
+                    let containers: std::collections::HashSet<_> = groups.keys()
+                        .filter_map(|key| key.rsplit_once('.').map(|(parent, _)| parent)).collect();
+                    egui::ScrollArea::vertical().id_salt("browser-plot-collections").show(ui, |ui| {
+                        for item in singles {
                             let path = item["path"].as_str().unwrap_or("");
-                            let mut enabled = self.plot_sources.contains(path);
-                            if ui.checkbox(&mut enabled, path).changed() {
-                                if enabled { self.plot_sources.insert(path.into()); }
-                                else { self.plot_sources.remove(path); }
-                                sources_changed = true;
-                            }
+                            if containers.contains(path) || (!query.is_empty() && !path.to_lowercase().contains(&query)) { continue; }
+                            let label = path.rsplit('.').next().unwrap_or(path);
+                            ui.push_id(path, |ui| {
+                                let mut enabled = self.plot_sources.contains(path);
+                                if ui.checkbox(&mut enabled, label).on_hover_text(path).changed() {
+                                    if enabled { self.plot_sources.insert(path.into()); }
+                                    else { self.plot_sources.remove(path); }
+                                    sources_changed = true;
+                                }
+                            });
+                        }
+                        for (key, mut members) in groups {
+                            members.sort_by_key(|(index, _)| *index);
+                            let label = key.rsplit('.').nth(1).unwrap_or(key);
+                            let matches_group = query.is_empty() || key.to_lowercase().contains(&query);
+                            members.retain(|(index, item)| matches_group || index.to_string().contains(&query)
+                                || item["path"].as_str().unwrap_or("").to_lowercase().contains(&query));
+                            if members.is_empty() { continue; }
+                            let selected = members.iter().filter(|(_, item)| self.plot_sources.contains(item["path"].as_str().unwrap_or(""))).count();
+                            egui::CollapsingHeader::new(format!("{label} · {}/{} items", crate::format::count(selected), crate::format::count(members.len())))
+                                .id_salt(key).default_open(!query.is_empty()).show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("Show group").clicked() {
+                                            for (_, item) in &members { sources_changed |= self.plot_sources.insert(item["path"].as_str().unwrap_or("").into()); }
+                                        }
+                                        if ui.small_button("Only group").clicked() {
+                                            self.plot_sources.clear();
+                                            self.plot_sources.extend(members.iter().map(|(_, item)| item["path"].as_str().unwrap_or("").to_owned()));
+                                            sources_changed = true;
+                                        }
+                                        if ui.small_button("Hide group").clicked() {
+                                            for (_, item) in &members { sources_changed |= self.plot_sources.remove(item["path"].as_str().unwrap_or("")); }
+                                        }
+                                    });
+                                    egui::ScrollArea::vertical().id_salt(("browser-collection-group", key)).max_height(260.)
+                                        .show_rows(ui, ui.spacing().interact_size.y, members.len(), |ui, rows| {
+                                            for row in rows {
+                                                let (index, item) = members[row];
+                                                let path = item["path"].as_str().unwrap_or("");
+                                                ui.push_id(path, |ui| { ui.horizontal(|ui| {
+                                                    let mut enabled = self.plot_sources.contains(path);
+                                                    if ui.checkbox(&mut enabled, format!("Item {index}")).on_hover_text(path).changed() {
+                                                        if enabled { self.plot_sources.insert(path.into()); }
+                                                        else { self.plot_sources.remove(path); }
+                                                        sources_changed = true;
+                                                    }
+                                                    if ui.small_button("Only").clicked() {
+                                                        self.plot_sources.clear();
+                                                        self.plot_sources.insert(path.into());
+                                                        sources_changed = true;
+                                                    }
+                                                }); });
+                                            }
+                                        });
+                                });
                         }
                     });
                     return;
@@ -1585,7 +1758,7 @@ impl BrowserApp {
             return;
         }
         let mut changed = false;
-        let mut series=self.plot["series"].as_array().cloned().unwrap_or_default();
+        let series=self.plot_channels.clone();
         let ranges:Vec<_>=series.iter().filter_map(|c| {
             let values:Vec<_>=c["points"].as_array()?.iter().filter_map(|p|p[1].as_f64()).filter(|v|v.is_finite()).collect();
             if values.is_empty() {return None;}
@@ -1650,7 +1823,7 @@ impl BrowserApp {
         }
         if changed {
             self.first="0".into();self.last=self.plot_count().min(512).to_string();
-            self.plot=Default::default();self.viewport.reset();
+            self.plot=Default::default();self.plot_channels=Default::default();self.viewport.reset();
             if self.plot_count()>0 {self.request_plot(1200);}
         }
         if self.plot_sources.is_empty() {ui.label("Use Series to add collections.");return;}
@@ -1659,11 +1832,18 @@ impl BrowserApp {
             ui.weak(self.plot["quality"].as_str().unwrap_or("Reduced samples"));
         }
         {
-            for channel in &mut series {
-                let p=self.presentation.placement(channel["name"].as_str().unwrap_or(""));
-                if let Some(points)=channel["points"].as_array_mut() {for point in points {if let Some(v)=point[1].as_f64() {point[1]=serde_json::json!(p.display(v));}}}
-                if let Some(bands)=channel["bands"].as_array_mut() {for band in bands {for i in [2,3] {if let Some(v)=band[i].as_f64(){band[i]=serde_json::json!(p.display(v));}}}}
-            }
+            let gpu_hidden: std::collections::HashSet<_> = self.hidden.iter().cloned().collect();
+            let gpu_key = self.hidden.iter().fold(self.gpu_revision, |key, name| {
+                name.bytes().fold(key, |key, byte| key.wrapping_mul(1099511628211) ^ u64::from(byte))
+            });
+            let gpu_mode = self.plot["estimated"].as_bool() != Some(true)
+                && series.iter().filter(|c| !self.hidden.contains(c["name"].as_str().unwrap_or(""))).count() >= 64
+                && self.plot_gpu.update(ui.ctx(), &self.gpu_points, &gpu_hidden, gpu_key);
+            let placed = if gpu_mode { Default::default() } else {
+                crate::plot_trace::placed_points(&mut self.placed_points, &self.trace_meshes,
+                    &self.gpu_points, &gpu_hidden, &self.presentation)
+            };
+            let visible_count = series.iter().filter(|c| !self.hidden.contains(c["name"].as_str().unwrap_or(""))).count();
             let placements=self.presentation.series.clone();
             let axis_placement = axis_names.first().map(|name|self.presentation.placement(name)).unwrap_or_default();
             let axis_uniform = axis_names.iter().all(|name| {
@@ -1677,8 +1857,12 @@ impl BrowserApp {
                     let name=c["name"].as_str().unwrap_or("");
                     !self.hidden.contains(name) && (fit_all || axis_names.is_empty() || axis_names.iter().any(|axis| axis == name))
                 })
-                    .flat_map(|c|c["points"].as_array().into_iter().flatten().filter_map(|p|p[1].as_f64())
-                        .chain(c["bands"].as_array().into_iter().flatten().flat_map(|band| [band[2].as_f64(), band[3].as_f64()].into_iter().flatten())))
+                    .flat_map(|c| {
+                        let placement = self.presentation.placement(c["name"].as_str().unwrap_or(""));
+                        c["points"].as_array().into_iter().flatten().filter_map(|p|p[1].as_f64())
+                        .chain(c["bands"].as_array().into_iter().flatten().flat_map(|band| [band[2].as_f64(), band[3].as_f64()].into_iter().flatten()))
+                        .map(move |value| placement.display(value))
+                    })
                     .filter(|v|v.is_finite());
                 values.fold((f64::INFINITY,f64::NEG_INFINITY),|(min,max),v|(min.min(v),max.max(v)))
             });
@@ -1711,8 +1895,12 @@ impl BrowserApp {
                 }
                 let y_range = fit_y.or_else(|| reset_bounds.then(|| {
                     series.iter().filter(|c| !self.hidden.contains(c["name"].as_str().unwrap_or("")))
-                        .flat_map(|c| c["points"].as_array().into_iter().flatten().filter_map(|p| p[1].as_f64())
-                            .chain(c["bands"].as_array().into_iter().flatten().flat_map(|band| [band[2].as_f64(), band[3].as_f64()].into_iter().flatten())))
+                        .flat_map(|c| {
+                            let placement = self.presentation.placement(c["name"].as_str().unwrap_or(""));
+                            c["points"].as_array().into_iter().flatten().filter_map(|p| p[1].as_f64())
+                            .chain(c["bands"].as_array().into_iter().flatten().flat_map(|band| [band[2].as_f64(), band[3].as_f64()].into_iter().flatten()))
+                            .map(move |value| placement.display(value))
+                        })
                         .filter(|v| v.is_finite())
                         .fold((f64::INFINITY,f64::NEG_INFINITY), |(min,max),v| (min.min(v),max.max(v)))
                 }));
@@ -1720,16 +1908,20 @@ impl BrowserApp {
                     let pad=((max-min)*0.05).max(0.1);
                     plot.set_plot_bounds_y(min-pad..=max+pad);
                 }
-                for channel in &series {
+                for channel in series.iter() {
                     let name = channel["name"].as_str().unwrap_or("");
                     if self.hidden.contains(name) {
                         continue;
                     }
-                    let points: Vec<[f64; 2]> =
-                        serde_json::from_value(channel["points"].clone()).unwrap_or_default();
-                    let bands: Vec<[f64;4]> = serde_json::from_value(channel["bands"].clone()).unwrap_or_default();
-                    crate::plot_trace::decoded_channel(plot, name, crate::plot_trace::series_color(name), points,
-                        self.plot["estimated"].as_bool().unwrap_or(false).then_some(bands.as_slice()));
+                    if !gpu_mode {
+                        let mut bands: Vec<[f64;4]> = serde_json::from_value(channel["bands"].clone()).unwrap_or_default();
+                        let placement = self.presentation.placement(name);
+                        for band in &mut bands { band[2] = placement.display(band[2]); band[3] = placement.display(band[3]); }
+                        let points = placed.get(name).map_or(&[][..], |points| points.as_slice());
+                        crate::plot_trace::decoded_channel_borrowed(plot, name, crate::plot_trace::series_color(name), points,
+                            self.plot["estimated"].as_bool().unwrap_or(false).then_some(bands.as_slice()),
+                            visible_count, self.trace_meshes.clone());
+                    }
                 }
                 if !self.stacked && plot.response().contains_pointer() {
                     let (wheel, pinch, shift)=plot_ctx.input(|input| {
@@ -1839,15 +2031,17 @@ impl BrowserApp {
                         return;
                     }
                     let nearest = series.iter().filter(|c| !self.hidden.contains(c["name"].as_str().unwrap_or("")))
-                        .flat_map(|c| c["points"].as_array().into_iter().flatten().enumerate().filter_map(move |(i,p)| {
-                            let x=p[0].as_f64()?; let y=p[1].as_f64()?;
+                        .flat_map(|c| {
+                            let placement = self.presentation.placement(c["name"].as_str().unwrap_or(""));
+                            c["points"].as_array().into_iter().flatten().enumerate().filter_map(move |(i,p)| {
+                            let x=p[0].as_f64()?; let y=placement.display(p[1].as_f64()?);
                             let distance=transform.position_from_point(&egui_plot::PlotPoint::new(x,y)).distance_sq(pointer);
                             Some((distance,c,i,x))
-                        })).min_by(|a,b| a.0.total_cmp(&b.0));
+                        })}).min_by(|a,b| a.0.total_cmp(&b.0));
                     if let Some((_, channel, i, x)) = nearest {
                         if let (Some(start), Some(end)) = (channel["bytes"][i][0].as_str().and_then(parse_offset), channel["bytes"][i][1].as_str().and_then(parse_offset)) {
                             let path=channel["path"].as_str().unwrap_or("").to_owned();
-                            self.collection=path;
+                            if self.collection != path { self.select_collection(path); }
                             self.select_range(start,end);
                             let index = x.round().max(0.) as u64;
                             self.plot_anchor=Some(index);
@@ -1866,6 +2060,7 @@ impl BrowserApp {
                     }
                 }
             }
+            if gpu_mode { self.plot_gpu.paint(ui.painter(), &response.transform, &self.presentation); }
             if response.response.double_clicked() {
                 self.first = "0".into(); self.last = self.plot_count().to_string();
                 self.request_plot(1200);

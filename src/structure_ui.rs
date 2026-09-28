@@ -584,6 +584,7 @@ impl StructureWorkspace {
         self.output.as_ref()?.nodes.iter().find(|n| n.name == name).map(|n| n.range.clone())
     }
     pub fn code_action(&mut self, action: &'static str) { self.yaml_layout.command(action); }
+    pub fn set_ram_cache_budget(&mut self, bytes: usize) { self.views.set_ram_cache_budget(bytes); }
     pub fn editor_tab_width(&self) -> usize { self.yaml_layout.tab_width() }
     pub fn set_editor_tab_width(&mut self, width: usize) {
         self.yaml_layout.set_tab_width(width);

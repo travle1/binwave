@@ -6,8 +6,8 @@ must not introduce another decoder or a second plot-reduction algorithm.
 | Concern | Shared implementation | Platform adapter |
 | --- | --- | --- |
 | YAML syntax, execution, lazy arrays, numeric plans | `structure.rs` | Native `ByteView`; browser bounded worker reader |
-| Viewport sampling, exact reads, min/max reduction | `structure_plot.rs` | Native thread scheduler; browser decoder worker |
-| Dense trace rendering | `plot_trace.rs` | Both shells use `decoded_channel`; sampled bands never connect unread gaps |
+| Numeric grouping, viewport resolution, exact reads, min/max reduction | `structure_plot.rs` | Native thread scheduler and decoded tile cache; browser decoder worker |
+| Trace rendering and display transforms | `plot_trace.rs`, `plot_gpu.rs`, `plot_presentation.rs` | Shared retained GPU buffers/shader on native and WebGPU; shared cached meshes on WebGL; sampled bands never connect unread gaps |
 | Source editor, highlighting, shortcuts, templates | `source_editor.rs` | Native and browser language/draft controls |
 | Inspector field lookup, display, and numeric encoding | `structure_selection.rs`, `workspace_inspector.rs`, `field_edit.rs` | Native selection and browser on-demand worker requests |
 | Python SDK and plan generation | `python/runner.py` | Native subprocess; browser-local Pyodide worker |
@@ -56,3 +56,31 @@ compatible viewport redraw is pending; obsolete results are discarded.
 Validation combines native engine tests with the actual built WASM API against
 a synthetic 40 GiB file (`tests/browser_decoder.mjs`). The synthetic file forbids
 whole-file reads and validates bounded plots, offsets, edits, and failed applies.
+
+Browser plotting uses `compatible_numeric_groups` and the native request-resolution
+policy. Compatible selected projections scan their record sequence once, not once
+per sensor. There is no separate 65,536-point browser demo budget. Exact and min/max
+output use the shared per-group limits; plot transport allows 64 MiB independently
+of the 8 MiB schema/table response bound. Incompatible layouts remain independent
+queries and large overviews remain explicitly labeled sampled previews.
+
+Both shells retain original points, cache display placements, reuse screen-space
+meshes, and use the same GPU shader and segment budget. Browser GPU uploads are
+prepared once per result/visibility change; navigation updates uniforms and series
+placements. Native upload preparation uses a background thread. WebGL cannot run
+the storage-buffer shader and uses the shared adaptive mesh renderer instead.
+The canvas exposes `data-graphics-backend` and `data-trace-renderer` for diagnostics.
+
+Browser decoder file tiles use a session-RAM LRU with a configurable budget,
+defaulting to 1 GiB, and 1 MiB tiles. Settings at the bottom of the browser sidebar
+accept a whole-number MiB budget (0 disables caching), without a fixed upper cap
+beyond safe integer byte accounting. The budget is persisted locally, applied to
+active and future YAML/Python decoder workers, and lowering it evicts old tiles
+immediately. The cache grows on demand; the budget is not a reservation or a file
+size limit. These tiles are neither uploaded nor persisted. The shared selection mapper
+routes Hex selections to the active matching projection, then another matching
+projection, while preserving original byte provenance. Desktop Settings exposes the same RAM cache control and 1 GiB default, applied
+to the native decoded plot tile/summary cache shared by active readers. Changing
+the budget trims active caches and persists the preference on the device. Native
+file reads use the OS page cache, which remains OS-managed. Native filesystem
+caching and OS thread scheduling remain platform adapters.

@@ -210,6 +210,9 @@ pub struct BinwaveApp {
     library_rename_draft: String,
     library_delete_confirm: bool,
     sidebar_settings_open: bool,
+    ram_cache_mib: String,
+    ram_cache_bytes: usize,
+    ram_cache_error: Option<String>,
     csv_table: CsvTable,
     pending_config: Option<AppConfig>,
     pending_recent_decoder: Option<(std::path::PathBuf, std::path::PathBuf)>,
@@ -278,6 +281,9 @@ impl Default for BinwaveApp {
             library_rename_draft: String::new(),
             library_delete_confirm: false,
             sidebar_settings_open: false,
+            ram_cache_mib: (crate::structure_plot::group_buffer_bytes() / (1024 * 1024)).to_string(),
+            ram_cache_bytes: crate::structure_plot::group_buffer_bytes(),
+            ram_cache_error: None,
             csv_table: CsvTable::default(),
             pending_config: None,
             pending_recent_decoder: None,
@@ -318,6 +324,14 @@ impl BinwaveApp {
         let mut app = Self::default();
         app.workspace = WorkspaceLayout::load(cc.storage);
         app.restore_file_locations(cc.storage);
+        if let Some(mib) = cc.storage.and_then(|s| s.get_string("ram-cache-mib"))
+            .and_then(|text| text.parse::<usize>().ok()) {
+            if let Some(bytes) = mib.checked_mul(1024 * 1024) {
+                app.ram_cache_mib = mib.to_string();
+                app.ram_cache_bytes = bytes;
+            }
+        }
+        app.binary.set_ram_cache_budget(app.ram_cache_bytes);
         app.sidebar_open = cc.storage
             .and_then(|storage| storage.get_string("sidebar-open-v2"))
             .as_deref() != Some("false");
@@ -1568,7 +1582,33 @@ impl BinwaveApp {
     fn ui_sidebar_settings(&mut self, ctx: &Context) {
         if !self.sidebar_settings_open { return; }
         egui::Window::new("Settings").open(&mut self.sidebar_settings_open).show(ctx, |ui| {
-            ui.label("BinWave workspace");
+            ui.horizontal(|ui| {
+                ui.label("RAM cache");
+                ui.label(egui::RichText::new(egui_phosphor::regular::INFO).family(egui::FontFamily::Name("phosphor".into()))).on_hover_text("Maximum RAM retained for decoded plot tiles and summaries, shared across active readers. Grows on demand; older tiles are evicted when full. Does not limit file size. 0 disables caching.");
+            });
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.ram_cache_mib).desired_width(crate::theme::DARK.size.sidebar_width));
+                ui.label("MiB");
+            });
+            ui.weak("Session RAM only. Preference saved on this device.");
+            ui.horizontal(|ui| {
+                if ui.button("Reset to 1 GiB").clicked() {
+                    self.ram_cache_mib = "1024".into();
+                    self.ram_cache_error = None;
+                }
+                if ui.button("Apply").clicked() {
+                    match self.ram_cache_mib.trim().parse::<usize>().ok().and_then(|mib| mib.checked_mul(1024 * 1024)) {
+                        Some(bytes) => {
+                            self.ram_cache_bytes = bytes;
+                            self.binary.set_ram_cache_budget(bytes);
+                            self.ram_cache_error = None;
+                        }
+                        None => self.ram_cache_error = Some("Enter a whole number of MiB, 0 or greater.".into()),
+                    }
+                }
+            });
+            if let Some(error) = &self.ram_cache_error { ui.label(error); }
+            ui.separator();
             if ui.button("Show decoding guide").clicked() { self.show_decoding_guide = true; }
         });
     }
@@ -1903,6 +1943,7 @@ impl BinwaveApp {
     fn ui_workspace(&mut self, root_ui: &mut egui::Ui) {
         let ctx = root_ui.ctx().clone();
         self.poll_workspace(&ctx);
+        self.binary.set_ram_cache_budget(self.ram_cache_bytes);
         let close_tab = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W);
         if ctx.input_mut(|i| i.consume_shortcut(&close_tab)) {
             if let Some(path) = self.workspace.dock.focused_leaf() {
@@ -2405,6 +2446,7 @@ impl eframe::App for BinwaveApp {
         self.workspace.save(storage);
         self.file_locations.save(storage);
         storage.set_string("sidebar-open-v2", self.sidebar_open.to_string());
+        storage.set_string("ram-cache-mib", (self.ram_cache_bytes / (1024 * 1024)).to_string());
         storage.set_string(
             "editor-tab-width",
             self.binary.editor_tab_width().to_string(),

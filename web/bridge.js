@@ -2,6 +2,10 @@
 (() => {
     const worker = new Worker(new URL('file-worker.mjs', document.currentScript.src), {type: 'module'});
     const events = [];
+    let cacheStorage;
+    try { cacheStorage = window.localStorage; } catch { /* private browsing */ }
+    let cacheBytes = globalThis.binwaveCacheSettings.load(cacheStorage);
+    worker.postMessage({type:'cache_settings', cacheBytes});
     let failed = false, graphicsReady = false;
     let busy = false, dirty = false, opened = false, exportable = false;
     let runtime = null, loadingDecoder = false, sourceEditorFocused = false;
@@ -193,6 +197,12 @@
         }
     });
     window.binwave = {
+        cacheBudgetMiB() { return cacheBytes / globalThis.binwaveCacheSettings.MIB; },
+        setCacheBudgetMiB(value) {
+            cacheBytes = globalThis.binwaveCacheSettings.fromMiB(value);
+            try { cacheStorage?.setItem(globalThis.binwaveCacheSettings.KEY, String(cacheBytes / globalThis.binwaveCacheSettings.MIB)); } catch { /* session-only preference */ }
+            worker.postMessage({type:'cache_settings', cacheBytes});
+        },
         menus(model, file, message, version) {
             if(message!==rustStatus){rustStatus=message;status.textContent=message;}
             const context=document.getElementById('file-context');
@@ -277,6 +287,11 @@
             if (command.type === 'cancel') { worker.postMessage(command); return true; }
             if (['decode', 'decode_python'].includes(command.type) && !runtime) return false;
             return submit(command);
+        },
+        graphicsBackend(name, retainedTraces) {
+            const canvas = document.getElementById('binwave');
+            canvas.setAttribute('data-graphics-backend', name);
+            canvas.setAttribute('data-trace-renderer', retainedTraces ? 'retained-gpu' : 'cached-mesh');
         },
         selection(start, end) { selectedStart = start; selectedEnd = end; controls(); },
         error(message) {

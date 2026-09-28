@@ -1541,6 +1541,7 @@ impl BinaryWorkspace {
             && !self.active_authoring_dirty()
     }
 
+    pub fn set_ram_cache_budget(&mut self, bytes: usize) { self.structure_ui.set_ram_cache_budget(bytes); }
     pub fn editor_tab_width(&self) -> usize { self.structure_ui.editor_tab_width() }
 
     pub fn set_editor_tab_width(&mut self, width: usize) {
