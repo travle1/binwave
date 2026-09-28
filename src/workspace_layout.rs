@@ -77,6 +77,7 @@ impl Default for WorkspaceLayout {
 impl WorkspaceLayout {
     /// Compare plots and source bytes while keeping the decoder within reach.
     /// Decoded samples are added below the right column when requested.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
     pub fn plot_and_bytes() -> Self {
         let mut dock = DockState::new(vec![Pane::Layout, Pane::Inspector, Pane::Structures]);
         let [_, editor] =

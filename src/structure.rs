@@ -599,6 +599,7 @@ impl Node {
         }
         self.name.clone()
     }
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // Only the browser uses it.
     pub fn tree_summary(&self) -> String {
         if self.lazy.is_some() || self.value.is_some() {
             return format!("{} · {}", self.kind, self.display());
@@ -662,6 +663,7 @@ impl Node {
 pub struct ParseOutput {
     pub nodes: Vec<Node>,
     pub definitions: Vec<ResolvedDefinition>,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
     pub revision: u64,
     pub consumed: Address,
 }
@@ -672,12 +674,14 @@ pub struct ParseFailure {
     pub output: ParseOutput,
 }
 #[derive(Debug, Clone)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
 pub struct ResolvedDefinition {
     pub name: String,
     pub origin: Option<Range<Address>>,
     pub fields: Vec<ResolvedField>,
 }
 #[derive(Debug, Clone)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
 pub struct ResolvedField {
     pub name: String,
     pub kind: String,
@@ -1424,6 +1428,7 @@ impl Program {
         validate_actions(&program.actions, 0)?;
         Ok(program)
     }
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
     pub fn run(&self, source: &ByteView, cancel: &AtomicBool) -> Result<ParseOutput> {
         self.run_with_partial(source, cancel).map_err(|failure| failure.error)
     }

@@ -298,6 +298,7 @@ impl YamlLayoutCache {
         self.editor_inner(ui, yaml, language, true);
     }
 
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
     pub(crate) fn editor_compact(&mut self, ui: &mut Ui, yaml: &mut String, language: DecoderLanguage) {
         self.editor_inner(ui, yaml, language, false);
     }

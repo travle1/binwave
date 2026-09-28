@@ -1,6 +1,7 @@
 //! Display grouping for decoded plot series; independent of file format.
 use std::collections::BTreeMap;
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // Only the browser uses it.
 fn indexed_component(path: &str) -> Option<(usize, usize)> {
     path.rfind('[').and_then(|start| {
         let end = path[start..].find(']')? + start;
@@ -9,15 +10,18 @@ fn indexed_component(path: &str) -> Option<(usize, usize)> {
     })
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // Only the browser uses it.
 pub fn group_key(name: &str) -> String {
     let path = name.rsplit_once(" / ").map_or(name, |(path, _)| path);
     indexed_component(path).map_or_else(|| path.to_owned(), |(start, _)| path[..start].to_owned())
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // Only the browser uses it.
 pub fn group_label(group: &str) -> &str {
     group.rsplit('.').next().unwrap_or(group)
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // Only the browser uses it.
 pub fn grouped<'a>(names: impl IntoIterator<Item = &'a str>) -> BTreeMap<String, Vec<(String, &'a str)>> {
     let mut groups: BTreeMap<String, Vec<(String, &'a str)>> = BTreeMap::new();
     for name in names {
@@ -64,6 +68,7 @@ pub fn collection_group(name: &str, path: &str) -> Option<(String, usize)> {
 }
 
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // Only the browser uses it.
 pub fn axis_targets(names: &[String], group: Option<&str>, series: Option<&str>) -> Vec<String> {
     if let Some(group) = group {
         names.iter().filter(|name| group_key(name) == group).cloned().collect()

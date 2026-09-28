@@ -98,6 +98,7 @@ pub fn preview(bytes: &[u8], kind: &str, big: bool) -> String {
 struct Existing {
     span: Range<usize>,
     name: String,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
     kind: String,
     comment: String,
 }
@@ -372,6 +373,7 @@ fn fresh_name(source: &str) -> String {
     unreachable!()
 }
 pub enum Edit {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
     Commit(String),
     #[allow(dead_code)] // The Interpret control is hidden for now; kept for when it returns.
     Interpret(String, Interpretation),
@@ -383,15 +385,12 @@ pub struct DirectAuthoring {
     error: String,
 }
 impl DirectAuthoring {
-    #[cfg(target_arch = "wasm32")]
-    pub fn editing(&self, name: &str) -> bool {
-        self.rename.as_ref().is_some_and(|(n, _)| n == name)
-    }
     pub fn created(&mut self, name: String) {
         self.rename = Some((name.clone(), name));
         self.focus = true;
     }
     /// Render the editable name exactly where the decoded name normally appears.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
     pub fn name_ui(
         &mut self,
         ui: &mut Ui,

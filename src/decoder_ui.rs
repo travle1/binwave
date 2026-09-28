@@ -6,6 +6,7 @@ use egui::{Color32, RichText, Ui};
 pub const RUN_LABEL: &str = "▶ Run (F5)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
 pub enum StatusTone {
     Neutral,
     Ready,
@@ -14,6 +15,7 @@ pub enum StatusTone {
     Error,
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
 fn tone_color(ui: &Ui, tone: StatusTone) -> Color32 {
     match tone {
         StatusTone::Neutral => ui.visuals().weak_text_color(),
@@ -38,6 +40,7 @@ pub fn run_button(ui: &mut Ui, enabled: bool, disabled_reason: Option<&str>) -> 
     response.on_hover_text("Run this decoder against the open data file")
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
 pub fn status_banner(ui: &mut Ui, headline: &str, detail: &str, tone: StatusTone, busy: bool) {
     let color = tone_color(ui, tone);
     let fill = color.gamma_multiply(if ui.visuals().dark_mode { 0.10 } else { 0.06 });
@@ -116,6 +119,7 @@ struct ParsingMap {
 /// Both application shells use this layout so a short Definition pane cannot
 /// push Python errors below the visible tab. The child UIs are clipped to their
 /// assigned regions; each contains its own scrolling surface.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
 pub fn source_console(
     ui: &mut Ui,
     stdout: &str,
@@ -158,6 +162,7 @@ pub fn source_console(
     .inner
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
 fn source_console_heights(available: f32, has_error: bool) -> (f32, f32) {
     let spacing = 6.0;
     let body = (available - spacing).max(0.0);

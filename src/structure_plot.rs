@@ -29,6 +29,7 @@ const PREVIEW_WINDOWS: Address = 128;
 const PREVIEW_WINDOW_SIZE: Address = PREVIEW_LIMIT / PREVIEW_WINDOWS;
 const MAX_BUCKETS: Address = 4096;
 const MAX_TOTAL_NUMERIC_POINTS: Address = 100_000;
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
 const CACHE_ENTRIES: Address = 3;
 #[cfg(not(target_arch = "wasm32"))]
 const GROUP_TILE_SAMPLES: Address = 4096;
@@ -49,6 +50,7 @@ pub struct PlotSample {
     pub index: Address,
     pub value: f64,
     pub bytes: Range<Address>,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
     pub path: PlotPath,
 }
 /// Numeric points share the path's fixed parts across a field. The full path
@@ -100,6 +102,7 @@ pub struct PlotEnvelope {
     pub max: PlotSample,
 }
 #[derive(Clone, Debug)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
 pub struct PlotData {
     pub range: Range<Address>,
     pub series: BTreeMap<String, Vec<PlotSample>>,
@@ -1259,6 +1262,7 @@ struct NumericBucket {
     last: NumericPoint,
 }
 impl NumericBucket {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
     fn merge(&mut self, next: Self) {
         if next.min.value < self.min.value { self.min = next.min; }
         if next.max.value > self.max.value { self.max = next.max; }

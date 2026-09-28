@@ -236,6 +236,7 @@ pub fn menus(s: &State) -> Vec<Item> {
         Item::menu("Help", vec![action("Decoder guide", Help, true)]),
     ]
 }
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
 fn menu_entries(ui: &mut egui::Ui, items: &[Item], selected: &mut Option<(Command, usize)>) {
         ui.set_min_width(200.);
         for item in items {
@@ -261,11 +262,13 @@ fn menu_entries(ui: &mut egui::Ui, items: &[Item], selected: &mut Option<(Comman
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
 pub enum OverflowSelection {
     Command(Command, usize),
     Panel(Pane),
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
 pub fn overflow_menu(ui: &mut egui::Ui, menus: &[Item], panels: &[(Pane, bool)]) -> Option<OverflowSelection> {
     let mut selected = None;
     let mut panel = None;
@@ -316,37 +319,6 @@ pub fn native_bar(ui: &mut egui::Ui, menus: &[Item]) -> Option<(Command, usize)>
         );
     });
     selected
-}
-#[cfg(target_arch = "wasm32")]
-pub fn decoder_controls(
-    ui: &mut egui::Ui,
-    enabled: bool,
-    busy: bool,
-    disabled_reason: Option<&str>,
-    can_save: bool,
-) -> Option<Command> {
-    let mut result = None;
-    ui.horizontal(|ui| {
-        if crate::decoder_ui::run_button(ui, enabled, disabled_reason).clicked() {
-            result = Some(Command::Apply);
-        }
-        if ui.add_enabled(can_save, egui::Button::new("Save decoder"))
-            .on_hover_text("Save this YAML or Python decoder")
-            .clicked()
-        {
-            result = Some(Command::SaveDecoder);
-        }
-        if ui.add_enabled(can_save, egui::Button::new("Save as…"))
-            .on_hover_text("Choose a decoder filename")
-            .clicked()
-        {
-            result = Some(Command::SaveDecoderAs);
-        }
-        if busy && ui.button("Stop").clicked() {
-            result = Some(Command::Cancel);
-        }
-    });
-    result
 }
 #[cfg(test)]
 mod tests {
