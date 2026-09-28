@@ -69,6 +69,7 @@ enum IoResult {
     SavedBinary(ByteSnapshot, PathBuf),
     SavedYaml(String, PathBuf, DecoderLanguage),
     SavedBytes(ByteView, PathBuf, Range<usize>, bool),
+    Replaced(ByteView, PathBuf),
 }
 
 /// The inactive language keeps its own document, including its save baseline.
@@ -161,6 +162,8 @@ pub struct BinaryWorkspace {
     external_dialog_pending: bool,
     pending: Option<Action>,
     overwrite: Option<(PathBuf, SaveContent)>,
+    /// Save bytes asks whether to write a new file or replace the open one.
+    save_choice: bool,
     allow_close: bool,
     load_progress: Option<Arc<LoadProgress>>,
     plot_cache: Arc<Mutex<binary::PlotCache>>,
@@ -233,6 +236,7 @@ impl Default for BinaryWorkspace {
             external_dialog_pending: false,
             pending: None,
             overwrite: None,
+            save_choice: false,
             allow_close: false,
             load_progress: None,
             plot_cache: Arc::new(Mutex::new(binary::PlotCache::default())),
@@ -459,11 +463,16 @@ impl BinaryWorkspace {
                 })
             });
         let raw_source = self.raw_source.clone();
-        let working_patches = self
+        let Some(working_patches) = self
             .bytes
             .as_ref()
-            .map(|s| (*s.view().patches).clone())
-            .unwrap_or_default();
+            .map_or(Some(Default::default()), |s| s.view().overwrite_patches())
+        else {
+            self.report(Err(anyhow::anyhow!(
+                "This layout reads fixed offsets, so it can't decode after bytes were inserted or deleted. Save the bytes first."
+            )));
+            return;
+        };
         if existing.is_none() && raw_source.is_none() {
             return;
         }
@@ -670,7 +679,12 @@ impl BinaryWorkspace {
     pub fn decoder_path(&self) -> Option<&Path> {
         self.yaml_path.as_deref()
     }
+    /// The current length, including inserted and deleted bytes.
     pub fn file_len(&self) -> usize {
+        self.bytes.as_ref().map(|store| store.view().len()).unwrap_or_else(|| self.saved_len())
+    }
+    /// The length on disk, before unsaved inserts and deletes.
+    pub fn saved_len(&self) -> usize {
         self.original
             .as_ref()
             .map(|o| o.bytes().len())
@@ -791,9 +805,7 @@ impl BinaryWorkspace {
                         self.applied_language = Some(DecoderLanguage::Yaml);
                         self.structure_ui.clear_program();
                         self.interpretation_stale = false;
-                        if let (Some(doc), Some(store)) = (&mut self.document, &mut self.bytes) {
-                            doc.bytes.patches = (*store.view().patches).clone();
-                        }
+                        self.sync_legacy_patches();
                         self.layout_applied = !self.validation_is_refresh;
                         if !self.validation_is_refresh {
                             if let Some(doc) = &mut self.document {
@@ -1065,12 +1077,14 @@ impl BinaryWorkspace {
                     if let Some(doc) = &mut self.document {
                         doc.mark_saved(&snapshot);
                     }
-                    if let Some(store) = &mut self.bytes {
-                        let mut view = store.view();
-                        view.patches = Arc::new(snapshot.patches.clone());
-                        store.mark_saved(&view);
-                    }
-                    self.report(Ok(format!("Saved edited copy: {}", path.display())));
+                    self.report(Ok(format!("Saved {}", path.display())));
+                }
+                Ok(IoResult::Replaced(view, path)) => self.reopen_saved(view, path, ctx),
+                Ok(IoResult::SavedBytes(view, path, _, true))
+                    if self.bytes.as_ref().is_some_and(|store| store.view().revision == view.revision) =>
+                {
+                    self.file_locations.remember_file(FileKind::Exports, &path);
+                    self.reopen_saved(view, path, ctx);
                 }
                 Ok(IoResult::SavedBytes(view, path, range, mark_saved)) => {
                     self.file_locations.remember_file(FileKind::Exports, &path);
@@ -1080,12 +1094,12 @@ impl BinaryWorkspace {
                         }
                         if let Some(doc) = &mut self.document {
                             let mut snapshot = doc.bytes.clone();
-                            snapshot.patches = (*view.patches).clone();
+                            snapshot.patches = view.overwrite_patches().unwrap_or_default();
                             doc.mark_saved(&snapshot);
                         }
                     }
                     self.report(Ok(if mark_saved {
-                        format!("Saved edited copy: {}", path.display())
+                        format!("Saved {}. Newer edits are not saved yet.", path.display())
                     } else {
                         format!(
                             "Exported {} ({}): {}",
@@ -1296,6 +1310,58 @@ impl BinaryWorkspace {
                 let action = self.pending.take().unwrap();
                 if proceed {
                     self.execute(action, ctx);
+                }
+            }
+        }
+        if self.save_choice {
+            let t = &crate::theme::DARK;
+            let name = self.source.as_deref().and_then(Path::file_name)
+                .map_or("the file".into(), |name| name.to_string_lossy().into_owned());
+            let sizes = self.bytes.as_ref().map(|store| {
+                let view = store.view();
+                (view.original_len() as u64, view.len() as u64)
+            });
+            let mut choice = None;
+            egui::Window::new("Save bytes")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0., 0.])
+                .show(ctx, |ui| {
+                    if let Some((before, after)) = sizes {
+                        let size = if before == after {
+                            crate::format::size(after)
+                        } else {
+                            format!("{} → {}", crate::format::size(before), crate::format::size(after))
+                        };
+                        ui.label(RichText::new(format!("{name} · {size}")).color(t.color.text.secondary))
+                            .on_hover_text(format!("{} → {}", crate::format::exact_bytes(before),
+                                crate::format::exact_bytes(after)));
+                    }
+                    ui.add_space(t.spacing.inspector_gap);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            choice = Some(None);
+                        }
+                        if ui.button("Save as new file…")
+                            .on_hover_text(format!("Write the edited bytes to a new file and continue there. {name} stays unchanged."))
+                            .clicked()
+                        {
+                            choice = Some(Some(false));
+                        }
+                        if ui.button(format!("Replace {name}"))
+                            .on_hover_text("Write a complete copy next to it, then swap it in. This can't be undone.")
+                            .clicked()
+                        {
+                            choice = Some(Some(true));
+                        }
+                    });
+                });
+            if let Some(choice) = choice {
+                self.save_choice = false;
+                match choice {
+                    Some(true) => self.replace_original(ctx),
+                    Some(false) => self.choose_save(ctx, false),
+                    None => {}
                 }
             }
         }
@@ -1525,6 +1591,7 @@ impl BinaryWorkspace {
             && !self.any_dialog_pending()
             && self.pending.is_none()
             && self.overwrite.is_none()
+            && !self.save_choice
     }
     pub fn has_selection(&self) -> bool {
         self.hex_editor.selection().is_some()
@@ -1545,10 +1612,66 @@ impl BinaryWorkspace {
     pub fn set_editor_tab_width(&mut self, width: usize) {
         self.structure_ui.set_editor_tab_width(width);
     }
+    /// Save bytes: ask whether to write a new file or replace the open one. Data
+    /// without a file on disk (a demo) can only be saved as a new file.
     pub fn save_copy(&mut self, ctx: &Context) {
-        if self.commands_available() {
+        if !self.commands_available() {
+            return;
+        }
+        if self.bytes.as_ref().is_some_and(|store| store.view().source_path().is_some()) {
+            self.save_choice = true;
+        } else {
             self.choose_save(ctx, false);
         }
+    }
+
+    fn replace_original(&mut self, ctx: &Context) {
+        if self.cell_dirty() {
+            self.report(Err(anyhow::anyhow!("Commit or cancel the table value before saving.")));
+            return;
+        }
+        let Some(view) = self.bytes.as_ref().map(ByteStore::view) else { return };
+        let Some(path) = view.source_path().map(Path::to_owned) else { return };
+        // Plot workers stop reading the file that is about to be replaced.
+        self.plot_cancel.store(true, Ordering::Relaxed);
+        self.plot_rx = None;
+        self.report(Ok(format!("Saving {}…", path.display())));
+        self.start_io(ctx, move || {
+            let path = view.replace_source()?;
+            Ok(IoResult::Replaced(view, path))
+        });
+    }
+
+    /// Continue on the file that now holds the saved bytes. Its content matches
+    /// what was shown, so selections and named ranges stay; undo history starts over.
+    fn reopen_saved(&mut self, view: ByteView, path: PathBuf, ctx: &Context) {
+        let source = match FileSource::open(&path) {
+            Ok(source) => Arc::new(source),
+            Err(error) => {
+                self.report(Err(error.context(format!("Saved {}, but could not reopen it", path.display()))));
+                return;
+            }
+        };
+        if let Some(store) = &mut self.bytes {
+            store.mark_saved(&view);
+        }
+        if source.len != view.len() {
+            self.report(Err(anyhow::anyhow!("Saved {}, but its size on disk differs; reopen it.", path.display())));
+            return;
+        }
+        self.bytes = Some(ByteStore::from_file(source.clone()));
+        self.raw_source = Some(source);
+        self.original = None;
+        // Explicit-offset layouts revalidate against the saved file.
+        if !self.structure_ui.has_published_program() {
+            self.document = None;
+        }
+        self.plot_cache = Arc::new(Mutex::new(binary::PlotCache::default()));
+        self.file_locations.remember_file(FileKind::Data, &path);
+        self.source = Some(path.clone());
+        self.after_byte_change(ctx, true);
+        self.bytes_changed = false;
+        self.report(Ok(format!("Saved {}", path.display())));
     }
     pub fn can_save_definition(&self) -> bool {
         !self.yaml.trim().is_empty() && !self.active_authoring_dirty()
@@ -1878,10 +2001,10 @@ impl BinaryWorkspace {
                 self.history(&ctx, true);
             }
             if ui
-                .add_enabled(self.has_file(), egui::Button::new("Save edited copy…"))
+                .add_enabled(self.has_file(), egui::Button::new("Save bytes…"))
                 .clicked()
             {
-                self.choose_save(&ctx, false);
+                self.save_copy(&ctx);
             }
         });
     }
@@ -2212,8 +2335,20 @@ impl BinaryWorkspace {
         let Some(store) = &mut self.bytes else {
             return;
         };
+        let before = store.view().len();
         let result = if redo { store.redo() } else { store.undo() };
+        let after = store.view().len();
         match result {
+            Ok(Some(range)) if before != after => {
+                self.shift_offsets(range.start, before, after);
+                self.after_byte_change(ctx, true);
+                // An undone insert or redone delete leaves no bytes to select; select
+                // the byte that now sits at the edit point.
+                let range = if range.is_empty() { range.start..(range.start + 1).min(after) } else { range };
+                self.structure_ui.select_bytes(range.clone());
+                self.hex_editor.select_range(range, true);
+                self.report(Ok(if redo { "Edit redone." } else { "Edit undone." }.into()));
+            }
             Ok(Some(range)) => {
                 let reinterpret = self.interpretation_stale
                     || self.structure_ui.has_published_program()
@@ -2271,7 +2406,7 @@ impl BinaryWorkspace {
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("No byte source is open"))?;
             store.replace(range.start, &values)?;
-            let patches = (*store.view().patches).clone();
+            let patches = store.view().overwrite_patches().unwrap_or_default();
             let doc = self.document.as_mut().unwrap();
             doc.bytes.patches = patches;
             doc.text(record, field)
@@ -2768,6 +2903,7 @@ impl BinaryWorkspace {
 
     pub fn hex_with_source_highlights(&mut self, ui: &mut Ui, highlights: &[HexHighlight]) {
         self.hex_editor.set_python_mode(self.is_python());
+        self.hex_editor.set_can_resize(self.can_resize());
         let source = self.bytes.as_ref().map(ByteStore::view);
         let actions = self.hex_editor.ui(ui, source, highlights);
         self.hex_actions(actions, ui.ctx());
@@ -2817,6 +2953,7 @@ impl BinaryWorkspace {
 
     pub fn hex(&mut self, ui: &mut Ui) {
         self.hex_editor.set_python_mode(self.is_python());
+        self.hex_editor.set_can_resize(self.can_resize());
         let mut highlights = self.structure_ui.highlights();
         if !self.interpretation_stale && !self.structure_ui.has_published_program() {
             if let Some(doc) = &self.document {
@@ -2868,6 +3005,16 @@ impl BinaryWorkspace {
                         }
                     }
                 }
+                HexAction::Insert { offset, bytes } => {
+                    let message = format!("Inserted {} at {}.", crate::format::exact_bytes(bytes.len() as u64),
+                        crate::format::offset(offset as u64));
+                    self.change_length(ctx, message, |store| store.insert(offset, &bytes));
+                }
+                HexAction::Delete(range) => {
+                    let message = format!("Deleted {} ({}).", crate::format::exact_bytes(range.len() as u64),
+                        crate::format::byte_range(range.start as u64, range.end as u64));
+                    self.change_length(ctx, message, |store| store.delete(range));
+                }
                 HexAction::Undo => self.history(ctx, false),
                 HexAction::Redo => self.history(ctx, true),
                 HexAction::Define(range) => {
@@ -2907,6 +3054,70 @@ impl BinaryWorkspace {
         }
     }
 
+    /// Explicit-offset layouts address the original file directly, so while one is
+    /// shown the file's length must stay the same.
+    fn can_resize(&self) -> bool {
+        self.document.is_none() || self.structure_ui.has_published_program()
+    }
+
+    fn change_length(
+        &mut self,
+        ctx: &Context,
+        message: String,
+        edit: impl FnOnce(&mut ByteStore) -> Result<Range<usize>>,
+    ) {
+        if !self.commands_available() {
+            return;
+        }
+        if self.cell_dirty() {
+            self.report(Err(anyhow::anyhow!("Commit or cancel the table value before editing bytes.")));
+            return;
+        }
+        if !self.can_resize() {
+            self.report(Err(anyhow::anyhow!(
+                "This decoder reads fixed offsets, so bytes can't be inserted or deleted."
+            )));
+            return;
+        }
+        let Some(store) = &mut self.bytes else { return };
+        let before = store.view().len();
+        match edit(store) {
+            Ok(range) => {
+                let after = store.view().len();
+                self.shift_offsets(range.start, before, after);
+                self.after_byte_change(ctx, true);
+                self.report(Ok(format!("{message} Undo reverses it.")));
+            }
+            Err(error) => self.report(Err(error)),
+        }
+    }
+
+    /// Keep Hex and the decoded panels on the same bytes after the length changes at `at`.
+    fn shift_offsets(&mut self, at: usize, before: usize, after: usize) {
+        if before == after {
+            return;
+        }
+        self.hex_editor.shift(at, before.saturating_sub(after), after.saturating_sub(before));
+        if let Some(range) = self.hex_editor.selection() {
+            let range = range.start.min(after.saturating_sub(1))..range.end.min(after);
+            self.structure_ui.select_bytes(range);
+        }
+    }
+
+    /// Explicit-offset layouts read the original file plus overwritten bytes. Once
+    /// inserts or deletes shift offsets they no longer describe the data.
+    fn sync_legacy_patches(&mut self) {
+        let Some(view) = self.bytes.as_ref().map(ByteStore::view) else { return };
+        match view.overwrite_patches() {
+            Some(patches) => {
+                if let Some(doc) = &mut self.document {
+                    doc.bytes.patches = patches;
+                }
+            }
+            None => self.document = None,
+        }
+    }
+
     fn after_byte_change(&mut self, ctx: &Context, reinterpret: bool) {
         let restart_preview = std::mem::take(&mut self.initial_plot_pending);
         self.initial_plot_ready = false;
@@ -2914,9 +3125,7 @@ impl BinaryWorkspace {
         self.direct_pending = None;
         self.completed_python = None;
         self.bytes_changed = true;
-        if let (Some(doc), Some(store)) = (&mut self.document, &self.bytes) {
-            doc.bytes.patches = (*store.view().patches).clone();
-        }
+        self.sync_legacy_patches();
         self.structure_ui.invalidate();
         if reinterpret || self.structure_ui.has_published_program() {
             self.interpretation_stale = true;
@@ -4893,7 +5102,7 @@ mod tests {
         let path = dir.path().join("described.raw");
         std::fs::write(&path, [2, 10, 20, 30]).unwrap();
         let mut workspace = BinaryWorkspace::default();
-        workspace.open(path, &ctx);
+        workspace.open(path.clone(), &ctx);
         settle(&mut workspace, &ctx);
         workspace.yaml = "actions:\n  - read: {name: count, type: u8}\n  - read: {name: values, type: u8, repeat: {ref: count}}\n".into();
         workspace.validate_layout(&ctx);
@@ -4922,14 +5131,56 @@ mod tests {
         );
         settle(&mut workspace, &ctx);
         assert_eq!(std::fs::read(&export).unwrap(), [3, 10, 20, 30]);
+        assert_eq!(std::fs::read(&path).unwrap(), [2, 10, 20, 30], "the original is untouched");
+        // Work continues on the saved file, with its own undo history.
+        assert_eq!(workspace.source_path(), Some(export.as_path()));
         assert!(!workspace.bytes.as_ref().unwrap().is_dirty());
-        workspace.history(&ctx, false);
+        assert!(!workspace.bytes.as_ref().unwrap().can_undo());
+        assert_eq!(workspace.bytes.as_ref().unwrap().view().read(0, 4).unwrap(), [3, 10, 20, 30]);
         settle(&mut workspace, &ctx);
-        assert_eq!(
-            workspace.bytes.as_ref().unwrap().view().read(0, 1).unwrap(),
-            [2]
-        );
-        assert!(workspace.bytes.as_ref().unwrap().is_dirty());
+        assert!(workspace.structure_ui.has_program(), "the decoder runs again on the saved file");
+    }
+
+    #[test]
+    fn inserted_and_deleted_bytes_redecode_shift_hex_and_replace_the_original_on_request() {
+        let ctx = Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("counted.raw");
+        std::fs::write(&path, [2, 10, 20, 7]).unwrap();
+        let mut workspace = BinaryWorkspace::default();
+        workspace.open(path.clone(), &ctx);
+        settle(&mut workspace, &ctx);
+        workspace.yaml = "actions:\n  - read: {name: count, type: u8}\n  - read: {name: values, type: u8, repeat: {ref: count}}\n".into();
+        workspace.validate_layout(&ctx);
+        settle(&mut workspace, &ctx);
+        workspace.hex_editor.select_range(3..4, false);
+        workspace.hex_actions(vec![HexAction::Insert { offset: 1, bytes: vec![5] }], &ctx);
+        assert_eq!(workspace.file_len(), 5);
+        assert_eq!(workspace.saved_len(), 4);
+        assert_eq!(workspace.hex_editor.selection(), Some(4..5), "the selection follows its byte");
+        workspace.hex_actions(vec![HexAction::Replace { offset: 0, bytes: vec![3] }], &ctx);
+        settle(&mut workspace, &ctx);
+        let view = workspace.bytes.as_ref().unwrap().view();
+        assert_eq!(workspace.structure_ui.select_path("values[2]", &view), Some(3..4),
+            "the decoder reads the inserted byte");
+        workspace.hex_actions(vec![HexAction::Delete(1..3)], &ctx);
+        assert_eq!(workspace.bytes.as_ref().unwrap().view().read(0, 8).unwrap(), [3, 20, 7]);
+        assert_eq!(workspace.hex_editor.selection(), Some(2..3));
+        workspace.history(&ctx, false);
+        assert_eq!(workspace.bytes.as_ref().unwrap().view().read(0, 8).unwrap(), [3, 5, 10, 20, 7]);
+        workspace.history(&ctx, true);
+        settle(&mut workspace, &ctx);
+        workspace.save_copy(&ctx);
+        assert!(workspace.save_choice, "Save bytes asks first");
+        workspace.save_choice = false;
+        workspace.replace_original(&ctx);
+        settle(&mut workspace, &ctx);
+        assert_eq!(std::fs::read(&path).unwrap(), [3, 20, 7]);
+        assert_eq!(workspace.source_path(), Some(path.as_path()));
+        assert!(!workspace.bytes.as_ref().unwrap().is_dirty());
+        assert_eq!(workspace.saved_len(), 3);
+        workspace.hex_actions(vec![HexAction::Delete(0..1)], &ctx);
+        assert_eq!(workspace.file_len(), 2, "the reopened file keeps editing");
     }
 
     #[test]

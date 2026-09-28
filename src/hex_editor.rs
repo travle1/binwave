@@ -26,6 +26,8 @@ pub struct HexHighlight {
 #[derive(Debug)]
 pub enum HexAction {
     Replace { offset: usize, bytes: Vec<u8> },
+    Insert { offset: usize, bytes: Vec<u8> },
+    Delete(Range<usize>),
     Undo,
     Redo,
     Define(Range<usize>),
@@ -36,7 +38,7 @@ pub enum HexAction {
 struct PageData {
     offset: usize,
     revision: u64,
-    result: Result<(Vec<u8>, Vec<u8>), String>,
+    result: Result<(Vec<u8>, Vec<bool>), String>,
 }
 
 struct SearchUpdate {
@@ -91,6 +93,12 @@ pub struct HexEditor {
     replacement: String,
     replace_text: bool,
     edit_mode: bool,
+    /// Typing inserts bytes before the cursor instead of overwriting them.
+    insert_mode: bool,
+    /// False while a decoder reads fixed offsets, so the length must not change.
+    can_resize: bool,
+    /// The bytes row inserts instead of overwriting the selection.
+    replace_inserts: bool,
     ascii_input: bool,
     high_nibble: Option<u8>,
     transfer_rx: Option<mpsc::Receiver<Result<String, String>>>,
@@ -141,6 +149,9 @@ impl Default for HexEditor {
             replacement: String::new(),
             replace_text: false,
             edit_mode: false,
+            insert_mode: false,
+            can_resize: true,
+            replace_inserts: false,
             ascii_input: false,
             high_nibble: None,
             transfer_rx: None,
@@ -174,7 +185,48 @@ impl HexEditor {
 
     pub fn show_replace(&mut self) {
         self.show_replace = true;
+        self.replace_inserts = false;
         self.focus_replace = true;
+    }
+
+    pub fn show_insert(&mut self) {
+        self.show_replace = true;
+        self.replace_inserts = true;
+        self.focus_replace = true;
+    }
+
+    pub fn set_can_resize(&mut self, can_resize: bool) {
+        self.can_resize = can_resize;
+        self.insert_mode &= can_resize;
+    }
+
+    /// Move offsets after an insert or delete: bytes before `at` stay, bytes after
+    /// the removed ones move by the size change, and removed ones collapse to `at`.
+    pub fn shift(&mut self, at: usize, removed: usize, inserted: usize) {
+        let map = |offset: usize| {
+            if offset < at {
+                offset
+            } else if offset >= at + removed {
+                offset - removed + inserted
+            } else {
+                at
+            }
+        };
+        if let Some(anchor) = self.anchor {
+            // Keep a caret that sat on the edit point after inserted bytes.
+            self.anchor = Some(map(anchor));
+            self.caret = map(self.caret);
+        }
+        for offset in &mut self.history {
+            *offset = map(*offset);
+        }
+        self.bookmarks.retain_mut(|bookmark| {
+            bookmark.range = map(bookmark.range.start)..map(bookmark.range.end);
+            !bookmark.range.is_empty()
+        });
+        self.cancel_search();
+        self.search_matches.clear();
+        self.high_nibble = None;
     }
 
     pub fn reset(&mut self) {
@@ -360,10 +412,9 @@ impl HexEditor {
             // One page of lookahead avoids a blank row at a page boundary.
             let result = source
                 .read(offset, (PAGE * 2).min(source.len().saturating_sub(offset)))
-                .and_then(|bytes| {
-                    source
-                        .read_original(offset, bytes.len())
-                        .map(|original| (bytes, original))
+                .map(|bytes| {
+                    let edited = source.edited(offset, bytes.len());
+                    (bytes, edited)
                 })
                 .map_err(|error| error.to_string());
             let _ = tx.send(PageData {
@@ -377,9 +428,9 @@ impl HexEditor {
 
     fn byte(&self, offset: usize) -> Option<(u8, bool)> {
         let page = self.page.as_ref()?;
-        let (bytes, original) = page.result.as_ref().ok()?;
+        let (bytes, edited) = page.result.as_ref().ok()?;
         let index = offset.checked_sub(page.offset)?;
-        Some((*bytes.get(index)?, bytes.get(index) != original.get(index)))
+        Some((*bytes.get(index)?, edited.get(index).copied().unwrap_or(false)))
     }
 
     pub fn copy_hex(&mut self, source: &ByteView) { self.copy(source, Transfer::Hex); }
@@ -542,6 +593,14 @@ impl HexEditor {
             return actions;
         };
         self.poll(ui, &source);
+        // A delete can leave the cursor past the new end of the file.
+        if let Some(last) = source.len().checked_sub(1) {
+            self.caret = self.caret.min(last);
+            self.anchor = self.anchor.map(|anchor| anchor.min(last));
+        } else {
+            self.anchor = None;
+            self.caret = 0;
+        }
         let navigation_origin = self.selection();
         // 16 bytes per row by default; 32 is a remembered setting.
         let wide_id = egui::Id::new("hex_32_bytes_per_row");
@@ -587,8 +646,7 @@ impl HexEditor {
             }
             if ui.toggle_value(&mut self.show_search, "Find").changed() && self.show_search { self.focus_find = true; }
             tools(ui);
-            ui.toggle_value(&mut self.edit_mode, "Overwrite")
-                .on_hover_text("Type hex digits (or text) over the selected bytes.");
+            self.edit_mode_switch(ui);
             crate::theme::more_menu(ui, |ui| {
                 self.selection_menu(ui, &source, &mut actions);
                 ui.separator();
@@ -596,7 +654,7 @@ impl HexEditor {
                     ui.ctx().data_mut(|data| data.insert_persisted(wide_id, wide));
                 }
                 ui.checkbox(&mut self.show_decoded_fields, "Highlight decoded fields");
-                if self.edit_mode { ui.checkbox(&mut self.ascii_input, "Overwrite with text"); }
+                if self.edit_mode { ui.checkbox(&mut self.ascii_input, "Type text instead of hex"); }
                 ui.separator();
                 ui.label("Saved ranges");
                 let mut visit = None;
@@ -701,21 +759,29 @@ impl HexEditor {
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.replacement)
                         .desired_width(200.0)
-                        .hint_text("Replacement bytes"),
+                        .hint_text(if self.replace_inserts { "Bytes to insert" } else { "Replacement bytes" }),
                 );
                 if self.focus_replace {
                     response.request_focus();
                     self.focus_replace = false;
                 }
-                if ui.button("Overwrite bytes").clicked() {
-                    match replacement_bytes(
-                        &self.replacement,
-                        self.replace_text,
-                        self.selection(),
-                        source.len(),
-                    ) {
+                let label = if self.replace_inserts { "Insert bytes" } else { "Overwrite bytes" };
+                if ui.button(label).clicked() {
+                    let result = if self.replace_inserts {
+                        typed_bytes(&self.replacement, self.replace_text).map(|bytes| {
+                            let offset = self.selection().map_or(0, |range| range.start);
+                            (offset, bytes)
+                        })
+                    } else {
+                        replacement_bytes(&self.replacement, self.replace_text, self.selection(), source.len())
+                    };
+                    match result {
                         Ok((offset, bytes)) => {
-                            actions.push(HexAction::Replace { offset, bytes });
+                            actions.push(if self.replace_inserts {
+                                HexAction::Insert { offset, bytes }
+                            } else {
+                                HexAction::Replace { offset, bytes }
+                            });
                             self.show_replace = false;
                             self.replacement.clear();
                         }
@@ -772,6 +838,35 @@ impl HexEditor {
         });
     }
 
+    /// Overwrite | Insert. Clicking the active mode stops editing.
+    fn edit_mode_switch(&mut self, ui: &mut egui::Ui) {
+        let t = &crate::theme::DARK;
+        // No vertical margin, so the switch lines up with the toolbar's buttons.
+        egui::Frame::new().fill(t.color.surface.window).corner_radius(t.radius.control)
+            .inner_margin(egui::Margin::symmetric(2, 0)).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 0.;
+                let overwrite = self.edit_mode && !self.insert_mode;
+                if ui.add(egui::Button::selectable(overwrite, "Overwrite"))
+                    .on_hover_text("Type hex digits (or text) over the selected bytes.")
+                    .clicked()
+                {
+                    self.edit_mode = !overwrite;
+                    self.insert_mode = false;
+                    self.high_nibble = None;
+                }
+                let insert = self.edit_mode && self.insert_mode;
+                if ui.add_enabled(self.can_resize, egui::Button::selectable(insert, "Insert"))
+                    .on_hover_text("Type to insert bytes before the cursor. Delete and Backspace remove bytes; the Insert key switches modes.")
+                    .on_disabled_hover_text("This decoder reads fixed offsets, so bytes can't be inserted or deleted.")
+                    .clicked()
+                {
+                    self.edit_mode = !insert;
+                    self.insert_mode = !insert;
+                    self.high_nibble = None;
+                }
+            });
+    }
+
     fn selection_menu(
         &mut self,
         ui: &mut egui::Ui,
@@ -812,6 +907,26 @@ impl HexEditor {
                 ui.close();
             }
         });
+        let resize_blocked = "This decoder reads fixed offsets, so bytes can't be inserted or deleted.";
+        if ui.add_enabled(self.can_resize, egui::Button::new("Insert bytes…"))
+            .on_hover_text("Insert bytes before the selection.")
+            .on_disabled_hover_text(resize_blocked)
+            .clicked()
+        {
+            self.show_insert();
+            ui.close();
+        }
+        let selected = self.selection();
+        let delete_label = selected.as_ref().map_or("Delete bytes".into(), |range| {
+            format!("Delete {}", crate::format::exact_bytes(range.len() as u64))
+        });
+        if ui.add_enabled(self.can_resize && selected.is_some(), egui::Button::new(delete_label))
+            .on_disabled_hover_text(if self.can_resize { "Select bytes to delete." } else { resize_blocked })
+            .clicked()
+        {
+            actions.push(HexAction::Delete(selected.unwrap()));
+            ui.close();
+        }
         ui.separator();
         if ui.button("Undo byte edit").clicked() {
             actions.push(HexAction::Undo);
@@ -1284,10 +1399,50 @@ impl HexEditor {
                             self.high_nibble = None;
                             None
                         }
+                        Key::Insert if self.can_resize => {
+                            self.insert_mode = !self.edit_mode || !self.insert_mode;
+                            self.edit_mode = true;
+                            self.high_nibble = None;
+                            None
+                        }
+                        Key::Delete | Key::Backspace if self.edit_mode && self.can_resize => {
+                            if let Some(range) = self.selection() {
+                                let range = if range.len() > 1 {
+                                    Some(range)
+                                } else if key == Key::Delete {
+                                    Some(self.caret..self.caret + 1)
+                                } else {
+                                    self.caret.checked_sub(1).map(|before| before..self.caret)
+                                };
+                                if let Some(range) = range {
+                                    actions.push(HexAction::Delete(range));
+                                }
+                            }
+                            self.high_nibble = None;
+                            None
+                        }
                         _ => None,
                     };
                     if let Some(target) = target {
                         self.move_caret(target, modifiers.shift);
+                    }
+                }
+                egui::Event::Text(text) if self.edit_mode && self.insert_mode && self.anchor.is_some() => {
+                    // The host shifts the cursor past the inserted bytes once they land.
+                    let bytes = if self.ascii_input {
+                        text.into_bytes()
+                    } else {
+                        let mut bytes = vec![];
+                        for nibble in text.chars().filter_map(|c| c.to_digit(16).map(|n| n as u8)) {
+                            match self.high_nibble.take() {
+                                Some(high) => bytes.push(high * 16 + nibble),
+                                None => self.high_nibble = Some(nibble),
+                            }
+                        }
+                        bytes
+                    };
+                    if !bytes.is_empty() {
+                        actions.push(HexAction::Insert { offset: self.caret, bytes });
                     }
                 }
                 egui::Event::Text(text) if self.edit_mode && self.anchor.is_some() => {
@@ -1514,6 +1669,17 @@ fn parse_hex(input: &str) -> Result<Vec<u8>, String> {
                 .map_err(|_| "Use hexadecimal digits 0–9 and A–F.".to_owned())
         })
         .collect()
+}
+
+fn typed_bytes(input: &str, text: bool) -> Result<Vec<u8>, String> {
+    let bytes = if text { input.as_bytes().to_vec() } else { parse_hex(input)? };
+    if bytes.is_empty() {
+        return Err("Enter bytes to insert.".into());
+    }
+    if bytes.len() > COPY_LIMIT {
+        return Err("One insert is limited to 1 MiB.".into());
+    }
+    Ok(bytes)
 }
 
 fn replacement_bytes(
@@ -1925,7 +2091,7 @@ mod tests {
         editor.page = Some(PageData {
             offset: 0,
             revision: source.revision,
-            result: Ok((vec![0x42; 1024], vec![0x41; 1024])),
+            result: Ok((vec![0x42; 1024], vec![true; 1024])),
         });
         let field = HexHighlight {
             range: 0..8,
@@ -2003,8 +2169,8 @@ mod tests {
         assert!(!texts.iter().any(|(text, _)| text == "Go"), "Enter jumps; there is no Go button");
         assert!(!texts.iter().any(|(text, _)| text.contains('⋯')), "⋯ is painted, not a missing glyph");
         let row = find("Find").center().y;
-        for label in ["‹", "›", "Overwrite"] {
-            assert!((find(label).center().y - row).abs() < 2., "{label} is not on the toolbar row");
+        for label in ["‹", "›", "Overwrite", "Insert"] {
+            assert!((find(label).center().y - row).abs() < 2., "{label} is not on the toolbar row: {:?} vs {row}", find(label));
         }
         assert!(readouts[0].1.bottom() <= find("Find").top(), "the readout heads the card");
     }
@@ -2134,9 +2300,9 @@ mod tests {
             .unwrap()
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
-        let (bytes, original) = page.result.unwrap();
+        let (bytes, edited) = page.result.unwrap();
         assert_eq!(bytes.len(), PAGE * 2);
-        assert_eq!(bytes, original);
+        assert_eq!(edited, vec![false; PAGE * 2]);
     }
 
     #[test]
@@ -2310,6 +2476,62 @@ mod tests {
             matches!(&actions[0], HexAction::Replace { offset: 6, bytes } if bytes == "é".as_bytes())
         );
         assert_eq!(editor.selection(), Some(8..9));
+    }
+
+    #[test]
+    fn insert_mode_inserts_typed_bytes_and_delete_keys_remove_bytes() {
+        let (_dir, source) = fixture();
+        let ctx = egui::Context::default();
+        let mut editor = HexEditor::default();
+        let mut press = |editor: &mut HexEditor, event: egui::Event| {
+            let mut actions = Vec::new();
+            let _ = ctx.run(egui::RawInput { events: vec![event], ..Default::default() }, |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| editor.keyboard(ui, &source, 500.0, 21.0, &mut actions));
+            });
+            actions
+        };
+        let key = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false,
+            modifiers: egui::Modifiers::NONE };
+        editor.select_range(5..6, false);
+        assert!(press(&mut editor, key(Key::Delete)).is_empty(), "Delete needs an edit mode");
+        press(&mut editor, key(Key::Insert));
+        assert!(editor.edit_mode && editor.insert_mode);
+        assert!(press(&mut editor, egui::Event::Text("A".into())).is_empty());
+        let actions = press(&mut editor, egui::Event::Text("5".into()));
+        assert!(matches!(&actions[..], [HexAction::Insert { offset: 5, bytes }] if bytes == &[0xA5]));
+        editor.ascii_input = true;
+        let actions = press(&mut editor, egui::Event::Text("hi".into()));
+        assert!(matches!(&actions[..], [HexAction::Insert { offset: 5, bytes }] if bytes == b"hi"));
+        editor.shift(5, 0, 2);
+        assert_eq!(editor.selection(), Some(7..8), "the cursor stays on the byte it was on");
+        let actions = press(&mut editor, key(Key::Backspace));
+        assert!(matches!(&actions[..], [HexAction::Delete(range)] if range == &(6..7)));
+        let actions = press(&mut editor, key(Key::Delete));
+        assert!(matches!(&actions[..], [HexAction::Delete(range)] if range == &(7..8)));
+        editor.select_range(2..6, false);
+        let actions = press(&mut editor, key(Key::Delete));
+        assert!(matches!(&actions[..], [HexAction::Delete(range)] if range == &(2..6)));
+        press(&mut editor, key(Key::Insert));
+        assert!(editor.edit_mode && !editor.insert_mode, "Insert switches back to Overwrite");
+        editor.set_can_resize(false);
+        assert!(press(&mut editor, key(Key::Delete)).is_empty());
+        press(&mut editor, key(Key::Insert));
+        assert!(!editor.insert_mode, "fixed-offset decoders keep the length");
+    }
+
+    #[test]
+    fn shifting_offsets_moves_named_ranges_and_drops_deleted_ones() {
+        let mut editor = HexEditor::default();
+        let bookmark = |range| HexHighlight { range, name: "range".into(), color: Color32::RED };
+        editor.bookmarks = vec![bookmark(0..4), bookmark(10..14), bookmark(20..30)];
+        editor.select_range(22..25, false);
+        editor.shift(8, 8, 0);
+        let ranges: Vec<_> = editor.bookmarks.iter().map(|b| b.range.clone()).collect();
+        assert_eq!(ranges, [0..4, 12..22], "the range inside the deleted bytes is gone");
+        assert_eq!(editor.selection(), Some(14..17));
+        editor.shift(12, 3, 0);
+        assert_eq!(editor.bookmarks[1].range, 12..19);
+        assert_eq!(editor.selection(), Some(12..14));
     }
 
     #[test]

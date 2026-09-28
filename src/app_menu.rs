@@ -129,7 +129,7 @@ pub fn menus(s: &State) -> Vec<Item> {
         action("Open file...", OpenFile, s.available),
         action("Open simple demo", SimpleDemo, s.available),
         action("Open advanced demo", AdvancedDemo, s.available),
-        action("Save edited copy...", SaveCopy, s.available && s.file),
+        action("Save bytes...", SaveCopy, s.available && s.file),
         action("Extract selection...", Extract, s.available && s.selection),
         action("Cancel operation", Cancel, s.busy),
     ];

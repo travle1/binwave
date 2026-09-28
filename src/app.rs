@@ -1434,13 +1434,20 @@ impl BinwaveApp {
                 }
             });
             if self.binary.has_file() {
-                let len = self.binary.file_len();
-                ui.label(egui::RichText::new(format!("{} · {}{}",
-                    crate::format::size(len as u64),
+                let (len, saved) = (self.binary.file_len() as u64, self.binary.saved_len() as u64);
+                let change = match len.cmp(&saved) {
+                    std::cmp::Ordering::Greater => format!(" · +{}", crate::format::size(len - saved)),
+                    std::cmp::Ordering::Less => format!(" · −{}", crate::format::size(saved - len)),
+                    std::cmp::Ordering::Equal => String::new(),
+                };
+                ui.label(egui::RichText::new(format!("{}{change} · {}{}",
+                    crate::format::size(len),
                     self.binary.default_byte_order().unwrap_or("byte order unspecified"),
                     if self.binary.is_dirty() { " · unsaved changes" } else { "" }))
                     .size(t.font.small).color(t.color.text.muted))
-                    .on_hover_text(crate::format::exact_bytes(len as u64));
+                    .on_hover_text(if change.is_empty() { crate::format::exact_bytes(len) } else {
+                        format!("{} (saved: {})", crate::format::exact_bytes(len), crate::format::exact_bytes(saved))
+                    });
                 let partial = self.data_partial || self.binary.status().1;
                 let (badge, color) = if self.binary.is_decoding() { ("Decoding", t.color.accent.base) }
                     else if partial { ("Partial decode", t.color.status.warning) }
@@ -1456,7 +1463,7 @@ impl BinwaveApp {
                 chosen = app_menu::overflow_menu(ui, &menus, &panels);
                 if ui.add_enabled(self.binary.has_file(), egui::Button::new("Export")
                     .stroke(egui::Stroke::new(t.size.frame_border, t.color.border.control)))
-                    .on_hover_text("Save an edited copy of this file").clicked() { export = true; }
+                    .on_hover_text("Save bytes (Ctrl+Shift+S)").clicked() { export = true; }
             });
         });
         if open_file { self.choose_data_file(&ctx); }
