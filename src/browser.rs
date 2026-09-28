@@ -1236,7 +1236,7 @@ impl BrowserApp {
         } else if self.decoding {
             ("Running decoder…", "The last results remain visible.", crate::theme::DARK.color.accent.base)
         } else if current {
-            ("Results are current", "Structure, Signal, Samples, Inspector and Hex use this run.", crate::theme::DARK.color.status.success)
+            ("Results are current", "Structure, Signal, Table, Inspector and Hex use this run.", crate::theme::DARK.color.status.success)
         } else if self.name.is_empty() {
             ("Open a data file to run this decoder", "Use Open file in the sidebar.", crate::theme::DARK.color.text.muted)
         } else {
@@ -1249,29 +1249,30 @@ impl BrowserApp {
         self.editor.editor(ui, &mut self.yaml, self.language);
         source_editor_focus(self.editor.focused());
     }
+    /// Collections in decoder order with their counts, as on the desktop Table.
     fn collection_picker(&mut self, ui: &mut egui::Ui) {
         let mut selected = self.collection.clone();
         let samples = self.samples_path();
-        egui::ComboBox::from_id_salt("collection")
-            .selected_text(if selected.is_empty() {
-                "Run a decoder"
-            } else {
-                &selected
-            })
-            .show_ui(ui, |ui| {
-                if let Some(arrays) = self.decoded["collections"].as_array() {
-                    for a in arrays {
-                        let path = a["path"].as_str().unwrap_or("");
-                        let count = a["count"].as_str().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-                        let label = if samples.as_deref() == Some(path) {
-                            crate::format::plural(count, "sample", "samples")
-                        } else {
-                            crate::format::plural(count, "item", "items")
-                        };
-                        ui.selectable_value(&mut selected, path.into(), format!("{path} · {label}"));
-                    }
-                }
-            });
+        ui.horizontal_wrapped(|ui| {
+            let Some(arrays) = self.decoded["collections"].as_array() else {
+                ui.weak("Run a decoder to list its collections.");
+                return;
+            };
+            for a in arrays {
+                let path = a["path"].as_str().unwrap_or("");
+                let count = a["count"].as_str().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+                let name = path.rsplit('.').next().unwrap_or(path);
+                let mut chars = name.chars();
+                let name: String = chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect());
+                let noun = if samples.as_deref() == Some(path) {
+                    crate::format::plural(count, "sample", "samples")
+                } else {
+                    crate::format::plural(count, "item", "items")
+                };
+                ui.selectable_value(&mut selected, path.into(), format!("{name} ({})", crate::format::count(count)))
+                    .on_hover_text(format!("{path}\n{noun}"));
+            }
+        });
         if selected != self.collection {
             self.select_collection(selected);
         }

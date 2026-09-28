@@ -20,6 +20,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+#[path = "structure_table.rs"]
+mod table;
+
 const PAGE_SIZE: usize = 128;
 // Large records contain nested lazy arrays. Keep one inspector request small
 // instead of constructing 128 complete record trees regardless of record size.
@@ -97,17 +100,6 @@ struct TableAnchor {
     bytes: Range<usize>,
 }
 
-struct TableNavigation {
-    label: String,
-    path: String,
-    group: bool,
-    depth: usize,
-}
-enum TableLine {
-    Navigation(usize),
-    Sample(usize),
-}
-
 #[derive(Default)]
 pub struct StructureViews {
     selected: Option<String>,
@@ -119,7 +111,7 @@ pub struct StructureViews {
     tree_jump_definition: Option<String>,
     tree_reveal_hex: bool,
     table_target: String,
-    table_open_groups: HashSet<String>,
+    table: table::TableState,
     table_anchor: Option<TableAnchor>,
     table_jump: usize,
     navigation_selection: Option<Range<usize>>,
@@ -432,6 +424,7 @@ impl StructureViews {
         self.source_revision
             .is_some_and(|revision| revision != output.revision)
     }
+    #[cfg(test)]
     fn page_nodes(&self, path: &str, revision: u64) -> Option<&[Node]> {
         self.page_for(path, revision)
             .and_then(|page| page.result.as_ref().ok())
@@ -469,6 +462,7 @@ impl StructureViews {
     fn collection_node<'a>(&'a self, output: &'a ParseOutput, path: &str) -> Option<&'a Node> {
         find_node(&output.nodes, path)
             .or_else(|| self.flattened_collections.iter().find(|node| node.path == path))
+            .or_else(|| self.table.known.get(path).filter(|node| is_collection(node)))
     }
     fn discover_flattened_collections(&mut self, output: &ParseOutput) {
         let mut found = Vec::new();
@@ -863,9 +857,8 @@ impl StructureViews {
         if reveal_definition.is_some() { self.tree_jump_definition = reveal_definition; }
         if reveal_hex { self.tree_reveal_hex = true; }
         if let Some(node) = toggle {
-            if is_collection(&node) && find_node(&output.nodes, &node.path).is_some() {
-                self.table_target = node.path.clone();
-                self.target_initialized = true;
+            if is_collection(&node) {
+                self.open_table_target(node.path.clone(), Some(node.clone()), false);
             }
             if !self.expanded.remove(&node.path) {
                 self.expanded.insert(node.path.clone());
@@ -874,9 +867,8 @@ impl StructureViews {
             clicked = Some(self.select(&node));
         }
         if let Some(node) = node_click {
-            if is_collection(&node) && find_node(&output.nodes, &node.path).is_some() {
-                self.table_target = node.path.clone();
-                self.target_initialized = true;
+            if is_collection(&node) {
+                self.open_table_target(node.path.clone(), Some(node.clone()), false);
             }
             self.request(&node, 0, output.revision, ui.ctx());
             clicked = Some(self.select(&node));
@@ -983,40 +975,6 @@ impl StructureViews {
         collections.extend(self.flattened_collections.iter());
         samples_collection(collections, output).map(|node| node.path.clone())
     }
-    fn target_controls(&mut self, ui: &mut Ui, output: &ParseOutput) {
-        self.initialize_target(output);
-        let mut collections = Vec::new();
-        collect_collections(&output.nodes, &mut collections);
-        let mut collections: Vec<Node> = collections.into_iter().cloned().collect();
-        collections.extend(self.flattened_collections.iter().cloned());
-        let samples = self.samples_path(output).as_deref() == Some(self.table_target.as_str());
-        let selected_text = if self.table_target.is_empty() {
-            "File elements".to_owned()
-        } else if let Some(node) = collections.iter().find(|node| node.path == self.table_target) {
-            collection_label(node, samples)
-        } else {
-            self.table_target.clone()
-        };
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Data");
-            ui.strong(selected_text);
-        });
-        if let Some(node) = self.collection_node(output, &self.table_target).cloned() {
-            if node.lazy.is_some() {
-                self.page_controls(ui, &node, output.revision, !samples);
-            } else {
-                let count = collection_count(&node);
-                ui.weak(format!(
-                    "{} {} · {}",
-                    crate::format::count(count),
-                    row_noun(samples, count),
-                    crate::format::byte_range(node.range.start as u64, node.range.end as u64)
-                ));
-            }
-        } else if collections.is_empty() {
-            ui.weak("No collections are defined. In Decoder, repeat a structure by count or until end to create one.");
-        }
-    }
     fn page_controls(&mut self, ui: &mut Ui, node: &Node, revision: u64, item_navigation: bool) {
         let Some(array) = &node.lazy else {
             return;
@@ -1106,6 +1064,7 @@ impl StructureViews {
         }).collect();
         self.expanded.extend(moved);
     }
+    #[cfg(test)]
     fn target_rows<'a>(&'a self, output: &'a ParseOutput) -> &'a [Node] {
         match self.collection_node(output, &self.table_target) {
             Some(node) if node.lazy.is_some() => {
@@ -1114,346 +1073,6 @@ impl StructureViews {
             Some(node) => &node.children,
             None => &output.nodes,
         }
-    }
-
-    fn table_navigation(&mut self, output: &ParseOutput) -> Vec<TableNavigation> {
-        let mut collections = Vec::new();
-        collect_collections(&output.nodes, &mut collections);
-        collections.extend(self.flattened_collections.iter());
-        let (mut single, groups) = grouped_collection_choices(&collections);
-        single.sort_by_key(|node| node.path != self.table_target);
-        let mut groups: Vec<_> = groups.into_iter().collect();
-        groups.sort_by_key(|(_, sensors)| !sensors.iter().any(|(_, node)| node.path == self.table_target));
-        let grouped_containers: HashSet<_> = groups.iter().filter_map(|(key, _)|
-            key.rsplit_once('.').map(|(path, _)| path.to_owned())).collect();
-        let mut navigation = Vec::new();
-        if self.table_target.is_empty() {
-            navigation.push(TableNavigation { label: "▾ File elements".into(), path: String::new(), group: false, depth: 0 });
-        }
-        if single.iter().any(|node| node.path == self.table_target) {
-            for node in &single {
-                if grouped_containers.contains(&node.path) { continue; }
-                navigation.push(TableNavigation {
-                    label: format!("{} {}", if node.path == self.table_target { "▾" } else { "▸" }, node.name),
-                    path: node.path.clone(), group: false, depth: 0,
-                });
-            }
-        }
-        for (key, sensors) in groups {
-            if sensors.iter().any(|(_, node)| node.path == self.table_target) {
-                self.table_open_groups.insert(key.clone());
-            }
-            let open = self.table_open_groups.contains(&key);
-            let label = key.rsplit('.').nth(1).unwrap_or(&key);
-            navigation.push(TableNavigation {
-                label: format!("{} {label} · {}", if open { "▾" } else { "▸" },
-                    crate::format::plural(sensors.len() as u64, "item", "items")),
-                path: key,
-                group: true,
-                depth: 0,
-            });
-            if open {
-                let mut sensors = sensors;
-                sensors.sort_by_key(|(_, node)| node.path != self.table_target);
-                for (index, node) in sensors {
-                    navigation.push(TableNavigation {
-                        label: format!("{} Item {index}", if node.path == self.table_target { "▾" } else { "▸" }),
-                        path: node.path.clone(),
-                        group: false,
-                        depth: 1,
-                    });
-                }
-            }
-        }
-        if !single.iter().any(|node| node.path == self.table_target) {
-            for node in single {
-                if grouped_containers.contains(&node.path) { continue; }
-                navigation.push(TableNavigation {
-                    label: format!("{} {}", if node.path == self.table_target { "▾" } else { "▸" }, node.name),
-                    path: node.path.clone(), group: false, depth: 0,
-                });
-            }
-        }
-        if !self.table_target.is_empty() {
-            navigation.push(TableNavigation { label: "▸ File elements".into(), path: String::new(), group: false, depth: 0 });
-        }
-        navigation
-    }
-
-    pub fn table(
-        &mut self,
-        ui: &mut Ui,
-        output: &ParseOutput,
-        program: Option<&Program>,
-        source: ByteView,
-    ) -> Option<Range<usize>> {
-        self.tick(ui.ctx(), source.clone());
-        self.discover_flattened_collections(output);
-        if self.stale(output) {
-            ui.label("Bytes changed. Press ▶ Run (F5) to refresh the table.");
-            return None;
-        }
-        self.start_nested_discovery(output, source, ui.ctx());
-        if let Some(error) = &self.discovery_error { ui.colored_label(Color32::LIGHT_RED, error); }
-        self.target_controls(ui, output);
-        let samples_target = self.samples_path(output).as_deref() == Some(self.table_target.as_str());
-        ui.weak(if samples_target {
-            "Click a sample or value · Shift-click to select a range of whole samples."
-        } else {
-            "Click an item or value · Shift-click to select a range of whole items."
-        });
-        let navigation = self.table_navigation(output);
-        let rows = self.target_rows(output);
-        let mut lines = Vec::with_capacity(navigation.len() + rows.len());
-        for (index, entry) in navigation.iter().enumerate() {
-            lines.push(TableLine::Navigation(index));
-            if !entry.group && entry.path == self.table_target {
-                lines.extend((0..rows.len()).map(TableLine::Sample));
-            }
-        }
-        let columns = table_columns(rows);
-        let selected = self.selected.as_deref();
-        let selected_bytes = self.last_hex_selection.as_ref();
-        let selected_row = rows.iter().position(|node| {
-            selected_bytes.is_some_and(|range| ranges_overlap(range, &node.range))
-                || selected.is_some_and(|path| contains_path(&node.path, path))
-        });
-        let reveal = self.reveal_selected_row && selected_row.is_some();
-        let reveal_line = selected_row.and_then(|selected| lines.iter().position(|line|
-            matches!(line, TableLine::Sample(index) if *index == selected)));
-        let first = self.page_for(&self.table_target, output.revision)
-            .map_or(0, |page| page.key.start);
-        let sample_collection = !self.table_target.is_empty();
-        let mut chosen = None;
-        let row_height = 26.;
-        let row_label = if samples_target { "sample" } else { "item" };
-        let metadata = [
-            if samples_target { "Sample" } else { "Item" },
-            "Byte offset",
-            "Bytes",
-        ];
-        let widths = [220., 120., 72.];
-        let available = ui.available_width();
-        let value_width =
-            ((available - widths.iter().sum::<f32>()) / columns.len().max(1) as f32).max(116.);
-        let table_width =
-            (widths.iter().sum::<f32>() + value_width * columns.len() as f32).max(available);
-        let mut navigation_click: Option<(String, bool)> = None;
-        egui::ScrollArea::horizontal()
-            .id_salt("decoded_table_horizontal")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.set_min_width(table_width);
-                ui.spacing_mut().item_spacing = egui::vec2(0., 0.);
-                ui.horizontal(|ui| {
-                    for (label, width) in metadata.into_iter().zip(widths) {
-                        table_cell(ui, label, width, row_height, false, false, true);
-                    }
-                    for name in &columns {
-                        table_cell(
-                            ui,
-                            if name.is_empty() { "Value" } else { name },
-                            value_width,
-                            row_height,
-                            false,
-                            false,
-                            true,
-                        )
-                        .on_hover_text(name);
-                    }
-                });
-                ui.separator();
-                let mut scroll = egui::ScrollArea::vertical()
-                    .id_salt(("decoded_table_vertical", &self.table_target))
-                    .auto_shrink([false, false]);
-                if reveal {
-                    scroll =
-                        scroll.vertical_scroll_offset(reveal_line.unwrap_or(0) as f32 * row_height);
-                }
-                scroll.show_rows(ui, row_height, lines.len(), |ui, range| {
-                    for line in range {
-                        if let TableLine::Navigation(index) = lines[line] {
-                            let entry = &navigation[index];
-                            let label = format!("{}{}", "  ".repeat(entry.depth), entry.label);
-                            let active = !entry.group && entry.path == self.table_target;
-                            if active {
-                                ui.painter().rect_filled(
-                                    egui::Rect::from_min_size(ui.cursor().min,
-                                        egui::vec2(table_width, row_height)),
-                                    egui::CornerRadius::same(crate::theme::DARK.radius.row),
-                                    crate::theme::DARK.color.surface.active,
-                                );
-                            }
-                            ui.horizontal(|ui| {
-                                if table_cell(ui, &label, widths[0], row_height,
-                                    false, true, false)
-                                    .on_hover_text(&entry.path).clicked() {
-                                    navigation_click = Some((entry.path.clone(), entry.group));
-                                }
-                                for width in widths.iter().skip(1) {
-                                    table_cell(ui, "", *width, row_height, false, false, false);
-                                }
-                                for _ in &columns {
-                                    table_cell(ui, "", value_width, row_height, false, false, false);
-                                }
-                            });
-                            continue;
-                        }
-                        let TableLine::Sample(index) = lines[line] else { continue; };
-                        let node = &rows[index];
-                        ui.push_id(&node.path, |ui| {
-                            let row_selected = selected_bytes
-                                .is_some_and(|range| ranges_overlap(range, &node.range));
-                            let row_rect = egui::Rect::from_min_size(
-                                ui.cursor().min,
-                                egui::vec2(table_width, row_height),
-                            );
-                            if row_selected {
-                                ui.painter().rect_filled(
-                                    row_rect,
-                                    0.,
-                                    ui.visuals().selection.bg_fill.gamma_multiply(0.35),
-                                );
-                            } else if index % 2 == 1 {
-                                ui.painter()
-                                    .rect_filled(row_rect, 0., ui.visuals().faint_bg_color);
-                            }
-                            ui.horizontal(|ui| {
-                                let label = if sample_collection {
-                                    (first + index).to_string()
-                                } else {
-                                    node.name.clone()
-                                };
-                                if table_cell_aligned(
-                                    ui,
-                                    &label,
-                                    widths[0],
-                                    row_height,
-                                    selected == Some(&node.path),
-                                    true,
-                                    false,
-                                    sample_collection,
-                                )
-                                .on_hover_text(format!(
-                                    "Select whole {row_label}\n{}\n{}",
-                                    node.path,
-                                    crate::format::byte_range(node.range.start as u64, node.range.end as u64)
-                                ))
-                                .clicked()
-                                {
-                                    chosen = Some((node.clone(), node.clone()));
-                                }
-                                if table_numeric_cell(
-                                    ui,
-                                    &crate::format::offset(node.range.start as u64),
-                                    widths[1],
-                                    row_height,
-                                    false,
-                                    true,
-                                    false,
-                                )
-                                .clicked()
-                                {
-                                    chosen = Some((node.clone(), node.clone()));
-                                }
-                                if table_numeric_cell(
-                                    ui,
-                                    &node.range.len().to_string(),
-                                    widths[2],
-                                    row_height,
-                                    false,
-                                    true,
-                                    false,
-                                )
-                                .clicked()
-                                {
-                                    chosen = Some((node.clone(), node.clone()));
-                                }
-                                for name in &columns {
-                                    if let Some(field) = field_at(node, name) {
-                                        // Enum codes show their meaning, as in Structure: `3 · f64`.
-                                        let parent = name.rsplit_once('.')
-                                            .and_then(|(parent, _)| field_at(node, parent)).unwrap_or(node);
-                                        let text = tree_enum_meaning(field, Some(parent.kind.as_str()), program)
-                                            .map_or_else(|| display(field, 180),
-                                                |meaning| format!("{} · {meaning}", display(field, 180)));
-                                        if table_cell_aligned(
-                                            ui,
-                                            &text,
-                                            value_width,
-                                            row_height,
-                                            selected == Some(&field.path),
-                                            true,
-                                            false,
-                                            field.value.as_ref().and_then(Value::numeric).is_some(),
-                                        )
-                                        .on_hover_text(format!(
-                                            "{}\n{} · {}\n{}",
-                                            field.path,
-                                            field.kind,
-                                            crate::format::byte_range(field.range.start as u64, field.range.end as u64),
-                                            display(field, 600)
-                                        ))
-                                        .clicked()
-                                        {
-                                            chosen = Some((node.clone(), field.clone()));
-                                        }
-                                    } else {
-                                        table_cell(
-                                            ui,
-                                            "—",
-                                            value_width,
-                                            row_height,
-                                            false,
-                                            false,
-                                            false,
-                                        );
-                                    }
-                                }
-                            });
-                        });
-                    }
-                });
-            });
-        if reveal {
-            self.reveal_selected_row = false;
-        }
-        if let Some((path, group)) = navigation_click {
-            if group {
-                if !self.table_open_groups.insert(path.clone()) {
-                    self.table_open_groups.remove(&path);
-                    if self.flattened_collections.iter().any(|node|
-                        node.path == self.table_target
-                            && sensor_group_key(node).is_some_and(|(key, _)| key == path)) {
-                        self.table_target.clear();
-                    }
-                }
-            } else {
-                self.table_target = if self.table_target == path { String::new() } else { path };
-                if !self.table_target.is_empty() && self.flattened_collections.iter().any(|node|
-                    node.path == self.table_target && sensor_group_key(node).is_some()) {
-                    self.plot_sources.clear();
-                    self.plot_sources.insert(self.table_target.clone());
-                    self.plot_sources_initialized = true;
-                    self.plot_target = self.table_target.clone();
-                    self.plot_catalog_target.clear();
-                    self.plot_view = None;
-                    self.plot_force_view = None;
-                    self.plot_fit_y = true;
-                    self.plot_reader.invalidate();
-                    self.extra_plot_readers.clear();
-                    self.group_plot_readers.clear();
-                    self.group_plan_cache = None;
-                }
-            }
-            self.table_anchor = None;
-            self.reveal_selected_row = false;
-        }
-        chosen
-            .map(|(row, field)| {
-                self.select_table_node(output, &row, &field, ui.input(|i| i.modifiers.shift))
-            })
-            .or_else(|| self.navigation_selection.take())
     }
 
     fn initialize_plot(&mut self, output: &ParseOutput) {
@@ -3409,13 +3028,6 @@ fn leaf_columns(node: &Node, prefix: &str, columns: &mut Vec<String>) {
         leaf_columns(child, &path, columns);
     }
 }
-fn table_columns(rows: &[Node]) -> Vec<String> {
-    let mut columns = Vec::new();
-    for node in rows {
-        leaf_columns(node, "", &mut columns);
-    }
-    columns
-}
 fn field_at<'a>(node: &'a Node, path: &str) -> Option<&'a Node> {
     if path.is_empty() {
         return Some(node);
@@ -3437,89 +3049,6 @@ fn highlight_fields<'a>(node: &'a Node, fields: &mut Vec<&'a Node>) {
             highlight_fields(child, fields);
         }
     }
-}
-fn table_cell(
-    ui: &mut Ui,
-    text: &str,
-    width: f32,
-    height: f32,
-    selected: bool,
-    clickable: bool,
-    header: bool,
-) -> egui::Response {
-    table_cell_aligned(ui, text, width, height, selected, clickable, header, false)
-}
-fn table_numeric_cell(
-    ui: &mut Ui,
-    text: &str,
-    width: f32,
-    height: f32,
-    selected: bool,
-    clickable: bool,
-    header: bool,
-) -> egui::Response {
-    table_cell_aligned(ui, text, width, height, selected, clickable, header, true)
-}
-fn table_cell_aligned(
-    ui: &mut Ui,
-    text: &str,
-    width: f32,
-    height: f32,
-    selected: bool,
-    clickable: bool,
-    header: bool,
-    numeric: bool,
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(width, height),
-        if clickable {
-            egui::Sense::click()
-        } else {
-            egui::Sense::hover()
-        },
-    );
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, text)
-    });
-    if ui.is_rect_visible(rect) {
-        let visuals = ui.style().interact_selectable(&response, selected);
-        if selected || clickable && response.hovered() {
-            ui.painter().rect_filled(
-                rect.shrink(1.),
-                egui::CornerRadius::same(crate::theme::DARK.radius.row),
-                if selected {
-                    ui.visuals().selection.bg_fill
-                } else {
-                    visuals.weak_bg_fill
-                },
-            );
-        }
-        let color = if selected {
-            ui.visuals().selection.stroke.color
-        } else {
-            visuals.text_color()
-        };
-        let font = if header {
-            egui::TextStyle::Button.resolve(ui.style())
-        } else {
-            egui::TextStyle::Monospace.resolve(ui.style())
-        };
-        let (position, alignment) = if numeric {
-            (rect.right_center() - egui::vec2(6., 0.), egui::Align2::RIGHT_CENTER)
-        } else {
-            (rect.left_center() + egui::vec2(6., 0.), egui::Align2::LEFT_CENTER)
-        };
-        ui.painter()
-            .with_clip_rect(rect.shrink2(egui::vec2(6., 0.)))
-            .text(
-                position,
-                alignment,
-                text,
-                font,
-                color,
-            );
-    }
-    response
 }
 fn flatten_visible<'a>(
     nodes: &'a [Node],
@@ -4463,9 +3992,18 @@ actions:
         }
         let mut views = StructureViews::default();
         views.flattened_collections = flat;
-        let navigation = views.table_navigation(&output);
-        assert!(navigation.iter().any(|entry| entry.group && entry.label.contains("Primary")));
-        assert!(navigation.iter().any(|entry| entry.group && entry.label.contains("AUX")));
+        let chips = views.table_chips(&output);
+        for channel in ["Primary", "AUX"] {
+            let channel = chips.iter().flat_map(|chip| &chip.channels)
+                .find(|candidate| candidate.label == channel).unwrap();
+            assert_eq!(channel.members.len(), 2, "one channel per sensor group, not per sensor");
+        }
+        // All channels share one chip; the real collection keeps its own.
+        let with_channels: Vec<_> = chips.iter().filter(|chip| !chip.channels.is_empty()).collect();
+        assert_eq!(with_channels.len(), 1, "channels must not each become a chip");
+        assert_eq!(with_channels[0].channels.len(), 2);
+        assert!(chips.iter().any(|chip| chip.channels.is_empty() && chip.label.starts_with("Blocks (130")),
+            "{:?}", chips.iter().map(|chip| &chip.label).collect::<Vec<_>>());
     }
     #[test]
     fn configured_groups_expose_each_position_across_records() {
@@ -4622,6 +4160,13 @@ actions:
         render_plot(&ctx, &mut views, &output, &store, vec![], Default::default());
         assert!(views.plot_overlay.as_ref().is_some_and(|(_, data)|
             data.series.contains_key("blocks.payload.field_0[2].values / value")));
+        // The Table picker shows one chip for the discovered channels, not one per position.
+        let chips = views.table_chips(&output);
+        let grouped: Vec<_> = chips.iter().filter(|chip| !chip.channels.is_empty()).collect();
+        assert_eq!(grouped.len(), 1, "{:?}", chips.iter().map(|chip| &chip.label).collect::<Vec<_>>());
+        assert!(grouped[0].label.starts_with("Payload ("), "{}", grouped[0].label);
+        assert_eq!(grouped[0].channels[0].label, "field_0");
+        assert!(grouped[0].channels[0].members.len() > 1);
     }
     #[test]
     fn indexed_virtual_series_supports_lazy_group_values() {
@@ -4806,15 +4351,16 @@ actions:
     fn selecting_root_elements_remains_selected_across_frames() {
         let (store, output) = array();
         let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
         let mut views = StructureViews::default();
         views.tick(&ctx, store.view());
         let _ = ctx.run(Default::default(), |_ctx, ui| {
-            egui::CentralPanel::default().show(ui, |ui| views.target_controls(ui, &output));
+            egui::CentralPanel::default().show(ui, |ui| { views.table(ui, &output, None, store.view()); });
         });
         assert_eq!(views.table_target, "items");
         views.table_target.clear();
         let _ = ctx.run(Default::default(), |_ctx, ui| {
-            egui::CentralPanel::default().show(ui, |ui| views.target_controls(ui, &output));
+            egui::CentralPanel::default().show(ui, |ui| { views.table(ui, &output, None, store.view()); });
         });
         assert!(views.table_target.is_empty());
     }
@@ -4923,6 +4469,13 @@ actions:
         );
         assert_eq!(views.selected_node(&output).unwrap().path, "header.count");
     }
+    /// Column names of the Table layout for these rows.
+    fn table_columns(rows: &[Node]) -> Vec<String> {
+        table::table_layout(rows).into_iter().map(|column| match column {
+            table::TableColumn::Field(name) | table::TableColumn::Payload(name) => name,
+        }).collect()
+    }
+
     fn table_frame(
         ctx: &egui::Context,
         views: &mut StructureViews,
@@ -4971,13 +4524,24 @@ actions:
             .find_map(|shape| {
                 if let egui::Shape::Text(text) = &shape.shape {
                     if text.galley.text().trim() == label && text.pos.x < 250. {
-                        return Some(text.pos + text.galley.size() * 0.5);
+                        // Row numbers are right-aligned; use the placed text rect.
+                        return Some(text.galley.rect.translate(text.pos.to_vec2()).center());
                     }
                 }
                 None
             })
             .expect("sample number should be visible");
-        let pos = if field { egui::pos2(750., pos.y) } else { pos };
+        // Field clicks land in the pair.a column, wherever the layout puts it.
+        let pos = if field {
+            let x = frame.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "pair.a" =>
+                    Some(text.galley.rect.translate(text.pos.to_vec2()).center().x),
+                _ => None,
+            }).expect("pair.a column should be visible");
+            egui::pos2(x, pos.y)
+        } else {
+            pos
+        };
         let modifiers = egui::Modifiers {
             shift,
             ..Default::default()
@@ -5024,6 +4588,7 @@ actions:
     fn rendered_table_shift_click_preserves_anchor_and_selects_whole_samples() {
         let (store, output) = records();
         let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
         let mut views = StructureViews::default();
         views.initialize_target(&output);
         views.request(&output.nodes[2], 0, output.revision, &ctx);
@@ -5239,6 +4804,7 @@ actions:
         );
         settle(&mut views, store.view());
         let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -5256,8 +4822,9 @@ actions:
         let first = render();
         let labels = texts(&first.shapes);
         for label in [
-            "Sample",
-            "Byte offset",
+            "#",
+            "Offset",
+            "Size",
             "timestamp",
             "pair.z",
             "pair.a",
@@ -5275,7 +4842,7 @@ actions:
             });
         });
         let labels = texts(&scrolled.shapes);
-        for label in ["Sample", "timestamp", "100"] {
+        for label in ["#", "timestamp", "100"] {
             assert!(
                 labels.iter().any(|text| text == label),
                 "missing {label} after scroll in {labels:?}"

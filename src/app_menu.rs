@@ -184,7 +184,7 @@ pub fn menus(s: &State) -> Vec<Item> {
         action("Hex", Hex, true),
         action("Structure", Structures, true),
         action("Signal", Plot, true),
-        action("Samples", Samples, true),
+        action("Table", Samples, true),
         action("Decoder", Code, true),
         action("Inspector", Inspector, true),
         action("Reset workspace", Reset, true),

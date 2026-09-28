@@ -895,7 +895,7 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.heading("Binwave decoder guide");
-            ui.label("A decoder describes how bytes become named values. Open a data file, edit the decoder, then press ▶ Run (F5). A successful run publishes the same decoded structure to Signal, Samples, Inspector, and Hex.");
+            ui.label("A decoder describes how bytes become named values. Open a data file, edit the decoder, then press ▶ Run (F5). A successful run publishes the same decoded structure to Signal, Table, Inspector, and Hex.");
             ui.label("This guide documents Binwave's decoder types and cursor rules. YAML is the declarative format; Python is available when the layout needs loops, validation, or other program logic.");
             ui.separator();
 
@@ -1065,7 +1065,7 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
                     ui.label("Field(name, type, length=None, count=None, offset=None, endian=None, expect=None) accepts a fixed numeric type, string, bytes, or another Struct. (name, type) is shorthand.");
                     ui.label("Struct(name, fields, endian=None) creates a fixed layout and exposes size and fields.");
                     ui.label("file.size is the byte length. file.tell() and file.seek(offset, whence=0) control the cursor. file.read(length) advances it; file.read_at(offset, length) does not. file.unpack(format, offset=None) uses Python struct formats.");
-                    ui.label("file.read_struct(name, struct, offset=None) decodes metadata now. file.records(name, struct, count=None, offset=None) registers a lazy collection for Signal and Samples. Without count, records consumes complete records to the end of the file.");
+                    ui.label("file.read_struct(name, struct, offset=None) decodes metadata now. file.records(name, struct, count=None, offset=None) registers a lazy collection for Signal and Table. Without count, records consumes complete records to the end of the file.");
                     ui.strong("Calculated checksum example");
                     ui.code("import zlib\n\ndef crc32_range(start, length):\n    crc = 0\n    while length:\n        size = min(length, 1024 * 1024)\n        crc = zlib.crc32(file.read_at(start, size), crc)\n        start += size\n        length -= size\n    return crc & 0xFFFFFFFF\n\nif crc32_range(payload_start, payload_bytes) != stored_checksum:\n    raise ValueError('checksum mismatch')");
                     ui.label("A single read/read_at call is limited to 1 MiB, so calculated validation over larger ranges must use bounded chunks as shown above.");
@@ -1074,7 +1074,7 @@ pub(crate) fn decoding_guide(ui: &mut Ui) {
 
             egui::CollapsingHeader::new("Large files and lazy decoding")
                 .show(ui, |ui| {
-                    ui.label("Fixed-size collections are kept lazy: Binwave stores the collection plan and decodes only the pages requested by Signal, Samples, Inspector, or Hex. This is the preferred representation for very large recordings.");
+                    ui.label("Fixed-size collections are kept lazy: Binwave stores the collection plan and decodes only the pages requested by Signal, Table, Inspector, or Hex. This is the preferred representation for very large recordings.");
                     ui.label("Variable-size records must be scanned to discover their boundaries. A tagged record containing choose is variable-size unless every selected layout has a known common stride. Keep each record length-delimited when the format provides a length.");
                     ui.label("Use file.records in Python or a fixed-size repeated structure in YAML for large homogeneous arrays. Avoid turning a large raw payload into one decoded node per byte.");
                 });

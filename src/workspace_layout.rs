@@ -52,7 +52,7 @@ impl Pane {
             Self::ParsingMap => "Parsing map",
             Self::Layout => "Decoder",
             Self::Plot => "Signal",
-            Self::Table => "Samples",
+            Self::Table => "Table",
             Self::Hex => "Hex",
         }
     }

@@ -1789,9 +1789,9 @@ impl BinaryWorkspace {
         } else if self.is_decoding() {
             "The last successful results remain visible while this run completes."
         } else if matches!(self.decoder_status(), "Decoded" | "Script finished") {
-            "Structure, Signal, Samples, Inspector, and Hex now use these results."
+            "Structure, Signal, Table, Inspector, and Hex now use these results."
         } else {
-            "Press ▶ Run (F5) to update Structure, Signal, Samples, Inspector, and Hex."
+            "Press ▶ Run (F5) to update Structure, Signal, Table, Inspector, and Hex."
         }
     }
 

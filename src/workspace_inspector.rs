@@ -54,7 +54,7 @@ pub fn empty_selection(ui: &mut Ui, has_file: bool, has_decoded: bool) {
     } else if has_decoded {
         (
             "Select a field or byte range",
-            "Choose a field in Structure, a point in Signal, a row in Samples, or bytes in Hex. The linked selection appears here.",
+            "Choose a field in Structure, a point in Signal, a row in Table, or bytes in Hex. The linked selection appears here.",
         )
     } else {
         (

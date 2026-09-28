@@ -11,7 +11,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const PAGE: usize = 64 * 1024;
-const WINDOW_ROWS: usize = 65_536;
+pub(crate) const WINDOW_ROWS: usize = 65_536;
 const COPY_LIMIT: usize = 1024 * 1024;
 const SEARCH_CHUNK: usize = 256 * 1024;
 const MATCH_LIMIT: usize = 10_000;
@@ -1451,7 +1451,7 @@ fn parse_offset(input: &str, len: usize) -> Result<usize, String> {
     Ok(offset)
 }
 
-fn recenter_scroll_window(
+pub(crate) fn recenter_scroll_window(
     start: usize,
     total_rows: usize,
     scroll_y: f32,
@@ -1529,7 +1529,7 @@ fn replacement_bytes(
     Ok((selection.start, bytes))
 }
 
-fn window_start(caret_row: usize, total_rows: usize) -> usize {
+pub(crate) fn window_start(caret_row: usize, total_rows: usize) -> usize {
     if total_rows <= WINDOW_ROWS {
         0
     } else {

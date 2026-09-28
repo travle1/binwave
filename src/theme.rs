@@ -105,6 +105,14 @@ pub struct Sizes {
     pub table_row_height: f32,
     pub hex_row_height: f32,
     pub inspector_width: f32,
+    /// Table panel: row height and initial column widths (# is sized for 7 digits,
+    /// Size for 10+).
+    pub table_row: f32,
+    pub table_index_column: f32,
+    pub table_offset_column: f32,
+    pub table_size_column: f32,
+    pub table_field_column: f32,
+    pub table_item_column: f32,
     pub inspector_min_host_width: f32,
     pub structure_type_min_width: f32,
     pub structure_status_width: f32,
@@ -128,6 +136,8 @@ pub struct Gaps {
     pub sidebar_row_gap: f32,
     pub sidebar_first_section_top: f32,
     pub sidebar_section_top: f32,
+    /// Indent per nesting level in trees and field lists.
+    pub tree_indent: f32,
 }
 pub struct FontSizes {
     pub title: f32,
@@ -243,6 +253,12 @@ pub const DARK: Theme = Theme {
         table_row_height: 24.,
         hex_row_height: 24.,
         inspector_width: 280.,
+        table_row: 24.,
+        table_index_column: 60.,
+        table_offset_column: 104.,
+        table_size_column: 96.,
+        table_field_column: 116.,
+        table_item_column: 220.,
         inspector_min_host_width: 720.,
         structure_type_min_width: 520.,
         structure_status_width: 22.,
@@ -266,6 +282,7 @@ pub const DARK: Theme = Theme {
         sidebar_row_gap: 2.,
         sidebar_first_section_top: 22.,
         sidebar_section_top: 16.,
+        tree_indent: 12.,
     },
     font: FontSizes {
         title: 14.5,
