@@ -1,6 +1,6 @@
 //! Inspector presentation shared by the native and browser shells.
-use crate::structure::Node;
-use egui::{RichText, Ui};
+use crate::structure::{Node, Program, Value};
+use egui::{Align2, FontFamily, FontId, RichText, Sense, Ui};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
@@ -18,10 +18,52 @@ pub struct FieldInfo {
     pub sample: Option<u64>,
     pub sample_start: Option<u64>,
     pub sample_end: Option<u64>,
+    /// The value as Structure shows it, with the decoder's `cases` meaning: `3 · f64`.
+    #[serde(default)]
+    pub display: String,
+    /// The decoder structure this field belongs to; `None` for top-level reads.
+    #[serde(default)]
+    pub structure: Option<String>,
+    /// The node's own structure type, for items and nested records.
+    #[serde(default)]
+    pub own_structure: Option<String>,
+    /// Byte ranges of the path's parts, when the host resolved them up front.
+    #[serde(default)]
+    pub crumbs: Vec<Crumb>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Crumb {
+    pub path: String,
+    pub start: u64,
+    pub end: u64,
 }
 
 impl FieldInfo {
-    pub fn from_node(node: &Node, sample: Option<(u64, Range<u64>)>) -> Self {
+    /// `parent` is the node containing this one, used to find its structure and
+    /// the meaning of enum values.
+    pub fn from_node(node: &Node, sample: Option<(u64, Range<u64>)>,
+        program: Option<&Program>, parent: Option<&Node>) -> Self {
+        let structure_named = |kind: &str| {
+            let kind = kind.trim_end_matches("[]");
+            program.is_some_and(|program| program.structures.contains_key(kind)).then(|| kind.to_owned())
+        };
+        let parent_kind = parent.map(|parent| parent.kind.trim_end_matches("[]"));
+        let display = match &node.value {
+            Some(value) => {
+                let text = match value {
+                    Value::Signed(number) => crate::format::count(number),
+                    Value::Unsigned(number) => crate::format::count(number),
+                    Value::Text(text) => text.clone(),
+                    _ => node.display(),
+                };
+                match program.and_then(|program| program.enum_meaning(node, parent_kind)) {
+                    Some(meaning) => format!("{text} · {meaning}"),
+                    None => text,
+                }
+            }
+            None => node.display(),
+        };
         Self {
             name: node.name.clone(),
             path: node.path.clone(),
@@ -35,26 +77,104 @@ impl FieldInfo {
             sample: sample.as_ref().map(|(index, _)| *index),
             sample_start: sample.as_ref().map(|(_, range)| range.start),
             sample_end: sample.as_ref().map(|(_, range)| range.end),
+            display,
+            structure: parent_kind.and_then(structure_named),
+            own_structure: structure_named(&node.kind),
+            crumbs: Vec::new(),
         }
     }
-    #[cfg(any(test, target_arch = "wasm32"))]
     pub fn sample_range(&self) -> Option<Range<u64>> {
         self.sample_start
             .zip(self.sample_end)
             .map(|(start, end)| start..end)
     }
+    /// The byte range of a breadcrumb part, when the host supplied it.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // Native resolves parts on click.
+    pub fn crumb(&self, path: &str) -> Option<Range<u64>> {
+        self.crumbs.iter().find(|crumb| crumb.path == path).map(|crumb| crumb.start..crumb.end)
+    }
 }
 
-/// The Inspector docked inside Hex. Its body scrolls both ways, so a long value
-/// scrolls inside the panel instead of widening it over the Hex grid.
-pub fn docked_panel<T>(ui: &mut Ui, id: &str, state: &mut T,
+/// The one-based decoder line that defines this field, found by name within
+/// its structure. Items point at their collection; structured nodes at their type.
+pub fn definition_line(source: &str, field: &FieldInfo) -> Option<usize> {
+    let lines: Vec<&str> = source.lines().collect();
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    let structure_line = |name: &str| lines.iter().position(|line| {
+        line.trim_start().strip_prefix("- name:")
+            .is_some_and(|value| value.trim().trim_matches(['\'', '"']) == name)
+    });
+    if let Some(line) = field.own_structure.as_deref().and_then(structure_line) {
+        return Some(line + 1);
+    }
+    let name = if field.name.starts_with('[') {
+        crate::structure_selection::parent_path(&field.path)
+            .map_or(field.name.as_str(), |collection| collection.rsplit('.').next().unwrap_or(collection))
+    } else {
+        field.name.as_str()
+    };
+    let (first, last) = match field.structure.as_deref() {
+        Some(structure) => {
+            let start = structure_line(structure)?;
+            let end = lines[start + 1..].iter()
+                .position(|line| !line.trim().is_empty() && indent(line) <= indent(lines[start]))
+                .map_or(lines.len(), |offset| start + 1 + offset);
+            (start + 1, end)
+        }
+        None => (lines.iter().position(|line| line.starts_with("actions:")).unwrap_or(0), lines.len()),
+    };
+    (first..last).find(|&index| declares(lines[index], name)).map(|index| index + 1)
+        .or_else(|| field.structure.as_ref().map(|_| first))
+}
+
+/// Whether a YAML line names `name`, in either `- name: x` or `{name: x, …}` form.
+fn declares(line: &str, name: &str) -> bool {
+    line.match_indices("name:").any(|(index, key)| {
+        let before = line[..index].chars().next_back();
+        let value = line[index + key.len()..].trim_start();
+        let value = &value[..value.find([',', '}', ']', '#']).unwrap_or(value.len())];
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && value.trim().trim_matches(['\'', '"']) == name
+    })
+}
+
+/// State of the Inspector's in-place value editor.
+#[derive(Clone, Debug, Default)]
+pub struct ValueEdit {
+    pub text: String,
+    pub original: String,
+    pub error: Option<String>,
+    pub editing: bool,
+}
+impl ValueEdit {
+    pub fn new(value: &str) -> Self {
+        Self { text: value.into(), original: value.into(), ..Self::default() }
+    }
+    fn cancel(&mut self) {
+        self.text.clone_from(&self.original);
+        self.error = None;
+        self.editing = false;
+    }
+}
+
+pub enum FieldAction {
+    /// Select the node at this path (a breadcrumb part).
+    SelectPath(String),
+    JumpToDefinition,
+    /// Encode `ValueEdit::text` into the field's bytes.
+    ApplyValue,
+}
+
+/// The Inspector docked inside Hex. It starts right after Hex's Text column
+/// (`grid_width` is the width the byte grid needs) and never gets narrower than
+/// its minimum. Its body scrolls both ways, so a long value never widens it.
+pub fn docked_panel<T>(ui: &mut Ui, id: &str, state: &mut T, grid_width: f32,
     header: impl FnOnce(&mut T, &mut Ui), body: impl FnOnce(&mut T, &mut Ui)) {
     let t = &crate::theme::DARK;
+    let width = (ui.available_width() - grid_width).max(t.size.inspector_min_width);
     egui::Panel::right(id.to_owned())
-        .resizable(true)
-        .default_size(t.size.inspector_width)
-        .min_size(t.size.inspector_min_width)
-        .max_size(t.size.inspector_max_width)
+        .resizable(false)
+        .exact_size(width)
         .frame(egui::Frame::new()
             .fill(t.color.surface.raised)
             .inner_margin(egui::Margin::same(t.spacing.card_padding as i8))
@@ -65,161 +185,440 @@ pub fn docked_panel<T>(ui: &mut Ui, id: &str, state: &mut T,
         });
 }
 
-/// The Inspector title with its ⋯ menu on the right.
-pub fn header(ui: &mut Ui, menu: impl FnOnce(&mut Ui)) {
+/// "Inspector" with the selection chip on the right: `0x48 · 16 bytes`.
+pub fn header(ui: &mut Ui, selection: Option<Range<u64>>) {
+    let t = &crate::theme::DARK;
     ui.horizontal(|ui| {
-        ui.heading("Inspector");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            crate::theme::more_menu(ui, menu);
-        });
+        ui.label(RichText::new("Inspector").size(t.font.card_title)
+            .family(FontFamily::Name("Geist SemiBold".into())).color(t.color.text.primary));
+        if let Some(range) = selection.filter(|range| !range.is_empty()) {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(format!("0x{:X} · {}", range.start,
+                    crate::format::plural(range.end - range.start, "byte", "bytes")))
+                    .monospace().size(t.font.label).color(t.color.text.muted))
+                    .on_hover_text(crate::format::byte_range(range.start, range.end));
+            });
+        }
     });
+    ui.add_space(t.spacing.inspector_gap);
+}
+
+fn info_icon(ui: &mut Ui, help: &str) {
+    let t = &crate::theme::DARK;
+    ui.label(RichText::new(egui_phosphor::regular::INFO)
+        .font(FontId::new(t.size.info_icon, FontFamily::Name("phosphor".into())))
+        .color(t.color.text.muted))
+        .on_hover_text(help);
 }
 
 pub fn empty_selection(ui: &mut Ui, has_file: bool, has_decoded: bool) {
-    let (title, detail) = if !has_file {
-        (
-            "Nothing to inspect yet",
-            "Open a data file, then select bytes in Hex.",
-        )
+    let (title, help) = if !has_file {
+        ("Nothing to inspect yet", "Open a data file, then select bytes in Hex.")
     } else if has_decoded {
-        (
-            "Select a field or byte range",
-            "Choose a field in Structure, a point in Signal, a row in Table, or bytes in Hex. The linked selection appears here.",
-        )
+        ("Select a field or bytes",
+            "Choose a field in Structure, a point in Signal, a row in Table, or bytes in Hex.")
     } else {
-        (
-            "Select bytes to inspect",
-            "Drag across bytes in Hex for raw interpretations, or press ▶ Run (F5) to inspect decoded fields.",
-        )
+        ("Select bytes in Hex",
+            "Drag across bytes in Hex to see their values, or press Run (F5) to inspect decoded fields.")
     };
-    crate::decoder_ui::empty_state(ui, title, detail);
-}
-
-/// `samples_collection` names the samples collection; indices in any other
-/// collection are items.
-pub fn field_heading(ui: &mut Ui, field: &FieldInfo, samples_collection: Option<&str>) {
-    ui.heading(&field.name);
-    if let Some(index) = field.sample {
-        let collection = field.path.rfind('[').map(|bracket| &field.path[..bracket]);
-        let noun = if collection.is_some() && collection == samples_collection { "Sample" } else { "Item" };
-        ui.weak(format!("{noun} {}", crate::format::count(index)));
-    }
-}
-
-pub fn field_details(ui: &mut Ui, field: &FieldInfo, definition: Option<(u64, usize)>) {
-    if let Some((consumed, types)) = definition {
-        ui.label(format!(
-            "Decoder covers {} · {}",
-            crate::format::size(consumed),
-            crate::format::plural(types as u64, "reusable type", "reusable types")
-        )).on_hover_text(crate::format::exact_bytes(consumed));
-    }
-    ui.label("Definition path");
-    ui.monospace(&field.path);
-    ui.label(format!("Type: {} · {} endian", field.kind, field.endian));
-    ui.label(format!("Field bytes: {}", crate::format::byte_range(field.start, field.end)));
-    if !field.references.is_empty() {
-        ui.label(format!("Uses: {}", field.references.join(", ")));
-    }
-}
-
-/// Draw the editable-value controls identically in native and browser Inspectors.
-pub fn value_editor(
-    ui: &mut Ui,
-    text: &mut String,
-    original: &str,
-    error: &mut Option<String>,
-    enabled: bool,
-) -> bool {
-    let mut apply = false;
-    ui.add_enabled_ui(enabled, |ui| {
-        let response = ui.add(egui::TextEdit::singleline(text).desired_width(f32::INFINITY));
-        let changed = text != original;
-        ui.horizontal_wrapped(|ui| {
-            apply = ui
-                .add_enabled(changed, egui::Button::new("Write value to bytes"))
-                .clicked()
-                || (changed
-                    && response.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-            if changed && ui.button("Cancel").clicked() {
-                text.clear();
-                text.push_str(original);
-                *error = None;
-            }
-        });
-        if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-            text.clear();
-            text.push_str(original);
-            *error = None;
-        }
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(title).color(crate::theme::DARK.color.text.muted));
+        info_icon(ui, help);
     });
-    if let Some(message) = error.as_deref() {
-        ui.colored_label(ui.visuals().error_fg_color, message);
-    }
-    apply
 }
 
-/// The supplied bytes must start at range.start; previews stay bounded to 64.
-pub fn byte_selection(ui: &mut Ui, range: Range<u64>, bytes: Option<&[u8]>) {
-    if range.is_empty() {
-        ui.weak("Select a byte or range in Hex.");
-        return;
+/// A padded inset card, as used for the field card.
+pub fn card<R>(ui: &mut Ui, contents: impl FnOnce(&mut Ui) -> R) -> R {
+    let t = &crate::theme::DARK;
+    egui::Frame::new()
+        .fill(t.color.surface.card)
+        .corner_radius(t.radius.inset)
+        .inner_margin(egui::Margin::same(t.spacing.card_padding as i8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            contents(ui)
+        })
+        .inner
+}
+
+/// The selected field: clickable path, name and type badge, large value,
+/// inclusive range and one action row. `selection` is Hex's byte selection.
+/// `menu` adds the host's items to the ⋯ menu.
+pub fn field_card(ui: &mut Ui, field: &FieldInfo, mut edit: Option<&mut ValueEdit>, can_edit: bool,
+    selection: Option<Range<u64>>, menu: impl FnOnce(&mut Ui)) -> Option<FieldAction> {
+    let t = &crate::theme::DARK;
+    let mut action = None;
+    card(ui, |ui| {
+        if let Some(path) = breadcrumb(ui, field) {
+            action = Some(FieldAction::SelectPath(path));
+        }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&field.name).size(t.font.body)
+                .family(FontFamily::Name("Geist SemiBold".into())).color(t.color.text.primary));
+            let size = field.end.saturating_sub(field.start);
+            egui::Frame::new()
+                .fill(t.color.status.success.gamma_multiply(t.color.status.soft_alpha))
+                .corner_radius(t.radius.chip)
+                .inner_margin(egui::Margin::symmetric(6, 1))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(format!("{} · {}", field.kind, crate::format::size(size)))
+                        .monospace().size(t.font.label).color(t.color.status.success))
+                        .on_hover_text(format!("{} · {} endian", crate::format::exact_bytes(size), field.endian));
+                });
+        });
+        let editable = field.editable && can_edit;
+        match edit.as_deref_mut().filter(|edit| edit.editing && editable) {
+            Some(edit) => {
+                let response = ui.add(egui::TextEdit::singleline(&mut edit.text)
+                    .font(FontId::monospace(t.font.value))
+                    .desired_width(f32::INFINITY));
+                if !response.has_focus() && !response.lost_focus() && edit.error.is_none() {
+                    response.request_focus();
+                }
+                let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if response.lost_focus() && enter && edit.text != edit.original {
+                    action = Some(FieldAction::ApplyValue);
+                } else if ui.input(|input| input.key_pressed(egui::Key::Escape))
+                    || (response.lost_focus() && edit.text == edit.original) {
+                    edit.cancel();
+                }
+                if let Some(error) = &edit.error {
+                    ui.colored_label(t.color.status.danger, error);
+                }
+            }
+            None => {
+                let value = if field.display.is_empty() { &field.value } else { &field.display };
+                let response = ui.add(egui::Label::new(RichText::new(value).size(t.font.value)
+                    .color(t.color.text.primary)).truncate()
+                    .sense(if editable { Sense::click() } else { Sense::hover() }));
+                let response = if editable {
+                    response.on_hover_cursor(egui::CursorIcon::Text)
+                        .on_hover_text(format!("{value}\nClick to edit. Enter writes the bytes."))
+                } else {
+                    response.on_hover_text(value)
+                };
+                if response.clicked() {
+                    if let Some(edit) = edit.as_deref_mut() {
+                        edit.editing = true;
+                    }
+                }
+            }
+        }
+        ui.label(RichText::new(crate::format::byte_range(field.start, field.end))
+            .monospace().size(t.font.label).color(t.color.text.muted));
+        if let Some(selected) = selection.filter(|range| {
+            !range.is_empty() && *range != (field.start..field.end)
+                && range.start >= field.start && range.end <= field.end
+        }) {
+            ui.label(RichText::new(format!("{} of {} selected",
+                crate::format::plural(selected.end - selected.start, "byte", "bytes"),
+                crate::format::size(field.end - field.start)))
+                .size(t.font.label).color(t.color.text.muted));
+        }
+        ui.add_space(t.spacing.inspector_gap);
+        ui.horizontal(|ui| {
+            if ui.button("Jump to definition").on_hover_text("Show this field in the decoder").clicked() {
+                action = Some(FieldAction::JumpToDefinition);
+            }
+            crate::theme::more_menu(ui, |ui| {
+                if editable && ui.button("Edit value").clicked() {
+                    if let Some(edit) = edit {
+                        edit.editing = true;
+                    }
+                    ui.close();
+                }
+                if ui.button("Copy value").clicked() {
+                    ui.ctx().copy_text(field.value.clone());
+                    ui.close();
+                }
+                if ui.button("Copy path").clicked() {
+                    ui.ctx().copy_text(field.path.clone());
+                    ui.close();
+                }
+                ui.separator();
+                menu(ui);
+            });
+        });
+    });
+    action
+}
+
+/// `sections[0] › payload › entries[1] › name`. Leading parts are dropped when the
+/// path is too long for the card; the full path shows on hover.
+fn breadcrumb(ui: &mut Ui, field: &FieldInfo) -> Option<String> {
+    let t = &crate::theme::DARK;
+    let parts = crate::structure_selection::path_parts(&field.path);
+    let font = FontId::monospace(t.font.label);
+    let width = |text: &str| ui.fonts_mut(|fonts| fonts.layout_no_wrap(text.into(), font.clone(),
+        t.color.text.muted).size().x);
+    let separator = " › ";
+    let available = ui.available_width();
+    let mut first = 0;
+    while first + 1 < parts.len() {
+        let shown = parts[first..].iter().map(|(label, _)| *label).collect::<Vec<_>>().join(separator);
+        let prefix = if first > 0 { width(&format!("…{separator}")) } else { 0. };
+        if width(&shown) + prefix <= available { break; }
+        first += 1;
     }
-    ui.label(RichText::new("Byte selection").strong());
-    ui.monospace(crate::format::byte_range(range.start, range.end));
-    ui.label(format!(
-        "{} · absolute offset {}",
-        crate::format::exact_bytes(range.end - range.start),
-        crate::format::count(range.start)
-    ));
+    let mut chosen = None;
+    let response = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.;
+        if first > 0 {
+            ui.label(RichText::new(format!("…{separator}")).font(font.clone()).color(t.color.text.muted));
+        }
+        for (index, (label, path)) in parts.iter().enumerate().skip(first) {
+            if index + 1 == parts.len() {
+                ui.label(RichText::new(*label).font(font.clone()).color(t.color.text.secondary));
+            } else {
+                let link = ui.add(egui::Label::new(RichText::new(*label).font(font.clone())
+                    .color(t.color.text.muted)).sense(Sense::click()));
+                let link = link.on_hover_cursor(egui::CursorIcon::PointingHand);
+                if link.hovered() {
+                    ui.painter().line_segment([link.rect.left_bottom(), link.rect.right_bottom()],
+                        egui::Stroke::new(t.size.frame_border, t.color.text.muted));
+                }
+                if link.clicked() {
+                    chosen = Some((*path).to_owned());
+                }
+                ui.label(RichText::new(separator).font(font.clone()).color(t.color.text.faint));
+            }
+        }
+    }).response;
+    response.on_hover_text(&field.path);
+    chosen
+}
+
+/// Values of the selected bytes as each type. `default_big` follows the field
+/// or decoder byte order until the user picks one. `menu`, when given, adds a ⋯
+/// menu for byte actions (used when no decoded field is selected).
+pub fn selected_bytes(ui: &mut Ui, range: Range<u64>, bytes: Option<&[u8]>, default_big: bool,
+    menu: Option<&mut dyn FnMut(&mut Ui)>) {
+    let t = &crate::theme::DARK;
+    let order_id = egui::Id::new("inspector_big_endian");
+    let mut big = ui.data(|data| data.get_temp::<bool>(order_id)).unwrap_or(default_big);
+    ui.add_space(t.spacing.inspector_gap);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Selected bytes").size(t.font.body).color(t.color.text.secondary));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some(menu) = menu {
+                crate::theme::more_menu(ui, |ui| menu(ui));
+            }
+            egui::Frame::new().fill(t.color.surface.window).corner_radius(t.radius.control)
+                .inner_margin(egui::Margin::same(2)).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 0.;
+                    let before = big;
+                    // Right-to-left: Big is added first so Little shows on the left.
+                    ui.selectable_value(&mut big, true, "Big");
+                    ui.selectable_value(&mut big, false, "Little");
+                    if big != before {
+                        ui.data_mut(|data| data.insert_temp(order_id, big));
+                    }
+                });
+        });
+    });
+    ui.add_space(t.spacing.inspector_gap);
     let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty()) else {
-        ui.weak("Loading selected bytes…");
+        ui.label(RichText::new("Loading selected bytes…").color(t.color.text.muted));
         return;
     };
-    let preview_len = (range.end - range.start).min(64) as usize;
-    let bytes = &bytes[..bytes.len().min(preview_len)];
-    egui::Grid::new("hex_numeric_inspector")
-        .striped(true)
-        .show(ui, |ui| {
-            ui.strong("Type");
-            ui.strong("Little endian");
-            ui.strong("Big endian");
-            ui.end_row();
-            if let Some(&b) = bytes.first() {
-                ui.label("u8 / i8");
-                ui.monospace(format!("{b} / {}", b as i8));
-                ui.weak("—");
-                ui.end_row();
+    let length = (range.end - range.start).min(bytes.len() as u64) as usize;
+    let bytes = &bytes[..length];
+    let cells = interpretations(bytes, big, range.end - range.start);
+    let gap = t.spacing.inspector_gap;
+    let chip_width = ((ui.available_width() - gap) / 2.).max(0.);
+    ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+    for pair in cells.chunks(2) {
+        ui.horizontal(|ui| {
+            for cell in pair {
+                chip(ui, chip_width, cell);
             }
-            macro_rules! numeric {
-                ($ty:ty, $count:expr, $name:expr) => {
-                    if bytes.len() >= $count {
-                        let b: [u8; $count] = bytes[..$count].try_into().unwrap();
-                        ui.label($name);
-                        ui.monospace(format!("{}", <$ty>::from_le_bytes(b)));
-                        ui.monospace(format!("{}", <$ty>::from_be_bytes(b)));
-                        ui.end_row();
-                    }
-                };
-            }
-            numeric!(u16, 2, "u16");
-            numeric!(i16, 2, "i16");
-            numeric!(u32, 4, "u32");
-            numeric!(i32, 4, "i32");
-            numeric!(f32, 4, "f32");
-            numeric!(u64, 8, "u64");
-            numeric!(i64, 8, "i64");
-            numeric!(f64, 8, "f64");
         });
-    if let Some(b) = bytes.first() {
-        ui.monospace(format!("Bits  {b:08b}"));
     }
-    ui.label(format!(
-        "Text  {}",
-        String::from_utf8_lossy(bytes)
-            .chars()
-            .map(|c| if c.is_control() { '·' } else { c })
-            .collect::<String>()
-    ));
+}
+
+struct Cell {
+    label: &'static str,
+    value: String,
+    hover: String,
+    missing: bool,
+}
+
+fn interpretations(bytes: &[u8], big: bool, selected: u64) -> Vec<Cell> {
+    fn take<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
+        bytes.get(..N).and_then(|slice| slice.try_into().ok())
+    }
+    let needs = |size: usize| Cell {
+        label: "", value: format!("needs {size} B"),
+        hover: format!("Select at least {} to read this type.", crate::format::plural(size, "byte", "bytes")),
+        missing: true,
+    };
+    macro_rules! integer {
+        ($label:expr, $ty:ty, $size:expr) => {
+            match take::<$size>(bytes) {
+                Some(raw) => {
+                    let value = if big { <$ty>::from_be_bytes(raw) } else { <$ty>::from_le_bytes(raw) };
+                    Cell { label: $label, value: crate::format::count(value),
+                        hover: format!("{value} · 0x{value:X}"), missing: false }
+                }
+                None => Cell { label: $label, ..needs($size) },
+            }
+        };
+    }
+    macro_rules! float {
+        ($label:expr, $ty:ty, $size:expr) => {
+            match take::<$size>(bytes) {
+                Some(raw) => {
+                    let value = if big { <$ty>::from_be_bytes(raw) } else { <$ty>::from_le_bytes(raw) };
+                    Cell { label: $label, value: crate::format::short_float(value as f64),
+                        hover: value.to_string(), missing: false }
+                }
+                None => Cell { label: $label, ..needs($size) },
+            }
+        };
+    }
+    let text: String = String::from_utf8_lossy(bytes).chars()
+        .map(|c| if c.is_control() { '·' } else { c }).collect();
+    let hex = bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+    let more = if selected > bytes.len() as u64 {
+        format!("\nFirst {} of {} shown.", bytes.len(), crate::format::exact_bytes(selected))
+    } else {
+        String::new()
+    };
+    vec![
+        integer!("u8", u8, 1), integer!("i8", i8, 1),
+        integer!("u16", u16, 2), integer!("i16", i16, 2),
+        integer!("u32", u32, 4), integer!("i32", i32, 4),
+        integer!("u64", u64, 8), integer!("i64", i64, 8),
+        float!("f32", f32, 4), float!("f64", f64, 8),
+        Cell { label: "text", value: format!("\"{text}\""), hover: format!("{text}{more}"), missing: false },
+        Cell { label: "hex", value: hex.clone(), hover: format!("{hex}{more}"), missing: false },
+    ]
+}
+
+fn chip(ui: &mut Ui, width: f32, cell: &Cell) {
+    let t = &crate::theme::DARK;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, t.size.inspector_chip_height), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, t.radius.row, t.color.surface.card);
+    let inner = rect.shrink2(egui::vec2(t.spacing.card_padding, 0.));
+    let label = painter.text(inner.left_center(), Align2::LEFT_CENTER, cell.label,
+        FontId::proportional(t.font.label), t.color.text.muted);
+    let font = if cell.missing { FontId::proportional(t.font.label) } else { FontId::monospace(t.font.small) };
+    let color = if cell.missing { t.color.text.faint } else { t.color.text.primary };
+    let room = inner.right() - label.right() - t.spacing.card_padding;
+    let mut value = cell.value.clone();
+    let fits = |text: &str| ui.fonts_mut(|fonts| fonts.layout_no_wrap(text.into(), font.clone(), color).size().x) <= room;
+    if !fits(&value) {
+        while !value.is_empty() && !fits(&format!("{value}…")) {
+            value.pop();
+        }
+        value = format!("{}…", value.trim_end());
+    }
+    painter.text(inner.right_center(), Align2::RIGHT_CENTER, value, font, color);
+    response.on_hover_text(&cell.hover);
+}
+
+/// "Definition" row, collapsed by default: the field's structure, type and
+/// byte order. `extra` adds host actions inside it.
+pub fn definition(ui: &mut Ui, field: &FieldInfo, line: Option<usize>, extra: impl FnOnce(&mut Ui)) {
+    let t = &crate::theme::DARK;
+    ui.add_space(t.spacing.inspector_gap);
+    let title = match line {
+        Some(line) => format!("Definition · line {}", crate::format::count(line)),
+        None => "Definition".into(),
+    };
+    egui::CollapsingHeader::new(RichText::new(title).color(t.color.text.muted))
+        .id_salt("inspector_definition")
+        .default_open(false)
+        .show(ui, |ui| {
+            egui::Grid::new("inspector_definition_rows").num_columns(2).show(ui, |ui| {
+                let mut row = |label: &str, value: &str| {
+                    ui.label(RichText::new(label).size(t.font.label).color(t.color.text.muted));
+                    ui.label(RichText::new(value).monospace().size(t.font.small));
+                    ui.end_row();
+                };
+                if let Some(structure) = field.structure.as_deref() {
+                    row("Structure", structure);
+                }
+                row("Type", &field.kind);
+                row("Byte order", &field.endian);
+                if !field.references.is_empty() {
+                    row("Uses", &field.references.join(", "));
+                }
+            });
+            extra(ui);
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn field(name: &str, path: &str, structure: Option<&str>, own: Option<&str>) -> FieldInfo {
+        FieldInfo {
+            name: name.into(), path: path.into(), kind: "u32".into(), value: String::new(),
+            editable: false, endian: "little".into(), start: 0, end: 4, references: Vec::new(),
+            sample: None, sample_start: None, sample_end: None, display: String::new(),
+            structure: structure.map(Into::into), own_structure: own.map(Into::into), crumbs: Vec::new(),
+        }
+    }
+
+    const DECODER: &str = "endian: little\nstructures:\n  - name: Header\n    fields:\n      - {name: count, type: u32}\n  - name: Field\n    fields:\n      - {name: name, type: string, length: 16}\n      - name: count\n        type: u32\nactions:\n  - read: {name: entries, type: {structure: Field}, repeat: 3}\n  - read: {name: count, type: u32}\n";
+
+    #[test]
+    fn definition_line_finds_the_field_in_its_own_structure() {
+        assert_eq!(definition_line(DECODER, &field("name", "entries[1].name", Some("Field"), None)), Some(8));
+        assert_eq!(definition_line(DECODER, &field("count", "entries[1].count", Some("Field"), None)), Some(9));
+        assert_eq!(definition_line(DECODER, &field("count", "header.count", Some("Header"), None)), Some(5));
+    }
+
+    #[test]
+    fn definition_line_uses_actions_for_top_level_reads_and_types_for_items() {
+        assert_eq!(definition_line(DECODER, &field("count", "count", None, None)), Some(13));
+        assert_eq!(definition_line(DECODER, &field("[1]", "entries[1]", None, Some("Field"))), Some(6));
+        assert_eq!(definition_line(DECODER, &field("[1]", "entries[1]", None, None)), Some(12));
+    }
+
+    #[test]
+    fn field_info_shows_enum_meanings_structures_and_parent_paths() {
+        use crate::byte_store::ByteStore;
+        let yaml = "structures:\n  - name: Field\n    fields:\n      - {name: name, type: string, length: 4}\n      - {name: format, type: u32}\n  - name: Header\n    fields:\n      - {name: entries, type: {structure: Field}, repeat: 2}\n    actions:\n      - define:\n          name: Sample\n          from: entries\n          fields:\n            name: {ref: name}\n            type: {ref: format, cases: {'3': f64, '5': u32}}\nactions:\n  - read: {name: header, type: {structure: Header}}\n";
+        let program = Program::parse(yaml).unwrap();
+        let mut bytes = Vec::new();
+        for (name, format) in [(b"sine", 3_u32), (b"ramp", 5)] {
+            bytes.extend_from_slice(name);
+            bytes.extend_from_slice(&format.to_le_bytes());
+        }
+        let store = ByteStore::from_snapshot(crate::binary::Original::from_bytes(&bytes).unwrap());
+        let source = store.view();
+        let output = program.run(&source, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        let node = |path: &str| crate::structure_selection::node_at_path(&output.nodes, &source, path).unwrap().unwrap();
+        let info = |path: &str| {
+            let parent = crate::structure_selection::parent_path(path).map(node);
+            FieldInfo::from_node(&node(path), None, Some(&program), parent.as_ref())
+        };
+        let format = info("header.entries[0].format");
+        assert_eq!(format.display, "3 · f64");
+        assert_eq!(format.structure.as_deref(), Some("Field"));
+        assert_eq!(definition_line(yaml, &format), Some(5));
+        assert_eq!(info("header.entries[1].format").display, "5 · u32");
+        let item = info("header.entries[1]");
+        assert_eq!(item.own_structure.as_deref(), Some("Field"));
+        assert_eq!(definition_line(yaml, &item), Some(2));
+        assert_eq!(crate::structure_selection::path_parts("header.entries[1].format").iter()
+            .map(|(label, _)| *label).collect::<Vec<_>>(), ["header", "entries[1]", "format"]);
+    }
+
+    #[test]
+    fn selected_bytes_read_both_byte_orders_and_report_short_selections() {
+        let cells = interpretations(&[0x74, 0x72], false, 2);
+        let value = |label: &str| cells.iter().find(|cell| cell.label == label).unwrap();
+        assert_eq!(value("u16").value, "29,300");
+        assert_eq!(interpretations(&[0x74, 0x72], true, 2).iter()
+            .find(|cell| cell.label == "u16").unwrap().value, "29,810");
+        assert!(value("u32").missing);
+        assert_eq!(value("u32").value, "needs 4 B");
+        assert_eq!(value("text").value, "\"tr\"");
+        assert_eq!(value("hex").value, "74 72");
+    }
 }

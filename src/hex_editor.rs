@@ -1334,18 +1334,33 @@ impl HexEditor {
         self.high_nibble = None;
     }
 
-    pub fn ui_inspector(&mut self, ui: &mut egui::Ui, source: Option<ByteView>) -> Vec<HexAction> {
+    /// Width of the byte grid (offsets, bytes and Text column) plus its scroll bar,
+    /// so a docked Inspector can start right after the Text column.
+    pub fn grid_width(&self, ui: &egui::Ui, len: usize) -> f32 {
+        let theme = &crate::theme::DARK;
+        let char_width = ui.fonts_mut(|f| f.glyph_width(&FontId::monospace(theme.font.hex), '0'));
+        let offset_width = (format!("{len:X}").len().max(8) + 2) as f32 * char_width;
+        let ascii_gutter = (char_width * 3.0).max(24.0);
+        offset_width + self.bytes_per_row as f32 * (char_width * 4.0) + ascii_gutter + 8.0
+            + ui.spacing().scroll.allocated_width()
+    }
+
+    pub fn name_selected_range(&mut self) {
+        self.show_bookmark = true;
+    }
+
+    /// The Inspector's "Selected bytes" section. `byte_menu` adds its ⋯ menu of
+    /// byte actions, for selections without a decoded field.
+    pub fn ui_inspector(&mut self, ui: &mut egui::Ui, source: Option<ByteView>, default_big: bool,
+        byte_menu: bool) -> Vec<HexAction> {
         let mut actions = Vec::new();
         let Some(source) = source else {
-            ui.weak("Open a file, then select bytes to inspect values.");
             return actions;
         };
         self.poll(ui, &source);
         let Some(range) = self.selection() else {
-            ui.weak("Select a byte or range in Hex.");
             return actions;
         };
-        // The byte display is shared with the browser Inspector.
         let preview_range = range.start..range.end.min(range.start.saturating_add(64));
         if self.selection_rx.is_none()
             && !self
@@ -1370,25 +1385,33 @@ impl HexEditor {
         }
         let preview = self.selection_bytes.as_ref()
             .filter(|(cached, revision, _)| *cached == preview_range && *revision == source.revision)
-            .map(|(_, _, bytes)| bytes.as_slice());
-        crate::workspace_inspector::byte_selection(
-            ui, range.start as u64..range.end as u64, preview,
-        );
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .button(if self.python_mode {
-                    "Copy Python read"
-                } else {
-                    "Describe selected bytes…"
-                })
-                .clicked()
-            {
+            .map(|(_, _, bytes)| bytes.clone());
+        let python = self.python_mode;
+        let (mut name_range, mut copy) = (false, false);
+        let mut menu = |ui: &mut egui::Ui| {
+            if ui.button(if python { "Copy Python read" } else { "Describe bytes…" }).clicked() {
                 actions.push(HexAction::Define(range.clone()));
+                ui.close();
             }
-            if ui.button("Name / color range").clicked() {
-                self.show_bookmark = true;
+            if ui.button("Name / color range…").clicked() {
+                name_range = true;
+                ui.close();
             }
-        });
+            if ui.button("Copy hex").clicked() {
+                copy = true;
+                ui.close();
+            }
+            if ui.button("Export bytes…").clicked() {
+                actions.push(HexAction::Extract(range.clone()));
+                ui.close();
+            }
+        };
+        crate::workspace_inspector::selected_bytes(ui, range.start as u64..range.end as u64,
+            preview.as_deref(), default_big, byte_menu.then_some(&mut menu as &mut dyn FnMut(&mut egui::Ui)));
+        self.show_bookmark |= name_range;
+        if copy {
+            self.copy(&source, Transfer::Hex);
+        }
         actions
     }
 }
@@ -1999,7 +2022,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_width_rows_stay_left_of_a_docked_inspector() {
+    fn fixed_width_rows_stay_left_of_a_docked_inspector_that_starts_after_the_text_column() {
         let (_dir, source) = fixture();
         let ctx = egui::Context::default();
         let mut editor = HexEditor::default();
@@ -2008,40 +2031,54 @@ mod tests {
         editor.select_range(0x18..0x20, false);
         let field = HexHighlight { range: 0x18..0x20, name: "sections[2].payload.records[104].chirp".into(),
             color: Color32::LIGHT_BLUE };
-        let mut frame = || ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(740.0, 600.0))),
-                ..Default::default()
-            },
-            |_ctx, ui| {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    crate::workspace_inspector::docked_panel(ui, "inspector", &mut (), |_, ui| { ui.label("Inspector"); }, |_, ui| {
-                        // Inspector values can be wider than the panel, e.g. a full-precision f32.
-                        ui.add(egui::Label::new(egui::RichText::new("f32  -27110105000000000000000000000000000000.0").monospace())
-                            .wrap_mode(egui::TextWrapMode::Extend));
+        // Narrow: the Inspector keeps its minimum width and Hex scrolls under it.
+        // Wide: the Inspector grows so it starts right after the Text column.
+        for width in [740.0, 1400.0] {
+            let mut frame = || ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 600.0))),
+                    ..Default::default()
+                },
+                |_ctx, ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let grid = editor.grid_width(ui, source.len());
+                        crate::workspace_inspector::docked_panel(ui, "inspector", &mut (), grid,
+                            |_, ui: &mut egui::Ui| { ui.label("Inspector"); }, |_, ui| {
+                            // Inspector values can be wider than the panel, e.g. a full-precision f32.
+                            ui.add(egui::Label::new(egui::RichText::new("f32  -27110105000000000000000000000000000000.0").monospace())
+                                .wrap_mode(egui::TextWrapMode::Extend));
+                        });
+                        editor.ui(ui, Some(source.clone()), std::slice::from_ref(&field));
                     });
-                    editor.ui(ui, Some(source.clone()), std::slice::from_ref(&field));
-                });
-            },
-        );
-        let mut output = frame();
-        for _ in 0..50 {
-            if output.shapes.iter().any(|shape| matches!(&shape.shape,
-                egui::Shape::Text(text) if text.galley.text() == "00000000")) { break; }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            output = frame();
+                },
+            );
+            let mut output = frame();
+            for _ in 0..50 {
+                if output.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::Shape::Text(text) if text.galley.text() == "00000000")) { break; }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                output = frame();
+            }
+            let text_rects: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some((text.galley.text().to_owned(),
+                    text.galley.rect.translate(text.pos.to_vec2()).intersect(shape.clip_rect))),
+                _ => None,
+            }).collect();
+            let inspector = text_rects.iter().find(|(text, _)| text == "Inspector").unwrap().1.left();
+            let overlapping: Vec<_> = text_rects.iter()
+                .filter(|(text, rect)| text != "Inspector" && !text.starts_with("f32")
+                    && rect.is_positive() && rect.right() > inspector)
+                .map(|(text, _)| text.clone()).collect();
+            assert!(overlapping.is_empty(), "hex text drawn over the inspector: {overlapping:?}");
+            if width > 1000.0 {
+                // The Text column is the last one drawn in each row: one glyph per byte.
+                let text_column = text_rects.iter()
+                    .filter(|(text, rect)| text.chars().count() == 1 && rect.is_positive() && rect.right() < inspector)
+                    .map(|(_, rect)| rect.right()).fold(f32::MIN, f32::max);
+                let gap = inspector - text_column;
+                assert!(gap < 48.0, "gap between the Text column and the Inspector: {gap}");
+            }
         }
-        let text_rects: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
-            egui::Shape::Text(text) => Some((text.galley.text().to_owned(),
-                text.galley.rect.translate(text.pos.to_vec2()).intersect(shape.clip_rect))),
-            _ => None,
-        }).collect();
-        let inspector = text_rects.iter().find(|(text, _)| text == "Inspector").unwrap().1.left();
-        let overlapping: Vec<_> = text_rects.iter()
-            .filter(|(text, rect)| text != "Inspector" && !text.starts_with("f32")
-                && rect.is_positive() && rect.right() > inspector)
-            .map(|(text, _)| text.clone()).collect();
-        assert!(overlapping.is_empty(), "hex text drawn over the inspector: {overlapping:?}");
     }
     #[test]
     fn rendered_view_fills_height_and_reads_a_bounded_page_asynchronously() {

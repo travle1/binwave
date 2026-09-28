@@ -1333,6 +1333,51 @@ impl Source for ByteView {
 }
 
 impl Program {
+    /// The meaning a decoder's `cases` give a field's value: `3` → `f64`.
+    pub fn enum_meaning<'a>(&'a self, node: &Node, parent_kind: Option<&str>) -> Option<&'a str> {
+        let program = self;
+        let key = node.value.as_ref()?.to_string();
+        fn mapped<'a>(choice: &'a TypeChoice, name: &str, key: &str, program: &'a Program) -> Option<&'a str> {
+            if choice.reference != name { return None; }
+            choice.cases.get(key).map(String::as_str).or_else(|| {
+                choice.enum_name.as_ref().and_then(|name| program.enums.iter().find(|item| &item.name == name))
+                    .and_then(|item| item.cases.get(key).map(String::as_str))
+            })
+        }
+        fn from_actions<'a>(actions: &'a [Action], name: &str, key: &str, program: &'a Program) -> Option<&'a str> {
+            actions.iter().find_map(|action| match action {
+                Action::Define(definition) => mapped(&definition.fields.kind, name, key, program),
+                Action::Choose(choice) => choice.cases.values().find_map(|branch| from_actions(branch, name, key, program))
+                    .or_else(|| from_actions(&choice.otherwise, name, key, program)),
+                _ => None,
+            })
+        }
+        // A `define` elsewhere maps this field when it reads the collection the field
+        // belongs to, e.g. `define: {from: entries, fields: {type: {ref: format, cases}}}`.
+        let collection = node.path.strip_suffix(&format!(".{}", node.name))
+            .and_then(|item| item.strip_suffix(']'))
+            .and_then(|item| item.rsplit_once('[')).map(|(collection, _)| collection)
+            .map(|collection| collection.rsplit('.').next().unwrap_or(collection));
+        fn defined_from<'a>(actions: &'a [Action], collection: &str, name: &str, key: &str, program: &'a Program) -> Option<&'a str> {
+            actions.iter().find_map(|action| match action {
+                Action::Define(definition) if definition.from == collection =>
+                    mapped(&definition.fields.kind, name, key, program),
+                Action::Choose(choice) => choice.cases.values()
+                    .find_map(|branch| defined_from(branch, collection, name, key, program))
+                    .or_else(|| defined_from(&choice.otherwise, collection, name, key, program)),
+                _ => None,
+            })
+        }
+        parent_kind.and_then(|kind| program.structures.get(kind)).and_then(|structure|
+            structure.fields.iter().find_map(|field| match &field.kind {
+                TypeSpec::Select { choose } => mapped(choose, &node.name, &key, program),
+                _ => None,
+            }).or_else(|| from_actions(&structure.actions, &node.name, &key, program)))
+            .or_else(|| from_actions(&program.actions, &node.name, &key, program))
+            .or_else(|| collection.and_then(|collection| program.structures.values()
+                .find_map(|structure| defined_from(&structure.actions, collection, &node.name, &key, program))))
+    }
+
     pub fn parse(yaml: &str) -> Result<Self> {
         ensure!(
             yaml.len() as Address <= MAX_YAML,

@@ -97,9 +97,7 @@ impl DecoderDraft {
 struct GenericValueEdit {
     node: Node,
     revision: u64,
-    original: String,
-    text: String,
-    error: Option<String>,
+    value: crate::workspace_inspector::ValueEdit,
 }
 
 pub struct BinaryWorkspace {
@@ -2764,7 +2762,7 @@ impl BinaryWorkspace {
     pub fn source_selection_inspector(&mut self, ui: &mut Ui) {
         self.hex_editor.set_python_mode(self.is_python());
         let source = self.bytes.as_ref().map(ByteStore::view);
-        let actions = self.hex_editor.ui_inspector(ui, source);
+        let actions = self.hex_editor.ui_inspector(ui, source, false, true);
         self.hex_actions(actions, ui.ctx());
     }
 
@@ -3089,13 +3087,10 @@ impl BinaryWorkspace {
                 || edit.node.endian != node.endian
                 || edit.revision != revision
         }) {
-            let value = node.display();
             self.generic_value_edit = Some(GenericValueEdit {
                 node: node.clone(),
                 revision,
-                original: value.clone(),
-                text: value,
-                error: None,
+                value: crate::workspace_inspector::ValueEdit::new(&node.display()),
             });
         }
     }
@@ -3109,7 +3104,7 @@ impl BinaryWorkspace {
         };
         let node = edit.node.clone();
         let revision = edit.revision;
-        let text = edit.text.clone();
+        let text = edit.value.text.clone();
         let result = (|| -> Result<String> {
             let selected = self
                 .structure_ui
@@ -3150,112 +3145,114 @@ impl BinaryWorkspace {
             Err(error) => {
                 let message = format!("{error:#}");
                 if let Some(edit) = &mut self.generic_value_edit {
-                    edit.error = Some(message.clone());
+                    edit.value.error = Some(message.clone());
                 }
                 self.report(Err(anyhow::anyhow!(message)));
             }
         }
     }
 
+    pub fn hex_grid_width(&self, ui: &Ui) -> f32 {
+        self.hex_editor.grid_width(ui, self.file_len())
+    }
+
+    /// Show the decoder at the line that defines this field.
+    fn jump_to_definition(&mut self, field: &crate::workspace_inspector::FieldInfo) {
+        match crate::workspace_inspector::definition_line(&self.yaml, field).filter(|_| !self.is_python()) {
+            Some(line) => {
+                self.structure_ui.go_to_line(line);
+                self.reveal_definition = true;
+            }
+            None => self.edit_decoder(),
+        }
+    }
+
     pub fn selection_inspector(&mut self, ui: &mut Ui) {
         self.hex_editor.set_python_mode(self.is_python());
-        let node = self.structure_ui.selected_node();
-        if let Some(node) = node {
-            let sample = self.structure_ui.selected_sample();
-            let field = crate::workspace_inspector::FieldInfo::from_node(
-                &node,
-                sample.as_ref().map(|(index, range)| (*index as u64, range.start as u64..range.end as u64)),
-            );
-            crate::workspace_inspector::field_heading(ui, &field,
-                self.structure_ui.samples_collection_path().as_deref());
-            if editable_value(&node) {
-                self.prepare_value_edit(&node);
-                let enabled = self.commands_available() && !self.cell_dirty();
-                ui.label("Value");
-                let apply = self.generic_value_edit.as_mut().is_some_and(|edit|
-                    crate::workspace_inspector::value_editor(
-                        ui, &mut edit.text, &edit.original, &mut edit.error, enabled));
-                if self
-                    .hex_editor
-                    .selection()
-                    .is_some_and(|selection| selection != node.range)
-                {
-                    ui.small(format!(
-                        "Value uses the full {}-byte field.",
-                        node.range.len()
-                    ));
-                }
-                if apply {
-                    self.commit_value_edit(ui.ctx());
-                }
-            } else {
-                self.generic_value_edit = None;
-                ui.label(node.display());
-                if node.value.is_some() {
-                    ui.weak("Edit this field in Hex.");
-                }
-            }
-            let enabled = self.commands_available();
-            ui.add_enabled_ui(enabled, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Reveal in Hex").clicked() {
-                        self.plot_action(PlotAction::InspectBytes(node.range.clone()), ui.ctx());
-                    }
-                    if ui.button("Export bytes…").clicked() {
-                        self.choose_export(ui.ctx(), node.range.clone());
-                    }
-                });
-                if let Some((index, range)) = sample {
-                    ui.menu_button("Sample actions", |ui| {
-                        if ui
-                            .button(format!("Select all bytes of sample {}", crate::format::count(index)))
-                            .clicked()
-                        {
-                            self.plot_action(PlotAction::InspectBytes(range.clone()), ui.ctx());
-                            ui.close();
-                        }
-                        if ui.button("Export whole sample…").clicked() {
-                            self.choose_export(ui.ctx(), range.clone());
-                            ui.close();
-                        }
-                    });
-                }
-            });
-            ui.add_space(8.);
-            egui::CollapsingHeader::new("Technical details").show(ui, |ui| {
-                self.structure_ui.inspector(ui, self.language);
-                if let Some(selected) = self.hex_editor.selection() {
-                    if selected != node.range {
-                        ui.label(format!(
-                            "{} selected within {}: {}",
-                            crate::format::exact_bytes(selected.len() as u64),
-                            node.name,
-                            crate::format::byte_range(selected.start as u64, selected.end as u64)
-                        ));
-                    }
-                }
-            });
-            egui::CollapsingHeader::new("Raw bytes").show(ui, |ui| {
-                let source = self.bytes.as_ref().map(ByteStore::view);
-                let actions = self.hex_editor.ui_inspector(ui, source);
-                self.hex_actions(actions, ui.ctx());
-            });
-        } else {
-            if self.hex_editor.selection().is_none() {
-                crate::workspace_inspector::empty_selection(
-                    ui,
-                    self.has_file(),
-                    self.structure_ui.has_published_program(),
-                );
-            }
+        let ctx = ui.ctx().clone();
+        let selection = self.hex_editor.selection();
+        let source = self.bytes.as_ref().map(ByteStore::view);
+        let Some((node, field)) = self.structure_ui.selected_field() else {
             self.generic_value_edit = None;
+            if selection.is_none() {
+                crate::workspace_inspector::empty_selection(
+                    ui, self.has_file(), self.structure_ui.has_published_program());
+                return;
+            }
             if self.structure_ui.is_parsing() {
                 ui.weak("Refreshing the selected value…");
             }
-            let source = self.bytes.as_ref().map(ByteStore::view);
-            let actions = self.hex_editor.ui_inspector(ui, source);
-            self.hex_actions(actions, ui.ctx());
+            let default_big = self.default_byte_order() == Some("big-endian");
+            let actions = self.hex_editor.ui_inspector(ui, source, default_big, true);
+            self.hex_actions(actions, &ctx);
+            return;
+        };
+        if editable_value(&node) {
+            self.prepare_value_edit(&node);
+        } else {
+            self.generic_value_edit = None;
         }
+        let can_edit = self.commands_available() && !self.cell_dirty();
+        let python = self.is_python();
+        let sample = field.sample.zip(field.sample_range());
+        let noun = if field.path.rfind('[').map(|bracket| &field.path[..bracket])
+            == self.structure_ui.samples_collection_path().as_deref() { "sample" } else { "item" };
+        let (mut export, mut describe, mut name_range, mut edit_decoder) = (false, false, false, false);
+        let (mut select_sample, mut export_sample) = (false, false);
+        let action = crate::workspace_inspector::field_card(ui, &field,
+            self.generic_value_edit.as_mut().map(|edit| &mut edit.value), can_edit,
+            selection.as_ref().map(|range| range.start as u64..range.end as u64), |ui| {
+                export = ui.button("Export bytes…").clicked();
+                describe = ui.button(if python { "Copy Python read" } else { "Describe bytes…" }).clicked();
+                name_range = ui.button("Name / color range…").clicked();
+                edit_decoder = ui.button("Edit decoder").clicked();
+                if let Some((index, _)) = &sample {
+                    ui.separator();
+                    select_sample = ui.button(format!("Select whole {noun} {}", crate::format::count(index))).clicked();
+                    export_sample = ui.button(format!("Export whole {noun}…")).clicked();
+                }
+                if export || describe || name_range || edit_decoder || select_sample || export_sample {
+                    ui.close();
+                }
+            });
+        match action {
+            Some(crate::workspace_inspector::FieldAction::SelectPath(path)) => {
+                if let Some(range) = source.as_ref().and_then(|source| self.structure_ui.select_path(&path, source)) {
+                    self.hex_editor.select_range(range, true);
+                }
+            }
+            Some(crate::workspace_inspector::FieldAction::JumpToDefinition) => self.jump_to_definition(&field),
+            Some(crate::workspace_inspector::FieldAction::ApplyValue) => self.commit_value_edit(&ctx),
+            None => {}
+        }
+        if export {
+            self.choose_export(&ctx, node.range.clone());
+        }
+        if describe {
+            self.hex_actions(vec![HexAction::Define(node.range.clone())], &ctx);
+        }
+        if name_range {
+            self.hex_editor.select_range(node.range.clone(), false);
+            self.hex_editor.name_selected_range();
+        }
+        if edit_decoder {
+            self.edit_decoder();
+        }
+        if let Some((_, range)) = sample {
+            let range = range.start as usize..range.end as usize;
+            if select_sample {
+                self.plot_action(PlotAction::InspectBytes(range.clone()), &ctx);
+            }
+            if export_sample {
+                self.choose_export(&ctx, range);
+            }
+        }
+        let actions = self.hex_editor.ui_inspector(ui, source, field.endian == "big", false);
+        self.hex_actions(actions, &ctx);
+        let line = crate::workspace_inspector::definition_line(&self.yaml, &field).filter(|_| !python);
+        let language = self.language;
+        crate::workspace_inspector::definition(ui, &field, line,
+            |ui| self.structure_ui.definition_actions(ui, language));
     }
 }
 
@@ -4555,6 +4552,7 @@ mod tests {
     #[test]
     fn generic_value_inspector_edits_full_field_from_partial_byte_selection() {
         let ctx = Context::default();
+        crate::theme::install(&ctx);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("samples.raw");
         let mut original = Vec::new();
@@ -4590,20 +4588,18 @@ mod tests {
             })
             .collect();
         assert!(labels.iter().any(|text| text == "triangle"));
-        assert!(labels.iter().any(|text| text == "Sample 1"));
-        assert!(labels
-            .iter()
-            .any(|text| text == "Value uses the full 8-byte field."));
+        assert!(labels.iter().any(|text| text == "samples[1]"));
+        assert!(labels.iter().any(|text| text == "1 byte of 8 B selected"));
         assert!(!labels
             .iter()
             .any(|text| text == "Definition path" || text == "Little endian"));
         let revision = workspace.bytes.as_ref().unwrap().view().revision;
-        workspace.generic_value_edit.as_mut().unwrap().text = "NaN".into();
+        workspace.generic_value_edit.as_mut().unwrap().value.text = "NaN".into();
         workspace.commit_value_edit(&ctx);
         assert!(workspace.error);
         assert_eq!(workspace.bytes.as_ref().unwrap().view().revision, revision);
         assert!(!workspace.bytes.as_ref().unwrap().has_changes());
-        workspace.generic_value_edit.as_mut().unwrap().text = "-18.25".into();
+        workspace.generic_value_edit.as_mut().unwrap().value.text = "-18.25".into();
         workspace.commit_value_edit(&ctx);
         assert_eq!(workspace.hex_editor.selection(), Some(16..24));
         settle(&mut workspace, &ctx);
@@ -4654,7 +4650,7 @@ mod tests {
         workspace.structure_ui.select_bytes(0..8);
         let node = workspace.structure_ui.selected_node().unwrap();
         workspace.prepare_value_edit(&node);
-        workspace.generic_value_edit.as_mut().unwrap().text = "18446744073709551615".into();
+        workspace.generic_value_edit.as_mut().unwrap().value.text = "18446744073709551615".into();
         workspace
             .bytes
             .as_mut()
@@ -4687,10 +4683,10 @@ mod tests {
             let node = &output.nodes[0];
             workspace.prepare_value_edit(node);
             let edit = workspace.generic_value_edit.as_mut().unwrap();
-            assert_eq!(edit.text, node.display());
+            assert_eq!(edit.value.text, node.display());
             assert_eq!(edit.node.kind, node.kind);
             assert_eq!(edit.node.endian, node.endian);
-            edit.text = "999".into();
+            edit.value.text = "999".into();
         }
         assert_eq!(source.read(0, 8).unwrap(), 11f64.to_le_bytes());
     }

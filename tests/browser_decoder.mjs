@@ -361,6 +361,15 @@ assert.equal(oddRecord.start, '5827');
 const oddField = JSON.parse(interleaved.inspect('5828', '5832'));
 assert.equal(oddField.field.value, '1457');
 assert.equal(oddField.field.sample, 1457);
+assert.equal(oddField.field.display, '1,457');
+assert.equal(oddField.field.structure, 'Long');
+assert.deepEqual(oddField.field.crumbs.map(c => [c.path, c.start, c.end]),
+    [['records[1457]', 5827, 5832], ['records[1457].payload', 5828, 5832], ['records[1457].payload.value', 5828, 5832]]);
+// A breadcrumb path picks the containing node that covers the same bytes.
+const payload = JSON.parse(interleaved.inspect('5828', '5832', 'records[1457].payload'));
+assert.equal(payload.field.path, 'records[1457].payload');
+assert.equal(payload.field.own_structure, 'Long');
+assert.equal(payload.field.structure, 'Record');
 assert.deepEqual(JSON.parse(interleaved.encode('5828','5832','12345')).bytes,[57,48,0,0]);
 interleaved.free();
 console.log('Browser WASM: 30,000 interleaved choose records, on-demand Inspector and editing passed.');

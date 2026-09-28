@@ -76,6 +76,42 @@ pub fn byte_range(start: impl Unsigned, end: impl Unsigned) -> String {
     }
 }
 
+/// Float with up to seven significant digits, switching to exponent form outside
+/// `0.0001..10,000,000`.
+pub fn compact_float(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    if value == 0. {
+        return "0".into();
+    }
+    let magnitude = value.abs();
+    if !(0.0001..10_000_000.).contains(&magnitude) {
+        return format!("{value:.6e}");
+    }
+    let decimals = (6. - magnitude.log10().floor()).max(0.) as usize;
+    let text = format!("{value:.decimals$}");
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_owned()
+    } else {
+        text
+    }
+}
+
+/// Float for a narrow cell: `29.5`, `2.69e20`. Pair with the full value on hover.
+pub fn short_float(value: f64) -> String {
+    let magnitude = value.abs();
+    if !value.is_finite() || value == 0. || (0.0001..10_000_000.).contains(&magnitude) {
+        return compact_float(value);
+    }
+    let text = format!("{value:.2e}");
+    match text.split_once('e') {
+        Some((mantissa, exponent)) if mantissa.contains('.') =>
+            format!("{}e{exponent}", mantissa.trim_end_matches('0').trim_end_matches('.')),
+        _ => text,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

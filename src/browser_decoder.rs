@@ -160,7 +160,7 @@ fn decoded_json(output: &ParseOutput, partial_error: Option<&str>, flattened: &B
     let nodes: Vec<_> = output.nodes.iter().map(describe).collect();
     json_result(json!({"nodes":nodes,"partial_preview_path":preview_path,
         "collections":arrays,"consumed":output.consumed.to_string(),
-        "partial":partial_error.is_some(),"error":partial_error}))
+        "types":output.definitions.len(),"partial":partial_error.is_some(),"error":partial_error}))
 }
 fn cells(node: &Node, prefix: &str, out: &mut BTreeMap<String, Value>) {
     if out.len() >= 64 {
@@ -211,6 +211,7 @@ fn page(node: &Node, source: &ByteView, start: u64, count: u64) -> Result<Vec<No
 pub struct DecoderSession {
     source: ByteView,
     output: Option<ParseOutput>,
+    program: Option<Program>,
     flattened: BTreeMap<String, Node>,
 }
 #[wasm_bindgen]
@@ -225,6 +226,7 @@ impl DecoderSession {
                     .map_err(|_| JsValue::from_str("Invalid file size"))?,
             },
             output: None,
+            program: None,
             flattened: BTreeMap::new(),
         })
     }
@@ -254,6 +256,7 @@ impl DecoderSession {
                 else { BTreeMap::new() };
             let result = decoded_json(&output, error.as_deref(), &flattened)?;
             self.output = Some(output);
+            self.program = Some(program);
             self.flattened = flattened;
             Ok(result)
         })()
@@ -311,16 +314,38 @@ impl DecoderSession {
     }
 
     /// Resolve the selected field on demand, paging only its containing records.
-    pub fn inspect(&self, start: &str, end: &str) -> Result<String, JsValue> {
+    /// `path` picks a containing node that covers the same bytes (an Inspector
+    /// breadcrumb part) over the most specific field.
+    pub fn inspect(&self, start: &str, end: &str, path: Option<String>) -> Result<String, JsValue> {
         (|| -> Result<String> {
             let output = self.output.as_ref().context("Apply a decoder first")?;
             let range = start.parse::<u64>()?..end.parse::<u64>()?;
             ensure!(range.start < range.end && range.end <= self.source.len(), "Invalid byte selection");
-            let field = crate::structure_selection::resolved_field(&output.nodes, &self.source, &range)?;
-            let field = field.as_ref().map(|node| {
+            let at_path = |path: &str| crate::structure_selection::node_at_path(&output.nodes, &self.source, path);
+            let field = match path.as_deref().filter(|path| !path.is_empty()) {
+                Some(path) => at_path(path)?.filter(|node| node.range == range),
+                None => None,
+            };
+            let field = match field {
+                Some(field) => Some(field),
+                None => crate::structure_selection::resolved_field(&output.nodes, &self.source, &range)?,
+            };
+            let field = field.as_ref().map(|node| -> Result<_> {
                 let sample = crate::structure_selection::sample_for_node(&output.nodes, node);
-                crate::workspace_inspector::FieldInfo::from_node(node, sample)
-            });
+                let parent = match crate::structure_selection::parent_path(&node.path) {
+                    Some(parent) => at_path(parent)?,
+                    None => None,
+                };
+                let mut field = crate::workspace_inspector::FieldInfo::from_node(
+                    node, sample, self.program.as_ref(), parent.as_ref());
+                for (_, part) in crate::structure_selection::path_parts(&node.path) {
+                    if let Some(part) = at_path(part)? {
+                        field.crumbs.push(crate::workspace_inspector::Crumb {
+                            path: part.path, start: part.range.start as u64, end: part.range.end as u64 });
+                    }
+                }
+                Ok(field)
+            }).transpose()?;
             json_result(json!({"field":field,"consumed":output.consumed.to_string(),
                 "types":output.definitions.len()}))
         })().map_err(js_error)

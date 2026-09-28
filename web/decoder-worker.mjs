@@ -41,7 +41,7 @@ self.onmessage = async ({data: m}) => {
         } else if (m.type === 'probe') {
             self.postMessage({type:'probe', request:m.request, result:JSON.parse(session.probe(m.path, m.start, m.end))});
         } else if (m.type === 'inspect') {
-            self.postMessage({type:'inspect', request:m.request, result:JSON.parse(session.inspect(m.start, m.end))});
+            self.postMessage({type:'inspect', request:m.request, result:JSON.parse(session.inspect(m.start, m.end, m.path))});
         } else if (m.type === 'encode') {
             self.postMessage({type:'encoded', request:m.request, result:JSON.parse(session.encode(m.start, m.end, m.value))});
         } else if (m.type === 'table') {

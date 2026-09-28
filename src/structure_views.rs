@@ -8,7 +8,7 @@ use crate::hex_editor::HexHighlight;
 use crate::plot_trace::{decoded_channel_borrowed, TraceMeshCache};
 use crate::plot_raster::PlotRaster;
 use crate::plot_gpu::GpuPlot;
-use crate::structure::{Action, LazyArray, Node, NumericPlan, ParseOutput, Program, TypeChoice, TypeSpec, Value};
+use crate::structure::{LazyArray, Node, NumericPlan, ParseOutput, Program, Value};
 use crate::structure_plot::{PlotData, PlotQuality, PlotReader};
 use egui::{Color32, Ui};
 use egui_plot::{AxisHints, Plot, PlotBounds, PlotPoint, PlotTransform, Points};
@@ -569,10 +569,14 @@ impl StructureViews {
         });
     }
     pub fn selected_node(&self, output: &ParseOutput) -> Option<Node> {
+        self.node_at(output, self.selected.as_ref()?)
+    }
+
+    /// A decoded node by path, from the output or an already-loaded page.
+    pub fn node_at(&self, output: &ParseOutput, path: &str) -> Option<Node> {
         if self.stale(output) {
             return None;
         }
-        let path = self.selected.as_ref()?;
         find_node(&output.nodes, path)
             .or_else(|| {
                 self.page.as_ref().into_iter().chain(self.cached_pages.iter())
@@ -581,6 +585,13 @@ impl StructureViews {
                     .find_map(|nodes| find_node(nodes, path))
             })
             .cloned()
+    }
+
+    /// Select a node by path, as a click on its Structure row does.
+    pub fn select_node(&mut self, node: &Node) -> Range<usize> {
+        expand_ancestors(&node.path, &mut self.expanded);
+        self.reveal_selected_row = true;
+        self.select(node)
     }
 
     /// Byte selection resolves its containing sample without depending on any visible pane.
@@ -902,7 +913,9 @@ impl StructureViews {
         output: &ParseOutput,
         clicked: &mut Option<Range<usize>>,
     ) {
-        egui::CollapsingHeader::new(egui::RichText::new(format!("Decoder types ({})", output.definitions.len()))
+        let consumed = output.consumed as u64;
+        let header = egui::CollapsingHeader::new(egui::RichText::new(format!("Decoder types ({}) · covers {}",
+            output.definitions.len(), crate::format::size(consumed)))
             .color(crate::theme::DARK.color.text.muted))
             .default_open(false)
             .icon(|ui, openness, response| {
@@ -964,6 +977,7 @@ impl StructureViews {
                         }
                     });
             });
+        header.header_response.on_hover_text(format!("The decoder reads {} of this file.", crate::format::exact_bytes(consumed)));
     }
 
     fn initialize_target(&mut self, output: &ParseOutput) {
@@ -3213,29 +3227,9 @@ fn collection_label(node: &Node, samples: bool) -> String {
     format!("{} · {} {}", node.name, crate::format::count(count), row_noun(samples, count))
 }
 
-fn compact_float(value: f64) -> String {
-    if !value.is_finite() {
-        return value.to_string();
-    }
-    if value == 0. {
-        return "0".into();
-    }
-    let magnitude = value.abs();
-    if !(0.0001..10_000_000.).contains(&magnitude) {
-        return format!("{value:.6e}");
-    }
-    let decimals = (6. - magnitude.log10().floor()).max(0.) as usize;
-    let text = format!("{value:.decimals$}");
-    if text.contains('.') {
-        text.trim_end_matches('0').trim_end_matches('.').to_owned()
-    } else {
-        text
-    }
-}
-
 fn display(node: &Node, limit: usize) -> String {
     match &node.value {
-        Some(Value::Float(value)) if limit <= 180 => compact_float(*value),
+        Some(Value::Float(value)) if limit <= 180 => crate::format::compact_float(*value),
         Some(Value::Text(text)) => clipped(text, limit),
         Some(Value::Bytes(bytes)) => {
             let mut text = bytes
@@ -3266,47 +3260,7 @@ fn tree_column_type(node: &Node) -> String {
 }
 
 fn tree_enum_meaning<'a>(node: &Node, parent_kind: Option<&str>, program: Option<&'a Program>) -> Option<&'a str> {
-    let program = program?;
-    let key = node.value.as_ref()?.to_string();
-    fn mapped<'a>(choice: &'a TypeChoice, name: &str, key: &str, program: &'a Program) -> Option<&'a str> {
-        if choice.reference != name { return None; }
-        choice.cases.get(key).map(String::as_str).or_else(|| {
-            choice.enum_name.as_ref().and_then(|name| program.enums.iter().find(|item| &item.name == name))
-                .and_then(|item| item.cases.get(key).map(String::as_str))
-        })
-    }
-    fn from_actions<'a>(actions: &'a [Action], name: &str, key: &str, program: &'a Program) -> Option<&'a str> {
-        actions.iter().find_map(|action| match action {
-            Action::Define(definition) => mapped(&definition.fields.kind, name, key, program),
-            Action::Choose(choice) => choice.cases.values().find_map(|branch| from_actions(branch, name, key, program))
-                .or_else(|| from_actions(&choice.otherwise, name, key, program)),
-            _ => None,
-        })
-    }
-    // A `define` elsewhere maps this field when it reads the collection the field
-    // belongs to, e.g. `define: {from: entries, fields: {type: {ref: format, cases}}}`.
-    let collection = node.path.strip_suffix(&format!(".{}", node.name))
-        .and_then(|item| item.strip_suffix(']'))
-        .and_then(|item| item.rsplit_once('[')).map(|(collection, _)| collection)
-        .map(|collection| collection.rsplit('.').next().unwrap_or(collection));
-    fn defined_from<'a>(actions: &'a [Action], collection: &str, name: &str, key: &str, program: &'a Program) -> Option<&'a str> {
-        actions.iter().find_map(|action| match action {
-            Action::Define(definition) if definition.from == collection =>
-                mapped(&definition.fields.kind, name, key, program),
-            Action::Choose(choice) => choice.cases.values()
-                .find_map(|branch| defined_from(branch, collection, name, key, program))
-                .or_else(|| defined_from(&choice.otherwise, collection, name, key, program)),
-            _ => None,
-        })
-    }
-    parent_kind.and_then(|kind| program.structures.get(kind)).and_then(|structure|
-        structure.fields.iter().find_map(|field| match &field.kind {
-            TypeSpec::Select { choose } => mapped(choose, &node.name, &key, program),
-            _ => None,
-        }).or_else(|| from_actions(&structure.actions, &node.name, &key, program)))
-        .or_else(|| from_actions(&program.actions, &node.name, &key, program))
-        .or_else(|| collection.and_then(|collection| program.structures.values()
-            .find_map(|structure| defined_from(&structure.actions, collection, &node.name, &key, program))))
+    program?.enum_meaning(node, parent_kind)
 }
 
 fn tree_column_value(node: &Node, parent_kind: Option<&str>, program: Option<&Program>) -> String {
@@ -3315,7 +3269,7 @@ fn tree_column_value(node: &Node, parent_kind: Option<&str>, program: Option<&Pr
         let display = match value {
             Value::Signed(number) => crate::format::count(number),
             Value::Unsigned(number) => crate::format::count(number),
-            Value::Float(number) => compact_float(*number),
+            Value::Float(number) => crate::format::compact_float(*number),
             Value::Text(text) => format!("{text:?}"),
             Value::Bytes(_) => display(node, 90),
         };

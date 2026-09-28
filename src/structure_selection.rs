@@ -47,6 +47,54 @@ pub(crate) fn sample_bytes(node: &Node, samples: Range<Address>) -> Option<Range
     )
 }
 
+/// A path split into its breadcrumb parts, each with the path it selects:
+/// `sections[0].payload.name` → `sections[0]`, `payload`, `name`.
+pub(crate) fn path_parts(path: &str) -> Vec<(&str, &str)> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for (index, ch) in path.char_indices() {
+        if ch == '.' {
+            parts.push((&path[start..index], &path[..index]));
+            start = index + 1;
+        }
+    }
+    parts.push((&path[start..], path));
+    parts
+}
+
+/// The node containing this one: the item for a field, the collection for an item.
+pub(crate) fn parent_path(path: &str) -> Option<&str> {
+    let end = if path.ends_with(']') { path.rfind('[')? } else { path.rfind('.')? };
+    Some(&path[..end]).filter(|parent| !parent.is_empty())
+}
+
+/// Find a node by path, paging the lazy collections above it one record at a time.
+pub(crate) fn node_at_path(
+    nodes: &[Node],
+    source: &crate::byte_store::ByteView,
+    path: &str,
+) -> anyhow::Result<Option<Node>> {
+    fn find<'a>(nodes: &'a [Node], path: &str) -> Option<&'a Node> {
+        nodes.iter().find_map(|node| if node.path == path { Some(node) } else { find(&node.children, path) })
+    }
+    if let Some(node) = find(nodes, path) {
+        return Ok(Some(node.clone()));
+    }
+    let mut end = path.len();
+    while let Some(bracket) = path[..end].rfind('[') {
+        let Some(close) = path[bracket..].find(']') else { break };
+        let (collection, index) = (&path[..bracket], &path[bracket + 1..bracket + close]);
+        if let (Ok(index), Some(collection)) = (index.parse::<Address>(), node_at_path(nodes, source, collection)?) {
+            if let Some(array) = &collection.lazy {
+                let rows = array.page(source, &std::sync::atomic::AtomicBool::new(false), index, 1)?;
+                return Ok(find(&rows, path).cloned());
+            }
+        }
+        end = bracket;
+    }
+    Ok(None)
+}
+
 /// Find the most specific decoded field containing a selected byte range.
 pub(crate) fn covering<'a>(nodes: &'a [Node], range: &Range<Address>) -> Option<&'a Node> {
     nodes

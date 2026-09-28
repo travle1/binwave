@@ -42,7 +42,7 @@ actions:
     assert_eq!(crate::structure_selection::sample_for_node(&output.nodes, &node),
         Some((221, sample.clone())));
     let info = crate::workspace_inspector::FieldInfo::from_node(
-        &node, Some((221, sample.start as u64..sample.end as u64)));
+        &node, Some((221, sample.start as u64..sample.end as u64)), None, None);
     assert_eq!(info.sample_range(), Some(sample.start as u64..sample.end as u64));
     assert!(info.editable);
     assert_eq!(crate::field_edit::encode_value(&node, "54321").unwrap().0,

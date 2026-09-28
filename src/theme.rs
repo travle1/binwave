@@ -45,6 +45,8 @@ pub struct Status {
     pub warning_text: Color32,
     pub warning_soft_alpha: f32,
     pub warning_badge_alpha: f32,
+    /// Tinted badge fill, e.g. the Inspector type badge.
+    pub soft_alpha: f32,
     pub success: Color32,
     pub danger: Color32,
 }
@@ -111,6 +113,9 @@ pub struct Sizes {
     pub more_dot_gap: f32,
     pub inspector_min_width: f32,
     pub inspector_max_width: f32,
+    /// Inspector value chips (Selected bytes grid).
+    pub inspector_chip_height: f32,
+    pub info_icon: f32,
     /// Table panel: row height and initial column widths (# is sized for 7 digits,
     /// Size for 10+).
     pub table_row: f32,
@@ -144,6 +149,8 @@ pub struct Gaps {
     pub sidebar_section_top: f32,
     /// Indent per nesting level in trees and field lists.
     pub tree_indent: f32,
+    /// Gap between Inspector value chips and between its sections.
+    pub inspector_gap: f32,
 }
 pub struct FontSizes {
     pub title: f32,
@@ -156,6 +163,8 @@ pub struct FontSizes {
     pub hex: f32,
     pub code: f32,
     pub code_line_height: f32,
+    /// The Inspector's large field value.
+    pub value: f32,
 }
 pub struct Theme {
     pub color: Colors,
@@ -207,6 +216,7 @@ pub const DARK: Theme = Theme {
             warning_text: rgb(0xF7, 0xD9, 0xAE),
             warning_soft_alpha: 0.08,
             warning_badge_alpha: 0.14,
+            soft_alpha: 0.12,
             success: rgb(0x5F, 0xD0, 0xBC),
             danger: rgb(0xFF, 0x95, 0x85),
         },
@@ -258,12 +268,14 @@ pub const DARK: Theme = Theme {
         recent_file_row_height: 34.,
         table_row_height: 24.,
         hex_row_height: 24.,
-        inspector_width: 280.,
+        inspector_width: 320.,
         more_button: 24.,
         more_dot: 1.5,
         more_dot_gap: 5.,
-        inspector_min_width: 240.,
+        inspector_min_width: 300.,
         inspector_max_width: 340.,
+        inspector_chip_height: 26.,
+        info_icon: 14.,
         table_row: 24.,
         table_index_column: 60.,
         table_offset_column: 104.,
@@ -294,6 +306,7 @@ pub const DARK: Theme = Theme {
         sidebar_first_section_top: 22.,
         sidebar_section_top: 16.,
         tree_indent: 12.,
+        inspector_gap: 6.,
     },
     font: FontSizes {
         title: 14.5,
@@ -306,6 +319,7 @@ pub const DARK: Theme = Theme {
         hex: 12.5,
         code: 12.,
         code_line_height: 18.,
+        value: 20.,
     },
 };
 

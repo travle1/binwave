@@ -1260,27 +1260,27 @@ impl BinwaveApp {
     fn ui_inspector(&mut self, ui: &mut Ui) {
         if self.displayed_decoder == Decoder::Csv {
             if let Some(selection) = &self.csv_selection {
-                if let Some(rows) = selection.rows {
-                    let range = rows.rows();
-                    ui.strong(format!("CSV rows {}–{}", crate::format::count(range.start),
-                        crate::format::count(range.end - 1)));
-                    ui.label(format!("{} selected", crate::format::plural(range.len() as u64, "row", "rows")));
-                } else {
-                    ui.strong(format!("CSV row {}", crate::format::count(selection.row.index)));
-                }
-                if let Some(column) = selection.column {
-                    ui.label(format!(
-                        "{}: {}",
-                        self.csv_column_name(column),
-                        selection.row.values[column]
-                    ));
-                }
-                ui.weak(format!(
-                    "{} selected · {}",
-                    crate::format::exact_bytes(selection.bytes.len() as u64),
-                    crate::format::byte_range(selection.bytes.start as u64, selection.bytes.end as u64)
-                ));
-                ui.separator();
+                let t = &crate::theme::DARK;
+                crate::workspace_inspector::card(ui, |ui| {
+                    let title = match selection.rows.map(|rows| rows.rows()) {
+                        Some(range) => format!("CSV rows {}–{} · {}", crate::format::count(range.start),
+                            crate::format::count(range.end - 1),
+                            crate::format::plural(range.len() as u64, "row", "rows")),
+                        None => format!("CSV row {}", crate::format::count(selection.row.index)),
+                    };
+                    ui.label(egui::RichText::new(title).size(t.font.body)
+                        .family(egui::FontFamily::Name("Geist SemiBold".into())).color(t.color.text.primary));
+                    if let Some(column) = selection.column {
+                        ui.label(egui::RichText::new(self.csv_column_name(column))
+                            .size(t.font.label).color(t.color.text.muted));
+                        let value = selection.row.values[column].to_string();
+                        ui.add(egui::Label::new(egui::RichText::new(&value).size(t.font.value)
+                            .color(t.color.text.primary)).truncate()).on_hover_text(value);
+                    }
+                    ui.label(egui::RichText::new(crate::format::byte_range(
+                        selection.bytes.start as u64, selection.bytes.end as u64))
+                        .monospace().size(t.font.label).color(t.color.text.muted));
+                });
             }
             self.binary.source_selection_inspector(ui);
         } else {
@@ -2524,16 +2524,10 @@ impl TabViewer for WorkspaceViewer<'_> {
             Pane::Hex => {
                 let t = &crate::theme::DARK;
                 if ui.available_width() >= t.size.inspector_min_host_width {
-                    crate::workspace_inspector::docked_panel(ui, "hex_embedded_inspector", &mut *self.app,
-                        |app, ui| {
-                            crate::workspace_inspector::header(ui, |ui| {
-                                if ui.button("Edit decoder").clicked() {
-                                    app.binary.edit_decoder();
-                                    ui.close();
-                                }
-                            });
-                            ui.separator();
-                        },
+                    let grid_width = self.app.binary.hex_grid_width(ui);
+                    crate::workspace_inspector::docked_panel(ui, "hex_embedded_inspector", &mut *self.app, grid_width,
+                        |app, ui| crate::workspace_inspector::header(ui, app.binary.byte_selection()
+                            .map(|range| range.start as u64..range.end as u64)),
                         |app, ui| app.ui_inspector(ui));
                 }
                 if self.app.displayed_decoder == Decoder::Csv {

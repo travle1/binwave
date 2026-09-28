@@ -606,15 +606,40 @@ impl StructureWorkspace {
         crate::structure_selection::sample_for_node(&self.partial_output.as_ref().or(self.output.as_ref())?.nodes, &field)
     }
 
-    /// Detailed parser information stays behind the inspector's disclosure control.
-    pub fn inspector(&mut self, ui: &mut Ui, language: DecoderLanguage) {
+    /// The selected node as the Inspector shows it: its structure, enum meaning and sample.
+    pub fn selected_field(&self) -> Option<(Node, crate::workspace_inspector::FieldInfo)> {
+        let node = self.selected_node()?;
+        let output = self.partial_output.as_ref().or(self.output.as_ref())?;
+        let parent = crate::structure_selection::parent_path(&node.path)
+            .and_then(|path| self.views.node_at(output, path));
+        let sample = self.selected_sample()
+            .map(|(index, range)| (index as u64, range.start as u64..range.end as u64));
+        let field = crate::workspace_inspector::FieldInfo::from_node(
+            &node, sample, self.program.as_ref(), parent.as_ref());
+        Some((node, field))
+    }
+
+    /// Select the node at `path` (an Inspector breadcrumb part) and return its bytes.
+    pub fn select_path(&mut self, path: &str, source: &ByteView) -> Option<Range<usize>> {
+        let output = self.partial_output.as_ref().or(self.output.as_ref())?;
+        let node = self.views.node_at(output, path)
+            .or_else(|| crate::structure_selection::node_at_path(&output.nodes, source, path).ok().flatten())?;
+        let range = self.views.select_node(&node);
+        self.selection = Some(range.clone());
+        Some(range)
+    }
+
+    /// Show the decoder source at a one-based line.
+    pub fn go_to_line(&mut self, line: usize) {
+        self.yaml_layout.go_to_line(line);
+        self.show_yaml();
+    }
+
+    /// Decoder authoring shortcuts shown inside the Inspector's Definition row.
+    pub fn definition_actions(&mut self, ui: &mut Ui, language: DecoderLanguage) {
         let Some(node) = self.selected_node() else {
             return;
         };
-        let definition = self.partial_output.as_ref().or(self.output.as_ref()).map(|output|
-            (output.consumed as u64, output.definitions.len()));
-        let field = crate::workspace_inspector::FieldInfo::from_node(&node, None);
-        crate::workspace_inspector::field_details(ui, &field, definition);
         if language == DecoderLanguage::Python {
             return;
         }

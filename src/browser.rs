@@ -85,10 +85,9 @@ pub struct BrowserApp {
     selected_samples: Option<(u64, u64)>,
     plot_anchor: Option<u64>,
     inspected: Option<crate::workspace_inspector::FieldInfo>,
-    inspector_definition: Option<(u64, usize)>,
-    value_text: String,
-    value_original: String,
-    value_error: Option<String>,
+    /// Breadcrumb path the next inspect request should resolve.
+    inspect_path: Option<String>,
+    value_edit: crate::workspace_inspector::ValueEdit,
     value_request: u64,
     plot_visible: Option<[f64; 2]>,
     probe_request: u64,
@@ -219,10 +218,8 @@ impl BrowserApp {
             selected_samples: None,
             plot_anchor: None,
             inspected: None,
-            inspector_definition: None,
-            value_text: String::new(),
-            value_original: String::new(),
-            value_error: None,
+            inspect_path: None,
+            value_edit: Default::default(),
             value_request: 0,
             plot_visible: None,
             probe_request: 0,
@@ -536,12 +533,8 @@ impl BrowserApp {
                 "inspect" => {
                     if event.request == self.probe_request.to_string() {
                         self.inspected = serde_json::from_value(event.result["field"].clone()).ok();
-                        self.inspector_definition = event.result["consumed"].as_str()
-                            .and_then(parse_offset).zip(event.result["types"].as_u64())
-                            .map(|(consumed, types)| (consumed, types as usize));
-                        self.value_original = self.inspected.as_ref().map(|field| field.value.clone()).unwrap_or_default();
-                        self.value_text = self.value_original.clone();
-                        self.value_error = None;
+                        self.value_edit = crate::workspace_inspector::ValueEdit::new(
+                            self.inspected.as_ref().map_or("", |field| field.value.as_str()));
                     }
                 }
                 "encoded" => {
@@ -596,7 +589,7 @@ impl BrowserApp {
                 }
                 "error" => {
                     if event.operation == "encode" {
-                        self.value_error = Some(event.message);
+                        self.value_edit.error = Some(event.message);
                         continue;
                     }
                     if self.direct_pending.is_none() && self.decoder_empty() && matches!(event.operation.as_str(), "decode" | "decode_python" | "table" | "plot" | "probe" | "pick" | "inspect") { continue; }
@@ -640,15 +633,9 @@ impl BrowserApp {
         }
         let embedded_inspector = !self.stacked && ui.available_width() >= crate::theme::DARK.size.inspector_min_host_width;
         if embedded_inspector {
-            crate::workspace_inspector::docked_panel(ui, "browser_hex_inspector", self,
-                |this, ui| {
-                    crate::workspace_inspector::header(ui, |ui| {
-                        if ui.button("Edit decoder").clicked() {
-                            this.reveal_decoder = true;
-                            ui.close();
-                        }
-                    });
-                },
+            let grid_width = self.hex_grid_width(ui);
+            crate::workspace_inspector::docked_panel(ui, "browser_hex_inspector", self, grid_width,
+                |this, ui| crate::workspace_inspector::header(ui, this.selection_range().map(|(start, end)| start..end)),
                 |this, ui| this.inspector(ui));
         }
         ui.horizontal_wrapped(|ui| {
@@ -901,76 +888,106 @@ impl BrowserApp {
             ui.close();
         }
         if ui.button("Select loaded page").clicked() {
-        if self.inspected.is_none() && self.selected.is_none() {
-            crate::workspace_inspector::empty_selection(
-                ui,
-                !self.name.is_empty(),
-                !self.decoded.is_null(),
-            );
-        }
             self.selection_anchor = Some(self.offset);
             self.set_hex_range(self.offset, self.offset + self.bytes.len() as u64);
             ui.close();
         }
     }
+    /// The selected byte range, end-exclusive, when it lies inside the file.
+    fn selection_range(&self) -> Option<(u64, u64)> {
+        parse_offset(&self.range_start).zip(parse_offset(&self.range_end))
+            .filter(|(start, end)| start < end && *end <= self.size)
+    }
+    /// Width of the 16-column Hex grid with its Text column, matching `hex`.
+    fn hex_grid_width(&self, ui: &egui::Ui) -> f32 {
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let digit = ui.fonts_mut(|fonts| fonts.layout_no_wrap("0".into(), font, egui::Color32::WHITE).size().x);
+        let digits = format!("{:X}", self.size.saturating_sub(1)).len().max(4);
+        let address_width = digits as f32 * digit + 8.;
+        let cell_width = (2. * digit + 12.).max(24.);
+        address_width + 16. * (cell_width + digit) + 12. + ui.spacing().scroll.allocated_width()
+    }
     fn inspector(&mut self, ui: &mut egui::Ui) {
+        let selection = self.selection_range();
+        if self.inspected.is_none() && selection.is_none() {
+            crate::workspace_inspector::empty_selection(ui, !self.name.is_empty(), !self.decoded.is_null());
+            return;
+        }
         let mut reveal = None;
         if let Some(field) = self.inspected.clone() {
-            crate::workspace_inspector::field_heading(ui, &field, self.samples_path().as_deref());
-            ui.label("Value");
-            if field.editable {
-                let apply = crate::workspace_inspector::value_editor(
-                    ui, &mut self.value_text, &self.value_original, &mut self.value_error, !self.decoding);
-                if apply {
+            let sample = field.sample.zip(field.sample_range());
+            let noun = if field.path.rfind('[').map(|bracket| &field.path[..bracket])
+                == self.samples_path().as_deref() { "sample" } else { "item" };
+            let (mut edit_decoder, mut select_sample) = (false, false);
+            let action = crate::workspace_inspector::field_card(ui, &field, Some(&mut self.value_edit),
+                !self.decoding, selection.map(|(start, end)| start..end), |ui| {
+                    edit_decoder = ui.button("Edit decoder").clicked();
+                    if let Some((index, _)) = &sample {
+                        ui.separator();
+                        select_sample = ui.button(format!("Select whole {noun} {}", crate::format::count(index))).clicked();
+                    }
+                    if edit_decoder || select_sample {
+                        ui.close();
+                    }
+                });
+            match action {
+                Some(crate::workspace_inspector::FieldAction::SelectPath(path)) => {
+                    if let Some(range) = field.crumb(&path) {
+                        self.tree_selected = Some(path.clone());
+                        self.inspect_path = Some(path);
+                        reveal = Some((range.start, range.end));
+                    }
+                }
+                Some(crate::workspace_inspector::FieldAction::JumpToDefinition) => {
+                    if self.language == crate::source_editor::DecoderLanguage::Yaml {
+                        if let Some(line) = crate::workspace_inspector::definition_line(&self.yaml, &field) {
+                            self.editor.go_to_line(line);
+                        }
+                    }
+                    self.reveal_decoder = true;
+                }
+                Some(crate::workspace_inspector::FieldAction::ApplyValue) => {
                     self.value_request = self.value_request.wrapping_add(1);
-                    self.value_error = None;
+                    self.value_edit.error = None;
                     self.queue(serde_json::json!({"type":"encode",
                         "start":field.start.to_string(),"end":field.end.to_string(),
-                        "value":self.value_text,
+                        "value":self.value_edit.text,
                         "request":format!("{}:{}",self.probe_request,self.value_request)}));
                 }
-            } else {
-                ui.label(&field.value);
-                ui.weak("Edit this field in Hex.");
+                None => {}
             }
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Reveal in Hex").clicked() {
-                    reveal = Some((field.start, field.end));
-                }
-                if let Some(range) = field.sample_range() {
-                    ui.menu_button("Sample actions", |ui| {
-                        if ui.button("Select all bytes of sample").clicked() {
-                            reveal = Some((range.start, range.end));
-                            ui.close();
-                        }
-                    });
-                }
-            });
-            egui::CollapsingHeader::new("Technical details").show(ui, |ui| {
-                crate::workspace_inspector::field_details(ui, &field, self.inspector_definition);
-            });
-            ui.separator();
+            if edit_decoder {
+                self.reveal_decoder = true;
+            }
+            if let Some((_, range)) = sample.filter(|_| select_sample) {
+                reveal = Some((range.start, range.end));
+            }
         } else if !self.decoded.is_null() && self.selected.is_some() {
             ui.weak("No decoded field covers this selection.");
         }
-        let selection = parse_offset(&self.range_start).zip(parse_offset(&self.range_end))
-            .filter(|(start, end)| start < end && *end <= self.size);
-        let preview = selection.and_then(|(start, end)| {
-            let index = usize::try_from(start.checked_sub(self.offset)?).ok()?;
-            let bytes = self.bytes.get(index..)?;
-            Some(bytes[..bytes.len().min(64).min((end - start).min(64) as usize)].to_vec())
-        });
-        let raw = |ui: &mut egui::Ui| {
-            if let Some((start, end)) = selection {
-                crate::workspace_inspector::byte_selection(ui, start..end, preview.as_deref());
-            } else {
-                ui.weak("Select a byte or range in Hex.");
+        if let Some((start, end)) = selection {
+            let preview = start.checked_sub(self.offset)
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| self.bytes.get(index..))
+                .map(|bytes| bytes[..bytes.len().min((end - start).min(64) as usize)].to_vec());
+            let default_big = self.inspected.as_ref().map_or_else(
+                || self.yaml.lines().any(|line| line.trim() == "endian: big"),
+                |field| field.endian == "big");
+            let mut copy = false;
+            let mut menu = |ui: &mut egui::Ui| {
+                copy = ui.button("Copy hex").clicked();
+                if copy { ui.close(); }
+            };
+            crate::workspace_inspector::selected_bytes(ui, start..end, preview.as_deref(), default_big,
+                self.inspected.is_none().then_some(&mut menu as &mut dyn FnMut(&mut egui::Ui)));
+            if copy {
+                self.copy_selected_hex();
             }
-        };
-        if self.inspected.is_some() {
-            egui::CollapsingHeader::new("Raw bytes").show(ui, raw);
-        } else {
-            raw(ui);
+        }
+        if let Some(field) = &self.inspected {
+            let line = crate::workspace_inspector::definition_line(&self.yaml, field)
+                .filter(|_| self.language == crate::source_editor::DecoderLanguage::Yaml);
+            crate::workspace_inspector::definition(ui, field, line, |_| {});
         }
         if let Some((start, end)) = reveal {
             self.select_range(start, end);
@@ -1059,10 +1076,7 @@ impl BrowserApp {
         self.selected_samples = None;
         self.plot_anchor = None;
         self.inspected = None;
-        self.inspector_definition = None;
-        self.value_text.clear();
-        self.value_original.clear();
-        self.value_error = None;
+        self.value_edit = Default::default();
         self.probe_request = self.probe_request.wrapping_add(1);
         self.decoder_error = None;
         self.decoded = Default::default();
@@ -1204,11 +1218,11 @@ impl BrowserApp {
     }
     fn request_inspect(&mut self, start: u64, end: u64) {
         self.inspected = None;
-        self.inspector_definition = None;
-        self.value_error = None;
+        self.value_edit = Default::default();
+        let path = self.inspect_path.take();
         if !self.decoded.is_null() && self.decoded["noData"].as_bool() != Some(true) && start < end {
             self.queue(serde_json::json!({"type":"inspect",
-                "start":start.to_string(),"end":end.to_string(),
+                "start":start.to_string(),"end":end.to_string(),"path":path,
                 "request":self.probe_request.to_string()}));
         }
     }
@@ -1478,6 +1492,14 @@ impl BrowserApp {
         ui.horizontal(|ui| {
             ui.weak("Structure");
             ui.small_button("i").on_hover_text("Expand an item to inspect its fields. Click a row to highlight its bytes in Hex. Hover a number for decimal, hex, and binary.");
+            if let (Some(consumed), Some(types)) = (self.decoded["consumed"].as_str().and_then(parse_offset),
+                self.decoded["types"].as_u64()) {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak(format!("Decoder types ({}) · covers {}", crate::format::count(types),
+                        crate::format::size(consumed)))
+                        .on_hover_text(format!("The decoder reads {} of this file.", crate::format::exact_bytes(consumed)));
+                });
+            }
         });
         if self.decoded["partial"].as_bool() == Some(true) {
             egui::Frame::group(ui.style()).fill(crate::theme::DARK.color.surface.raised)
