@@ -120,6 +120,15 @@ pub struct Sizes {
     /// Label column of the Inspector's Definition rows.
     pub inspector_definition_label: f32,
     pub info_icon: f32,
+    /// Start screen: column width, its top as a share of the height, drop zone
+    /// height and icon, recent row height, and the drop zone's dashes.
+    pub start_column_width: f32,
+    pub start_top_ratio: f32,
+    pub start_drop_zone_height: f32,
+    pub start_icon: f32,
+    pub start_row_height: f32,
+    pub dash_length: f32,
+    pub dash_gap: f32,
     /// Table panel: row height and initial column widths (# is sized for 7 digits,
     /// Size for 10+).
     pub table_row: f32,
@@ -149,6 +158,8 @@ pub struct Gaps {
     pub card_padding: f32,
     pub tab_gap: f32,
     pub sidebar_row_gap: f32,
+    /// Vertical padding inside small chips.
+    pub chip_padding_y: f32,
     pub sidebar_first_section_top: f32,
     pub sidebar_section_top: f32,
     /// Indent per nesting level in trees and field lists.
@@ -282,6 +293,13 @@ pub const DARK: Theme = Theme {
         inspector_badge_max_width: 160.,
         inspector_definition_label: 72.,
         info_icon: 14.,
+        start_column_width: 560.,
+        start_top_ratio: 0.3,
+        start_drop_zone_height: 176.,
+        start_icon: 32.,
+        start_row_height: 44.,
+        dash_length: 6.,
+        dash_gap: 4.,
         table_row: 24.,
         table_index_column: 60.,
         table_offset_column: 104.,
@@ -309,6 +327,7 @@ pub const DARK: Theme = Theme {
         card_padding: 10.,
         tab_gap: 2.,
         sidebar_row_gap: 2.,
+        chip_padding_y: 2.,
         sidebar_first_section_top: 22.,
         sidebar_section_top: 16.,
         tree_indent: 12.,

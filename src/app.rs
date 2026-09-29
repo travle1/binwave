@@ -197,6 +197,7 @@ pub struct BinwaveApp {
     displayed_decoder: Decoder,
     workspace: WorkspaceLayout,
     show_empty_workspace: bool,
+    start_screen: crate::start_screen::StartScreen,
     show_decoding_guide: bool,
     sidebar_open: bool,
     sidebar_search_open: bool,
@@ -268,6 +269,7 @@ impl Default for BinwaveApp {
             displayed_decoder: Decoder::Layout,
             workspace: WorkspaceLayout::default(),
             show_empty_workspace: false,
+            start_screen: Default::default(),
             show_decoding_guide: false,
             sidebar_open: true,
             sidebar_search_open: false,
@@ -1410,8 +1412,10 @@ impl BinwaveApp {
                 if ui.button(egui::RichText::new(egui_phosphor::regular::FOLDER_OPEN).font(icon_font))
                     .on_hover_text("Open file (Ctrl+O)").clicked() { open_file = true; }
             }
+            // The start screen's header has no title, dropdown or Export.
             let title = self.binary.source_path().and_then(|path| path.file_name())
                 .map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Open a file".into());
+            let has_file = self.binary.has_file();
             let mut title_job = egui::text::LayoutJob::default();
             title_job.append(&title, 0., egui::TextFormat {
                 font_id: egui::FontId::new(t.font.title, egui::FontFamily::Name("Geist SemiBold".into())),
@@ -1424,7 +1428,7 @@ impl BinwaveApp {
                 color: t.color.text.muted,
                 ..Default::default()
             });
-            egui::containers::menu::MenuButton::from_button(
+            if has_file { egui::containers::menu::MenuButton::from_button(
                 egui::Button::new(title_job).frame(false)
             ).ui(ui, |ui| {
                 if ui.button("Open file…").clicked() { open_file = true; ui.close(); }
@@ -1432,7 +1436,7 @@ impl BinwaveApp {
                     let label = Self::recent_label(pair);
                     if ui.button(label).clicked() { recent_file = Some(index); ui.close(); }
                 }
-            });
+            }); }
             if self.binary.has_file() {
                 let (len, saved) = (self.binary.file_len() as u64, self.binary.saved_len() as u64);
                 let change = match len.cmp(&saved) {
@@ -1475,7 +1479,7 @@ impl BinwaveApp {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 chosen = app_menu::overflow_menu(ui, &menus, &panels);
-                if ui.add_enabled(self.binary.has_file(), egui::Button::new("Export")
+                if has_file && ui.add(egui::Button::new("Export")
                     .stroke(egui::Stroke::new(t.size.frame_border, t.color.border.control)))
                     .on_hover_text("Save bytes (Ctrl+Shift+S)").clicked() { export = true; }
             });
@@ -2037,13 +2041,14 @@ impl BinwaveApp {
             });
         }
         let mut workspace = std::mem::take(&mut self.workspace);
+        let mut start_action = None;
         egui::CentralPanel::default().show(root_ui, |ui| {
             if self.decoder_library_open {
                 self.ui_decoder_library_entry(ui);
                 return;
             }
             if !self.binary.has_file() && !self.show_empty_workspace {
-                self.ui_welcome(ui);
+                start_action = self.ui_welcome(ui);
                 return;
             }
             DockArea::new(&mut workspace.dock)
@@ -2094,6 +2099,10 @@ impl BinwaveApp {
             workspace.reveal(Pane::Hex);
         }
         self.workspace = workspace;
+        // Start screen choices run once the dock is back in place.
+        if let Some(action) = start_action {
+            self.start_action(action, &ctx);
+        }
         if let Some(message) = self.cache_message.clone() {
             let mut open = true;
             let mut dismiss = false;
@@ -2109,59 +2118,38 @@ impl BinwaveApp {
             if !open || dismiss { self.cache_message = None; }
         }
         self.poll_csv_links(&ctx);
-        if ctx
-            .data_mut(|data| data.remove_temp::<bool>(egui::Id::new("welcome_definitions")))
-            .unwrap_or(false)
-        {
-            self.workspace.reveal(Pane::Layout);
-        }
         self.reveal_requested_panels();
     }
 
-    fn ui_welcome(&mut self, ui: &mut Ui) {
+    fn start_action(&mut self, action: crate::start_screen::Action, ctx: &Context) {
+        use crate::start_screen::Action;
+        match action {
+            Action::OpenFile => self.choose_data_file(ctx),
+            Action::TrySample => {
+                self.pending_config = None;
+                self.binary.open_advanced_demo(ctx);
+            }
+            Action::Recent(index) => self.open_recent(index, ctx),
+            Action::Remove(index) => {
+                if let Some(pair) = self.file_locations.recent_pairs().get(index) {
+                    self.file_locations.forget_pair(&pair.data);
+                }
+            }
+            Action::NewDecoder => {
+                self.decoder = Decoder::Layout;
+                self.binary.new_yaml(ctx);
+                self.show_view(Pane::Layout);
+            }
+            Action::DecoderLibrary => self.decoder_library_open = true,
+        }
+    }
+
+    fn ui_welcome(&mut self, ui: &mut Ui) -> Option<crate::start_screen::Action> {
         let recent = self.file_locations.recent_pairs();
-        ui.add_space((ui.available_height() * 0.22).max(20.));
-        ui.vertical_centered(|ui| {
-            ui.heading("Inspect and edit a file");
-            ui.add_space(8.);
-            ui.label("Open any file to explore its bytes.");
-            ui.label("Build reusable decoders from the structures you discover.");
-            ui.add_space(18.);
-            if ui
-                .add_enabled(
-                    self.commands_available(),
-                    egui::Button::new("Open file…").min_size(egui::vec2(150., 34.)),
-                )
-                .clicked()
-            {
-                self.choose_data_file(ui.ctx());
-            }
-            ui.add_space(8.);
-            ui.weak("You can also drop a file anywhere in the workspace.");
-            if !recent.is_empty() {
-                ui.add_space(18.);
-                ui.label("Open recent");
-                for (index, pair) in recent.iter().enumerate() {
-                    let label = Self::recent_label(pair);
-                    if ui.add_enabled(self.commands_available(), egui::Button::new(label))
-                        .on_hover_text(format!("Data: {}\nDecoder: {}", pair.data.display(), pair.decoder.as_ref().map_or_else(|| "none".into(), |p| p.display().to_string())))
-                        .clicked() {
-                        self.open_recent(index, ui.ctx());
-                    }
-                }
-            }
-            ui.add_space(18.);
-            if ui.link("Create a decoder").clicked() {
-                if self.decoder == Decoder::Layout {
-                    self.binary.show_yaml();
-                }
-                self.show_empty_workspace = true;
-                // The docking state is temporarily moved out while drawing.
-                // Defer this command until it has been restored below.
-                ui.ctx()
-                    .data_mut(|data| data.insert_temp(egui::Id::new("welcome_definitions"), true));
-            }
-        });
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let enabled = self.commands_available();
+        self.start_screen.show(ui, &recent, enabled, now)
     }
 
     fn ui_view_controls(&mut self, ui: &mut Ui) {
@@ -3856,7 +3844,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(top.iter().any(|label| label.starts_with("Open a file"))
+        assert!(!top.iter().any(|label| label.starts_with("Open a file"))
             && top.iter().any(|label| label == egui_phosphor::regular::DOTS_THREE)
             && !top.iter().any(|label| label == "File"), "{top:?}");
         workspace_click(&mut app, &ctx, egui_phosphor::regular::DOTS_THREE);
@@ -3913,6 +3901,26 @@ mod tests {
     }
 
     #[test]
+    fn start_screen_sample_opens_with_its_decoder_and_remove_keeps_the_file() {
+        let ctx = Context::default();
+        let mut app = BinwaveApp::default();
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("kept.bin");
+        std::fs::write(&data, b"keep").unwrap();
+        app.file_locations.remember_pair(&data, None);
+        app.start_action(crate::start_screen::Action::Remove(0), &ctx);
+        assert!(app.file_locations.recent_pairs().is_empty());
+        assert_eq!(std::fs::read(&data).unwrap(), b"keep", "Remove only forgets the entry");
+        app.start_action(crate::start_screen::Action::TrySample, &ctx);
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !(app.binary.has_file() && app.binary.has_layout()) {
+            workspace_frame(&mut app, &ctx);
+            assert!(Instant::now() < deadline, "the sample and its decoder open");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
     fn welcome_does_not_reserve_empty_editors_and_views() {
         let ctx = Context::default();
         let mut app = BinwaveApp::default();
@@ -3925,7 +3933,13 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(labels.iter().any(|text| text == "Inspect and edit a file"));
+        for text in ["Open file…", "Try a sample file", "New decoder", "Decoder library"] {
+            assert!(labels.iter().any(|shown| shown == text), "missing {text}");
+        }
+        // Without a file the header has no title, dropdown or Export.
+        for text in ["Open a file", "Export", "Ready"] {
+            assert!(!labels.iter().any(|shown| shown == text), "unexpected {text}");
+        }
         for pane in [
             Pane::Hex,
             Pane::Plot,

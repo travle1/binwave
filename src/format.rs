@@ -112,6 +112,38 @@ pub fn short_float(value: f64) -> String {
     }
 }
 
+/// When something happened, for lists of recent things: `Just now`, `12 min ago`,
+/// `3 h ago`, `Yesterday`, `4 days ago`, then the date (`12 Sep 2026`, UTC).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
+pub fn ago(then_unix_secs: u64, now_unix_secs: u64) -> String {
+    if then_unix_secs == 0 {
+        return "Earlier".into();
+    }
+    let elapsed = now_unix_secs.saturating_sub(then_unix_secs);
+    let days = now_unix_secs / 86_400 - (then_unix_secs / 86_400).min(now_unix_secs / 86_400);
+    match (elapsed, days) {
+        (0..60, _) => "Just now".into(),
+        (60..3600, _) => format!("{} min ago", elapsed / 60),
+        (_, 0) => format!("{} h ago", elapsed / 3600),
+        (_, 1) => "Yesterday".into(),
+        (_, 2..=6) => format!("{days} days ago"),
+        _ => {
+            // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+            let z = (then_unix_secs / 86_400) as i64 + 719_468;
+            let era = z.div_euclid(146_097);
+            let doe = z - era * 146_097;
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let day = doy - (153 * mp + 2) / 5 + 1;
+            let month = if mp < 10 { mp + 3 } else { mp - 9 };
+            let year = yoe + era * 400 + i64::from(month <= 2);
+            const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            format!("{day} {} {year}", MONTHS[(month - 1) as usize])
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,4 +183,17 @@ mod tests {
         assert_eq!(byte_range(0x6Bu64, 0x6Cu64), "0x6B · 1 B");
         assert_eq!(byte_range(0x6Bu64, 0x6Bu64), "0x6B · 0 B");
     }
+
+    #[test]
+    fn ago_is_relative_for_a_week_then_a_date() {
+        let now = 1_792_000_000; // 2026-10-14, 17:46 UTC
+        assert_eq!(super::ago(now - 30, now), "Just now");
+        assert_eq!(super::ago(now - 12 * 60, now), "12 min ago");
+        assert_eq!(super::ago(now - 3 * 3600, now), "3 h ago");
+        assert_eq!(super::ago(now - 20 * 3600, now), "Yesterday");
+        assert_eq!(super::ago(now - 4 * 86_400, now), "4 days ago");
+        assert_eq!(super::ago(1_789_000_000, now), "10 Sep 2026");
+        assert_eq!(super::ago(0, now), "Earlier");
+    }
 }
+

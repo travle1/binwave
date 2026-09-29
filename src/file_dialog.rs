@@ -31,7 +31,7 @@ impl FileKind {
 }
 
 const FILE_LOCATIONS_KEY: &str = "binwave.file_locations.v1";
-const MAX_RECENT_PAIRS: usize = 8;
+const MAX_RECENT_PAIRS: usize = 32;
 const MAX_LIBRARY_DECODERS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -163,6 +163,11 @@ impl FileLocations {
         }
         state.recent_pairs.insert(0, pair);
         state.recent_pairs.truncate(MAX_RECENT_PAIRS);
+    }
+    /// Drop a data file from the recent list; the file itself is untouched.
+    pub fn forget_pair(&self, data: &Path) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.recent_pairs.retain(|pair| pair.data != data);
     }
     pub fn load(storage: Option<&dyn eframe::Storage>) -> Self {
         let state = storage
@@ -470,7 +475,9 @@ mod tests {
             locations.remember_pair(&PathBuf::from(format!("/data/{index}.bin")), None);
         }
         assert_eq!(locations.recent_pairs().len(), MAX_RECENT_PAIRS);
-        assert_eq!(locations.recent_pairs()[0].data, PathBuf::from("/data/9.bin"));
+        assert_eq!(locations.recent_pairs()[0].data, PathBuf::from(format!("/data/{}.bin", MAX_RECENT_PAIRS + 1)));
+        locations.forget_pair(&PathBuf::from(format!("/data/{}.bin", MAX_RECENT_PAIRS + 1)));
+        assert_eq!(locations.recent_pairs().len(), MAX_RECENT_PAIRS - 1);
     }
 
     #[test]

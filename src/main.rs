@@ -74,6 +74,8 @@ mod theme;
 #[cfg(not(target_arch = "wasm32"))]
 mod sidebar;
 #[cfg(not(target_arch = "wasm32"))]
+mod start_screen;
+#[cfg(not(target_arch = "wasm32"))]
 mod window_frame;
 #[cfg(not(target_arch = "wasm32"))]
 mod structure_ui;
