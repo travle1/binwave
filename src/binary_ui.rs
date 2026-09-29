@@ -2642,7 +2642,7 @@ impl BinaryWorkspace {
                 .ok()
                 .flatten()
         });
-        let response = Plot::new("binary_plot")
+        let response = crate::theme::labeled_grid(Plot::new("binary_plot"))
             .height(ui.available_height().max(100.))
             .allow_drag(true)
             .allow_zoom(true)

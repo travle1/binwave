@@ -73,6 +73,8 @@ pub struct Colors {
     pub syntax: Syntax,
     pub hex_regions: HexRegions,
     pub scrollbar: Color32,
+    /// Plot gridlines: just above the card, so they never compete with signals.
+    pub plot_grid: Color32,
 }
 pub struct Radii {
     pub window: u8,
@@ -141,6 +143,12 @@ pub struct Sizes {
     pub structure_type_min_width: f32,
     pub structure_status_width: f32,
     pub plot_line_width: f32,
+    /// Plot tick labels need at least this much room (egui_plot's defaults);
+    /// gridlines are drawn only where a label is.
+    pub plot_x_label_min: f32,
+    pub plot_y_label_min: f32,
+    /// Gridlines fade in between these spacings, like their labels.
+    pub plot_grid_fade: [f32; 2],
     pub plot_point_radius: f32,
     pub plot_selected_radius: f32,
     pub library_details_width: f32,
@@ -250,6 +258,7 @@ pub const DARK: Theme = Theme {
             entry_b: rgb(0xC5, 0xC4, 0xC2),
         },
         scrollbar: rgb(0x42, 0x42, 0x41),
+        plot_grid: rgb(0x30, 0x30, 0x30),
     },
     radius: Radii {
         window: 14,
@@ -310,6 +319,9 @@ pub const DARK: Theme = Theme {
         structure_type_min_width: 520.,
         structure_status_width: 22.,
         plot_line_width: 1.5,
+        plot_x_label_min: 60.,
+        plot_y_label_min: 20.,
+        plot_grid_fade: [20., 80.],
         plot_point_radius: 2.5,
         plot_selected_radius: 7.,
         library_details_width: 480.,
@@ -347,6 +359,27 @@ pub const DARK: Theme = Theme {
         value: 20.,
     },
 };
+
+/// Gridlines only at labelled ticks: egui_plot's decimal marks, minus those too
+/// close together for the axis to label them.
+pub fn labeled_grid(plot: egui_plot::Plot<'_>) -> egui_plot::Plot<'_> {
+    let t = &DARK;
+    let [fade_min, fade_max] = t.size.plot_grid_fade;
+    let spacer = move |label_min: f32| move |input| labeled_marks(input, fade_min, label_min);
+    plot.grid_spacing(egui::Rangef::new(fade_min, fade_max))
+        .grid_color(t.color.plot_grid)
+        .x_grid_spacer(spacer(t.size.plot_x_label_min))
+        .y_grid_spacer(spacer(t.size.plot_y_label_min))
+}
+
+/// Decimal grid marks at least `label_min` points apart. `base_step_size` is the
+/// value span of `grid_min` points, as egui_plot passes it.
+fn labeled_marks(input: egui_plot::GridInput, grid_min: f32, label_min: f32) -> Vec<egui_plot::GridMark> {
+    let points_per_value = f64::from(grid_min) / input.base_step_size;
+    let mut marks = egui_plot::log_grid_spacer(10)(input);
+    marks.retain(|mark| mark.step_size * points_per_value > f64::from(label_min));
+    marks
+}
 
 pub fn dock_style(egui_style: &egui::Style) -> egui_dock::Style {
     let t = &DARK;
@@ -533,6 +566,20 @@ pub fn install(ctx: &Context) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gridlines_sit_only_at_ticks_the_axis_labels() {
+        // 1,000 values across 1,000 points: one value per point.
+        let input = || egui_plot::GridInput { bounds: (0., 1000.), base_step_size: 20. };
+        let x = labeled_marks(input(), 20., 60.);
+        assert!(x.iter().all(|mark| mark.step_size >= 100.), "no unlabelled 10-value lines: {x:?}");
+        assert_eq!(x.iter().filter(|mark| mark.value > 0. && mark.value < 1000.).count(), 9);
+        let y = labeled_marks(input(), 20., 20.);
+        assert!(y.iter().all(|mark| mark.step_size >= 100.), "10 points apart is too close to label");
+        // Zoomed in: 10 values across 1,000 points puts labels every value.
+        let zoomed = labeled_marks(egui_plot::GridInput { bounds: (0., 10.), base_step_size: 0.2 }, 20., 60.);
+        assert!(zoomed.iter().any(|mark| mark.step_size == 1.));
+    }
+
     use super::*;
 
     #[test]

@@ -2341,7 +2341,7 @@ impl BinwaveApp {
             ui.colored_label(egui::Color32::LIGHT_RED, err);
         }
         let selected_samples = self.csv_selected_samples();
-        let response = Plot::new("plot")
+        let response = crate::theme::labeled_grid(Plot::new("plot"))
             .id(egui::Id::new(("csv_plot", self.dataset)))
             .allow_zoom(true)
             .allow_scroll(true)

@@ -2048,7 +2048,7 @@ impl StructureViews {
             self.plot_y_axis_key = Some(axis_key);
             self.plot_y_axis_thickness = 0.;
         }
-        let response = Plot::new(plot_id)
+        let response = crate::theme::labeled_grid(Plot::new(plot_id))
             .id(plot_id)
             .auto_bounds(egui::Vec2b::new(false, false))
             .allow_double_click_reset(false)

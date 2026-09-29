@@ -2039,7 +2039,7 @@ impl BrowserApp {
                 values.fold((f64::INFINITY,f64::NEG_INFINITY),|(min,max),v|(min.min(v),max.max(v)))
             });
 
-            let plot = egui_plot::Plot::new("decoded-plot-overlay").x_axis_label("Sample index")
+            let plot = crate::theme::labeled_grid(egui_plot::Plot::new("decoded-plot-overlay")).x_axis_label("Sample index")
                 .allow_scroll(false)
                 .allow_drag(egui::Vec2b::new(true,false))
                 .allow_zoom(false)
