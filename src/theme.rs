@@ -115,6 +115,10 @@ pub struct Sizes {
     pub inspector_max_width: f32,
     /// Inspector value chips (Selected bytes grid).
     pub inspector_chip_height: f32,
+    /// The field card's type badge; longer type names end in "…".
+    pub inspector_badge_max_width: f32,
+    /// Label column of the Inspector's Definition rows.
+    pub inspector_definition_label: f32,
     pub info_icon: f32,
     /// Table panel: row height and initial column widths (# is sized for 7 digits,
     /// Size for 10+).
@@ -275,6 +279,8 @@ pub const DARK: Theme = Theme {
         inspector_min_width: 300.,
         inspector_max_width: 340.,
         inspector_chip_height: 26.,
+        inspector_badge_max_width: 160.,
+        inspector_definition_label: 72.,
         info_icon: 14.,
         table_row: 24.,
         table_index_column: 60.,

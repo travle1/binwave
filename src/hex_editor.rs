@@ -677,6 +677,7 @@ impl HexEditor {
                 if let Some(index) = remove { self.bookmarks.remove(index); }
                 if self.bookmarks.is_empty() { ui.weak("Select bytes to name and color a range."); }
             });
+            crate::workspace_inspector::toggle_button(ui);
         });
         if self.show_search {
             ui.horizontal_wrapped(|ui| {
@@ -2286,6 +2287,7 @@ mod tests {
     fn fixed_width_rows_stay_left_of_a_docked_inspector_that_starts_after_the_text_column() {
         let (_dir, source) = fixture();
         let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
         let mut editor = HexEditor::default();
         editor.bytes_per_row = 16;
         // A selection inside a named field makes the long cursor readout appear.

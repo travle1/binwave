@@ -3456,9 +3456,10 @@ impl BinaryWorkspace {
             == self.structure_ui.samples_collection_path().as_deref() { "sample" } else { "item" };
         let (mut export, mut describe, mut name_range, mut edit_decoder) = (false, false, false, false);
         let (mut select_sample, mut export_sample) = (false, false);
+        let language = self.language;
+        let structure_ui = &mut self.structure_ui;
         let action = crate::workspace_inspector::field_card(ui, &field,
-            self.generic_value_edit.as_mut().map(|edit| &mut edit.value), can_edit,
-            selection.as_ref().map(|range| range.start as u64..range.end as u64), |ui| {
+            self.generic_value_edit.as_mut().map(|edit| &mut edit.value), can_edit, |ui| {
                 export = ui.button("Export bytes…").clicked();
                 describe = ui.button(if python { "Copy Python read" } else { "Describe bytes…" }).clicked();
                 name_range = ui.button("Name / color range…").clicked();
@@ -3468,6 +3469,7 @@ impl BinaryWorkspace {
                     select_sample = ui.button(format!("Select whole {noun} {}", crate::format::count(index))).clicked();
                     export_sample = ui.button(format!("Export whole {noun}…")).clicked();
                 }
+                structure_ui.definition_actions(ui, language);
                 if export || describe || name_range || edit_decoder || select_sample || export_sample {
                     ui.close();
                 }
@@ -3507,9 +3509,7 @@ impl BinaryWorkspace {
         let actions = self.hex_editor.ui_inspector(ui, source, field.endian == "big", false);
         self.hex_actions(actions, &ctx);
         let line = crate::workspace_inspector::definition_line(&self.yaml, &field).filter(|_| !python);
-        let language = self.language;
-        crate::workspace_inspector::definition(ui, &field, line,
-            |ui| self.structure_ui.definition_actions(ui, language));
+        crate::workspace_inspector::definition(ui, &field, line);
     }
 }
 
@@ -4846,7 +4846,8 @@ mod tests {
             .collect();
         assert!(labels.iter().any(|text| text == "triangle"));
         assert!(labels.iter().any(|text| text == "samples[1]"));
-        assert!(labels.iter().any(|text| text == "1 byte of 8 B selected"));
+        assert!(!labels.iter().any(|text| text.ends_with("selected")),
+            "the header's chip shows the selection; the card doesn't repeat it");
         assert!(!labels
             .iter()
             .any(|text| text == "Definition path" || text == "Little endian"));

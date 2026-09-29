@@ -636,6 +636,7 @@ impl StructureWorkspace {
     }
 
     /// Decoder authoring shortcuts shown inside the Inspector's Definition row.
+    /// Decoder actions for the selected field, in the Inspector's ⋯ menu.
     pub fn definition_actions(&mut self, ui: &mut Ui, language: DecoderLanguage) {
         let Some(node) = self.selected_node() else {
             return;
@@ -643,17 +644,22 @@ impl StructureWorkspace {
         if language == DecoderLanguage::Python {
             return;
         }
-        if matches!(node.value, Some(Value::Signed(_) | Value::Unsigned(_)))
-            && ui.button("Use this value for…").clicked()
+        let numeric = matches!(node.value, Some(Value::Signed(_) | Value::Unsigned(_)));
+        let collection = node.lazy.is_some() || !node.children.is_empty();
+        if numeric || collection {
+            ui.separator();
+        }
+        if numeric && ui.button("Use this value for…").clicked()
         {
+            ui.close();
             self.builder.reference = node.path.clone();
             self.builder.active = true;
             self.editor_page = EditorPage::Structures;
             self.reveal = true;
         }
-        if (node.lazy.is_some() || !node.children.is_empty())
-            && ui.button("Build a type from these descriptions…").clicked()
+        if collection && ui.button("Build a type from these descriptions…").clicked()
         {
+            ui.close();
             self.builder = Builder::from_range(node.range.end..node.range.end);
             self.builder.name = "Discovered".into();
             self.builder.instance = "payload".into();

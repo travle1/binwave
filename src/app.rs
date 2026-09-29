@@ -2550,6 +2550,8 @@ impl TabViewer for WorkspaceViewer<'_> {
                         |app, ui| crate::workspace_inspector::header(ui, app.binary.byte_selection()
                             .map(|range| range.start as u64..range.end as u64)),
                         |app, ui| app.ui_inspector(ui));
+                } else {
+                    crate::workspace_inspector::not_docked(ui.ctx());
                 }
                 if self.app.displayed_decoder == Decoder::Csv {
                     let highlights = self.app.csv_highlights();

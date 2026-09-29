@@ -165,12 +165,52 @@ pub enum FieldAction {
     ApplyValue,
 }
 
+const OPEN_ID: &str = "inspector_open";
+const DOCKED_ID: &str = "inspector_docked";
+
+/// Whether the docked Inspector is shown. Remembered between launches.
+pub fn is_open(ctx: &egui::Context) -> bool {
+    ctx.data_mut(|data| *data.get_persisted_mut_or(egui::Id::new(OPEN_ID), true))
+}
+
+pub fn set_open(ctx: &egui::Context, open: bool) {
+    ctx.data_mut(|data| data.insert_persisted(egui::Id::new(OPEN_ID), open));
+}
+
+/// Hex's toolbar toggle for the docked Inspector (Ctrl+I). Hidden when Hex is too
+/// narrow to dock it.
+pub fn toggle_button(ui: &mut Ui) {
+    let t = &crate::theme::DARK;
+    if !ui.data(|data| data.get_temp::<bool>(egui::Id::new(DOCKED_ID))).unwrap_or(false) {
+        return;
+    }
+    let open = is_open(ui.ctx());
+    let icon = RichText::new(egui_phosphor::regular::SIDEBAR_SIMPLE)
+        .font(FontId::new(t.size.info_icon, FontFamily::Name("phosphor".into())));
+    if ui.add(egui::Button::selectable(open, icon))
+        .on_hover_text(if open { "Hide Inspector (Ctrl+I)" } else { "Show Inspector (Ctrl+I)" })
+        .clicked()
+    {
+        set_open(ui.ctx(), !open);
+    }
+}
+
 /// The Inspector docked inside Hex. It starts right after Hex's Text column
 /// (`grid_width` is the width the byte grid needs) and never gets narrower than
-/// its minimum. Its body scrolls both ways, so a long value never widens it.
+/// its minimum. Its content lays out at the panel's width, and long text ends in
+/// "…" instead of widening it. Ctrl+I and the Hex toolbar toggle hide it.
 pub fn docked_panel<T>(ui: &mut Ui, id: &str, state: &mut T, grid_width: f32,
     header: impl FnOnce(&mut T, &mut Ui), body: impl FnOnce(&mut T, &mut Ui)) {
     let t = &crate::theme::DARK;
+    let ctx = ui.ctx().clone();
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new(DOCKED_ID), true));
+    if ctx.input_mut(|input| input.consume_shortcut(
+        &egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::I))) {
+        set_open(&ctx, !is_open(&ctx));
+    }
+    if !is_open(&ctx) {
+        return;
+    }
     let width = (ui.available_width() - grid_width).max(t.size.inspector_min_width);
     egui::Panel::right(id.to_owned())
         .resizable(false)
@@ -181,24 +221,41 @@ pub fn docked_panel<T>(ui: &mut Ui, id: &str, state: &mut T, grid_width: f32,
             .corner_radius(t.radius.inset))
         .show(ui, |ui| {
             header(state, ui);
-            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| body(state, ui));
+            // Content lays out at the panel's width; anything still wider scrolls
+            // rather than widening the panel over Hex.
+            let width = ui.available_width();
+            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                ui.set_max_width(width);
+                body(state, ui)
+            });
         });
 }
 
-/// "Inspector" with the selection chip on the right: `0x48 · 16 bytes`.
+/// Hex is too narrow to dock the Inspector this frame, so its toggle hides.
+pub fn not_docked(ctx: &egui::Context) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new(DOCKED_ID), false));
+}
+
+/// "Inspector" with the selection chip and a hide button on the right: `0x48 · 16 bytes`.
 pub fn header(ui: &mut Ui, selection: Option<Range<u64>>) {
     let t = &crate::theme::DARK;
     ui.horizontal(|ui| {
         ui.label(RichText::new("Inspector").size(t.font.card_title)
             .family(FontFamily::Name("Geist SemiBold".into())).color(t.color.text.primary));
-        if let Some(range) = selection.filter(|range| !range.is_empty()) {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let icon = RichText::new(egui_phosphor::regular::CARET_DOUBLE_RIGHT)
+                .font(FontId::new(t.size.info_icon, FontFamily::Name("phosphor".into())))
+                .color(t.color.text.muted);
+            if ui.add(egui::Button::new(icon).frame(false)).on_hover_text("Hide Inspector (Ctrl+I)").clicked() {
+                set_open(ui.ctx(), false);
+            }
+            if let Some(range) = selection.filter(|range| !range.is_empty()) {
                 ui.label(RichText::new(format!("0x{:X} · {}", range.start,
                     crate::format::plural(range.end - range.start, "byte", "bytes")))
                     .monospace().size(t.font.label).color(t.color.text.muted))
                     .on_hover_text(crate::format::byte_range(range.start, range.end));
-            });
-        }
+            }
+        });
     });
     ui.add_space(t.spacing.inspector_gap);
 }
@@ -242,10 +299,9 @@ pub fn card<R>(ui: &mut Ui, contents: impl FnOnce(&mut Ui) -> R) -> R {
 }
 
 /// The selected field: clickable path, name and type badge, large value,
-/// inclusive range and one action row. `selection` is Hex's byte selection.
-/// `menu` adds the host's items to the ⋯ menu.
+/// inclusive range and one action row. `menu` adds the host's items to the ⋯ menu.
 pub fn field_card(ui: &mut Ui, field: &FieldInfo, mut edit: Option<&mut ValueEdit>, can_edit: bool,
-    selection: Option<Range<u64>>, menu: impl FnOnce(&mut Ui)) -> Option<FieldAction> {
+    menu: impl FnOnce(&mut Ui)) -> Option<FieldAction> {
     let t = &crate::theme::DARK;
     let mut action = None;
     card(ui, |ui| {
@@ -253,17 +309,28 @@ pub fn field_card(ui: &mut Ui, field: &FieldInfo, mut edit: Option<&mut ValueEdi
             action = Some(FieldAction::SelectPath(path));
         }
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&field.name).size(t.font.body)
-                .family(FontFamily::Name("Geist SemiBold".into())).color(t.color.text.primary));
             let size = field.end.saturating_sub(field.start);
+            let badge = format!("{} · {}", field.kind, crate::format::size(size));
+            // The badge keeps its size; the name gives way first.
+            let badge_width = ui.fonts_mut(|fonts| fonts.layout_no_wrap(badge.clone(),
+                FontId::monospace(t.font.label), t.color.status.success).size().x)
+                .min(t.size.inspector_badge_max_width) + 2. * t.spacing.inspector_gap;
+            ui.scope(|ui| {
+                ui.set_max_width((ui.available_width() - badge_width - ui.spacing().item_spacing.x).max(0.));
+                ui.add(egui::Label::new(RichText::new(&field.name).size(t.font.body)
+                    .family(FontFamily::Name("Geist SemiBold".into())).color(t.color.text.primary)).truncate())
+                    .on_hover_text(&field.name);
+            });
             egui::Frame::new()
                 .fill(t.color.status.success.gamma_multiply(t.color.status.soft_alpha))
                 .corner_radius(t.radius.chip)
-                .inner_margin(egui::Margin::symmetric(6, 1))
+                .inner_margin(egui::Margin::symmetric(t.spacing.inspector_gap as i8, 1))
                 .show(ui, |ui| {
-                    ui.label(RichText::new(format!("{} · {}", field.kind, crate::format::size(size)))
-                        .monospace().size(t.font.label).color(t.color.status.success))
-                        .on_hover_text(format!("{} · {} endian", crate::format::exact_bytes(size), field.endian));
+                    ui.set_max_width(t.size.inspector_badge_max_width);
+                    ui.add(egui::Label::new(RichText::new(&badge)
+                        .monospace().size(t.font.label).color(t.color.status.success)).truncate())
+                        .on_hover_text(format!("{} · {}\n{} endian", field.kind, crate::format::exact_bytes(size),
+                            field.endian));
                 });
         });
         let editable = field.editable && can_edit;
@@ -287,15 +354,21 @@ pub fn field_card(ui: &mut Ui, field: &FieldInfo, mut edit: Option<&mut ValueEdi
                 }
             }
             None => {
-                let value = if field.display.is_empty() { &field.value } else { &field.display };
+                let full = if field.display.is_empty() { &field.value } else { &field.display };
+                // A collection shows its count; the rest of its summary is on hover.
+                let value = if field.kind.ends_with("[]") {
+                    full.split(" · ").next().unwrap_or(full)
+                } else {
+                    full
+                };
                 let response = ui.add(egui::Label::new(RichText::new(value).size(t.font.value)
                     .color(t.color.text.primary)).truncate()
                     .sense(if editable { Sense::click() } else { Sense::hover() }));
                 let response = if editable {
                     response.on_hover_cursor(egui::CursorIcon::Text)
-                        .on_hover_text(format!("{value}\nClick to edit. Enter writes the bytes."))
+                        .on_hover_text(format!("{full}\nClick to edit. Enter writes the bytes."))
                 } else {
-                    response.on_hover_text(value)
+                    response.on_hover_text(full)
                 };
                 if response.clicked() {
                     if let Some(edit) = edit.as_deref_mut() {
@@ -304,17 +377,8 @@ pub fn field_card(ui: &mut Ui, field: &FieldInfo, mut edit: Option<&mut ValueEdi
                 }
             }
         }
-        ui.label(RichText::new(crate::format::byte_range(field.start, field.end))
-            .monospace().size(t.font.label).color(t.color.text.muted));
-        if let Some(selected) = selection.filter(|range| {
-            !range.is_empty() && *range != (field.start..field.end)
-                && range.start >= field.start && range.end <= field.end
-        }) {
-            ui.label(RichText::new(format!("{} of {} selected",
-                crate::format::plural(selected.end - selected.start, "byte", "bytes"),
-                crate::format::size(field.end - field.start)))
-                .size(t.font.label).color(t.color.text.muted));
-        }
+        ui.add(egui::Label::new(RichText::new(crate::format::byte_range(field.start, field.end))
+            .monospace().size(t.font.label).color(t.color.text.muted)).truncate());
         ui.add_space(t.spacing.inspector_gap);
         ui.horizontal(|ui| {
             if ui.button("Jump to definition").on_hover_text("Show this field in the decoder").clicked() {
@@ -423,7 +487,8 @@ pub fn selected_bytes(ui: &mut Ui, range: Range<u64>, bytes: Option<&[u8]>, defa
     };
     let length = (range.end - range.start).min(bytes.len() as u64) as usize;
     let bytes = &bytes[..length];
-    let cells = interpretations(bytes, big, range.end - range.start);
+    let cells: Vec<Cell> = interpretations(bytes, big, range.end - range.start)
+        .into_iter().filter(|cell| !cell.missing).collect();
     let gap = t.spacing.inspector_gap;
     let chip_width = ((ui.available_width() - gap) / 2.).max(0.);
     ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
@@ -433,6 +498,19 @@ pub fn selected_bytes(ui: &mut Ui, range: Range<u64>, bytes: Option<&[u8]>, defa
                 chip(ui, chip_width, cell);
             }
         });
+    }
+    if let Some(note) = wider_types_note(range.end - range.start) {
+        ui.add(egui::Label::new(RichText::new(note).size(t.font.label).color(t.color.text.muted)).truncate());
+    }
+}
+
+/// One line in place of the types a short selection can't hold.
+fn wider_types_note(selected: u64) -> Option<&'static str> {
+    match selected {
+        0 | 8.. => None,
+        1 => Some("Select 2+ bytes for 16-bit and wider types"),
+        2 | 3 => Some("Select 4+ bytes for 32- and 64-bit types"),
+        _ => Some("Select 8+ bytes for 64-bit types"),
     }
 }
 
@@ -518,9 +596,9 @@ fn chip(ui: &mut Ui, width: f32, cell: &Cell) {
     response.on_hover_text(&cell.hover);
 }
 
-/// "Definition" row, collapsed by default: the field's structure, type and
-/// byte order. `extra` adds host actions inside it.
-pub fn definition(ui: &mut Ui, field: &FieldInfo, line: Option<usize>, extra: impl FnOnce(&mut Ui)) {
+/// "Definition" row, collapsed by default: the field's structure and type.
+/// Byte order is the Little/Big switch above it.
+pub fn definition(ui: &mut Ui, field: &FieldInfo, line: Option<usize>) {
     let t = &crate::theme::DARK;
     ui.add_space(t.spacing.inspector_gap);
     let title = match line {
@@ -531,22 +609,23 @@ pub fn definition(ui: &mut Ui, field: &FieldInfo, line: Option<usize>, extra: im
         .id_salt("inspector_definition")
         .default_open(false)
         .show(ui, |ui| {
-            egui::Grid::new("inspector_definition_rows").num_columns(2).show(ui, |ui| {
-                let mut row = |label: &str, value: &str| {
-                    ui.label(RichText::new(label).size(t.font.label).color(t.color.text.muted));
-                    ui.label(RichText::new(value).monospace().size(t.font.small));
-                    ui.end_row();
-                };
-                if let Some(structure) = field.structure.as_deref() {
-                    row("Structure", structure);
-                }
-                row("Type", &field.kind);
-                row("Byte order", &field.endian);
-                if !field.references.is_empty() {
-                    row("Uses", &field.references.join(", "));
-                }
-            });
-            extra(ui);
+            let row = |ui: &mut Ui, label: &str, value: &str, hover: String| {
+                ui.horizontal(|ui| {
+                    ui.add_sized([t.size.inspector_definition_label, t.size.inspector_chip_height / 2.],
+                        egui::Label::new(RichText::new(label).size(t.font.label).color(t.color.text.muted)));
+                    ui.add(egui::Label::new(RichText::new(value).monospace().size(t.font.small)).truncate())
+                        .on_hover_text(hover);
+                });
+            };
+            if let Some(structure) = field.structure.as_deref() {
+                row(ui, "Structure", structure, structure.to_owned());
+            }
+            let uses = if field.references.is_empty() {
+                String::new()
+            } else {
+                format!("\nUses {}", field.references.join(", "))
+            };
+            row(ui, "Type", &field.kind, format!("{}{uses}", field.kind));
         });
 }
 
@@ -620,5 +699,44 @@ mod tests {
         assert_eq!(value("u32").value, "needs 4 B");
         assert_eq!(value("text").value, "\"tr\"");
         assert_eq!(value("hex").value, "74 72");
+    }
+
+    #[test]
+    fn short_selections_get_one_line_instead_of_a_row_per_missing_type() {
+        assert_eq!(wider_types_note(1), Some("Select 2+ bytes for 16-bit and wider types"));
+        assert_eq!(wider_types_note(3), Some("Select 4+ bytes for 32- and 64-bit types"));
+        assert_eq!(wider_types_note(7), Some("Select 8+ bytes for 64-bit types"));
+        assert_eq!(wider_types_note(8), None);
+        let shown: Vec<_> = interpretations(&[1], false, 1).into_iter().filter(|cell| !cell.missing)
+            .map(|cell| cell.label).collect();
+        assert_eq!(shown, ["u8", "i8", "text", "hex"]);
+    }
+
+    #[test]
+    fn ctrl_i_hides_and_shows_the_docked_inspector() {
+        use crate::egui_compat::ContextRun as _;
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let frame = |events: Vec<egui::Event>| {
+            let output = ctx.run(egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200., 600.))),
+                ..Default::default()
+            }, |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    docked_panel(ui, "inspector", &mut (), 600., |_, ui: &mut Ui| header(ui, None),
+                        |_, ui: &mut Ui| { ui.label("body"); });
+                });
+            });
+            output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == "body"))
+        };
+        let ctrl_i = || vec![egui::Event::Key { key: egui::Key::I, physical_key: None, pressed: true,
+            repeat: false, modifiers: egui::Modifiers::COMMAND }];
+        assert!(frame(vec![]), "open by default");
+        assert!(!frame(ctrl_i()));
+        assert!(!is_open(&ctx));
+        assert!(!frame(vec![]), "stays hidden");
+        assert!(frame(ctrl_i()));
     }
 }

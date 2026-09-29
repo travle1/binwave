@@ -637,6 +637,8 @@ impl BrowserApp {
             crate::workspace_inspector::docked_panel(ui, "browser_hex_inspector", self, grid_width,
                 |this, ui| crate::workspace_inspector::header(ui, this.selection_range().map(|(start, end)| start..end)),
                 |this, ui| this.inspector(ui));
+        } else {
+            crate::workspace_inspector::not_docked(ui.ctx());
         }
         ui.horizontal_wrapped(|ui| {
             if ui
@@ -677,6 +679,7 @@ impl BrowserApp {
             if let Some((start, end)) = parse_offset(&self.range_start).zip(parse_offset(&self.range_end)) {
                 ui.label(format!("Bytes {}", crate::format::byte_range(start, end)));
             }
+            crate::workspace_inspector::toggle_button(ui);
         });
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         let digit = ui.fonts_mut(|fonts| fonts.layout_no_wrap("0".into(), font.clone(), egui::Color32::WHITE).size().x);
@@ -920,7 +923,7 @@ impl BrowserApp {
                 == self.samples_path().as_deref() { "sample" } else { "item" };
             let (mut edit_decoder, mut select_sample) = (false, false);
             let action = crate::workspace_inspector::field_card(ui, &field, Some(&mut self.value_edit),
-                !self.decoding, selection.map(|(start, end)| start..end), |ui| {
+                !self.decoding, |ui| {
                     edit_decoder = ui.button("Edit decoder").clicked();
                     if let Some((index, _)) = &sample {
                         ui.separator();
@@ -987,7 +990,7 @@ impl BrowserApp {
         if let Some(field) = &self.inspected {
             let line = crate::workspace_inspector::definition_line(&self.yaml, field)
                 .filter(|_| self.language == crate::source_editor::DecoderLanguage::Yaml);
-            crate::workspace_inspector::definition(ui, field, line, |_| {});
+            crate::workspace_inspector::definition(ui, field, line);
         }
         if let Some((start, end)) = reveal {
             self.select_range(start, end);
