@@ -2,6 +2,7 @@
 #[cfg(test)]
 use crate::egui_compat::ContextRun as _;
 use crate::byte_store::ByteView;
+use crate::byte_display::{loose_hex, parse_hex};
 use egui::{Color32, FontId, Key, RichText, Sense};
 use std::ops::Range;
 use std::sync::{
@@ -1730,26 +1731,6 @@ pub(crate) fn recenter_scroll_window(
     None
 }
 
-fn parse_hex(input: &str) -> Result<Vec<u8>, String> {
-    let cleaned: String = input
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '_')
-        .collect();
-    if cleaned.len() % 2 != 0 {
-        return Err("Enter complete hexadecimal byte pairs, for example 00 A4 FF.".into());
-    }
-    if !cleaned.is_ascii() {
-        return Err("Use hexadecimal digits 0–9 and A–F.".into());
-    }
-    (0..cleaned.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&cleaned[i..i + 2], 16)
-                .map_err(|_| "Use hexadecimal digits 0–9 and A–F.".to_owned())
-        })
-        .collect()
-}
-
 #[derive(Clone, Copy, PartialEq)]
 enum BytesRow {
     Replace,
@@ -1763,19 +1744,11 @@ fn pasted_bytes(clipboard: &str, text: bool) -> Result<Vec<u8>, String> {
     if text {
         return Ok(clipboard.as_bytes().to_vec());
     }
-    let cleaned = clipboard.replace("0x", " ").replace("0X", " ").replace([',', ';'], " ");
-    parse_hex(&cleaned).map_err(|_| "The clipboard isn't hex bytes. Click the Text column to paste it as text.".into())
+    loose_hex(clipboard).map_err(|_| "The clipboard isn't hex bytes. Click the Text column to paste it as text.".into())
 }
 
 fn typed_bytes(input: &str, text: bool) -> Result<Vec<u8>, String> {
-    let bytes = if text { input.as_bytes().to_vec() } else { parse_hex(input)? };
-    if bytes.is_empty() {
-        return Err("Enter bytes to insert.".into());
-    }
-    if bytes.len() > COPY_LIMIT {
-        return Err("One insert is limited to 1 MiB.".into());
-    }
-    Ok(bytes)
+    crate::byte_display::typed_bytes(input, text, COPY_LIMIT)
 }
 
 fn replacement_bytes(

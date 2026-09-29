@@ -1,4 +1,5 @@
 import {range} from './file-backend.mjs';
+import * as edits from './byte-pieces.mjs';
 import './cache-settings.js';
 
 // FileReaderSync is restricted to this dedicated worker. No source file is copied
@@ -7,10 +8,11 @@ import './cache-settings.js';
 export const DECODER_PAGE_SIZE = 1024 * 1024;
 export const DECODER_CACHE_BYTES = globalThis.binwaveCacheSettings.DEFAULT_BYTES;
 export class DecoderSource {
-    constructor(file, patches, readSlice, cacheBytes = DECODER_CACHE_BYTES) {
+    // `pieces` is the edited file from the file worker; null reads the file as is.
+    constructor(file, pieces, readSlice, cacheBytes = DECODER_CACHE_BYTES) {
         this.file = file;
-        this.size = BigInt(file.size);
-        this.patches = new Map(patches);
+        this.pieces = pieces ?? edits.original(BigInt(file.size));
+        this.size = edits.sizeOf(this.pieces);
         this.readSlice = readSlice;
         this.cache = new Map();
         this.cachedBytes = 0;
@@ -29,11 +31,22 @@ export class DecoderSource {
         }
     }
     exact(at, length) {
-        const bytes = new Uint8Array(this.readSlice(this.file.slice(Number(at), Number(at) + length)));
-        if (bytes.length !== length) throw Error('Source changed or ended during decoding');
-        for (const [position, value] of this.patches) {
-            if (position >= at && position < at + BigInt(length)) bytes[Number(position - at)] = value;
+        const bytes = new Uint8Array(length);
+        let written = 0;
+        for (const {piece, from, to} of edits.segments(this.pieces, at, length)) {
+            let part;
+            if (piece.kind === 'added') part = piece.bytes.subarray(Number(from), Number(to));
+            else if (piece.kind === 'pattern') part = edits.patternBytes(piece, from, to);
+            else {
+                const file = piece.kind === 'base' ? this.file : piece.file;
+                const first = Number(piece.start + from), last = Number(piece.start + to);
+                part = new Uint8Array(this.readSlice(file.slice(first, last)));
+                if (part.length !== last - first) throw Error('Source changed or ended during decoding');
+            }
+            bytes.set(part, written);
+            written += part.length;
         }
+        if (written !== length) throw Error('Source changed or ended during decoding');
         return bytes;
     }
     read(start, length) {

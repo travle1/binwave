@@ -9,11 +9,11 @@ self.onmessage = async ({data: m}) => {
         }
         if (m.type === 'decode' || m.type === 'decode_python') {
             const reader = new FileReaderSync();
-            source = new DecoderSource(m.file, m.patches, blob => reader.readAsArrayBuffer(blob), m.cacheBytes);
+            source = new DecoderSource(m.file, m.pieces, blob => reader.readAsArrayBuffer(blob), m.cacheBytes);
             self.binwaveDecoder = {read: (start, length) => source.read(start, length)};
             const bindings = await import(m.runtime.js);
             await bindings.default({module_or_path: m.runtime.wasm});
-            session = new bindings.DecoderSession(String(m.file.size));
+            session = new bindings.DecoderSession(source.size.toString());
             if (m.type === 'decode_python') {
                 const answer = await runPythonDecoder(m, source, bindings.python_runner());
                 if (answer.error) throw Error([answer.stdout, answer.error].filter(Boolean).join('\n'));

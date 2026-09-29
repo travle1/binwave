@@ -11,7 +11,9 @@
     let runtime = null, loadingDecoder = false, sourceEditorFocused = false;
     let decoderSource = '', decoderLanguage = 'yaml', rustStatus = '';
     let ignoreDecoder = false, operation = '';
-    let size = '0', selectedStart = '0', selectedEnd = '0';
+    let size = '0', savedSize = '0', selectedStart = '0', selectedEnd = '0';
+    // The open file's picker handle and name: Save bytes can replace it in place.
+    let currentHandle = null, currentName = '';
     const recentFiles = [];
     const status = document.getElementById('status');
     const open = document.getElementById('open');
@@ -37,6 +39,8 @@
             recentFiles.unshift({file:m.file, handle:m.handle, demo:m.demo});
             recentFiles.length = Math.min(recentFiles.length, 8);
             window.binwaveShell?.recent(recentFiles.map(entry => entry.file.name));
+            currentHandle = m.handle ?? null;
+            currentName = m.file.name;
         }
         busy = true;
         operation = m.type;
@@ -54,7 +58,14 @@
         if (ignoreDecoder && (['decoded', 'decode_failed','tree_page'].includes(data.type) || (data.type === 'error' && ['decode','decode_python','table','tree_page','plot','probe','pick','inspect','encode'].includes(operation)))) return;
         if (data.type === 'progress') { status.textContent = `Exported ${count(data.done)} / ${bytes(data.total)}`; return; }
         if (['opened', 'edited', 'exported'].includes(data.type)) {
-            dirty = data.dirty; size = data.size; opened = true;
+            dirty = data.dirty; size = data.size; savedSize = data.savedSize ?? data.size; opened = true;
+            if (data.saved) {
+                // The worker continues on the saved file; so does Save bytes.
+                currentHandle = data.handle ?? currentHandle;
+                currentName = data.name;
+                status.textContent = `Saved to ${data.name}`;
+            }
+            delete data.handle;
             exportable = data.exportable && typeof window.showSaveFilePicker === 'function';
             if (data.type === 'opened') selectedStart = selectedEnd = '0';
         }
@@ -128,12 +139,57 @@
         const end = selection ? selectedEnd : size;
         busy = true; controls();
         try {
-            const handle = await window.showSaveFilePicker({suggestedName: selection ? 'selection.bin' : 'edited-copy.bin'});
+            const edited = currentName.replace(/(\.[^.]*)?$/, '-edited$1');
+            const handle = await window.showSaveFilePicker({suggestedName: selection ? 'selection.bin' : edited});
             busy = false;
-            submit({type: 'export', handle, start, end});
+            // A whole-file save continues on the new file.
+            submit({type: 'export', handle, start, end, reopen: !selection});
         } catch (e) { busy = false; controls(); if (e.name !== 'AbortError') status.textContent = e.message; }
     }
-    save.onclick = () => exportFile(false);
+    // Save bytes asks whether to write a new file or replace the open one.
+    const saveDialog = document.getElementById('save-bytes-dialog');
+    function saveBytes() {
+        if (!currentHandle) { exportFile(false); return; }
+        const sizes = savedSize === size ? bytes(size) : `${bytes(savedSize)} → ${bytes(size)}`;
+        document.getElementById('save-bytes-summary').textContent = `${currentName} · ${sizes}`;
+        const replace = document.getElementById('save-bytes-replace');
+        replace.textContent = `Replace ${currentName}`;
+        replace.title = `Rewrite ${currentName} on disk: a complete copy is written, then swapped in. This can't be undone.`;
+        document.getElementById('save-bytes-new').title = `Write the edited bytes to a new file and continue there. ${currentName} stays unchanged.`;
+        saveDialog.showModal();
+    }
+    document.getElementById('save-bytes-close').onclick = () => saveDialog.close();
+    document.getElementById('save-bytes-new').onclick = () => { saveDialog.close(); exportFile(false); };
+    document.getElementById('save-bytes-replace').onclick = async () => {
+        saveDialog.close();
+        try {
+            // Writing needs permission the picker didn't grant; ask during this click.
+            if (currentHandle.requestPermission && await currentHandle.requestPermission({mode: 'readwrite'}) !== 'granted') {
+                status.textContent = `Saving needs permission to change ${currentName}.`;
+                return;
+            }
+            submit({type: 'save_in_place'});
+        } catch (e) { status.textContent = e.message; }
+    };
+    // Insert file… from the Hex menu: pick a file here, where the picker is allowed.
+    async function pickInsertFile(offset) {
+        try {
+            let file;
+            if (window.showOpenFilePicker) {
+                const [handle] = await window.showOpenFilePicker({multiple: false});
+                file = await handle.getFile();
+            } else {
+                file = await new Promise(resolve => {
+                    const picker = document.createElement('input');
+                    picker.type = 'file';
+                    picker.onchange = () => resolve(picker.files[0]);
+                    picker.click();
+                });
+            }
+            if (file) submit({type: 'insert_file', offset, file});
+        } catch (e) { if (e.name !== 'AbortError') status.textContent = e.message; }
+    }
+    save.onclick = saveBytes;
     extract.onclick = () => exportFile(true);
     cancel.onclick = () => worker.postMessage({type: 'cancel'});
     window.addEventListener('beforeunload', event => {
@@ -285,6 +341,11 @@
         send(json) {
             const command = JSON.parse(json);
             if (command.type === 'cancel') { worker.postMessage(command); return true; }
+            if (command.type === 'pick_insert_file') {
+                if (busy || failed) return false;
+                pickInsertFile(command.offset);
+                return true;
+            }
             if (['decode', 'decode_python'].includes(command.type) && !runtime) return false;
             return submit(command);
         },

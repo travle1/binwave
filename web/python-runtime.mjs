@@ -14,7 +14,8 @@ export async function runPythonDecoder(message, source, runnerSource, runtimeBas
     pyodide.globals.set('_bw_runner_source', runnerSource);
     pyodide.globals.set('_bw_script', message.script);
     pyodide.globals.set('_bw_filename', message.filename || '<decoder.py>');
-    pyodide.globals.set('_bw_size', message.file.size);
+    // The edited size: inserts and deletes change it from the file's.
+    pyodide.globals.set('_bw_size', Number(source.size ?? message.file.size));
     // The runner module's __name__ is not __main__, so its subprocess protocol
     // entrypoint is never invoked. Only run_decoder is called.
     pyodide.runPython(`

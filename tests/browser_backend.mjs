@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {FileBackend, READ_LIMIT, MAX_EDITS, MAX_HISTORY, offset, range} from '../web/file-backend.mjs';
+import {FileBackend, READ_LIMIT, MAX_EDIT_BYTES, MAX_HISTORY, PAGE_SIZE, offset, range} from '../web/file-backend.mjs';
+import * as edits from '../web/byte-pieces.mjs';
 
 function fixture(size = 40 * 1024 ** 3) {
     const reads = [];
@@ -76,18 +77,20 @@ test('whole-field edits are atomic, bounded, and one undo step', async () => {
     assert.deepEqual(await source.read('4', 3), new Uint8Array([4, 5, 6]));
     source.history(true);
     assert.deepEqual(await source.read('4', 3), new Uint8Array([9, 8, 7]));
-    const count = source.patches.size;
+    const pieces = source.pieces;
     const steps = source.undo.length;
     await assert.rejects(source.replaceRange('15', [1, 2]), /Invalid byte replacement/);
     await assert.rejects(source.replaceRange('4', [1, 256]), /Invalid byte replacement/);
-    assert.equal(source.patches.size, count);
+    assert.equal(source.pieces, pieces);
     assert.equal(source.undo.length, steps);
 });
-test('multi-byte limit failure does not partially change the source', async () => {
-    const {source} = fixture(MAX_EDITS + 2);
-    for (let i = 0; i < MAX_EDITS - 1; i++) source.patches.set(BigInt(i), 0);
-    await assert.rejects(source.replaceRange(String(MAX_EDITS), [1, 2]), /edit limit/);
-    assert.equal(source.patches.size, MAX_EDITS - 1);
+test('edits over the memory limit fail without changing the source', async () => {
+    const {source} = fixture(64);
+    source.pieces = [edits.added(new Uint8Array(MAX_EDIT_BYTES - 1)), ...edits.splice(source.pieces, 0n, 0n, []).pieces];
+    source.size = edits.sizeOf(source.pieces);
+    const pieces = source.pieces;
+    await assert.rejects(source.insert(source.size.toString(), [1, 2]), /edit limit/);
+    assert.equal(source.pieces, pieces);
     assert.equal(source.undo.length, 0);
 });
 test('streams an edited high-offset selection in bounded chunks with backpressure', async () => {
@@ -138,13 +141,73 @@ test('disk errors, cancellation and changes during export abort without committi
         assert.equal(output.state.aborted, true);
     }
 });
-test('edit and history limits are independent of source size', async () => {
+test('history limits are independent of source size', async () => {
     const {source} = fixture();
-    for (let i = 0; i < MAX_HISTORY + 1; i++) await source.replace(String(i), 255 - (i % 256));
+    for (let i = 0; i < MAX_HISTORY + 1; i++) await source.replace(String(i * 2), 255 - ((i * 2) % 256));
     assert.equal(source.undo.length, MAX_HISTORY);
-    while (source.patches.size < MAX_EDITS) source.patches.set(BigInt(source.patches.size), 0);
-    await assert.rejects(source.replace(String(MAX_EDITS), 1), /edit limit/);
-    assert.equal(source.patches.size, MAX_EDITS);
+});
+test('inserts and deletes shift later bytes on a 40 GiB file without reading it', async () => {
+    const {source, reads} = fixture();
+    const size = source.size;
+    await source.insert('2', [0xAA, 0xBB]);
+    assert.equal(source.size, size + 2n);
+    assert.equal(source.originalSize, size);
+    assert.deepEqual(await source.read('0', 6), new Uint8Array([0, 1, 0xAA, 0xBB, 2, 3]));
+    await source.remove('1', (size + 1n).toString());
+    assert.equal(source.size, 2n);
+    assert.deepEqual(await source.read('0', 8), new Uint8Array([0, 255]));
+    assert.ok(reads.every(([start, end]) => end - start <= 6), 'no bulk reads');
+    source.history();
+    assert.equal(source.size, size + 2n);
+    source.history();
+    assert.equal(source.size, size);
+    assert.deepEqual(await source.read('0', 4), new Uint8Array([0, 1, 2, 3]));
+    source.history(true);
+    assert.deepEqual(await source.read('0', 4), new Uint8Array([0, 1, 0xAA, 0xBB]));
+    await assert.rejects(source.insert((source.size + 1n).toString(), [1]), /Invalid/);
+    await assert.rejects(source.remove('5', '5'), /Invalid/);
+});
+test('patterns and fills repeat without expanding, and inserted files stay in their file', async () => {
+    const {source} = fixture(8);
+    await source.insertPattern('2', [0xDE, 0xAD], 3);
+    assert.deepEqual(await source.read('0', 16), new Uint8Array([0, 1, 0xDE, 0xAD, 0xDE, 0xAD, 0xDE, 0xAD, 2, 3, 4, 5, 6, 7]));
+    assert.deepEqual(await source.read('3', 3), new Uint8Array([0xAD, 0xDE, 0xAD]), 'reads start mid-pattern');
+    await source.fill('0', '2', [9]);
+    assert.deepEqual(await source.read('0', 3), new Uint8Array([9, 9, 0xDE]));
+    const part = new File([new Uint8Array([80, 65, 82, 84])], 'part.bin');
+    await source.insertFile('14', part);
+    assert.deepEqual(await source.read('12', 8), new Uint8Array([6, 7, 80, 65, 82, 84]));
+    await assert.rejects(source.insertFile('0', new File([], 'empty.bin')), /not empty/);
+    const {source: large} = fixture(16);
+    await large.insertPattern('8', [0], 2 ** 40);
+    assert.equal(large.size, 2n ** 40n + 16n);
+    assert.ok(edits.memory(large.pieces) < 16, 'a 1 TiB pattern is not expanded');
+    assert.deepEqual(await large.read((large.size - 10n).toString(), 10), new Uint8Array([0, 0, 8, 9, 10, 11, 12, 13, 14, 15]));
+    await assert.rejects(large.insertPattern('0', [], 3), /Invalid/);
+    await assert.rejects(large.fill('4', (large.size + 1n).toString(), [1]), /Invalid/);
+});
+test('saving in place streams through the open file handle and aborts on failure', async () => {
+    const {source, file} = fixture(READ_LIMIT + 4);
+    await source.insert('0', [7]);
+    const writes = [];
+    let closed = false;
+    source.handle = {getFile: async () => file, async createWritable(options) {
+        assert.equal(options.keepExistingData, false);
+        return {async write(bytes) { writes.push(bytes.length); }, async close() { closed = true; }, async abort() {}};
+    }};
+    await source.replaceSource();
+    assert.equal(closed, true);
+    assert.equal(writes.reduce((a, b) => a + b, 0), READ_LIMIT + 5);
+    const {source: failing, file: failingFile} = fixture(8);
+    let aborted = false;
+    failing.handle = {getFile: async () => failingFile, async createWritable() {
+        return {async write() { throw Error('disk full'); }, async close() { throw Error('must not commit'); },
+            async abort() { aborted = true; }};
+    }};
+    await assert.rejects(failing.replaceSource(), /disk full/);
+    assert.equal(aborted, true);
+    failing.handle = null;
+    await assert.rejects(failing.replaceSource(), /picker/);
 });
 
 test('decoder workers reuse bounded session tiles and evict least recently used pages', async () => {
@@ -156,13 +219,15 @@ test('decoder workers reuse bounded session tiles and evict least recently used 
     }, arrayBuffer() { throw Error('No whole-file copy'); }};
     const budget = 4 * DECODER_PAGE_SIZE;
     assert.equal(DECODER_CACHE_BYTES, 1024 ** 3);
-    const source = new DecoderSource(file, [[4n, 19]], ({start, end}) => {
+    const pieces = edits.splice(edits.original(BigInt(file.size)), 4n, 1n, [edits.added([19])]).pieces;
+    const source = new DecoderSource(file, pieces, ({start, end}) => {
         reads++;
         return new Uint8Array(end-start).buffer;
     }, budget);
     assert.equal(source.read('4', 1)[0], 19);
+    const tile = reads;
     source.read('100', 4000);
-    assert.equal(reads, 1, 'Nearby queries share their file tile');
+    assert.equal(reads, tile, 'Nearby queries share their file tile');
     const pages = budget / DECODER_PAGE_SIZE;
     for (let page = 1; page < pages; page++) source.read(String(page * DECODER_PAGE_SIZE), 1);
     source.read('4', 1); // Touch the first page before filling the next.
@@ -183,7 +248,7 @@ test('default decoder cache retains more than the former 32 MiB ceiling', async 
     const {DecoderSource, DECODER_PAGE_SIZE} = await import('../web/decoder-source.mjs');
     const file = {size: 64 * DECODER_PAGE_SIZE, slice(start, end) { return {start, end}; }};
     let reads = 0;
-    const source = new DecoderSource(file, [], ({start, end}) => {
+    const source = new DecoderSource(file, null, ({start, end}) => {
         reads++;
         return new Uint8Array(end - start).buffer;
     });
@@ -192,4 +257,15 @@ test('default decoder cache retains more than the former 32 MiB ceiling', async 
     source.read('0', 1);
     assert.equal(reads, 40, 'First tile survives reads beyond the old cap');
     assert.equal(source.cachedBytes, 40 * DECODER_PAGE_SIZE);
+});
+
+test('decoder workers read inserted, deleted and patterned bytes at their new offsets', async () => {
+    const {DecoderSource} = await import('../web/decoder-source.mjs');
+    const file = {size: 8, slice(start, end) { return {start, end}; }};
+    let pieces = edits.original(8n);
+    pieces = edits.splice(pieces, 2n, 3n, [{kind: 'pattern', pattern: new Uint8Array([0xAB]), phase: 0, len: 4n}]).pieces;
+    const source = new DecoderSource(file, pieces, ({start, end}) =>
+        Uint8Array.from({length: end - start}, (_, i) => start + i).buffer, 0);
+    assert.equal(source.size, 9n);
+    assert.deepEqual(source.read('0', 9), new Uint8Array([0, 1, 0xAB, 0xAB, 0xAB, 0xAB, 5, 6, 7]));
 });

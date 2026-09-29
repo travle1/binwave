@@ -6,6 +6,7 @@ import {openSync, closeSync, fstatSync, readSync} from 'node:fs';
 import {pathToFileURL} from 'node:url';
 import {resolve} from 'node:path';
 import {DecoderSource, DECODER_PAGE_SIZE, DECODER_CACHE_BYTES} from '../web/decoder-source.mjs';
+import * as edits from '../web/byte-pieces.mjs';
 const html=await readFile('dist/web/index.html','utf8');
 const js=html.match(/rel="modulepreload" href="\.\/([^"]+)"/)[1];
 const wasm=html.match(/href="\.\/([^"]+\.wasm)"/)[1];
@@ -17,7 +18,8 @@ const file={size, slice(start,end) {
     reads.push([start,end]);
     return {start,end};
 }, arrayBuffer(){throw Error('No whole-file reads');}};
-const source=new DecoderSource(file,[[BigInt(size-2),255]],({start,end})=> {
+const edited=edits.splice(edits.original(BigInt(size)),BigInt(size-2),1n,[edits.added([255])]).pieces;
+const source=new DecoderSource(file,edited,({start,end})=> {
     const bytes=new Uint8Array(end-start);
     for(let i=0;i<bytes.length;i++)bytes[i]=(start+i)%256;
     return bytes.buffer;

@@ -1,4 +1,5 @@
 import {FileBackend, PAGE_SIZE} from './file-backend.mjs';
+import * as edits from './byte-pieces.mjs';
 import './cache-settings.js';
 let cacheBytes = globalThis.binwaveCacheSettings.DEFAULT_BYTES;
 let source = null;
@@ -21,7 +22,7 @@ async function decoding(m) {
             rejectDecoder = reject;
             worker.onmessage = ({data}) => data.type === 'error' ? reject(Error(data.message)) : resolve(data);
             worker.onerror = e => reject(Error(e.message || 'Decoder worker failed'));
-            worker.postMessage(candidate ? {...m, cacheBytes, file:source.file, patches:Array.from(source.patches)} : m);
+            worker.postMessage(candidate ? {...m, cacheBytes, file:source.file, pieces:source.pieces} : m);
         });
         await source.validate();
         if (candidate) { decoder?.terminate(); decoder = worker; }
@@ -33,8 +34,33 @@ async function decoding(m) {
         rejectDecoder = null; pendingDecoder = null;
     }
 }
-const metadata = () => ({name: source.file.name, size: source.size.toString(), dirty: source.dirty,
+const metadata = () => ({name: source.file.name, size: source.size.toString(),
+    savedSize: source.originalSize.toString(), memory: edits.memory(source.pieces), dirty: source.dirty,
     undo: source.undo.length > 0, redo: source.redo.length > 0, exportable: !!source.handle});
+const EDITS = {
+    replace: m => source.replace(m.offset, m.value),
+    replace_range: m => source.replaceRange(m.offset, m.bytes),
+    insert: m => source.insert(m.offset, m.bytes),
+    insert_pattern: m => source.insertPattern(m.offset, m.bytes, m.count),
+    fill: m => source.fill(m.start, m.end, m.bytes),
+    insert_file: m => source.insertFile(m.offset, m.file),
+    delete: m => source.remove(m.start, m.end),
+};
+// Continue on the file that now holds the saved bytes, with fresh history.
+async function reopen(handle) {
+    resetDecoder();
+    source = new FileBackend(await handle.getFile(), handle);
+    self.postMessage({type: 'edited', ...metadata(), saved: true, handle});
+}
+function reporter() {
+    let lastUpdate = 0;
+    return (done, total) => {
+        if (performance.now() - lastUpdate > 100) {
+            lastUpdate = performance.now();
+            self.postMessage({type: 'progress', done, total});
+        }
+    };
+}
 self.onmessage = async ({data: m}) => {
     if (m.type === 'cache_settings') {
         if (!Number.isSafeInteger(m.cacheBytes) || m.cacheBytes < 0) return;
@@ -71,21 +97,19 @@ self.onmessage = async ({data: m}) => {
                 await source.validate();
                 const bytes = await source.read(m.offset, m.length);
                 self.postMessage({type: 'page', offset: m.offset, bytes: bytes.buffer}, [bytes.buffer]);
-            } else if (['replace', 'replace_range', 'undo', 'redo'].includes(m.type)) {
-                if (m.type === 'replace') await source.replace(m.offset, m.value);
-                else if (m.type === 'replace_range') await source.replaceRange(m.offset, m.bytes);
+            } else if (EDITS[m.type] || m.type === 'undo' || m.type === 'redo') {
+                if (EDITS[m.type]) await EDITS[m.type](m);
                 else { await source.validate(); source.history(m.type === 'redo'); }
                 resetDecoder();
-                self.postMessage({type: 'edited', ...metadata()});
+                self.postMessage({type: 'edited', ...metadata(), operation: m.type});
             } else if (m.type === 'export') {
-                let lastUpdate = 0;
-                await source.export(m.handle, m.start, m.end, () => cancelled, (done, total) => {
-                    if (performance.now() - lastUpdate > 100) {
-                        lastUpdate = performance.now();
-                        self.postMessage({type: 'progress', done, total});
-                    }
-                });
-                self.postMessage({type: 'exported', ...metadata()});
+                const whole = m.start === '0' && m.end === source.size.toString();
+                await source.export(m.handle, m.start, m.end, () => cancelled, reporter());
+                if (whole && m.reopen) await reopen(m.handle);
+                else self.postMessage({type: 'exported', ...metadata()});
+            } else if (m.type === 'save_in_place') {
+                await source.replaceSource(() => cancelled, reporter());
+                await reopen(source.handle);
             } else throw Error('Unknown file operation');
         }
     } catch (error) {

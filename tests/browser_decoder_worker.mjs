@@ -8,9 +8,12 @@ const awaitedSettings = await readFile(new URL('../web/cache-settings.js',import
 function harness() {
     const workers=[],messages=[];
     class FileBackend {
-        constructor(file) {this.file=file;this.size=BigInt(file.size);this.patches=new Map();this.undo=[];this.redo=[];}
+        constructor(file,handle=null) {this.file=file;this.handle=handle;this.size=BigInt(file.size);this.originalSize=this.size;this.pieces=[];this.undo=[];this.redo=[];}
         async validate() {}
-        async replace(offset,value) {this.patches.set(BigInt(offset),value);}
+        async replace(offset,value) {this.pieces=[{kind:'added',at:BigInt(offset),bytes:[value]}];}
+        async insert(offset,bytes) {this.size+=BigInt(bytes.length);this.pieces=[{kind:'added',at:BigInt(offset),bytes}];this.dirty=true;}
+        async remove(start,end) {this.size-=BigInt(end)-BigInt(start);this.dirty=true;}
+        async replaceSource() {this.replaced=true;}
     }
     class Worker {
         constructor() {this.terminated=false;this.commands=[];workers.push(this);}
@@ -22,7 +25,8 @@ function harness() {
         }
     }
     const self={postMessage:m=>messages.push(m)};
-    const context = vm.createContext({FileBackend,Worker,self,URL,PAGE_SIZE:65536,performance});
+    const edits = {memory: pieces => pieces.length};
+    const context = vm.createContext({FileBackend,Worker,self,URL,PAGE_SIZE:65536,performance,edits});
     vm.runInContext(awaitedSettings, context);
     vm.runInContext(source, context);
     return {workers,messages,send: m=>self.onmessage({data:m})};
@@ -50,7 +54,7 @@ test('failed candidate preserves the previous decoder; edits invalidate it',asyn
     await h.send({type:'table',path:'samples',start:'0'});
     assert.match(h.messages.at(-2).message,/Apply the decoder again/);
     await h.send({type:'decode',yaml:'valid'});
-    assert.equal(h.workers.at(-1).commands[0].patches[0][0],4294967297n);
+    assert.equal(h.workers.at(-1).commands[0].pieces[0].at,4294967297n, 'decoders read the edited pieces');
 });
 test('browser Python applies as a candidate and shares subsequent result requests',async()=>{
     const h=harness();
@@ -92,4 +96,24 @@ test('RAM budget updates reach retained, pending, and future decoder sessions', 
     await pending;
     await h.send({type:'decode_python',script:'pass'});
     assert.equal(h.workers.at(-1).commands[0].cacheBytes, 0);
+});
+test('inserts and deletes report the new size, and an in-place save continues on the saved file',async()=>{
+    const h=harness();
+    const saved={name:'data.bin',size:12};
+    const handle={getFile:async()=>saved};
+    await h.send({type:'open',file:{name:'data.bin',size:10},handle});
+    await h.send({type:'decode',yaml:'valid'});
+    await h.send({type:'insert',offset:'2',bytes:[1,2,3]});
+    let edited=h.messages.findLast(m=>m.type==='edited');
+    assert.equal(edited.size,'13');
+    assert.equal(edited.savedSize,'10');
+    assert.equal(h.workers[0].terminated,true,'a size change invalidates the decoder');
+    await h.send({type:'delete',start:'0',end:'1'});
+    assert.equal(h.messages.findLast(m=>m.type==='edited').size,'12');
+    await h.send({type:'save_in_place'});
+    edited=h.messages.findLast(m=>m.type==='edited');
+    assert.equal(edited.saved,true);
+    assert.equal(edited.size,'12');
+    assert.equal(edited.savedSize,'12');
+    assert.equal(edited.dirty,undefined,'the reopened file has no unsaved edits');
 });

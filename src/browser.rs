@@ -61,6 +61,20 @@ struct Event {
     result: serde_json::Value,
     request: String,
     reset: bool,
+    /// The file's size on disk, before unsaved inserts and deletes.
+    #[serde(rename = "savedSize")]
+    saved_size: String,
+    /// Bytes the unsaved edits hold in memory.
+    memory: u64,
+    /// The edit was a save; the worker now reads the saved file.
+    saved: bool,
+}
+
+/// What the Hex bytes row does with the bytes typed into it.
+#[derive(Clone, Copy, PartialEq)]
+enum BytesRow {
+    Insert,
+    Fill,
 }
 
 pub struct BrowserApp {
@@ -104,6 +118,13 @@ pub struct BrowserApp {
     extract_last: String,
     extract_seen: (String, String),
     replacement: String,
+    /// Hex's bytes row: Insert bytes… or Fill selection…, its input, and repeat count.
+    bytes_row: Option<BytesRow>,
+    row_input: String,
+    row_text: bool,
+    row_repeat: String,
+    saved_size: u64,
+    edit_memory: u64,
     status: String,
     dirty: bool,
     undo: bool,
@@ -230,6 +251,12 @@ impl BrowserApp {
             extract_last: String::new(),
             extract_seen: (String::new(), String::new()),
             replacement: String::new(),
+            bytes_row: None,
+            row_input: String::new(),
+            row_text: false,
+            row_repeat: "1".into(),
+            saved_size: 0,
+            edit_memory: 0,
             status: "Use Open file above to inspect a local file. Files stay on your computer."
                 .into(),
             dirty: false,
@@ -334,9 +361,12 @@ impl BrowserApp {
             };
             match event.kind.as_str() {
                 "opened" | "edited" | "exported" => {
+                    let was_dirty = self.dirty;
                     self.dirty = event.dirty;
                     self.undo = event.undo;
                     self.redo = event.redo;
+                    self.saved_size = event.saved_size.parse().unwrap_or(self.saved_size);
+                    self.edit_memory = event.memory;
                     if event.kind == "opened" {
                         self.clear_results();
                         self.name = event.name;
@@ -357,10 +387,35 @@ impl BrowserApp {
                             self.apply_decoder();
                         }
                     } else if event.kind == "edited" {
+                        // Re-decode what was decoded: inserts and deletes move every later field.
+                        let decoded = !self.decoded.is_null();
                         self.clear_results();
+                        self.size = event.size.parse().unwrap_or(self.size);
+                        if event.saved {
+                            self.name = event.name;
+                        }
+                        if let Some((start, end)) = parse_offset(&self.range_start).zip(parse_offset(&self.range_end)) {
+                            let (start, end) = (start.min(self.size), end.min(self.size));
+                            self.range_start = start.to_string();
+                            self.range_end = end.to_string();
+                            self.selected = self.selected.filter(|&at| at < self.size);
+                            export_selection(&self.range_start, &self.range_end);
+                        }
+                        if self.offset >= self.size {
+                            self.navigate(self.size.saturating_sub(1) / PAGE as u64 * PAGE as u64);
+                        }
                         self.bytes.clear();
                         self.needs_read = true;
-                        self.status = "Byte edit applied. Save edited copy to export.".into();
+                        self.status = if event.saved {
+                            format!("Saved to {}. Now editing it.", self.name)
+                        } else if !was_dirty {
+                            format!("Edited in memory; {} is unchanged until you save it.", self.name)
+                        } else {
+                            "Byte edit applied. Undo reverses it.".into()
+                        };
+                        if decoded {
+                            self.apply_decoder();
+                        }
                     } else {
                         self.status = "Export complete.".into();
                     }
@@ -681,6 +736,7 @@ impl BrowserApp {
             }
             crate::workspace_inspector::toggle_button(ui);
         });
+        self.bytes_row_ui(ui);
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         let digit = ui.fonts_mut(|fonts| fonts.layout_no_wrap("0".into(), font.clone(), egui::Color32::WHITE).size().x);
         // Keep full addresses, but omit padding that adds no information.
@@ -886,6 +942,32 @@ impl BrowserApp {
             self.copy_selected_hex();
             ui.close();
         }
+        let selection = self.selection_range();
+        let at = selection.map_or(0, |(start, _)| start);
+        if ui.button("Insert bytes…").on_hover_text("Insert bytes, or a pattern repeated N times, before the selection.").clicked() {
+            self.show_bytes_row(BytesRow::Insert);
+            ui.close();
+        }
+        if ui.add_enabled(selection.is_some(), egui::Button::new("Fill selection…"))
+            .on_hover_text("Repeat a pattern across the selected bytes.").clicked() {
+            self.show_bytes_row(BytesRow::Fill);
+            ui.close();
+        }
+        if ui.button("Insert file…").on_hover_text("Insert another file's bytes before the selection. They stay in that file until you save.").clicked() {
+            if !self.command(serde_json::json!({"type":"pick_insert_file","offset":at.to_string()})) {
+                self.status = "Wait for the current file operation.".into();
+            }
+            ui.close();
+        }
+        if let Some((start, end)) = selection {
+            if ui.button(format!("Delete {}", crate::format::exact_bytes(end - start))).clicked() {
+                if !self.command(serde_json::json!({"type":"delete","start":start.to_string(),"end":end.to_string()})) {
+                    self.status = "Wait for the current file operation.".into();
+                }
+                ui.close();
+            }
+        }
+        ui.separator();
         if ui.button("Interpret selected bytes").clicked() {
             self.status = "Choose a type beside the byte selection, then name the field and press Enter.".into();
             ui.close();
@@ -894,6 +976,71 @@ impl BrowserApp {
             self.selection_anchor = Some(self.offset);
             self.set_hex_range(self.offset, self.offset + self.bytes.len() as u64);
             ui.close();
+        }
+    }
+    /// ` · +16 B` after inserts, ` · −1 KiB` after deletes.
+    fn size_change(&self) -> String {
+        match self.size.cmp(&self.saved_size) {
+            std::cmp::Ordering::Greater => format!(" · +{}", crate::format::size(self.size - self.saved_size)),
+            std::cmp::Ordering::Less => format!(" · −{}", crate::format::size(self.saved_size - self.size)),
+            std::cmp::Ordering::Equal => String::new(),
+        }
+    }
+    fn show_bytes_row(&mut self, row: BytesRow) {
+        self.bytes_row = Some(row);
+        self.row_repeat = "1".into();
+    }
+    /// Insert bytes… (× count) or Fill selection…, under the Hex toolbar.
+    fn bytes_row_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(row) = self.bytes_row else { return };
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.row_text, "Text");
+            let input = ui.add(egui::TextEdit::singleline(&mut self.row_input).desired_width(180.)
+                .hint_text(if row == BytesRow::Insert { "Bytes to insert" } else { "Pattern" }));
+            let mut apply = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if row == BytesRow::Insert {
+                ui.label("×");
+                let count = ui.add(egui::TextEdit::singleline(&mut self.row_repeat).desired_width(64.))
+                    .on_hover_text("How many times to repeat the bytes.");
+                apply |= count.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            }
+            apply |= ui.button(if row == BytesRow::Insert { "Insert bytes" } else { "Fill selection" }).clicked();
+            if apply {
+                match self.bytes_row_command(row) {
+                    Ok(command) => {
+                        if self.command(command) {
+                            self.bytes_row = None;
+                            self.row_input.clear();
+                        } else {
+                            self.status = "Wait for the current file operation.".into();
+                        }
+                    }
+                    Err(error) => self.status = error,
+                }
+            }
+            if ui.small_button("Cancel").clicked() {
+                self.bytes_row = None;
+            }
+        });
+    }
+    fn bytes_row_command(&self, row: BytesRow) -> Result<serde_json::Value, String> {
+        let bytes = crate::byte_display::typed_bytes(&self.row_input, self.row_text, 1024 * 1024)?;
+        match row {
+            BytesRow::Insert => {
+                let count = self.row_repeat.trim().replace([',', '_'], "").parse::<u64>().ok()
+                    .filter(|&count| count > 0 && count <= (1 << 53))
+                    .ok_or("Repeat a whole number of times, 1 or more.")?;
+                let at = self.selection_range().map_or(0, |(start, _)| start).to_string();
+                Ok(if count == 1 {
+                    serde_json::json!({"type":"insert","offset":at,"bytes":bytes})
+                } else {
+                    serde_json::json!({"type":"insert_pattern","offset":at,"bytes":bytes,"count":count})
+                })
+            }
+            BytesRow::Fill => {
+                let (start, end) = self.selection_range().ok_or("Select bytes to fill.")?;
+                Ok(serde_json::json!({"type":"fill","start":start.to_string(),"end":end.to_string(),"bytes":bytes}))
+            }
         }
     }
     /// The selected byte range, end-exclusive, when it lies inside the file.
@@ -2146,7 +2293,7 @@ impl eframe::App for BrowserApp {
         }).collect();
         menus.insert(0,crate::app_menu::Item {label:"Panels".into(),command:None,argument:0,enabled:true,checked:None,children:panels});
         menus.insert(1,crate::app_menu::Item {label:"Reset layout".into(),command:Some(crate::app_menu::Command::Reset),argument:0,enabled:true,checked:None,children:vec![]});
-        publish_menus(&serde_json::to_string(&menus).unwrap(), &if self.name.is_empty() { String::new() } else { format!("{} · {}{}",self.name,crate::format::size(self.size),if self.dirty {" · unsaved changes"}else{""}) }, &self.status, crate::APP_VERSION);
+        publish_menus(&serde_json::to_string(&menus).unwrap(), &if self.name.is_empty() { String::new() } else { format!("{} · {}{}{}",self.name,crate::format::size(self.size),self.size_change(),if self.dirty {" · not saved (edits in memory)"}else{""}) }, &self.status, crate::APP_VERSION);
         if self.stacked {
             egui::CentralPanel::default().show(root_ui, |ui| {
                 ui.spacing_mut().interact_size.y = 32.;

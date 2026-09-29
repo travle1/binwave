@@ -1,7 +1,12 @@
 // Worker-owned file state. Only bounded slices enter memory; positions are BigInt.
+// Edits are pieces over the original (see byte-pieces.mjs), so inserts, deletes,
+// patterns and inserted files never copy the file.
+import * as edits from './byte-pieces.mjs';
 export const READ_LIMIT = 1024 * 1024;
 export const PAGE_SIZE = 64 * 1024;
-export const MAX_EDITS = 65536;
+// Typed bytes held in memory, and pieces, across all edits.
+export const MAX_EDIT_BYTES = 64 * 1024 * 1024;
+export const MAX_PIECES = 65536;
 export const MAX_HISTORY = 4096;
 const MAX_OFFSET = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -24,8 +29,9 @@ export class FileBackend {
         if (!Number.isSafeInteger(file.size) || file.size < 0) throw Error('File size is not exactly representable');
         this.file = file;
         this.handle = handle;
-        this.size = BigInt(file.size);
-        this.patches = new Map();
+        this.originalSize = BigInt(file.size);
+        this.pieces = edits.original(this.originalSize);
+        this.size = this.originalSize;
         this.undo = [];
         this.redo = [];
         this.dirty = false;
@@ -39,47 +45,108 @@ export class FileBackend {
     }
     async read(start, count) {
         const [at, length] = range(start, count, this.size);
-        const bytes = new Uint8Array(await this.file.slice(Number(at), Number(at) + length).arrayBuffer());
-        if (bytes.length !== length) throw Error('Source ended during read; reopen it');
-        for (const [position, value] of this.patches) {
-            if (position >= at && position < at + BigInt(length)) bytes[Number(position - at)] = value;
+        const bytes = new Uint8Array(length);
+        let written = 0;
+        for (const {piece, from, to} of edits.segments(this.pieces, at, length)) {
+            let part;
+            if (piece.kind === 'added') part = piece.bytes.subarray(Number(from), Number(to));
+            else if (piece.kind === 'pattern') part = edits.patternBytes(piece, from, to);
+            else {
+                const file = piece.kind === 'base' ? this.file : piece.file;
+                const first = Number(piece.start + from), last = Number(piece.start + to);
+                part = new Uint8Array(await file.slice(first, last).arrayBuffer());
+                if (part.length !== last - first) {
+                    throw Error(piece.kind === 'base' ? 'Source ended during read; reopen it' : 'An inserted file changed; insert it again');
+                }
+            }
+            bytes.set(part, written);
+            written += part.length;
         }
         return bytes;
+    }
+    // Splice without recording history; refuses edits over the limits unchanged.
+    apply(at, remove, insert) {
+        const {pieces, removed} = edits.splice(this.pieces, at, remove, insert);
+        if (edits.memory(pieces) > MAX_EDIT_BYTES || pieces.length > MAX_PIECES) {
+            throw Error('Browser edit limit reached (64 MiB of typed bytes). Save, then keep editing.');
+        }
+        this.pieces = pieces;
+        this.size = edits.sizeOf(pieces);
+        return removed;
+    }
+    async record(at, remove, insert) {
+        await this.validate();
+        const removed = this.apply(at, remove, insert);
+        this.undo.push({at, removed, inserted: insert});
+        if (this.undo.length > MAX_HISTORY) this.undo.shift();
+        this.redo = [];
+        this.dirty = true;
     }
     async replace(start, value) {
         return this.replaceRange(start, [value]);
     }
-    // One multi-byte field edit is one undo step. Validate before mutating patches.
+    // One multi-byte field edit is one undo step. Validate before changing anything.
     async replaceRange(start, values) {
         const at = offset(start);
-        if (!Array.isArray(values) && !(values instanceof Uint8Array)) throw Error('Invalid byte replacement');
-        if (values.length < 1 || values.length > PAGE_SIZE || at + BigInt(values.length) > this.size
-            || Array.from(values).some(value => !Number.isInteger(value) || value < 0 || value > 255)) {
+        if (!validBytes(values) || values.length < 1 || values.length > PAGE_SIZE || at + BigInt(values.length) > this.size) {
             throw Error('Invalid byte replacement');
         }
-        await this.validate();
         const before = await this.read(start, values.length);
-        const changes = [];
-        for (let i = 0; i < values.length; i++) {
-            if (before[i] !== values[i]) changes.push({at:at + BigInt(i), before:before[i], after:values[i]});
+        if (Array.from(values).every((value, i) => value === before[i])) return;
+        await this.record(at, BigInt(values.length), [edits.added(values)]);
+    }
+    async insert(start, values) {
+        const at = offset(start);
+        if (!validBytes(values) || values.length < 1 || values.length > READ_LIMIT || at > this.size) {
+            throw Error('Invalid byte insert');
         }
-        const added = changes.filter(change => !this.patches.has(change.at)).length;
-        if (this.patches.size + added > MAX_EDITS) throw Error('Browser edit limit reached (65,536 bytes)');
-        if (!changes.length) return;
-        this.undo.push(changes);
-        if (this.undo.length > MAX_HISTORY) this.undo.shift();
-        this.redo = [];
-        for (const change of changes) this.patches.set(change.at, change.after);
-        this.dirty = true;
+        await this.record(at, 0n, [edits.added(values)]);
+    }
+    // `pattern` repeated `count` times, never expanded in memory.
+    async insertPattern(start, pattern, count) {
+        const at = offset(start);
+        if (!validBytes(pattern) || pattern.length < 1 || pattern.length > READ_LIMIT || at > this.size
+            || !Number.isSafeInteger(count) || count < 1) throw Error('Invalid pattern insert');
+        const len = BigInt(pattern.length) * BigInt(count);
+        await this.record(at, 0n, [{kind: 'pattern', pattern: Uint8Array.from(pattern), phase: 0, len}]);
+    }
+    async fill(start, end, pattern) {
+        const at = offset(start), last = offset(end);
+        if (!validBytes(pattern) || pattern.length < 1 || pattern.length > READ_LIMIT || at >= last || last > this.size) {
+            throw Error('Invalid fill');
+        }
+        await this.record(at, last - at, [{kind: 'pattern', pattern: Uint8Array.from(pattern), phase: 0, len: last - at}]);
+    }
+    // Another file's bytes; they stay in that file until the edited file is saved.
+    async insertFile(start, file) {
+        const at = offset(start);
+        if (!file || !Number.isSafeInteger(file.size) || file.size < 1 || at > this.size) throw Error('Choose a file that is not empty');
+        await this.record(at, 0n, [{kind: 'file', file, start: 0n, len: BigInt(file.size)}]);
+    }
+    async remove(start, end) {
+        const at = offset(start), last = offset(end);
+        if (at >= last || last > this.size) throw Error('Invalid delete range');
+        await this.record(at, last - at, []);
     }
     history(redo = false) {
         const from = redo ? this.redo : this.undo;
         const to = redo ? this.undo : this.redo;
-        const changes = from.pop();
-        if (!changes) return;
-        for (const change of changes) this.patches.set(change.at, redo ? change.after : change.before);
-        to.push(changes);
+        const entry = from.at(-1);
+        if (!entry) return;
+        if (redo) this.apply(entry.at, edits.sizeOf(entry.removed), entry.inserted);
+        else this.apply(entry.at, edits.sizeOf(entry.inserted), entry.removed);
+        to.push(from.pop());
         this.dirty = true;
+    }
+    async stream(writer, first, last, cancelled, progress) {
+        for (let at = first; at < last;) {
+            if (cancelled()) throw Error('Export cancelled');
+            const length = Number((last - at) < BigInt(READ_LIMIT) ? last - at : BigInt(READ_LIMIT));
+            const bytes = await this.read(at.toString(), length);
+            await writer.write(bytes); // Backpressure: never queue the whole file.
+            at += BigInt(bytes.length);
+            progress((at - first).toString(), (last - first).toString());
+        }
     }
     async export(handle, start, end, cancelled = () => false, progress = () => {}) {
         const first = offset(start), last = offset(end);
@@ -90,14 +157,7 @@ export class FileBackend {
         if (cancelled()) throw Error('Export cancelled');
         const writer = await handle.createWritable();
         try {
-            for (let at = first; at < last;) {
-                if (cancelled()) throw Error('Export cancelled');
-                const length = Number((last - at) < BigInt(READ_LIMIT) ? last - at : BigInt(READ_LIMIT));
-                const bytes = await this.read(at.toString(), length);
-                await writer.write(bytes); // Backpressure: never queue the whole file.
-                at += BigInt(bytes.length);
-                progress((at - first).toString(), (last - first).toString());
-            }
+            await this.stream(writer, first, last, cancelled, progress);
             await this.validate();
             if (cancelled()) throw Error('Export cancelled');
             await writer.close(); // Commit only after successful streaming/validation.
@@ -107,4 +167,25 @@ export class FileBackend {
             throw error;
         }
     }
+    // Rewrite the open file. The browser writes a complete temporary copy and
+    // swaps it in only when the writer closes, so a failure leaves it intact.
+    async replaceSource(cancelled = () => false, progress = () => {}) {
+        if (!this.handle) throw Error('Replacing the file requires opening it with the file-system picker');
+        await this.validate();
+        const writer = await this.handle.createWritable({keepExistingData: false});
+        try {
+            await this.stream(writer, 0n, this.size, cancelled, progress);
+            await this.validate();
+            if (cancelled()) throw Error('Save cancelled');
+            await writer.close();
+        } catch (error) {
+            try { await writer.abort(); } catch { /* Preserve the original failure. */ }
+            throw error;
+        }
+    }
+}
+
+function validBytes(values) {
+    return (Array.isArray(values) || values instanceof Uint8Array)
+        && Array.from(values).every(value => Number.isInteger(value) && value >= 0 && value <= 255);
 }

@@ -32,7 +32,7 @@
   <div hidden aria-hidden="true">
     <button id="open" disabled>Open file...</button><input type="file" id="file">
     <button id="open-decoder" disabled>Open decoder...</button><input type="file" id="decoder-file" aria-label="Choose a YAML or Python decoder">
-    <button id="save" disabled>Save edited copy...</button><button id="extract" disabled>Extract selection...</button><button id="cancel" disabled>Cancel operation</button>
+    <button id="save" disabled>Save bytes...</button><button id="extract" disabled>Extract selection...</button><button id="cancel" disabled>Cancel operation</button>
   </div>
   <main id="workspace">
     <canvas id="binwave" aria-label="Binwave editing workspace"></canvas>
@@ -50,6 +50,11 @@
   </div>
   <dialog id="search-dialog" aria-label="Search commands"><div class="dialog-header"><strong>Search commands</strong><button id="search-close" aria-label="Close search">×</button></div><input id="search-input" type="search" placeholder="Search commands and panels…" autocomplete="off"><div id="search-results"></div></dialog>
   <dialog id="decoder-library" aria-label="Decoder library"><div class="dialog-header"><strong>Decoder library</strong><button id="library-close" aria-label="Close library">×</button></div><div class="library-toolbar"><input id="library-search" type="search" placeholder="Search decoders" autocomplete="off"><button id="library-import">Import…</button><button id="library-new">+ New decoder</button></div><div class="library-layout"><div id="library-items" role="listbox" aria-label="Bundled decoders"></div><div class="library-details"><h2 id="library-name">Choose a decoder</h2><p id="library-description">Select an example to preview its YAML, then open it in the workspace.</p><button id="library-open" disabled>Open in workspace</button><pre id="library-preview"></pre></div></div></dialog>
+  <dialog id="save-bytes-dialog" aria-label="Save bytes">
+    <div class="dialog-header"><strong>Save bytes</strong><button id="save-bytes-close" aria-label="Close">×</button></div>
+    <p id="save-bytes-summary"></p>
+    <div class="settings-actions"><button id="save-bytes-new" type="button">Save to a new file…</button><button id="save-bytes-replace" type="button"></button></div>
+  </dialog>
   <dialog id="settings-dialog" aria-label="Settings">
     <div class="dialog-header"><strong>Settings</strong><button id="settings-close" aria-label="Close settings">×</button></div>
     <form id="cache-settings-form">
