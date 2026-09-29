@@ -149,6 +149,8 @@ pub struct Sizes {
     pub plot_y_label_min: f32,
     /// Gridlines fade in between these spacings, like their labels.
     pub plot_grid_fade: [f32; 2],
+    /// Signal's sample-index labels are wider, so they need more room.
+    pub plot_signal_label_spacing: [f32; 2],
     pub plot_point_radius: f32,
     pub plot_selected_radius: f32,
     pub library_details_width: f32,
@@ -322,6 +324,7 @@ pub const DARK: Theme = Theme {
         plot_x_label_min: 60.,
         plot_y_label_min: 20.,
         plot_grid_fade: [20., 80.],
+        plot_signal_label_spacing: [100., 150.],
         plot_point_radius: 2.5,
         plot_selected_radius: 7.,
         library_details_width: 480.,
@@ -363,12 +366,17 @@ pub const DARK: Theme = Theme {
 /// Gridlines only at labelled ticks: egui_plot's decimal marks, minus those too
 /// close together for the axis to label them.
 pub fn labeled_grid(plot: egui_plot::Plot<'_>) -> egui_plot::Plot<'_> {
+    labeled_grid_spaced(plot, DARK.size.plot_x_label_min)
+}
+
+/// `labeled_grid` for a plot whose x-axis labels need `x_label_min` points.
+pub fn labeled_grid_spaced(plot: egui_plot::Plot<'_>, x_label_min: f32) -> egui_plot::Plot<'_> {
     let t = &DARK;
     let [fade_min, fade_max] = t.size.plot_grid_fade;
     let spacer = move |label_min: f32| move |input| labeled_marks(input, fade_min, label_min);
     plot.grid_spacing(egui::Rangef::new(fade_min, fade_max))
         .grid_color(t.color.plot_grid)
-        .x_grid_spacer(spacer(t.size.plot_x_label_min))
+        .x_grid_spacer(spacer(x_label_min))
         .y_grid_spacer(spacer(t.size.plot_y_label_min))
 }
 

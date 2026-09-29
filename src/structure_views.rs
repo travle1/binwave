@@ -2048,7 +2048,8 @@ impl StructureViews {
             self.plot_y_axis_key = Some(axis_key);
             self.plot_y_axis_thickness = 0.;
         }
-        let response = crate::theme::labeled_grid(Plot::new(plot_id))
+        let [label_min, label_max] = crate::theme::DARK.size.plot_signal_label_spacing;
+        let response = crate::theme::labeled_grid_spaced(Plot::new(plot_id), label_min)
             .id(plot_id)
             .auto_bounds(egui::Vec2b::new(false, false))
             .allow_double_click_reset(false)
@@ -2084,7 +2085,7 @@ impl StructureViews {
                 })])
             .custom_x_axes(vec![AxisHints::new_x()
                 .label("Sample index")
-                .label_spacing(egui::Rangef::new(100., 150.))
+                .label_spacing(egui::Rangef::new(label_min, label_max))
                 .formatter(|mark, _| format!("{:.0}", mark.value))
                 .tick_label_font(egui::FontId::new(
                     crate::theme::DARK.font.axis,
