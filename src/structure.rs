@@ -2265,6 +2265,10 @@ impl<'a> Engine<'a> {
             return Ok(node);
         }
         let stride = self.fixed_size(&element, path, 0);
+        // Items that hold their own collections (blocks of channels, say) are read
+        // lazily even when there are few, so their collections can be followed
+        // across every item instead of becoming one set per item.
+        let lazy_above = if self.nests_collections(&element, path, 0) { 1 } else { LAZY_THRESHOLD };
         let count = match repeat {
             Repeat::Count(expr) => Some(self.size(expr, path)?),
             Repeat::Until(_) => {
@@ -2306,19 +2310,19 @@ impl<'a> Engine<'a> {
                 .checked_mul(stride)
                 .context("collection byte length overflow")?;
             let array_end = checked_end(start, length, end)?;
-            if count > LAZY_THRESHOLD {
+            if count > lazy_above {
                 *cursor = array_end;
                 let node = self.fixed_array_node(field, &element, path, start, array_end, count, stride, endian)?;
                 self.collections.insert(path.into(), node.clone());
                 return Ok(node);
             }
         }
-        if stride.is_none() && count.is_none_or(|count| count > LAZY_THRESHOLD) {
+        if stride.is_none() && count.is_none_or(|count| count > lazy_above) {
             if let Some(offsets) = self.index_variable(
                 &element, path, start, end, count, field.endian.unwrap_or(endian), depth,
             )? {
                 let indexed_count = (offsets.len() - 1) as Address;
-                if indexed_count > LAZY_THRESHOLD {
+                if indexed_count > lazy_above {
                     let array_end = *offsets.last().unwrap();
                     *cursor = array_end;
                     let node = Node {
@@ -2699,6 +2703,16 @@ impl<'a> Engine<'a> {
             Some(Repeat::Until(_)) => None,
         }
     }
+    /// Whether an item of this field's type contains a repeated field of its own.
+    fn nests_collections(&self, field: &Field, scope: &str, depth: Address) -> bool {
+        if depth > MAX_DEPTH {
+            return false;
+        }
+        let Ok(kind) = self.selected_type(&field.kind, scope) else { return false };
+        self.structures.get(&kind).is_some_and(|structure| structure.fields.iter()
+            .any(|inner| inner.repeat.is_some() || self.nests_collections(inner, scope, depth + 1)))
+    }
+
     fn has_actions(&self, kind: &str, depth: Address) -> bool {
         if depth > MAX_DEPTH {
             return true;
@@ -3057,6 +3071,23 @@ fn field_references(field: &Field) -> Vec<String> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn few_blocks_holding_channels_are_read_lazily_but_plain_records_are_not() {
+        let source = crate::byte_store::ByteStore::from_snapshot(
+            crate::binary::Original::from_bytes(&[7u8; 40 * 10]).unwrap());
+        let run = |yaml: &str| Program::parse(yaml).unwrap().run(&source.view(), &AtomicBool::new(false)).unwrap();
+        let blocks = run("structures:\n  - name: Block\n    fields:\n      - {name: header, type: u16}\n\
+            \x20     - {name: channel, type: u16, repeat: 4}\nactions:\n  - read: {name: blocks, type: {structure: Block}, repeat: until end}\n");
+        let blocks = &blocks.nodes[0];
+        assert_eq!(blocks.lazy.as_ref().map(|array| array.count), Some(40),
+            "40 blocks with a collection inside are one lazy collection, not 40 items");
+        assert!(blocks.children.is_empty());
+        let records = run("structures:\n  - name: Record\n    fields:\n      - {name: a, type: u16}\n      - {name: b, type: u64}\n\
+            actions:\n  - read: {name: records, type: {structure: Record}, repeat: until end}\n");
+        assert_eq!(records.nodes[0].children.len(), 40, "plain records under the limit stay individual");
+        assert!(records.nodes[0].lazy.is_none());
+    }
 
     #[test]
     fn one_item_segments_are_one_strided_read_run() {

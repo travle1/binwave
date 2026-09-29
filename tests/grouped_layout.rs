@@ -91,8 +91,10 @@ actions:
     let source = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
     let view = source.view();
     let output = Program::parse(yaml).unwrap().run(&view, &AtomicBool::new(false)).unwrap();
+    // Blocks holding their own collections are read lazily, even two of them.
     let blocks = &output.nodes[1];
-    let first = blocks.children.first().unwrap();
+    let rows = blocks.lazy.as_ref().expect("blocks are lazy").page(&view, &AtomicBool::new(false), 0, 1).unwrap();
+    let first = rows.first().unwrap();
     let fields = &first.children[0].children;
     for (field, base_value, offset, step) in [(0, 100, 3, 4), (1, 200, 14, 2)] {
         let children = &fields[field].children;
