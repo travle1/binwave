@@ -131,6 +131,9 @@ pub fn show(ui: &mut Ui, recent: &[RecentPair], current: Option<&Path>, partial:
     egui::ScrollArea::vertical().max_height(scroll_height).show(ui, |ui| {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
+        // File names, with parent folders where two recent files share a name.
+        let names = crate::file_dialog::display_names(&recent.iter().map(|pair| pair.data.as_path()).collect::<Vec<_>>());
+        let current_canonical = current.and_then(|path| path.canonicalize().ok());
         let mut first = true;
         for section in RecentSection::ALL {
             let items = recent.iter().enumerate().filter(|(_, pair)| recent_section(pair.opened_at_unix_secs, now) == section)
@@ -139,9 +142,10 @@ pub fn show(ui: &mut Ui, recent: &[RecentPair], current: Option<&Path>, partial:
             section_label(ui, section.label(), first);
             first = false;
             for (index, pair) in items {
-                let name = pair.data.file_name().unwrap_or(pair.data.as_os_str()).to_string_lossy();
-                let active = current.is_some_and(|path| path == pair.data);
-                if row(ui, egui_phosphor::regular::FILE, &name, None, active, active && partial)
+                let name = &names[index];
+                let active = current.is_some_and(|path| path == pair.data)
+                    || current_canonical.as_ref() == Some(&pair.data);
+                if row(ui, egui_phosphor::regular::FILE, name, None, active, active && partial)
                     .on_hover_text(pair.data.display().to_string()).clicked() {
                     action = Some(Action::Recent(index));
                 }
@@ -181,5 +185,24 @@ mod tests {
         assert_eq!(recent_section(now - 86_400, now), RecentSection::Yesterday);
         assert_eq!(recent_section(now - 7 * 86_400, now), RecentSection::PreviousSevenDays);
         assert_eq!(recent_section(0, now), RecentSection::Earlier);
+    }
+
+    #[test]
+    fn recent_files_with_the_same_name_show_their_folders() {
+        use crate::egui_compat::ContextRun as _;
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let pair = |path: &str| RecentPair { data: path.into(), decoder: None, opened_at_unix_secs: 0 };
+        let recent = [pair("/runs/a/data.bin"), pair("/runs/b/data.bin"), pair("/runs/b/notes.bin")];
+        let output = ctx.run(egui::RawInput::default(), |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| { show(ui, &recent, None, false, "Tester"); });
+        });
+        let texts: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+            _ => None,
+        }).collect();
+        for name in ["data.bin — a", "data.bin — b", "notes.bin"] {
+            assert!(texts.iter().any(|text| text == name), "missing {name}: {texts:?}");
+        }
     }
 }

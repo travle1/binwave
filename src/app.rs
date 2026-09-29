@@ -198,6 +198,9 @@ pub struct BinwaveApp {
     workspace: WorkspaceLayout,
     show_empty_workspace: bool,
     start_screen: crate::start_screen::StartScreen,
+    /// The data file and decoder last written to recent files, so they are
+    /// recorded when they change rather than every frame.
+    remembered: Option<(PathBuf, Option<PathBuf>)>,
     show_decoding_guide: bool,
     sidebar_open: bool,
     sidebar_search_open: bool,
@@ -270,6 +273,7 @@ impl Default for BinwaveApp {
             workspace: WorkspaceLayout::default(),
             show_empty_workspace: false,
             start_screen: Default::default(),
+            remembered: None,
             show_decoding_guide: false,
             sidebar_open: true,
             sidebar_search_open: false,
@@ -1128,15 +1132,10 @@ impl BinwaveApp {
         self.binary.open(pair.data, ctx);
     }
 
-    fn recent_label(pair: &crate::file_dialog::RecentPair) -> String {
-        let data = pair.data.file_name().unwrap_or(pair.data.as_os_str()).to_string_lossy();
-        match &pair.decoder {
-            Some(decoder) => {
-                let name = decoder.file_name().unwrap_or(decoder.as_os_str()).to_string_lossy();
-                format!("{data}  ·  {name}")
-            }
-            None => data.into_owned(),
-        }
+    /// Recent file names for menus and search, with parent folders where names collide.
+    fn recent_labels(&self) -> Vec<String> {
+        let recent = self.file_locations.recent_pairs();
+        crate::file_dialog::display_names(&recent.iter().map(|pair| pair.data.as_path()).collect::<Vec<_>>())
     }
 
     fn clear_csv(&mut self) {
@@ -1173,6 +1172,8 @@ impl BinwaveApp {
             self.clear_csv();
             self.decoder = Decoder::Layout;
             self.workspace.reveal(Pane::Hex);
+            // Each open moves the file to the top of recent files, even a reopen.
+            self.remembered = None;
             if let OpenedFile::Path(path) = opened {
                 let recent_decoder = self.pending_recent_decoder.take()
                     .filter(|(data, _)| data == &path)
@@ -1205,8 +1206,10 @@ impl BinwaveApp {
             if self.decoder != Decoder::Layout { self.workspace.show_decoder(); }
         }
         if let Some(data) = self.binary.source_path() {
-            if file_kind(data) != FileKind::Csv {
-                self.file_locations.remember_pair(data, self.binary.decoder_path());
+            let current = (data.to_path_buf(), self.binary.decoder_path().map(Path::to_path_buf));
+            if file_kind(data) != FileKind::Csv && self.remembered.as_ref() != Some(&current) {
+                self.file_locations.remember_pair(&current.0, current.1.as_deref());
+                self.remembered = Some(current);
             }
         }
         if self.binary.take_bytes_changed() {
@@ -1393,7 +1396,7 @@ impl BinwaveApp {
         let t = &crate::theme::DARK;
         let available=self.commands_available();
         let (undo,redo)=self.binary.menu_history();
-        let recent=self.file_locations.recent_pairs().iter().map(Self::recent_label).collect();
+        let recent=self.recent_labels();
         let menus=app_menu::menus(&app_menu::State { native:true, available, recent,
             file:self.binary.has_file(), selection:self.binary.has_selection(), undo,redo,
             save_decoder:self.decoder==Decoder::Layout && self.binary.can_save_definition(), apply:available && if self.decoder==Decoder::Csv { self.binary.source_path().is_some() && !self.binary.has_byte_edits() } else { self.binary.can_apply_definition() },
@@ -1432,8 +1435,7 @@ impl BinwaveApp {
                 egui::Button::new(title_job).frame(false)
             ).ui(ui, |ui| {
                 if ui.button("Open file…").clicked() { open_file = true; ui.close(); }
-                for (index, pair) in self.file_locations.recent_pairs().iter().enumerate() {
-                    let label = Self::recent_label(pair);
+                for (index, label) in self.recent_labels().into_iter().enumerate() {
                     if ui.button(label).clicked() { recent_file = Some(index); ui.close(); }
                 }
             }); }
@@ -1570,6 +1572,7 @@ impl BinwaveApp {
         let mut selected = None;
         let mut selected_pane = None;
         let recent = self.file_locations.recent_pairs();
+        let labels = self.recent_labels();
         egui::Window::new("Search files")
             .open(&mut self.sidebar_search_open)
             .default_width(crate::theme::DARK.size.sidebar_width * 2.)
@@ -1587,10 +1590,10 @@ impl BinwaveApp {
                     }
                 }
                 if !recent.is_empty() { ui.separator(); }
-                for (index, pair) in recent.iter().enumerate() {
-                    let label = Self::recent_label(pair);
-                    if (query.is_empty() || label.to_lowercase().contains(&query))
-                        && ui.button(&label).clicked() {
+                for (index, (pair, label)) in recent.iter().zip(&labels).enumerate() {
+                    let path = pair.data.display().to_string().to_lowercase();
+                    if (query.is_empty() || label.to_lowercase().contains(&query) || path.contains(&query))
+                        && ui.button(label).on_hover_text(pair.data.display().to_string()).clicked() {
                         selected = Some(index);
                     }
                 }

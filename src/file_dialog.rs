@@ -42,6 +42,38 @@ pub struct RecentPair {
     pub opened_at_unix_secs: u64,
 }
 
+/// Names for a list of files: each file name, plus as many parent folders as it
+/// takes to tell apart names that collide (`data.bin — run1`).
+pub fn display_names(paths: &[&Path]) -> Vec<String> {
+    let name = |path: &Path, depth: usize| {
+        let file = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned();
+        let parents: Vec<_> = path.parent().into_iter()
+            .flat_map(|parent| parent.components().rev().take(depth).collect::<Vec<_>>())
+            .collect();
+        if parents.is_empty() {
+            return file;
+        }
+        let folder: std::path::PathBuf = parents.into_iter().rev().collect();
+        format!("{file} — {}", folder.display())
+    };
+    let mut depths = vec![0; paths.len()];
+    let deepest = paths.iter().map(|path| path.components().count()).max().unwrap_or(0);
+    for _ in 0..deepest {
+        let names: Vec<_> = paths.iter().zip(&depths).map(|(path, &depth)| name(path, depth)).collect();
+        let mut changed = false;
+        for (index, label) in names.iter().enumerate() {
+            if names.iter().enumerate().any(|(other, same)| other != index && same == label && paths[other] != paths[index]) {
+                depths[index] += 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    paths.iter().zip(depths).map(|(path, depth)| name(path, depth)).collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DecoderRun {
     pub decoder: PathBuf,
@@ -145,12 +177,15 @@ impl FileLocations {
             .clone()
     }
 
-    /// Keep one current decoder per data file, without storing file contents.
+    /// One entry per full path, moved to the top with the time it was opened. A
+    /// file reopened without a decoder keeps the last decoder used with it.
     pub fn remember_pair(&self, data: &Path, decoder: Option<&Path>) {
+        let data = data.canonicalize().unwrap_or_else(|_| data.to_path_buf());
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let previous = state.recent_pairs.iter().find(|old| old.data == data).and_then(|old| old.decoder.clone());
         let pair = RecentPair {
-            data: data.to_path_buf(),
-            decoder: decoder.map(Path::to_path_buf),
+            data,
+            decoder: decoder.map(Path::to_path_buf).or(previous),
             opened_at_unix_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_secs()),
@@ -812,5 +847,29 @@ mod tests {
         drop(dialog);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         dropped_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn colliding_names_gain_parent_folders_until_they_differ() {
+        let paths = [Path::new("/a/run1/data.bin"), Path::new("/b/run1/data.bin"), Path::new("/b/run2/data.bin"),
+            Path::new("/c/other.bin")];
+        assert_eq!(display_names(&paths), [
+            "data.bin — a/run1", "data.bin — b/run1", "data.bin — run2", "other.bin",
+        ]);
+    }
+
+    #[test]
+    fn one_entry_per_full_path_keeps_the_last_decoder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let data = dir.path().join("data.bin");
+        std::fs::write(&data, b"x").unwrap();
+        let locations = FileLocations::default();
+        let decoder = dir.path().join("layout.yaml");
+        locations.remember_pair(&data, Some(&decoder));
+        locations.remember_pair(&dir.path().join("sub/../data.bin"), None);
+        let pairs = locations.recent_pairs();
+        assert_eq!(pairs.len(), 1, "two spellings of one path are one entry");
+        assert_eq!(pairs[0].decoder.as_deref(), Some(decoder.as_path()), "reopening without a decoder keeps it");
     }
 }
