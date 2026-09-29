@@ -134,6 +134,8 @@ pub struct StructureViews {
     source_revision: Option<u64>,
     repaint_context: Option<egui::Context>,
     plot_reader: PlotReader,
+    /// The whole-file overview strip under the plot.
+    overview: crate::overview_strip::OverviewStrip,
     ram_cache_bytes: Option<usize>,
     presentation: crate::plot_presentation::Presentation,
     plot_hidden: HashSet<String>,
@@ -2049,8 +2051,12 @@ impl StructureViews {
             self.plot_y_axis_thickness = 0.;
         }
         let [label_min, label_max] = crate::theme::DARK.size.plot_signal_label_spacing;
+        // Leave room under the plot for the whole-file overview strip.
+        let strip_height = crate::theme::DARK.size.overview_height + crate::theme::DARK.size.overview_gap;
+        let plot_height = (ui.available_height() - strip_height).max(crate::theme::DARK.size.overview_height);
         let response = crate::theme::labeled_grid_spaced(Plot::new(plot_id), label_min)
             .id(plot_id)
+            .height(plot_height)
             .auto_bounds(egui::Vec2b::new(false, false))
             .allow_double_click_reset(false)
             .allow_boxed_zoom(false)
@@ -2382,6 +2388,33 @@ impl StructureViews {
             ui.ctx().request_repaint();
         }
         let frame = *response.transform.frame();
+        {
+            let catalog_hidden = |field: &str| hidden.contains(&format!("{} / {field}", self.plot_target));
+            let fields = crate::overview_strip::scanned_fields(&self.plot_catalog, catalog_hidden);
+            // Scan grouped channels the way the plot does, not as one combined series.
+            let group = primary_group.map(|(_, (group_node, plan, _))| (group_node.clone(), plan.clone()))
+                .or_else(|| sensor_group_key(&node).and_then(|_| node.lazy.as_ref()?.numeric_plan())
+                    .map(|plan| (node.clone(), plan)));
+            let loading = self.plot_reader.is_loading()
+                || self.group_plot_readers.values().any(PlotReader::is_loading)
+                || self.extra_plot_readers.values().any(PlotReader::is_loading);
+            self.overview.update(ui.ctx(), &source, &node, count, fields, group, loading);
+            ui.add_space(crate::theme::DARK.size.overview_gap);
+            let issues = overview_issues(&node, count);
+            match self.overview.show(ui, frame.x_range(), &node, count, actual.clone(), &issues) {
+                Some(crate::overview_strip::Action::View(range)) => {
+                    self.plot_force_view = Some(range);
+                    ui.ctx().request_repaint();
+                }
+                Some(crate::overview_strip::Action::Fit) => {
+                    self.plot_force_view = Some(0..count);
+                    self.plot_fit_all_y = true;
+                    self.plot_fit_y = false;
+                    ui.ctx().request_repaint();
+                }
+                None => {}
+            }
+        }
         let painter = ui.painter().with_clip_rect(frame.intersect(ui.clip_rect()));
         if response
             .response
@@ -2857,6 +2890,19 @@ fn expand_ancestors(path: &str, expanded: &mut HashSet<String>) {
 fn is_collection(node: &Node) -> bool {
     node.lazy.is_some() || node.kind.ends_with("[]")
 }
+/// Where the overview strip marks trouble: samples decoded only in part, and
+/// the end of a collection whose decoding stopped early.
+fn overview_issues(node: &Node, count: usize) -> Vec<(usize, String)> {
+    let mut issues: Vec<(usize, String)> = node.children.iter().enumerate()
+        .filter(|(_, child)| child.kind.starts_with("partial"))
+        .map(|(index, _)| (index, format!("Sample {} is incomplete", crate::format::count(index))))
+        .collect();
+    if node.kind == "partial collection" && count > 0 {
+        issues.push((count - 1, format!("Decoding stopped after sample {}", crate::format::count(count - 1))));
+    }
+    issues
+}
+
 fn collection_count(node: &Node) -> usize {
     node.lazy
         .as_ref()
@@ -3753,6 +3799,7 @@ actions:
     }
 
     use super::*;
+
     use crate::binary::Original;
     use crate::byte_store::ByteStore;
     use crate::structure::Program;
@@ -3920,6 +3967,77 @@ actions:
         assert_eq!(with_channels[0].channels.len(), 2);
         assert!(chips.iter().any(|chip| chip.channels.is_empty() && chip.label.starts_with("Blocks (130")),
             "{:?}", chips.iter().map(|chip| &chip.label).collect::<Vec<_>>());
+    }
+    #[test]
+    fn overview_strip_scans_grouped_channels_one_series_each() {
+        let yaml = r#"
+structures:
+  - name: Descriptor
+    fields:
+      - {name: width, type: u8}
+      - {name: groups, type: u8}
+  - name: Metadata
+    fields:
+      - {name: items_per_group, type: u8}
+      - {name: descriptors, type: {structure: Descriptor}, repeat: 1}
+    actions:
+      - define:
+          name: Generated
+          from: descriptors
+          fields:
+            type: {ref: width, cases: {'2': i16}}
+            repeat: {ref: groups}
+            items_per_group: {ref: items_per_group}
+            layout: interleaved
+  - name: Block
+    fields:
+      - {name: header, type: bytes, length: 2}
+      - {name: payload, type: {structure: Generated}}
+actions:
+  - read: {name: metadata, type: {structure: Metadata}}
+  - read: {name: blocks, type: {structure: Block}, repeat: 130}
+"#;
+        let mut bytes = vec![48, 2, 130];
+        for block in 0..130_i16 {
+            bytes.extend([0xAA, 0xBB]);
+            for index in 0..6_240_i16 { bytes.extend((block * 100 + index).to_le_bytes()); }
+        }
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let output = Program::parse(yaml).unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let mut views = StructureViews::default();
+        let ctx = egui::Context::default();
+        views.request(&output.nodes[1], 0, output.revision, &ctx);
+        settle(&mut views, store.view());
+        views.discover_flattened_collections(&output);
+        assert!(views.flattened_collections.iter().any(|node| node.path == "blocks.payload.field_0"));
+        views.start_nested_discovery(&output, store.view(), &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !views.flattened_collections.iter().any(|node| node.path == "blocks.payload.field_0[2].values") {
+            assert!(std::time::Instant::now() < deadline, "discovery timed out: {:?}", views.discovery_error);
+            views.discover_flattened_collections(&output);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let references: Vec<_> = views.flattened_collections.iter().collect();
+        let (_, groups) = grouped_collection_choices(&references);
+        let sensors = &groups["blocks.payload.field_0.values"];
+        let selected: std::collections::BTreeSet<String> = sensors.iter().take(3)
+            .map(|(_, node)| node.path.clone()).collect();
+        let by_path: HashMap<&str, &Node> = references.iter().map(|node| (node.path.as_str(), *node)).collect();
+        let grouped = grouped_numeric_plans(&selected, &by_path);
+        let (group_node, group_plan, _) = &grouped["blocks.payload.field_0.values"];
+        let count = collection_count(group_node);
+        let mut strip = crate::overview_strip::OverviewStrip::default();
+        let mut bands = None;
+        while bands.is_none() {
+            assert!(std::time::Instant::now() < deadline, "overview scan timed out");
+            strip.update(&ctx, &store.view(), group_node, count, Vec::new(),
+                Some((group_node.clone(), group_plan.clone())), false);
+            bands = strip.envelope().filter(|envelope| envelope.complete).map(|envelope| envelope.bands.clone());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let bands = bands.unwrap();
+        assert_eq!(bands.len(), 3, "one band per channel, not one combined series: {:?}", bands.keys());
+        assert!(bands.keys().all(|name| name.contains("field_0[")));
     }
     #[test]
     fn configured_groups_expose_each_position_across_records() {

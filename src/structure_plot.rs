@@ -855,7 +855,7 @@ impl PlotReader {
                 && self.data_key.as_ref() == self.desired.as_ref().map(|request| &request.key)))
     }
 }
-fn identity(node: &Node) -> u64 {
+pub(crate) fn identity(node: &Node) -> u64 {
     if let Some(array) = &node.lazy {
         return array.identity() as u64;
     }

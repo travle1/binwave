@@ -75,6 +75,8 @@ pub struct Colors {
     pub scrollbar: Color32,
     /// Plot gridlines: just above the card, so they never compete with signals.
     pub plot_grid: Color32,
+    /// The overview strip's whole-file envelope.
+    pub overview_band: Color32,
 }
 pub struct Radii {
     pub window: u8,
@@ -85,6 +87,8 @@ pub struct Radii {
     pub row: u8,
     pub chip: u8,
     pub selection: u8,
+    /// Range markers such as the overview strip's viewport box.
+    pub marker: u8,
     pub pill: u16,
 }
 pub struct Sizes {
@@ -151,6 +155,16 @@ pub struct Sizes {
     pub plot_grid_fade: [f32; 2],
     /// Signal's sample-index labels are wider, so they need more room.
     pub plot_signal_label_spacing: [f32; 2],
+    /// Overview strip under Signal: height, gap above it, the viewport marker's
+    /// minimum width, how close to its edge a drag resizes it, and wheel zoom
+    /// per point scrolled.
+    pub overview_height: f32,
+    pub overview_gap: f32,
+    pub overview_marker_min: f32,
+    pub overview_edge_grab: f32,
+    pub overview_wheel_zoom: f32,
+    /// The overview's series picker scrolls past this height.
+    pub overview_picker_height: f32,
     pub plot_point_radius: f32,
     pub plot_selected_radius: f32,
     pub library_details_width: f32,
@@ -261,6 +275,7 @@ pub const DARK: Theme = Theme {
         },
         scrollbar: rgb(0x42, 0x42, 0x41),
         plot_grid: rgb(0x30, 0x30, 0x30),
+        overview_band: rgb(0x48, 0x48, 0x47),
     },
     radius: Radii {
         window: 14,
@@ -271,6 +286,7 @@ pub const DARK: Theme = Theme {
         row: 7,
         chip: 6,
         selection: 5,
+        marker: 2,
         pill: 999,
     },
     size: Sizes {
@@ -325,6 +341,12 @@ pub const DARK: Theme = Theme {
         plot_y_label_min: 20.,
         plot_grid_fade: [20., 80.],
         plot_signal_label_spacing: [100., 150.],
+        overview_height: 26.,
+        overview_gap: 8.,
+        overview_marker_min: 4.,
+        overview_edge_grab: 5.,
+        overview_wheel_zoom: 0.004,
+        overview_picker_height: 320.,
         plot_point_radius: 2.5,
         plot_selected_radius: 7.,
         library_details_width: 480.,
