@@ -2030,7 +2030,11 @@ impl StructureViews {
         }
         let mut wheel_zoomed = false;
         let plot_ctx = ui.ctx().clone();
-        let plot_outer = ui.available_rect_before_wrap();
+        // The overview strip sits under the plot; the plot's own axis drag and
+        // wheel handling must stop above it, or both react to the strip.
+        let strip_height = crate::theme::DARK.size.overview_height + crate::theme::DARK.size.overview_gap;
+        let mut plot_outer = ui.available_rect_before_wrap();
+        plot_outer.max.y = (plot_outer.max.y - strip_height).max(plot_outer.min.y);
         let plot_clip = ui.clip_rect();
         let plot_layer = ui.layer_id();
         let dot_radius = self.plot_dot_radius.unwrap_or(2.5);
@@ -2054,7 +2058,6 @@ impl StructureViews {
         }
         let [label_min, label_max] = crate::theme::DARK.size.plot_signal_label_spacing;
         // Leave room under the plot for the whole-file overview strip.
-        let strip_height = crate::theme::DARK.size.overview_height + crate::theme::DARK.size.overview_gap;
         let plot_height = (ui.available_height() - strip_height).max(crate::theme::DARK.size.overview_height);
         let response = crate::theme::labeled_grid_spaced(Plot::new(plot_id), label_min)
             .id(plot_id)
@@ -5415,6 +5418,30 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
             Some(5001 * 24 + 16..5001 * 24 + 24),
             "selecting a peak inside an amplitude band must retain exact source bytes"
         );
+    }
+
+    #[test]
+    fn dragging_the_overview_strip_does_not_pan_the_plot_under_it() {
+        let (store, output) = waveform_plot_fixture();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        views.plot_force_view = Some(0..1000);
+        settle_plot(&ctx, &mut views, &output, &store);
+        let before = views.plot_view.clone();
+        // The strip is the bottom 26 px of the 700 px panel.
+        let y = 700. - 8. - crate::theme::DARK.size.overview_height / 2.;
+        let press = |x: f32, pressed: bool| egui::Event::PointerButton { pos: egui::pos2(x, y),
+            button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        render_plot(&ctx, &mut views, &output, &store, vec![egui::Event::PointerMoved(egui::pos2(200., y)), press(200., true)], Default::default());
+        assert!(views.plot_axis_panning.is_none(), "a press on the strip is not a plot axis drag");
+        for x in [300., 400., 500.] {
+            render_plot(&ctx, &mut views, &output, &store, vec![egui::Event::PointerMoved(egui::pos2(x, y))], Default::default());
+            assert_eq!(views.plot_view, before, "the plot doesn't follow the pointer while the strip is dragged");
+        }
+        render_plot(&ctx, &mut views, &output, &store, vec![press(500., false)], Default::default());
+        settle_plot(&ctx, &mut views, &output, &store);
+        assert!(views.plot_view.as_ref().unwrap().start > before.as_ref().unwrap().start,
+            "releasing moves the view forward into the file: {:?} -> {:?}", before, views.plot_view);
     }
 
     #[test]
