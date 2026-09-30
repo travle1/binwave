@@ -425,12 +425,17 @@ fn parse_u64_prefix(text: &str) -> Option<u64> {
 }
 
 pub fn empty_state(ui: &mut Ui, title: &str, detail: &str) {
+    empty_state_with(ui, title, |ui| { ui.label(detail); });
+}
+
+/// An empty state whose body is a control, such as the button that fills it.
+pub fn empty_state_with<R>(ui: &mut Ui, title: &str, contents: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
             ui.strong(title);
-            ui.label(detail);
-        });
+            contents(ui)
+        }).inner
 }
 
 /// Return the first one-based source line mentioned by common Python/YAML errors.

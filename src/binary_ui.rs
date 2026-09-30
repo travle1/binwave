@@ -2564,12 +2564,16 @@ impl BinaryWorkspace {
             return;
         }
         if self.document.is_none() {
-            crate::decoder_ui::empty_state(
-                ui,
-                "Nothing to plot yet",
-                if self.has_file() { "Press ▶ Run (F5). Repeated numeric fields become plot series." }
-                else { "Open a data file, then press ▶ Run (F5) with a decoder." },
-            );
+            if self.has_file() {
+                let ctx = ui.ctx().clone();
+                let run = crate::decoder_ui::empty_state_with(ui, "Nothing to plot yet", |ui|
+                    crate::decoder_ui::run_button(ui, self.can_apply_definition(), self.run_disabled_reason())
+                        .on_hover_text("Repeated numeric fields become plot series").clicked());
+                if run { self.apply_definition(&ctx); }
+            } else {
+                crate::decoder_ui::empty_state(ui, "Nothing to plot yet",
+                    "Open a data file, then press ▶ Run (F5) with a decoder.");
+            }
             return;
         }
         if self.document.as_ref().unwrap().layout.fields.is_empty() {
