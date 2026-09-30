@@ -523,7 +523,7 @@ impl PlotReader {
                 && key.fields.as_ref().is_some_and(|fields| fields.len() == plan.fields.len()
                     && fields.iter().zip(&plan.fields).all(|(name, field)| name == &field.name))
                 && covers_view(key, &range, pixel_width, Some(plan.fields.len()),
-                    &fresh_query(&range, count, true, refine))
+                    &fresh_query(&range, count, true, refine, Some(plan.fields.len())))
         })
     }
 
@@ -548,7 +548,7 @@ impl PlotReader {
                 && key.fields.is_none()
                 && covers_view(key, &range, pixel_width,
                     plan.as_ref().map(|plan| plan.fields.len()),
-                    &fresh_query(&range, count, plan.is_some(), refine))
+                    &fresh_query(&range, count, plan.is_some(), refine, plan.as_ref().map(|plan| plan.fields.len())))
         })
     }
 
@@ -577,7 +577,7 @@ impl PlotReader {
                 && key.path == node.path && key.refine == refine
                 && key.fields.as_deref() == fields.as_deref()
                 && covers_view(key, &range, pixel_width, field_count,
-                    &fresh_query(&range, count, numeric_plan.is_some(), refine))
+                    &fresh_query(&range, count, numeric_plan.is_some(), refine, field_count))
         }) {
             if let Err(error) = source.validate() {
                 self.invalidate();
@@ -585,7 +585,7 @@ impl PlotReader {
             }
             return;
         }
-        let query_range = fresh_query(&range, count, numeric_plan.is_some(), refine);
+        let query_range = fresh_query(&range, count, numeric_plan.is_some(), refine, field_count);
         let (buckets, exact_limit) = query_resolution(&range, &query_range,
             pixel_width, field_count);
         let key = Key {
@@ -1072,6 +1072,9 @@ fn request_resolution(
     } else {
         exact_limit(pixel_width)
     };
+    // A grouped scan reads every field exactly only within its shared budget;
+    // beyond it the reader reduces, so it must not be recorded as exact.
+    let exact = field_count.map_or(exact, |count| exact.min(field_budget(count)));
     (buckets, exact)
 }
 
@@ -1100,11 +1103,30 @@ fn query_resolution(view: &Range<Address>, query: &Range<Address>,
     (buckets, exact)
 }
 
+/// Samples per field a grouped scan can read exactly.
+fn field_budget(field_count: usize) -> Address {
+    (MAX_TOTAL_NUMERIC_POINTS / field_count.max(1) as Address).max(1)
+}
+
 /// The range a new request for `view` would scan: numeric refinements add an
-/// aligned margin so short pans reuse the scan.
+/// aligned margin so short pans reuse the scan. When the view itself fits a
+/// grouped scan's exact budget, the margin is trimmed to fit it too, so the
+/// view is read exactly rather than reduced.
 #[cfg(not(target_arch = "wasm32"))]
-fn fresh_query(view: &Range<Address>, count: Address, numeric: bool, refine: bool) -> Range<Address> {
-    if numeric && refine { numeric_query_coverage(view, count) } else { view.clone() }
+fn fresh_query(view: &Range<Address>, count: Address, numeric: bool, refine: bool,
+    field_count: Option<usize>) -> Range<Address> {
+    if !(numeric && refine) {
+        return view.clone();
+    }
+    let coverage = numeric_query_coverage(view, count);
+    match field_count.map(field_budget) {
+        Some(budget) if view.len() <= budget && coverage.len() > budget => {
+            let start = view.start.saturating_sub((budget - view.len()) / 2);
+            let end = (start + budget).min(count);
+            end.saturating_sub(budget).min(view.start)..end
+        }
+        _ => coverage,
+    }
 }
 
 /// Whether a cached scan is as good as a fresh one for `view`: it spans the view
@@ -3111,8 +3133,10 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
         let range = 0..100_000;
         let expected_buckets = MAX_TOTAL_NUMERIC_POINTS / 512;
         for width in [640, 1280, 1920, 4096] {
+            // Exactness is limited by the same shared budget: the reader reduces
+            // any wider grouped scan, so it must not be recorded as exact.
             assert_eq!(request_resolution(&range, width, Some(512)),
-                (expected_buckets, MAX_EXACT_LIMIT));
+                (expected_buckets, expected_buckets));
         }
         assert_ne!(request_resolution(&range, 640, Some(1)),
             request_resolution(&range, 1280, Some(1)));
