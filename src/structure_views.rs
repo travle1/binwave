@@ -177,6 +177,10 @@ pub struct StructureViews {
     plot_gpu: GpuPlot,
     /// Zoomed-out views of the primary collection, drawn from its min/max summary.
     plot_summary: crate::plot_summary::SummaryPlot,
+    /// Tests of the reader's own drawing (used for collections without a fixed
+    /// layout) turn the column path off.
+    #[cfg(test)]
+    plot_summary_off: bool,
     #[cfg(test)]
     plot_overlay_builds: usize,
     plot_view: Option<Range<usize>>,
@@ -1518,7 +1522,11 @@ impl StructureViews {
         let mut summary_hash = std::collections::hash_map::DefaultHasher::new();
         (group_key, source.revision, count).hash(&mut summary_hash);
         let summary_focus = self.plot_view.clone().unwrap_or(0..count.min(INITIAL_PLOT_SAMPLES));
-        self.plot_summary.sync(ui.ctx(), Some(summary_hash.finish()), summary_focus, || {
+        #[cfg(test)]
+        let summary_key = Some(summary_hash.finish()).filter(|_| !self.plot_summary_off);
+        #[cfg(not(test))]
+        let summary_key = Some(summary_hash.finish());
+        self.plot_summary.sync(ui.ctx(), summary_key, summary_focus, || {
             match primary_group {
                 Some((_, (_, plan, _))) => {
                     let names = plan.fields.iter().map(|field| field.name.clone()).collect();
@@ -4227,6 +4235,18 @@ actions:
                 assert_eq!(columns.values[sensor][column], Some(expected), "sensor {sensor} column {column}");
             }
         }
+        // Columns read straight from the samples, spanning block boundaries.
+        let sensors = [0, 1, 200, 431];
+        let read = crate::plot_pyramid::read_columns(&store.view(), group_plan, count, 100, 37, 50, &sensors,
+            &AtomicBool::new(false)).unwrap();
+        for (slot, &sensor) in sensors.iter().enumerate() {
+            for column in 0..50 {
+                let span = (100 + column * 37).min(count)..(100 + (column + 1) * 37).min(count);
+                let seen: Vec<f64> = span.clone().map(|sample| value(sensor, sample)).collect();
+                let expected = [seen.iter().copied().fold(f64::INFINITY, f64::min), seen.iter().copied().fold(f64::NEG_INFINITY, f64::max)];
+                assert_eq!(read[slot][column], Some(expected), "read sensor {sensor} column {column}");
+            }
+        }
     }
 
     #[test]
@@ -5684,6 +5704,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
         let (store, output) = waveform_plot_fixture();
         let ctx = egui::Context::default();
         let mut views = StructureViews::default();
+        views.plot_summary_off = true;
         settle_plot(&ctx, &mut views, &output, &store);
         fn paths(shape: &egui::Shape, color: Color32, traces: &mut Vec<Vec<egui::Pos2>>) {
             match shape {
@@ -5931,6 +5952,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
         let (store, output) = waveform_plot_fixture();
         let ctx = egui::Context::default();
         let mut views = StructureViews::default();
+        views.plot_summary_off = true;
         settle_plot(&ctx, &mut views, &output, &store);
         views.plot_force_view = Some(0..4096);
         settle_plot(&ctx, &mut views, &output, &store);
@@ -6016,6 +6038,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 .unwrap();
         let ctx = egui::Context::default();
         let mut views = StructureViews::default();
+        views.plot_summary_off = true;
         settle_plot(&ctx, &mut views, &output, &store);
         views.plot_force_view = Some(0..count);
         settle_plot(&ctx, &mut views, &output, &store);
@@ -6060,6 +6083,7 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
                 .unwrap();
         let ctx = egui::Context::default();
         let mut views = StructureViews::default();
+        views.plot_summary_off = true;
         settle_plot(&ctx, &mut views, &output, &store);
         views.plot_force_view = Some(0..count);
         views.plot_fit_y = true;

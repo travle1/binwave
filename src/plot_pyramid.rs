@@ -318,6 +318,77 @@ fn read_rows(source: &ByteView, plan: &NumericPlan, samples: Range<usize>) -> Re
     Ok(reads)
 }
 
+/// Min/max per column for each of several channels: `values[channel][column]`.
+type ChannelColumns = Vec<Vec<Option<[f64; 2]>>>;
+
+/// Per-column min/max straight from the samples, for views too close for the
+/// pyramid's bins. Column `c` covers samples `first + c * per_column` up to the
+/// next column or `count`; `values[i]` is `channels[i]`. Reads run in parallel,
+/// a few megabytes at a time, and stop early when `cancel` is set.
+#[allow(clippy::too_many_arguments)] // The window's grid and the channels are all needed.
+pub fn read_columns(source: &ByteView, plan: &NumericPlan, count: usize, first: usize, per_column: usize,
+    columns: usize, channels: &[usize], cancel: &AtomicBool) -> Result<ChannelColumns> {
+    use rayon::prelude::*;
+    let per_column = per_column.max(1);
+    let span = |column: usize| (first + column * per_column).min(count)..(first + (column + 1) * per_column).min(count);
+    let runs = runs(plan);
+    let total: usize = runs.iter().map(|run| run.channels).sum();
+    let mut slots = vec![None; total];
+    for (slot, &channel) in channels.iter().enumerate() {
+        if let Some(entry) = slots.get_mut(channel) { *entry = Some(slot); }
+    }
+    // Jobs of whole columns, about CHUNK_BYTES of rows each.
+    let per_job = (CHUNK_BYTES / (plan.stride.max(1) * per_column)).max(1);
+    let jobs: Vec<Range<usize>> = (0..columns).step_by(per_job).map(|start| start..(start + per_job).min(columns)).collect();
+    let row_stride = plan.physical_stride().max(1);
+    let parts: Vec<Result<ChannelColumns>> = jobs.par_iter().map(|job| {
+        ensure!(!cancel.load(Ordering::Relaxed), "column read cancelled");
+        let mut out = vec![vec![None; job.len()]; channels.len()];
+        let samples = span(job.start).start..span(job.end - 1).end;
+        if samples.is_empty() { return Ok(out); }
+        let reads = read_rows(source, plan, samples)?;
+        let mut channel = 0;
+        for run in &runs {
+            let wanted: Vec<(usize, usize)> = (0..run.channels)
+                .filter_map(|offset| slots[channel + offset].map(|slot| (offset, slot))).collect();
+            if !wanted.is_empty() {
+                let spans: Vec<_> = job.clone().map(span).collect();
+                by_primitive!(run.primitive, T => reduce_spans::<T>(&reads, run, row_stride, &spans, &wanted, &mut out));
+            }
+            channel += run.channels;
+        }
+        Ok(out)
+    }).collect();
+    let mut values = vec![Vec::with_capacity(columns); channels.len()];
+    for part in parts {
+        for (column, part) in values.iter_mut().zip(part?) { column.extend(part); }
+    }
+    Ok(values)
+}
+
+/// Reduce each span's rows of one run, keeping the `wanted` (offset in run, output slot) channels.
+fn reduce_spans<T: Sample>(reads: &[(usize, Vec<u8>)], run: &Run, row_stride: usize, spans: &[Range<usize>],
+    wanted: &[(usize, usize)], out: &mut [Vec<Option<[f64; 2]>>]) {
+    let matrix = Matrix { first: run.first, channels: run.channels, row_stride, little_endian: run.little };
+    for (column, span) in spans.iter().enumerate() {
+        if span.is_empty() { continue; }
+        let mut result = MinMax::<T>::new(run.channels);
+        for (first, bytes) in reads {
+            let rows = bytes.len().saturating_sub(run.first + run.channels * T::WIDTH) / row_stride + 1;
+            let (lo, hi) = (span.start.max(*first), span.end.min(first + rows));
+            if lo < hi {
+                result.reduce(bytes, &matrix, lo - first..hi - first);
+            }
+        }
+        for &(offset, slot) in wanted {
+            let (low, high) = (result.min[offset], result.max[offset]);
+            if low <= high {
+                out[slot][column] = Some([low.to_f64(), high.to_f64()]);
+            }
+        }
+    }
+}
+
 /// The sample in `samples` whose `channel` value is nearest `target`, with that
 /// value: what a click on a column picks.
 pub fn nearest_sample(source: &ByteView, plan: &NumericPlan, channel: usize, samples: Range<usize>,
@@ -608,6 +679,29 @@ mod tests {
     }
 
     #[test]
+    fn columns_read_from_the_samples_match_a_brute_force_scan() {
+        let count = 50_000;
+        let (store, plan, values) = fixture(count);
+        // Channels from all three runs, out of order: u16, the f32 with NaNs, the i8.
+        let channels = [3, 13, 12, 0];
+        for (first, step, columns) in [(0, 7, 200), (12_345, 1, 64), (49_000, 300, 5)] {
+            let read = read_columns(&store.view(), &plan, count, first, step, columns, &channels,
+                &AtomicBool::new(false)).unwrap();
+            assert_eq!(read.len(), channels.len());
+            for (slot, &channel) in channels.iter().enumerate() {
+                assert_eq!(read[slot].len(), columns);
+                for column in 0..columns {
+                    let span = (first + column * step).min(count)..(first + (column + 1) * step).min(count);
+                    let expected = if span.is_empty() { None } else { brute(&values[channel], span.clone()) };
+                    assert_eq!(read[slot][column], expected, "channel {channel} column {column} span {span:?}");
+                }
+            }
+        }
+        assert!(read_columns(&store.view(), &plan, count, 0, 10, 100, &channels, &AtomicBool::new(true)).is_err(),
+            "a cancelled read stops");
+    }
+
+    #[test]
     fn the_focused_view_is_built_first_and_usable_before_the_rest() {
         // 10 chunks of 1,000 samples; the view covers chunks 6 and 7.
         let order = build_order(&[false; 10], 1000, 10_000, &(6_500..7_500));
@@ -716,6 +810,14 @@ mod tests {
                 while reader.is_loading() { reader.tick(&ctx); std::thread::sleep(std::time::Duration::from_millis(1)); }
                 let seconds = t.elapsed().as_secs_f64();
                 eprintln!("  reader, {samples} samples at 1830 px: {:.2} s ({:.1} M samples/s)", seconds, samples as f64 / seconds / 1e6);
+                // What Signal now does instead: the view and a view each side, read as pixel columns.
+                let (step, window) = (samples / 1830, (3 * samples).min(records));
+                let t = std::time::Instant::now();
+                let read = read_columns(&store.view(), &plan, records, records - window, step, window / step, &all,
+                    &AtomicBool::new(false)).unwrap();
+                assert!(read[0].iter().all(Option::is_some));
+                let seconds = t.elapsed().as_secs_f64();
+                eprintln!("  direct columns, {window} samples: {:.3} s ({:.1} M samples/s)", seconds, window as f64 / seconds / 1e6);
             }
             let _ = std::fs::remove_file(cache::path(&store.view(), &plan, records).unwrap());
             std::fs::remove_file(&path).unwrap();

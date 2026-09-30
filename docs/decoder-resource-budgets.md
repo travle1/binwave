@@ -61,9 +61,10 @@ the sample index; the full path string is formatted only for selection or
 inspection. This removes per-point path-string allocations from numeric
 query output. Byte ranges and exact sample indices remain attached to points.
 
-Zoomed out, fixed-layout numeric collections are drawn as per-pixel min/max
-columns from a min/max pyramid (one entry per 256 samples, about 1.6% of the
-data, saved under the app cache directory once complete). Decoded plot values are no longer stored
+Fixed-layout numeric collections are drawn as per-pixel min/max columns: from
+a min/max pyramid (one entry per 256 samples, about 1.6% of the data, saved
+under the app cache directory once complete) when zoomed out, and read
+straight from the samples closer in, down to two samples per pixel. Decoded plot values are no longer stored
 on disk; the earlier decoded-chunk cache and its **Keep decoded data for this
 file** option were removed, and the app deletes their folder on start.
 
