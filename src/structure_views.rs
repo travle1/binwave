@@ -151,6 +151,8 @@ pub struct StructureViews {
     plot_target: String,
     plot_sources: std::collections::BTreeSet<String>,
     plot_sources_initialized: bool,
+    /// The user emptied the plot selection; don't pick a collection for them again.
+    plot_sources_cleared: bool,
     plot_collections_open: bool,
     plot_sidebar_series: bool,
     plot_axis_series: Option<String>,
@@ -1415,6 +1417,7 @@ impl StructureViews {
         if close_collections { self.plot_collections_open = false; }
         if changed {
             self.plot_sources.retain(|path| collection_by_path.contains_key(path.as_str()));
+            self.plot_sources_cleared = self.plot_sources.is_empty();
             self.plot_fit_y = true;
         }
         if !self.plot_sources.iter().any(|path| collection_by_path.contains_key(path.as_str())) {
@@ -1429,6 +1432,17 @@ impl StructureViews {
             self.extra_plot_readers.clear();
             self.group_plot_readers.clear();
             self.group_plan_cache = None;
+            if self.plot_sources_cleared {
+                self.plot_reader.stop();
+                self.plot_summary = Default::default();
+                crate::decoder_ui::empty_state(ui, "No collections selected",
+                    "Choose what to plot in Collections.");
+                if ui.button("Collections…").clicked() {
+                    self.plot_collections_open = true;
+                    self.plot_sidebar_series = false;
+                }
+                return None;
+            }
             // Plot the best collection without asking: the largest channel group
             // once discovery has run, else the best-ranked one. Collections…
             // switches to another.
@@ -3812,6 +3826,17 @@ actions:
         assert_eq!(views.plot_sources.iter().collect::<Vec<_>>(), ["samples"]);
         assert_eq!(views.plot_target, "samples");
         assert_eq!(views.plot_collection(), Some("samples"));
+        // Emptying the selection in Collections (as Clear selection or Hide group
+        // does) is respected: nothing is picked again behind the user's back.
+        views.plot_sources.clear();
+        views.plot_sources_cleared = true;
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |_ctx, ui| {
+                egui::CentralPanel::default().show(ui, |ui| { views.plot(ui, &output, store.view()); });
+            });
+        }
+        assert!(views.plot_sources.is_empty(), "a hidden collection stays hidden");
+        assert!(!views.plot_reader.is_loading());
         // A remembered collection that no longer exists is ignored.
         let mut remembered = StructureViews::default();
         remembered.set_plot_preference(Some("gone".into()));
