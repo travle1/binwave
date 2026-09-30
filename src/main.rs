@@ -81,6 +81,9 @@ mod overview_strip;
 #[allow(dead_code)] // The plot pipeline adopts it in the next steps.
 mod plot_reduce;
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)] // Signal adopts it in step 4.
+mod plot_pyramid;
+#[cfg(not(target_arch = "wasm32"))]
 mod window_frame;
 #[cfg(not(target_arch = "wasm32"))]
 mod structure_ui;

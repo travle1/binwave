@@ -4049,6 +4049,85 @@ actions:
             "{:?}", chips.iter().map(|chip| &chip.label).collect::<Vec<_>>());
     }
     #[test]
+    fn plot_pyramid_matches_the_samples_of_a_blocked_interleaved_sensor_group() {
+        let yaml = r#"
+structures:
+  - name: Descriptor
+    fields:
+      - {name: width, type: u8}
+      - {name: groups, type: u16}
+  - name: Metadata
+    fields:
+      - {name: items_per_group, type: u16}
+      - {name: descriptors, type: {structure: Descriptor}, repeat: 1}
+    actions:
+      - define:
+          name: Generated
+          from: descriptors
+          fields:
+            type: {ref: width, cases: {'2': i16}}
+            repeat: {ref: groups}
+            items_per_group: {ref: items_per_group}
+            layout: interleaved
+  - name: Block
+    fields:
+      - {name: header, type: bytes, length: 2}
+      - {name: payload, type: {structure: Generated}}
+actions:
+  - read: {name: metadata, type: {structure: Metadata}}
+  - read: {name: blocks, type: {structure: Block}, repeat: 8}
+"#;
+        // 432 sensors, 256 samples each per block, 8 blocks.
+        let mut bytes = vec![0xB0, 0x01, 2, 0x00, 0x01];
+        for block in 0..8_i32 {
+            bytes.extend([0xAA, 0xBB]);
+            for index in 0..432 * 256 { bytes.extend(((block * 1000 + index / 432) as i16).to_le_bytes()); }
+        }
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let output = Program::parse(yaml).unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        let frame = |views: &mut StructureViews| { let _ = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200., 700.))), ..Default::default() },
+            |_ctx, ui| { egui::CentralPanel::default().show(ui, |ui| { views.plot(ui, &output, store.view()); }); }); };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let settle = |views: &mut StructureViews| loop {
+            frame(views);
+            if !views.plot_sources.is_empty() && views.discovery_rx.is_none() && !views.plot_reader.is_loading() { break; }
+            assert!(std::time::Instant::now() < deadline, "plot timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        settle(&mut views);
+        let references: Vec<_> = views.flattened_collections.iter().collect();
+        let (_, groups) = grouped_collection_choices(&references);
+        let sensors = &groups["blocks.payload.field_0.values"];
+        let selected: std::collections::BTreeSet<String> = sensors.iter().map(|(_, node)| node.path.clone()).collect();
+        let by_path: HashMap<&str, &Node> = references.iter().map(|node| (node.path.as_str(), *node)).collect();
+        let grouped = grouped_numeric_plans(&selected, &by_path);
+        let (group_node, group_plan, _) = &grouped["blocks.payload.field_0.values"];
+        let count = collection_count(group_node);
+        let builder = crate::plot_pyramid::PyramidBuilder::start(store.view(), group_plan.clone(), count, 0..count, || {});
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while builder.built() < 1. { assert!(std::time::Instant::now() < deadline, "{:?}", builder.error()); std::thread::sleep(std::time::Duration::from_millis(2)); }
+        // Every sensor's value for one sample, read through the plan's own offsets.
+        let value = |sensor: usize, sample: usize| {
+            let row = store.view().read(group_plan.offset(sample).unwrap(), group_plan.stride).unwrap();
+            group_plan.fields[sensor].decode(&row).unwrap()
+        };
+        let columns = builder.columns(0..count, 4);
+        for sensor in [0, 1, 200, 431] {
+            for column in 0..4 {
+                let span = column * count / 4..((column + 1) * count / 4).min(count);
+                let bin = columns.bin_samples;
+                let span = span.start / bin * bin..(span.end.div_ceil(bin) * bin).min(count);
+                let seen: Vec<f64> = span.clone().map(|sample| value(sensor, sample)).collect();
+                let expected = [seen.iter().copied().fold(f64::INFINITY, f64::min), seen.iter().copied().fold(f64::NEG_INFINITY, f64::max)];
+                assert_eq!(columns.values[sensor][column], Some(expected), "sensor {sensor} column {column}");
+            }
+        }
+    }
+
+    #[test]
     fn many_channels_zoomed_in_are_read_exactly_and_picked_as_one_group() {
         let yaml = r#"
 structures:

@@ -750,7 +750,7 @@ impl NumericPlan {
             field.source_path, field.kind, field.endian,
         ]).to_string()).collect()
     }
-    #[cfg(all(test, not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn cache_layout_key(&self) -> String {
         let segment = self.segmented.as_ref().map(|part| [
             part.outer_start, part.outer_stride, part.inner_offset,
@@ -837,6 +837,14 @@ pub(crate) struct NumericField {
     endian: Endian,
 }
 impl NumericField {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop plots only.
+    pub(crate) fn primitive(&self) -> Primitive {
+        self.primitive
+    }
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop plots only.
+    pub(crate) fn little_endian(&self) -> bool {
+        self.endian == Endian::Little
+    }
     pub fn decode(&self, record: &[u8]) -> Result<f64> {
         let start = usize::try_from(self.offset).context("field offset exceeds memory range")?;
         let end = start.checked_add(usize::try_from(self.width).context("field width exceeds memory range")?)
@@ -847,8 +855,8 @@ impl NumericField {
 }
 
 /// A numeric primitive type, resolved from its name once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Primitive { U8, U16, U32, U64, I8, I16, I32, I64, F32, F64 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Primitive { U8, U16, U32, U64, I8, I16, I32, I64, F32, F64 }
 impl Primitive {
     fn from_name(kind: &str) -> Option<Self> {
         Some(match kind {
