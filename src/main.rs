@@ -84,6 +84,9 @@ mod plot_reduce;
 #[allow(dead_code)] // Signal adopts it in step 4.
 mod plot_pyramid;
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)] // Signal adopts it in step 4.
+mod plot_columns_gpu;
+#[cfg(not(target_arch = "wasm32"))]
 mod window_frame;
 #[cfg(not(target_arch = "wasm32"))]
 mod structure_ui;

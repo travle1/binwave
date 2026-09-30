@@ -16,6 +16,9 @@ static TARGET_FORMAT: OnceLock<wgpu::TextureFormat> = OnceLock::new();
 static NEXT_UPLOAD: AtomicU64 = AtomicU64::new(1);
 
 pub fn configure(format: wgpu::TextureFormat) { let _ = TARGET_FORMAT.set(format); }
+/// The surface format set by `configure`, once the GPU is available.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop column plots only.
+pub fn target_format() -> Option<wgpu::TextureFormat> { TARGET_FORMAT.get().copied() }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
