@@ -351,6 +351,18 @@ pub struct PyramidBuilder {
     shared: Arc<Shared>,
 }
 
+/// Queries a pyramid from another thread without keeping its build alive.
+#[derive(Clone)]
+pub struct PyramidQuery {
+    shared: Arc<Shared>,
+}
+
+impl PyramidQuery {
+    pub fn columns_of(&self, view: Range<usize>, columns: usize, channels: &[usize]) -> Columns {
+        self.shared.pyramid.read().unwrap().columns_of(view, columns, channels)
+    }
+}
+
 impl Drop for PyramidBuilder {
     fn drop(&mut self) {
         self.shared.cancel.store(true, Ordering::Relaxed);
@@ -391,8 +403,8 @@ impl PyramidBuilder {
         self.shared.pyramid.read().unwrap().columns(view, columns)
     }
 
-    pub fn columns_of(&self, view: Range<usize>, columns: usize, channels: &[usize]) -> Columns {
-        self.shared.pyramid.read().unwrap().columns_of(view, columns, channels)
+    pub fn query(&self) -> PyramidQuery {
+        PyramidQuery { shared: self.shared.clone() }
     }
 
     pub fn built(&self) -> f32 {
@@ -683,7 +695,7 @@ mod tests {
             let all: Vec<usize> = (0..channels).collect();
             let colors: Vec<_> = (0..channels).map(|slot| (slot, egui::Color32::WHITE)).collect();
             let t = std::time::Instant::now();
-            let window = builder.columns_of(records / 3..records / 3 + records / 2, 3 * 1157, &all);
+            let window = builder.query().columns_of(records / 3..records / 3 + records / 2, 3 * 1157, &all);
             let fetch = t.elapsed().as_secs_f64();
             let t = std::time::Instant::now();
             let _ = crate::plot_columns_gpu::ColumnUpload::new(&window, &colors);
@@ -694,6 +706,17 @@ mod tests {
                 fetch * 1e3, pack * 1e3, (channels * 3 * 1157 * 8) as f64 / 1e6, bytes as f64 / 1e6,
                 bytes as f64 * 100. / (records * channels * 2) as f64);
             drop(pyramid);
+            // Today's reader over the same file, for views too close for the summary.
+            let ctx = egui::Context::default();
+            for samples in [100_000usize, 400_000] {
+                let mut reader = crate::structure_plot::PlotReader::default();
+                let start = records / 2;
+                let t = std::time::Instant::now();
+                reader.request_group(&ctx, store.view(), node.clone(), plan.clone(), start..start + samples, 1830, true);
+                while reader.is_loading() { reader.tick(&ctx); std::thread::sleep(std::time::Duration::from_millis(1)); }
+                let seconds = t.elapsed().as_secs_f64();
+                eprintln!("  reader, {samples} samples at 1830 px: {:.2} s ({:.1} M samples/s)", seconds, samples as f64 / seconds / 1e6);
+            }
             let _ = std::fs::remove_file(cache::path(&store.view(), &plan, records).unwrap());
             std::fs::remove_file(&path).unwrap();
         }

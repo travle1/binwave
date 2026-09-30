@@ -11,8 +11,8 @@ struct View {
     columns: u32,
     channels: u32,
     pad0: u32,
-    pad1: u32,
-    pad2: u32,
+    // Sample range, relative to the origin, left to another renderer; empty when skip.x > skip.y.
+    skip: vec2<f32>,
 };
 @group(0) @binding(0) var<storage, read> values: array<vec2<f32>>;
 @group(0) @binding(1) var<uniform> view: View;
@@ -31,6 +31,10 @@ fn to_pixel(x: f32, y: f32) -> vec2<f32> {
     return vec2<f32>((x - view.bounds.x) / span * view.size.x, (view.bounds.w - y) / rise * view.size.y);
 }
 
+fn skipped(x: f32) -> bool {
+    return x >= view.skip.x && x <= view.skip.y;
+}
+
 @vertex fn vs_main(@builtin(vertex_index) vertex: u32,
                    @builtin(instance_index) instance: u32) -> VertexOutput {
     var output: VertexOutput;
@@ -42,10 +46,10 @@ fn to_pixel(x: f32, y: f32) -> vec2<f32> {
     let placement = placements[channel];
     var p0 = vec2<f32>(0.0);
     var p1 = vec2<f32>(0.0);
-    var draw = value.x <= value.y;
     let x = f32(column) * view.x_step;
+    var draw = value.x <= value.y && !skipped(x);
     if (joint) {
-        draw = draw && column + 1u < view.columns;
+        draw = draw && column + 1u < view.columns && !skipped(x + view.x_step);
         let next = values[channel * view.columns + min(column + 1u, view.columns - 1u)];
         draw = draw && next.x <= next.y;
         p0 = to_pixel(x, (value.x + value.y) * 0.5 * placement.x + placement.y);

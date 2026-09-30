@@ -5,6 +5,7 @@ use crate::plot_pyramid::Columns;
 use eframe::{egui_wgpu, wgpu};
 use egui::{Color32, Painter, Rect};
 use egui_plot::PlotTransform;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -19,7 +20,9 @@ struct ViewUniform {
     x_step: f32,
     columns: u32,
     channels: u32,
-    pad: [u32; 3],
+    pad: u32,
+    /// Sample range left to another renderer, relative to the upload's origin.
+    skip: [f32; 2],
 }
 unsafe impl bytemuck::Zeroable for ViewUniform {}
 unsafe impl bytemuck::Pod for ViewUniform {}
@@ -53,38 +56,50 @@ impl ColumnUpload {
                 None => [f32::INFINITY, f32::NEG_INFINITY],
             }));
         }
-        let colors = channels.iter().map(|&(_, color)| u32::from_le_bytes(color.to_array())).collect();
+        // The same opacity as the line renderer, so crossing between them keeps the look.
+        let colors = channels.iter().map(|&(_, color)| {
+            let [r, g, b, _] = color.to_array();
+            u32::from_le_bytes([r, g, b, crate::plot_gpu::TRACE_ALPHA])
+        }).collect();
         Self { values, columns: count as u32, channels: channels.len() as u32, x_origin, x_step, y_origin, colors }
     }
 }
 
-/// Keeps the last upload and paints it for the current view.
+/// Keeps the last upload and paints it for the current view. Each `LAYER`
+/// has its own GPU buffers, so layers drawn in one frame never share them.
 #[derive(Default)]
-pub struct GpuColumns {
+pub struct GpuColumns<const LAYER: usize = 0> {
     upload: Option<(u64, Arc<ColumnUpload>)>,
 }
 
-impl GpuColumns {
+impl<const LAYER: usize> GpuColumns<LAYER> {
     pub fn set(&mut self, upload: ColumnUpload) {
         self.upload = Some((NEXT_UPLOAD.fetch_add(1, Ordering::Relaxed), Arc::new(upload)));
     }
 
-    /// `placements` gives each uploaded channel's display scale and offset.
-    pub fn paint(&self, painter: &Painter, transform: &PlotTransform, placements: &[[f32; 2]]) {
+    #[cfg(test)]
+    pub fn generation(&self) -> Option<u64> {
+        self.upload.as_ref().map(|(generation, _)| *generation)
+    }
+
+    /// `placements` gives each uploaded channel's display scale and offset;
+    /// columns inside `skip` (sample coordinates) are left undrawn.
+    pub fn paint(&self, painter: &Painter, transform: &PlotTransform, placements: &[[f32; 2]],
+        skip: Option<Range<f64>>) {
         let Some((generation, upload)) = &self.upload else { return };
         if upload.values.is_empty() { return; }
         let frame = *transform.frame();
-        let view = view_uniform(upload, transform);
+        let view = view_uniform(upload, transform, skip);
         // Placements apply to values relative to the upload's Y origin.
         let placements = placements.iter().map(|&[scale, offset]|
             [scale, (upload.y_origin * (scale as f64 - 1.)) as f32 + offset]).collect();
-        let callback = ColumnCallback { upload: upload.clone(), generation: *generation, placements, view };
+        let callback = ColumnCallback { layer: LAYER, upload: upload.clone(), generation: *generation, placements, view };
         painter.with_clip_rect(frame).add(egui::Shape::Callback(
             egui_wgpu::Callback::new_paint_callback(Rect::from_min_max(frame.min, frame.max), callback)));
     }
 }
 
-fn view_uniform(upload: &ColumnUpload, transform: &PlotTransform) -> ViewUniform {
+fn view_uniform(upload: &ColumnUpload, transform: &PlotTransform, skip: Option<Range<f64>>) -> ViewUniform {
     let bounds = transform.bounds();
     let frame = transform.frame();
     ViewUniform {
@@ -94,16 +109,21 @@ fn view_uniform(upload: &ColumnUpload, transform: &PlotTransform) -> ViewUniform
         x_step: upload.x_step as f32,
         columns: upload.columns,
         channels: upload.channels,
-        pad: [0; 3],
+        pad: 0,
+        skip: skip.map_or([1., 0.], |skip| [(skip.start - upload.x_origin) as f32, (skip.end - upload.x_origin) as f32]),
     }
 }
 
 struct ColumnCallback {
+    layer: usize,
     upload: Arc<ColumnUpload>,
     generation: u64,
     placements: Vec<[f32; 2]>,
     view: ViewUniform,
 }
+
+/// GPU buffers per column layer.
+struct Layers(Vec<Option<Resources>>);
 
 struct Resources {
     pipeline: wgpu::RenderPipeline,
@@ -164,11 +184,16 @@ impl egui_wgpu::CallbackTrait for ColumnCallback {
     fn prepare(&self, device: &wgpu::Device, queue: &wgpu::Queue,
         _screen: &egui_wgpu::ScreenDescriptor, _encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources) -> Vec<wgpu::CommandBuffer> {
-        if resources.get::<Resources>().is_none() {
-            let Some(format) = crate::plot_gpu::target_format() else { return Vec::new() };
-            resources.insert(Resources::new(device, format));
+        if resources.get::<Layers>().is_none() {
+            resources.insert(Layers(Vec::new()));
         }
-        let resource = resources.get_mut::<Resources>().unwrap();
+        let layers = &mut resources.get_mut::<Layers>().unwrap().0;
+        if layers.len() <= self.layer { layers.resize_with(self.layer + 1, || None); }
+        if layers[self.layer].is_none() {
+            let Some(format) = crate::plot_gpu::target_format() else { return Vec::new() };
+            layers[self.layer] = Some(Resources::new(device, format));
+        }
+        let resource = layers[self.layer].as_mut().unwrap();
         let mut rebind = false;
         let placement_bytes = std::mem::size_of_val(self.placements.as_slice());
         if (resource.placements.size() as usize) < placement_bytes {
@@ -200,7 +225,7 @@ impl egui_wgpu::CallbackTrait for ColumnCallback {
 
     fn paint(&self, _info: egui::PaintCallbackInfo, pass: &mut wgpu::RenderPass<'static>,
         resources: &egui_wgpu::CallbackResources) {
-        let Some(resource) = resources.get::<Resources>() else { return };
+        let Some(Some(resource)) = resources.get::<Layers>().and_then(|layers| layers.0.get(self.layer)) else { return };
         pass.set_pipeline(&resource.pipeline);
         pass.set_bind_group(0, &resource.bind_group, &[]);
         pass.draw(0..6, 0..resource.instances);
@@ -239,7 +264,8 @@ mod tests {
         assert_eq!(&upload.values[..4], [[0., 2.], [1., 1.], [f32::INFINITY, f32::NEG_INFINITY],
             [f32::INFINITY, f32::NEG_INFINITY]], "missing columns are inverted pairs");
         assert_eq!(upload.values[4], [-99_990., -99_988.]);
-        assert_eq!(upload.colors, [u32::from_le_bytes(Color32::RED.to_array()), u32::from_le_bytes(Color32::BLUE.to_array())]);
+        let alpha = crate::plot_gpu::TRACE_ALPHA;
+        assert_eq!(upload.colors, [u32::from_le_bytes([255, 0, 0, alpha]), u32::from_le_bytes([0, 0, 255, alpha])]);
     }
 
     #[test]
@@ -248,8 +274,10 @@ mod tests {
         let upload = ColumnUpload::new(&columns, &[(0, Color32::WHITE)]);
         let transform = PlotTransform::new(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200., 100.)),
             egui_plot::PlotBounds::from_min_max([5_000., -1.], [5_100., 3.]), false);
-        let view = view_uniform(&upload, &transform);
+        let view = view_uniform(&upload, &transform, None);
         assert_eq!(view.bounds, [-5., 95., -1., 3.]);
+        assert!(view.skip[0] > view.skip[1], "nothing skipped");
+        assert_eq!(view_uniform(&upload, &transform, Some(5_020.0..5_040.)).skip, [15., 35.]);
         assert_eq!((view.size, view.x_step, view.columns, view.channels), ([200., 100.], 10., 10, 1));
         assert_eq!(std::mem::size_of::<ViewUniform>() % 16, 0, "uniform size is 16-byte aligned");
     }
@@ -278,7 +306,7 @@ mod tests {
             &resources.placements, &resources.colors);
         let transform = PlotTransform::new(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(64., 64.)),
             egui_plot::PlotBounds::from_min_max([0., 0.], [8., 10.]), false);
-        queue.write_buffer(&resources.uniform, 0, bytemuck::bytes_of(&view_uniform(&upload, &transform)));
+        queue.write_buffer(&resources.uniform, 0, bytemuck::bytes_of(&view_uniform(&upload, &transform, None)));
         let texture = device.create_texture(&wgpu::TextureDescriptor { label: None,
             size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
             dimension: wgpu::TextureDimension::D2, format,
@@ -306,11 +334,13 @@ mod tests {
         receiver.recv().unwrap().unwrap();
         let pixels = readback.slice(..).get_mapped_range().unwrap();
         let at = |x: usize, y: usize| { let i = (y * 64 + x) * 4; [pixels[i], pixels[i + 1], pixels[i + 2]] };
-        let red_rows = (0..64).filter(|&y| (0..64).any(|x| at(x, y) == [255, 0, 0])).collect::<Vec<_>>();
+        // Traces are drawn at TRACE_ALPHA over the black background.
+        let (red, green) = ([crate::plot_gpu::TRACE_ALPHA, 0, 0], [0, crate::plot_gpu::TRACE_ALPHA, 0]);
+        let red_rows = (0..64).filter(|&y| (0..64).any(|x| at(x, y) == red)).collect::<Vec<_>>();
         assert!(!red_rows.is_empty() && *red_rows.first().unwrap() >= 5 && *red_rows.last().unwrap() <= 27,
             "the band spans y 6..9 (rows about 6.4..25.6): {red_rows:?}");
         let green_row = 64 - 2 * 64 / 10;
-        let green_columns: Vec<_> = (0..64).filter(|&x| (green_row - 3..green_row + 3).any(|y| at(x, y) == [0, 255, 0])).collect();
+        let green_columns: Vec<_> = (0..64).filter(|&x| (green_row - 3..green_row + 3).any(|y| at(x, y) == green)).collect();
         assert!(green_columns.len() > 30, "the flat channel draws across: {green_columns:?}");
         assert!(!(18..=21).all(|x| green_columns.contains(&x)) || green_columns.len() < 64,
             "the gap column has no data");

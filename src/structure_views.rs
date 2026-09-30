@@ -186,6 +186,8 @@ pub struct StructureViews {
     plot_y_axis_thickness: f32,
     plot_y_axis_key: Option<(Option<String>, Option<String>, bool)>,
     plot_force_view: Option<Range<usize>>,
+    /// The Y range a fit in progress has reached; it only widens until the view is complete.
+    plot_fit_extent: Option<(f64, f64)>,
     plot_fit_y: bool,
     plot_fit_all_y: bool,
     plot_free_y: bool,
@@ -1593,17 +1595,12 @@ impl StructureViews {
         }
         // The summary knows every channel's range over the part built so far.
         let mut summary_names = Vec::new();
-        if let Some((_, channels, columns)) = self.plot_summary.overview() {
-            let seen: HashSet<&str> = ranges.iter().map(|(name, _, _)| name.as_str()).collect();
-            let extra: Vec<_> = channels.iter().zip(&columns.values)
-                .filter(|(name, _)| !seen.contains(name.as_str()))
-                .filter_map(|(name, bands)| {
-                    let [min, max] = bands.iter().flatten().copied()
-                        .reduce(|[low, high], [min, max]| [low.min(min), high.max(max)])?;
-                    Some((name.clone(), min, max))
-                }).collect();
-            ranges.extend(extra);
+        if let Some((_, channels, _)) = self.plot_summary.overview() {
             summary_names = channels.to_vec();
+            let seen: HashSet<&str> = ranges.iter().map(|(name, _, _)| name.as_str()).collect();
+            let extra: Vec<_> = self.plot_summary.ranges().filter(|(name, _)| !seen.contains(name.as_str()))
+                .map(|(name, [min, max])| (name.clone(), min, max)).collect();
+            ranges.extend(extra);
         }
         let mut names: Vec<String> = self
             .plot_catalog
@@ -1852,6 +1849,9 @@ impl StructureViews {
         // Closer in, while the reader loads a view it has nothing for, the
         // summary's coarser columns stand in so the plot never blanks.
         let summary_mode = self.plot_summary.active(&requested, pixel_width);
+        // With the whole collection summarized, the reader swaps in each view
+        // once complete instead of showing it half-read; the summary fills gaps.
+        self.plot_reader.set_complete_only(self.plot_summary.ready());
         let summary_backdrop = !summary_mode && self.plot_reader.is_loading()
             && self.plot_reader.display_data().is_none_or(|data|
                 data.range.start > requested.start || data.range.end < requested.end);
@@ -2153,7 +2153,17 @@ impl StructureViews {
         } else {
             None
         };
-        if y_fit.is_some() && data.is_some_and(|data| data.complete) {
+        // While the view is still filling in, a fit only widens, so the axis
+        // settles instead of jumping with every update. Zoomed out, it settles
+        // once the summary covers the view, without waiting on other collections.
+        let fit_complete = if summary_mode { self.plot_summary.complete(&requested) }
+            else { data.is_some_and(|data| data.complete) };
+        let y_fit = match (y_fit, self.plot_fit_extent) {
+            (Some((low, high)), Some((min, max))) => Some((low.min(min), high.max(max))),
+            (fit, extent) => fit.or(extent.filter(|_| fitting)),
+        };
+        self.plot_fit_extent = y_fit.filter(|_| fitting && !fit_complete);
+        if y_fit.is_some() && fit_complete {
             self.plot_fit_y = false;
             self.plot_fit_all_y = false;
         }
@@ -2486,7 +2496,11 @@ impl StructureViews {
             None => "Drag or middle-drag to pan · Shift+wheel to pan horizontally · wheel or pinch to zoom · click a point to link Hex and Inspector".to_owned(),
         });
         if summary_mode || summary_backdrop {
-            self.plot_summary.paint(ui.painter(), &response.transform, &self.presentation);
+            // Standing in for the reader, the summary fills only what the reader
+            // cannot draw yet, instead of covering its samples.
+            let skip = self.plot_reader.display_data().filter(|_| summary_backdrop)
+                .map(|data| data.range.start as f64 - 0.5..data.range.end as f64 - 0.5);
+            self.plot_summary.paint(ui.painter(), &response.transform, &self.presentation, skip);
         }
         if gpu_mode { self.plot_gpu.paint(ui.painter(), &response.transform, &self.presentation); }
         log_slow_plot_phase(&mut phase_clock, "draw plot");

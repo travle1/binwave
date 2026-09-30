@@ -13,6 +13,8 @@ use wgpu::util::DeviceExt;
 
 const MAX_SEGMENTS: usize = 1_000_000;
 static TARGET_FORMAT: OnceLock<wgpu::TextureFormat> = OnceLock::new();
+/// Opacity of GPU-drawn traces, so crowded channels blend instead of hiding each other.
+pub const TRACE_ALPHA: u8 = 180;
 static NEXT_UPLOAD: AtomicU64 = AtomicU64::new(1);
 
 pub fn configure(format: wgpu::TextureFormat) { let _ = TARGET_FORMAT.set(format); }
@@ -92,7 +94,9 @@ impl GpuPlot {
             }
         }
         if self.key == Some(key) { return !self.segments.is_empty(); }
-        if self.pending.is_some() { return false; }
+        // Keep drawing the last upload while the next one is prepared; its
+        // points sit at their own sample positions, so it stays in place.
+        if self.pending.is_some() { return !self.segments.is_empty(); }
         // Cloning Arc handles is cheap even when the decoded arrays are large.
         // Segment reduction runs entirely off the UI thread.
         let visible: Vec<_> = points.iter().filter(|(name, _)| !hidden.contains(*name))
@@ -126,7 +130,7 @@ impl GpuPlot {
                 repaint.request_repaint();
             });
             self.pending = Some(PendingUpload { key, receiver, cancel });
-            false
+            !self.segments.is_empty()
         }
     }
     /// Series offset and scale are applied by the shader, so panning or zooming
@@ -173,7 +177,7 @@ fn prepare_segments(visible: &[(String, Arc<Vec<PlotPoint>>)], cancel: &AtomicBo
         if cancel.load(Ordering::Relaxed) { return None; }
         if segments.len() >= MAX_SEGMENTS { break; }
         let [r, g, b, _] = series_color(name).to_array();
-        let color = u32::from(r) | u32::from(g) << 8 | u32::from(b) << 16 | 180 << 24;
+        let color = u32::from(r) | u32::from(g) << 8 | u32::from(b) << 16 | u32::from(TRACE_ALPHA) << 24;
         let budget = per_series.min(MAX_SEGMENTS - segments.len());
         let index = series.len() as u32;
         series.push(name.clone());
@@ -368,6 +372,16 @@ mod tests {
         assert!(gpu.pending.is_none(), "GPU geometry worker did not finish");
         assert!(!gpu.segments.is_empty());
         assert!(gpu.segments.len() <= MAX_SEGMENTS);
+        // New data for the same traces: the last upload stays drawn until the
+        // next one is ready, so the plot never blinks.
+        let drawn = gpu.generation;
+        assert!(gpu.update(&ctx, &points, &HashSet::new(), 2), "the previous upload keeps painting");
+        assert!(gpu.pending.is_some() && gpu.generation == drawn);
+        while gpu.pending.is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            assert!(gpu.update(&ctx, &points, &HashSet::new(), 2));
+        }
+        assert_ne!(gpu.generation, drawn, "the new upload replaces it");
     }
     #[test]
     fn crowded_plot_keeps_gpu_segments_bounded_and_preserves_peak() {

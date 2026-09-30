@@ -11,14 +11,16 @@ use crate::structure_plot::PlotPath;
 use egui::{Painter, Pos2};
 use egui_plot::{PlotPoint, PlotTransform};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 /// View widths fetched on each side of the view, so panning draws from the
 /// upload already on the GPU.
 const MARGIN_VIEWS: f64 = 1.;
 /// While the summary builds, how often shown columns are fetched again.
-const REFRESH: Duration = Duration::from_millis(200);
+const REFRESH: Duration = Duration::from_millis(250);
+/// While the summary builds, how often the whole-collection overview is.
+const OVERVIEW_REFRESH: Duration = Duration::from_secs(1);
 /// Whole-collection columns kept for the overview strip and series ranges.
 const OVERVIEW_COLUMNS: usize = 2000;
 /// Bytes a click reads at most to find the sample under the pointer.
@@ -70,8 +72,18 @@ pub struct SummaryPlot {
     names: Vec<String>,
     count: usize,
     shown: Option<Shown>,
+    /// A fetch running off the UI thread; the last one stays drawn meanwhile.
+    fetching: Option<mpsc::Receiver<(Shown, ColumnUpload)>>,
+    ctx: Option<egui::Context>,
     overview: Option<(f32, Instant, Columns)>,
+    /// Each channel's range over the overview, when it has data.
+    ranges: Vec<Option<[f64; 2]>>,
     gpu: GpuColumns,
+    /// The whole collection at overview resolution, drawn under the detailed
+    /// columns so a fast pan or zoom-out never shows empty ends; keyed by the
+    /// overview it came from and its channels.
+    whole: GpuColumns<1>,
+    whole_key: Option<(Instant, Vec<usize>)>,
 }
 
 impl SummaryPlot {
@@ -82,6 +94,7 @@ impl SummaryPlot {
         if self.key == key { return; }
         *self = Self { key, ..Self::default() };
         let Some((source, plan, names, count)) = key.and_then(|_| start()) else { return };
+        self.ctx = Some(ctx.clone());
         let repaint = ctx.clone();
         self.builder = Some(PyramidBuilder::start(source.clone(), plan.clone(), count, focus,
             move || repaint.request_repaint()));
@@ -93,6 +106,12 @@ impl SummaryPlot {
         self.builder.is_some() && view.len() >= BIN * pixel_width.max(1)
     }
 
+    /// Whether the whole collection is summarized, so the summary can stand in
+    /// anywhere the reader hasn't drawn yet.
+    pub fn ready(&self) -> bool {
+        self.builder.as_ref().is_some_and(|builder| builder.built() >= 1.)
+    }
+
     /// Share of the collection summarized, while building.
     pub fn building(&self) -> Option<f32> {
         self.builder.as_ref().map(PyramidBuilder::built).filter(|built| *built < 1.)
@@ -102,38 +121,95 @@ impl SummaryPlot {
         self.builder.as_ref()?.error()
     }
 
+    /// Take a finished fetch; `wait` blocks for one in flight.
+    fn take_fetch(&mut self, wait: bool) {
+        let Some(receiver) = &self.fetching else { return };
+        let result = if wait { receiver.recv().ok() } else { receiver.try_recv().ok() };
+        if let Some((shown, upload)) = result {
+            self.gpu.set(upload);
+            self.shown = Some(shown);
+            self.fetching = None;
+        } else if wait || matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+            self.fetching = None;
+        }
+    }
+
     /// Fetch and upload columns for `view` when it leaves the fetched window,
     /// the zoom changes enough to matter, the shown channels change, or more of
-    /// it has been built.
+    /// it has been built. Fetches run off the UI thread, one at a time.
     pub fn prepare(&mut self, view: Range<usize>, pixel_width: usize, visible: impl Fn(&str) -> bool) {
+        self.take_fetch(false);
+        if self.builder.is_none() { return; }
+        // Stack channels in name order, as the line renderers do, so the colours
+        // on top don't change when a zoom moves between them.
+        let mut channels: Vec<usize> = (0..self.names.len()).filter(|&channel| visible(&self.names[channel])).collect();
+        channels.sort_by(|&a, &b| self.names[a].cmp(&self.names[b]));
+        self.update_whole(&channels);
         let Some(builder) = &self.builder else { return };
         builder.focus(view.clone());
+        if self.fetching.is_some() { return; }
         let per_column = view.len().max(1) as f64 / pixel_width.max(1) as f64;
-        let channels: Vec<usize> = (0..self.names.len()).filter(|&channel| visible(&self.names[channel])).collect();
         let built = builder.built();
+        // Fetch ahead once the view comes within a quarter view of the window's
+        // edge, so a steady pan never reaches the end of what is on the GPU.
+        let slack = view.len() / 4;
         let stale = self.shown.as_ref().is_none_or(|shown| shown.channels != channels
-            || view.start < shown.window.start || view.end > shown.window.end
+            || shown.window.start > 0 && view.start < shown.window.start + slack
+            || shown.window.end < self.count && view.end + slack > shown.window.end
             || shown.per_column > per_column * 1.5 || shown.per_column < per_column / 2.
             || shown.built < built && (built >= 1. || shown.at.elapsed() >= REFRESH));
         if !stale { return; }
         let margin = (view.len() as f64 * MARGIN_VIEWS) as usize;
         let window = view.start.saturating_sub(margin)..view.end.saturating_add(margin).min(self.count);
         let count = ((window.len() as f64 / per_column).round() as usize).max(1);
-        let columns = builder.columns_of(window.clone(), count, &channels);
         let colors: Vec<_> = channels.iter().enumerate()
             .map(|(slot, &channel)| (slot, crate::plot_trace::series_color(&self.names[channel]))).collect();
-        self.gpu.set(ColumnUpload::new(&columns, &colors));
-        self.shown = Some(Shown { per_column: window.len() as f64 / count as f64, window, channels, columns,
-            built, at: Instant::now() });
+        let (query, repaint) = (builder.query(), self.ctx.clone());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let columns = query.columns_of(window.clone(), count, &channels);
+            let upload = ColumnUpload::new(&columns, &colors);
+            let shown = Shown { per_column: window.len() as f64 / count as f64, window, channels, columns,
+                built, at: Instant::now() };
+            let _ = sender.send((shown, upload));
+            if let Some(repaint) = repaint { repaint.request_repaint(); }
+        });
+        self.fetching = Some(receiver);
     }
 
-    pub fn paint(&self, painter: &Painter, transform: &PlotTransform, presentation: &Presentation) {
-        let Some(shown) = &self.shown else { return };
-        let placements: Vec<[f32; 2]> = shown.channels.iter().map(|&channel| {
+    /// Upload the overview's columns for `channels` when either changed.
+    fn update_whole(&mut self, channels: &[usize]) {
+        self.overview();
+        let Some((_, at, columns)) = &self.overview else { return };
+        if self.whole_key.as_ref().is_some_and(|(seen, shown)| seen == at && shown == channels) { return; }
+        let colors: Vec<_> = channels.iter()
+            .map(|&channel| (channel, crate::plot_trace::series_color(&self.names[channel]))).collect();
+        self.whole.set(ColumnUpload::new(columns, &colors));
+        self.whole_key = Some((*at, channels.to_vec()));
+    }
+
+    fn placements(&self, channels: &[usize], presentation: &Presentation) -> Vec<[f32; 2]> {
+        channels.iter().map(|&channel| {
             let placement = presentation.placement(&self.names[channel]);
             [placement.scale as f32, placement.offset as f32]
-        }).collect();
-        self.gpu.paint(painter, transform, &placements);
+        }).collect()
+    }
+
+    /// Paint the shown columns, except over `skip` (sample coordinates), where
+    /// another renderer already draws samples. Without `skip` the summary is
+    /// the plot, and the whole-collection layer fills whatever the detailed
+    /// columns don't reach yet.
+    pub fn paint(&self, painter: &Painter, transform: &PlotTransform, presentation: &Presentation,
+        skip: Option<Range<f64>>) {
+        if skip.is_none() {
+            if let Some((_, channels)) = &self.whole_key {
+                let detailed = self.shown.as_ref()
+                    .map(|shown| shown.window.start as f64 - 0.5..shown.window.end as f64 - 0.5);
+                self.whole.paint(painter, transform, &self.placements(channels, presentation), detailed);
+            }
+        }
+        let Some(shown) = &self.shown else { return };
+        self.gpu.paint(painter, transform, &self.placements(&shown.channels, presentation), skip);
     }
 
     /// Displayed Y extent of the included channels across `view`.
@@ -218,11 +294,20 @@ impl SummaryPlot {
         let builder = self.builder.as_ref()?;
         let built = builder.built();
         let stale = self.overview.as_ref().is_none_or(|(seen, at, _)|
-            *seen < built && (built >= 1. || at.elapsed() >= REFRESH));
+            *seen < built && (built >= 1. || at.elapsed() >= OVERVIEW_REFRESH));
         if stale {
-            self.overview = Some((built, Instant::now(), builder.columns(0..self.count, OVERVIEW_COLUMNS)));
+            let columns = builder.columns(0..self.count, OVERVIEW_COLUMNS);
+            self.ranges = columns.values.iter().map(|bands| bands.iter().flatten().copied()
+                .reduce(|[low, high], [min, max]| [low.min(min), high.max(max)])).collect();
+            self.overview = Some((built, Instant::now(), columns));
         }
         self.overview.as_ref().map(|(built, _, columns)| (*built, self.names.as_slice(), columns))
+    }
+
+    /// Each channel's name and range over the part summarized, as of the last
+    /// `overview`.
+    pub fn ranges(&self) -> impl Iterator<Item = (&String, [f64; 2])> {
+        self.names.iter().zip(&self.ranges).filter_map(|(name, range)| Some((name, (*range)?)))
     }
 }
 
@@ -248,6 +333,12 @@ mod tests {
         let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
         let names = plan.fields.iter().map(|field| format!("records / {}", field.name)).collect();
         (store, plan, names)
+    }
+
+    /// `prepare`, then wait for its fetch.
+    fn prepare(summary: &mut SummaryPlot, view: Range<usize>, pixel_width: usize, visible: impl Fn(&str) -> bool) {
+        summary.prepare(view, pixel_width, visible);
+        summary.take_fetch(true);
     }
 
     fn built(count: usize) -> (SummaryPlot, ByteStore) {
@@ -277,7 +368,7 @@ mod tests {
         let count = BIN * 1000;
         let (mut summary, _store) = built(count);
         let presentation = Presentation::default();
-        summary.prepare(0..count, 500, |name| name != "records / b");
+        prepare(&mut summary, 0..count, 500, |name| name != "records / b");
         let shown = summary.shown.as_ref().unwrap();
         assert_eq!(shown.channels, [0, 2, 3], "hidden series are not uploaded");
         assert!(summary.complete(&(0..count)));
@@ -288,11 +379,45 @@ mod tests {
         assert_eq!((low, high), (7., 7.));
         // Panning within the fetched window keeps the upload; leaving it refetches.
         let at = shown.at;
-        summary.prepare(count / 10..count / 10 + count / 4, 500, |name| name != "records / b");
+        prepare(&mut summary, count / 10..count / 10 + count / 4, 500, |name| name != "records / b");
         let at_zoomed = summary.shown.as_ref().unwrap().at;
         assert_ne!(at, at_zoomed, "zooming in refetches");
-        summary.prepare(count / 10 + 10..count / 10 + count / 4 + 10, 500, |name| name != "records / b");
+        prepare(&mut summary, count / 10 + 10..count / 10 + count / 4 + 10, 500, |name| name != "records / b");
         assert_eq!(summary.shown.as_ref().unwrap().at, at_zoomed, "a small pan reuses the upload");
+        // Nearing the fetched window's edge fetches ahead, before the view runs out.
+        let window = summary.shown.as_ref().unwrap().window.clone();
+        let near_end = window.end - count / 4 - count / 32..window.end - count / 32;
+        prepare(&mut summary, near_end, 500, |name| name != "records / b");
+        assert_ne!(summary.shown.as_ref().unwrap().at, at_zoomed, "fetched ahead of the edge");
+    }
+
+    #[test]
+    fn fetches_run_off_the_ui_thread_and_the_last_columns_stay_drawn() {
+        let count = BIN * 1000;
+        let (mut summary, _store) = built(count);
+        prepare(&mut summary, 0..count, 500, |_| true);
+        let first = summary.shown.as_ref().unwrap().at;
+        // Zooming in starts a fetch; until it lands the previous columns remain.
+        summary.prepare(0..count / 8, 500, |_| true);
+        assert!(summary.fetching.is_some());
+        assert_eq!(summary.shown.as_ref().unwrap().at, first);
+        summary.take_fetch(true);
+        assert_ne!(summary.shown.as_ref().unwrap().at, first);
+        assert_eq!(summary.shown.as_ref().unwrap().window, 0..count / 4, "the view and a view width after it");
+    }
+
+    #[test]
+    fn the_whole_collection_layer_follows_the_shown_channels() {
+        let count = BIN * 1000;
+        let (mut summary, _store) = built(count);
+        prepare(&mut summary, 0..count / 8, 500, |name| name != "records / b");
+        assert_eq!(summary.whole_key.as_ref().unwrap().1, [0, 2, 3], "ready before any detailed fetch lands");
+        let generation = summary.whole.generation();
+        prepare(&mut summary, count / 16..count / 16 + count / 8, 500, |name| name != "records / b");
+        assert_eq!(summary.whole.generation(), generation, "panning keeps the whole-collection upload");
+        prepare(&mut summary, 0..count / 8, 500, |_| true);
+        assert_eq!(summary.whole_key.as_ref().unwrap().1, [0, 1, 2, 3]);
+        assert_ne!(summary.whole.generation(), generation, "showing a series uploads it");
     }
 
     #[test]
@@ -300,7 +425,7 @@ mod tests {
         let count = BIN * 1000;
         let (mut summary, store) = built(count);
         let presentation = Presentation::default();
-        summary.prepare(0..count, 1000, |_| true);
+        prepare(&mut summary, 0..count, 1000, |_| true);
         let frame = egui::Rect::from_min_size(egui::pos2(0., 0.), egui::vec2(1000., 600.));
         let transform = PlotTransform::new(frame, egui_plot::PlotBounds::from_min_max(
             [-0.5, 0.], [count as f64 - 0.5, 65_535.]), egui::Vec2b::new(false, false));

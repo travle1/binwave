@@ -452,6 +452,10 @@ pub struct PlotReader {
     group_tiles: Arc<Mutex<GroupTileCache>>,
     cache_budget: usize,
     data_generation: u64,
+    /// Publish only complete reads: the last complete data stays drawn until
+    /// the next read replaces it in one step. For when something else (the
+    /// plot summary) fills whatever that data doesn't cover.
+    complete_only: bool,
 }
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for PlotReader {
@@ -567,6 +571,7 @@ impl PlotReader {
         numeric_plan: Option<NumericPlan>,
         partial_updates: bool,
     ) {
+        let partial_updates = partial_updates && !self.complete_only;
         let count = node
             .lazy
             .as_ref()
@@ -816,6 +821,9 @@ impl PlotReader {
     }
     pub fn data_generation(&self) -> u64 {
         self.data_generation
+    }
+    pub fn set_complete_only(&mut self, complete_only: bool) {
+        self.complete_only = complete_only;
     }
     pub(crate) fn set_cache_budget(&mut self, bytes: usize) {
         if self.cache_budget == bytes { return; }
@@ -2865,6 +2873,33 @@ actions:
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn complete_only_reads_keep_the_last_complete_data_until_the_next_is_done() {
+        let (store, node) = fixture(400_000, usize::MAX);
+        let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
+        let ctx = egui::Context::default();
+        let mut reader = PlotReader::default();
+        reader.set_complete_only(true);
+        reader.request_group(&ctx, store.view(), node.clone(), plan.clone(), 100_000..200_000, 1280, true);
+        settle(&mut reader, &ctx);
+        let first = reader.data.as_ref().unwrap().clone();
+        reader.request_group(&ctx, store.view(), node, plan, 150_000..350_000, 1280, true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while reader.is_loading() {
+            reader.tick(&ctx);
+            let shown = reader.display_data().unwrap();
+            assert!(shown.complete, "no partial read replaces the complete one");
+            if !Arc::ptr_eq(reader.data.as_ref().unwrap(), &first) {
+                assert!(shown.range.start <= 150_000 && shown.range.end >= 350_000, "{:?}", shown.range);
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let range = reader.data().unwrap().range.clone();
+        assert!(range.start <= 150_000 && range.end >= 350_000, "{range:?}");
+        assert!(!Arc::ptr_eq(reader.data.as_ref().unwrap(), &first), "the new view replaced it");
     }
 
     #[test]
