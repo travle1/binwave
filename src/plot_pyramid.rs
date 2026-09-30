@@ -162,6 +162,8 @@ pub struct Pyramid {
     level_bins: Vec<usize>,
     /// Which bins hold complete data, per level.
     present: Vec<Vec<bool>>,
+    /// Level-0 bins present, so progress is cheap to ask for every frame.
+    done: usize,
     runs: Vec<(Run, Store)>,
     channels: usize,
 }
@@ -188,15 +190,12 @@ impl Pyramid {
         }).collect();
         let channels = runs.iter().map(|(run, _)| run.channels).sum();
         let present = level_bins.iter().map(|&bins| vec![false; bins]).collect();
-        Self { count, level_bins, present, runs, channels }
+        Self { count, level_bins, present, done: 0, runs, channels }
     }
-
-    pub fn channels(&self) -> usize { self.channels }
 
     /// Share of level 0 built, 0 to 1.
     pub fn built(&self) -> f32 {
-        let done = self.present[0].iter().filter(|&&present| present).count();
-        done as f32 / self.present[0].len().max(1) as f32
+        self.done as f32 / self.present[0].len().max(1) as f32
     }
 
     /// Store a chunk's level-0 bins and fill every level above them that is now complete.
@@ -221,6 +220,7 @@ impl Pyramid {
             }
         }
         for bin in first_bin..first_bin + bins {
+            self.done += usize::from(!self.present[0][bin]);
             self.present[0][bin] = true;
         }
         let mut changed = first_bin..first_bin + bins;
@@ -246,16 +246,25 @@ impl Pyramid {
     }
 
     /// Per-pixel min/max for `view` across `columns` columns.
+    pub fn columns(&self, view: Range<usize>, columns: usize) -> Columns {
+        self.columns_of(view, columns, &(0..self.channels).collect::<Vec<_>>())
+    }
+
+    /// Like `columns`, for only the listed channels: `values[i]` is `channels[i]`.
     // `column` picks each column's sample range and its slot in every channel.
     #[allow(clippy::needless_range_loop)]
-    pub fn columns(&self, view: Range<usize>, columns: usize) -> Columns {
+    pub fn columns_of(&self, view: Range<usize>, columns: usize, channels: &[usize]) -> Columns {
         let view = view.start.min(self.count)..view.end.min(self.count);
         let columns = columns.max(1);
         let per_column = view.len() as f64 / columns as f64;
         let level = (0..self.level_bins.len()).rev()
             .find(|&level| (BIN << level) as f64 <= per_column).unwrap_or(0);
         let bin_samples = BIN << level;
-        let mut values = vec![vec![None; columns]; self.channels];
+        let mut slots = vec![None; self.channels];
+        for (slot, &channel) in channels.iter().enumerate() {
+            if let Some(entry) = slots.get_mut(channel) { *entry = Some(slot); }
+        }
+        let mut values = vec![vec![None; columns]; channels.len()];
         for column in 0..columns {
             let first = view.start + (column as f64 * per_column) as usize;
             let last = (view.start + ((column + 1) as f64 * per_column) as usize).min(view.end).max(first + 1);
@@ -269,6 +278,7 @@ impl Pyramid {
                 each!(store, Store, levels => {
                     let data = &levels[level];
                     for offset in 0..channels {
+                        let Some(slot) = slots[channel + offset] else { continue };
                         let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
                         for bin in bins.clone() {
                             let base = bin * channels * 2;
@@ -279,7 +289,7 @@ impl Pyramid {
                             }
                         }
                         if low <= high {
-                            values[channel + offset][column] = Some([low, high]);
+                            values[slot][column] = Some([low, high]);
                         }
                     }
                 });
@@ -308,6 +318,26 @@ fn read_rows(source: &ByteView, plan: &NumericPlan, samples: Range<usize>) -> Re
     Ok(reads)
 }
 
+/// The sample in `samples` whose `channel` value is nearest `target`, with that
+/// value: what a click on a column picks.
+pub fn nearest_sample(source: &ByteView, plan: &NumericPlan, channel: usize, samples: Range<usize>,
+    target: f64) -> Result<Option<(usize, f64)>> {
+    let field = plan.fields.get(channel).context("no such channel")?;
+    let row_stride = plan.physical_stride().max(1);
+    let mut best: Option<(usize, f64)> = None;
+    for (first, bytes) in read_rows(source, plan, samples)? {
+        let rows = (bytes.len() - plan.stride) / row_stride + 1;
+        for row in 0..rows {
+            let start = row * row_stride;
+            let value = field.decode(&bytes[start..start + plan.stride])?;
+            if !value.is_nan() && best.is_none_or(|(_, seen)| (value - target).abs() < (seen - target).abs()) {
+                best = Some((first + row, value));
+            }
+        }
+    }
+    Ok(best)
+}
+
 struct Shared {
     pyramid: RwLock<Pyramid>,
     focus: Mutex<Range<usize>>,
@@ -330,26 +360,25 @@ impl Drop for PyramidBuilder {
 impl PyramidBuilder {
     pub fn start(source: ByteView, plan: NumericPlan, count: usize, focus: Range<usize>,
         repaint: impl Fn() + Send + 'static) -> Self {
-        let cached = cache::load(&source, &plan, count);
-        let complete = cached.is_some();
         let shared = Arc::new(Shared {
-            pyramid: RwLock::new(cached.unwrap_or_else(|| Pyramid::new(&plan, count))),
+            pyramid: RwLock::new(Pyramid::new(&plan, count)),
             focus: Mutex::new(focus),
             cancel: AtomicBool::new(false),
             error: Mutex::new(None),
         });
-        if !complete {
-            let worker = shared.clone();
-            std::thread::spawn(move || {
-                if let Err(error) = build(&worker, &source, &plan, count, &repaint) {
-                    if !worker.cancel.load(Ordering::Relaxed) {
-                        log::warn!("Plot summary build failed: {error:#}");
-                        *worker.error.lock().unwrap() = Some(format!("{error:#}"));
-                    }
+        let worker = shared.clone();
+        // A saved summary can be hundreds of megabytes; load it off the UI thread too.
+        std::thread::spawn(move || {
+            if let Some(cached) = cache::load(&source, &plan, count) {
+                *worker.pyramid.write().unwrap() = cached;
+            } else if let Err(error) = build(&worker, &source, &plan, count, &repaint) {
+                if !worker.cancel.load(Ordering::Relaxed) {
+                    log::warn!("Plot summary build failed: {error:#}");
+                    *worker.error.lock().unwrap() = Some(format!("{error:#}"));
                 }
-                repaint();
-            });
-        }
+            }
+            repaint();
+        });
         Self { shared }
     }
 
@@ -360,6 +389,10 @@ impl PyramidBuilder {
 
     pub fn columns(&self, view: Range<usize>, columns: usize) -> Columns {
         self.shared.pyramid.read().unwrap().columns(view, columns)
+    }
+
+    pub fn columns_of(&self, view: Range<usize>, columns: usize, channels: &[usize]) -> Columns {
+        self.shared.pyramid.read().unwrap().columns_of(view, columns, channels)
     }
 
     pub fn built(&self) -> f32 {
@@ -645,6 +678,22 @@ mod tests {
             let pan = t.elapsed().as_secs_f64() / 10.;
             eprintln!("{channels} ch, {records} samples: first tenth visible {:.3}s, whole build {build:.2}s ({:.0} M samples/s), whole-file query {:.1} ms, pan query {:.1} ms",
                 first_view.unwrap_or(build), records as f64 / build / 1e6, whole * 1e3, pan * 1e3);
+            // What Signal does when a pan leaves the fetched window or the zoom
+            // changes: fetch three view widths for every channel and pack them.
+            let all: Vec<usize> = (0..channels).collect();
+            let colors: Vec<_> = (0..channels).map(|slot| (slot, egui::Color32::WHITE)).collect();
+            let t = std::time::Instant::now();
+            let window = builder.columns_of(records / 3..records / 3 + records / 2, 3 * 1157, &all);
+            let fetch = t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let _ = crate::plot_columns_gpu::ColumnUpload::new(&window, &colors);
+            let pack = t.elapsed().as_secs_f64();
+            let pyramid = builder.shared.pyramid.read().unwrap();
+            let bytes: usize = pyramid.level_bins.iter().sum::<usize>() * channels * 2 * 2;
+            eprintln!("  refetch {:.1} ms + pack {:.1} ms ({:.1} MB to the GPU); summary in memory {:.1} MB ({:.1}% of the data)",
+                fetch * 1e3, pack * 1e3, (channels * 3 * 1157 * 8) as f64 / 1e6, bytes as f64 / 1e6,
+                bytes as f64 * 100. / (records * channels * 2) as f64);
+            drop(pyramid);
             let _ = std::fs::remove_file(cache::path(&store.view(), &plan, records).unwrap());
             std::fs::remove_file(&path).unwrap();
         }

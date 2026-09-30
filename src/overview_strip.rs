@@ -217,6 +217,33 @@ impl OverviewStrip {
         }
     }
 
+    /// Take the envelope from the plot's min/max summary of this collection
+    /// instead of scanning: `bands` gives each of `names` across the whole
+    /// collection, and `built` is the share summarized so far.
+    pub fn update_from_summary(&mut self, source: &ByteView, scanned: &Node, count: usize, names: &[String],
+        built: f32, bands: impl FnOnce() -> Vec<Vec<Option<[f64; 2]>>>) {
+        let identity = crate::structure_plot::identity(scanned);
+        if self.key.as_ref().is_none_or(|key| key.revision != source.revision || key.path != scanned.path
+            || key.identity != identity || key.fields != names) {
+            self.reader.stop();
+            self.reading = None;
+            self.chunk = 0;
+            self.envelope = None;
+            self.key = Some(Key { revision: source.revision, path: scanned.path.clone(), identity,
+                fields: names.to_vec() });
+        }
+        let scanned = (built as f64 * count as f64) as usize;
+        if self.envelope.as_ref().is_some_and(|envelope| envelope.complete || envelope.scanned == scanned) {
+            return;
+        }
+        self.envelope = Some(Envelope {
+            total: count,
+            bands: names.iter().cloned().zip(bands()).collect(),
+            scanned,
+            complete: built >= 1.,
+        });
+    }
+
     #[cfg(test)]
     pub(crate) fn envelope(&self) -> Option<&Envelope> {
         self.envelope.as_ref()

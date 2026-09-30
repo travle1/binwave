@@ -74,6 +74,7 @@ impl<T: Sample> MinMax<T> {
     }
 
     /// Widen by another result over the same channels.
+    #[cfg(test)]
     pub fn merge(&mut self, other: &Self) {
         for (lo, &other) in self.min.iter_mut().zip(&other.min) {
             if other < *lo { *lo = other; }

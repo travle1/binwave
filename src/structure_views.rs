@@ -34,6 +34,8 @@ fn inspector_page_size(array: &LazyArray) -> usize {
 }
 const INITIAL_PLOT_SAMPLES: usize = 1024;
 const MAX_HIGHLIGHTS: usize = 256;
+/// How close, in points, a click or hover must be to a trace to pick it.
+const PICK_RADIUS: f32 = 12.;
 /// Plotted points shared by all visible series. Hundreds of channels still get
 /// about one min/max bucket per pixel.
 const DISPLAY_POINT_BUDGET: usize = 4_000_000;
@@ -171,6 +173,8 @@ pub struct StructureViews {
     plot_mesh_cache: Arc<TraceMeshCache>,
     plot_raster: PlotRaster,
     plot_gpu: GpuPlot,
+    /// Zoomed-out views of the primary collection, drawn from its min/max summary.
+    plot_summary: crate::plot_summary::SummaryPlot,
     #[cfg(test)]
     plot_overlay_builds: usize,
     plot_view: Option<Range<usize>>,
@@ -1495,6 +1499,23 @@ impl StructureViews {
         let grouped_plans = self.group_plan_cache.as_ref().unwrap().1.clone();
         let primary_group = grouped_plans.iter().find(|(_, (_, _, paths))|
             paths.iter().any(|path| path == &self.plot_target));
+        // Fixed-layout numeric collections get a min/max summary for zoomed-out views.
+        let mut summary_hash = std::collections::hash_map::DefaultHasher::new();
+        (group_key, source.revision, count).hash(&mut summary_hash);
+        let summary_focus = self.plot_view.clone().unwrap_or(0..count.min(INITIAL_PLOT_SAMPLES));
+        self.plot_summary.sync(ui.ctx(), Some(summary_hash.finish()), summary_focus, || {
+            match primary_group {
+                Some((_, (_, plan, _))) => {
+                    let names = plan.fields.iter().map(|field| field.name.clone()).collect();
+                    Some((source.clone(), plan.clone(), names, count))
+                }
+                None => {
+                    let plan = node.lazy.as_ref()?.numeric_plan()?;
+                    let names = plan.fields.iter().map(|field| format!("{} / {}", self.plot_target, field.name)).collect();
+                    Some((source.clone(), plan, names, count))
+                }
+            }
+        });
         log_slow_plot_phase(&mut phase_clock, "prepare collections and group plans");
         let grouped_paths: HashSet<_> = grouped_plans.values().flat_map(|(_, _, paths)| paths.iter().cloned()).collect();
         self.group_plot_readers.retain(|key, _| grouped_plans.contains_key(key));
@@ -1556,13 +1577,27 @@ impl StructureViews {
                 ranges.extend(data.bounds.iter().map(|(name, (min, max))| (name.clone(), *min, *max)));
             }
         }
+        // The summary knows every channel's range over the part built so far.
+        let mut summary_names = Vec::new();
+        if let Some((_, channels, columns)) = self.plot_summary.overview() {
+            let seen: HashSet<&str> = ranges.iter().map(|(name, _, _)| name.as_str()).collect();
+            let extra: Vec<_> = channels.iter().zip(&columns.values)
+                .filter(|(name, _)| !seen.contains(name.as_str()))
+                .filter_map(|(name, bands)| {
+                    let [min, max] = bands.iter().flatten().copied()
+                        .reduce(|[low, high], [min, max]| [low.min(min), high.max(max)])?;
+                    Some((name.clone(), min, max))
+                }).collect();
+            ranges.extend(extra);
+            summary_names = channels.to_vec();
+        }
         let mut names: Vec<String> = self
             .plot_catalog
             .iter()
             .map(|name| format!("{} / {name}", self.plot_target))
             .collect();
         let mut known: HashSet<String> = names.iter().cloned().collect();
-        for (name, _, _) in &ranges {
+        for name in ranges.iter().map(|(name, _, _)| name).chain(&summary_names) {
             if known.insert(name.clone()) {
                 names.push(name.clone());
             }
@@ -1799,7 +1834,17 @@ impl StructureViews {
         let selected_fields = (!self.plot_catalog.is_empty()).then(|| self.plot_catalog.iter()
             .filter(|name| !self.plot_hidden.contains(&format!("{} / {name}", self.plot_target)))
             .cloned().collect::<Vec<_>>());
-        if primary_group.is_none() && selected_fields.as_ref().is_some_and(Vec::is_empty) {
+        // Zoomed out, the summary draws the primary collection and the reader rests.
+        // Closer in, while the reader loads a view it has nothing for, the
+        // summary's coarser columns stand in so the plot never blanks.
+        let summary_mode = self.plot_summary.active(&requested, pixel_width);
+        let summary_backdrop = !summary_mode && self.plot_reader.is_loading()
+            && self.plot_reader.display_data().is_none_or(|data|
+                data.range.start > requested.start || data.range.end < requested.end);
+        if summary_mode || summary_backdrop {
+            self.plot_summary.prepare(requested.clone(), pixel_width, |name| !self.plot_hidden.contains(name));
+        }
+        if summary_mode || primary_group.is_none() && selected_fields.as_ref().is_some_and(Vec::is_empty) {
             self.plot_reader.stop();
         } else if !self.plot_paused {
             let buffered = primary_group.map(|(_, (group_node, plan, _))|
@@ -1874,7 +1919,19 @@ impl StructureViews {
         }
         log_slow_plot_phase(&mut phase_clock, "schedule plot readers");
         ui.horizontal_wrapped(|ui| {
-            if let Some(data) = self.plot_reader.display_data() {
+            if summary_mode {
+                ui.small(PlotQuality::MinMax.label())
+                    .on_hover_text("Each pixel shows the lowest and highest sample it covers. Zoom in to see individual samples.");
+            }
+            if let Some(built) = self.plot_summary.building() {
+                ui.add(egui::ProgressBar::new(built).desired_width(120.)
+                    .text(format!("{:.0}% summarized", built * 100.)))
+                    .on_hover_text("Min/max summary for zoomed-out views, built nearest the view first and kept for next time");
+            }
+            if let Some(error) = self.plot_summary.error() {
+                ui.colored_label(Color32::LIGHT_RED, format!("Summary: {error}"));
+            }
+            if let Some(data) = self.plot_reader.display_data().filter(|_| !summary_mode) {
                 if data.quality != PlotQuality::Exact {
                     ui.small(data.quality.label()).on_hover_text(format!(
                         "Data covers sample indices {}–{}. Zoom in to see individual samples.",
@@ -1947,7 +2004,19 @@ impl StructureViews {
             self.plot_raster.invalidate();
             self.plot_gpu.invalidate();
         }
-        if let Some(raw) = self.plot_reader.display_data() {
+        // In summary mode the primary collection contributes no reader series;
+        // the overlay still carries the other collections.
+        let summary_raw = summary_mode.then(|| PlotData {
+            range: requested.clone(),
+            series: BTreeMap::new(),
+            envelopes: BTreeMap::new(),
+            bounds: BTreeMap::new(),
+            quality: PlotQuality::MinMax,
+            scanned: requested.len(),
+            total: requested.len(),
+            complete: self.plot_summary.complete(&requested),
+        });
+        if let Some(raw) = summary_raw.as_ref().or_else(|| self.plot_reader.display_data()) {
             if self.plot_overlay.is_none() {
                 self.plot_overlay = Some((overlay_key, PlotData {
                     range: raw.range.clone(),
@@ -1961,7 +2030,7 @@ impl StructureViews {
                 }));
             }
             let (_, combined) = self.plot_overlay.as_mut().unwrap();
-            let primary_generation = self.plot_reader.data_generation();
+            let primary_generation = if summary_mode { u64::MAX } else { self.plot_reader.data_generation() };
             if self.plot_overlay_generations.get(&self.plot_target) != Some(&primary_generation) {
                 if let Some((_, (_, _, paths))) = primary_group {
                     update_group_overlay(combined, &mut self.plot_overlay_points, paths, Some(raw),
@@ -2037,9 +2106,14 @@ impl StructureViews {
         let data = self.plot_overlay.as_ref().map(|(_, data)| data);
         let plot_id = egui::Id::new(("decoded_structure_plot", "overlay", output.revision));
         let hidden = self.plot_hidden.clone();
-        let y_fit = if (self.plot_fit_y || self.plot_fit_all_y) && self.plot_range_zoom.is_none() {
+        let fitting = (self.plot_fit_y || self.plot_fit_all_y) && self.plot_range_zoom.is_none();
+        let summary_extent = (summary_mode && fitting).then(|| self.plot_summary.y_bounds(&requested,
+            |name| !hidden.contains(name) && (self.plot_fit_all_y || axis_names.is_empty()
+                || axis_names.iter().any(|axis| axis == name)),
+            &self.presentation)).flatten();
+        let y_fit = if fitting {
             data.and_then(|data| {
-                numeric_bounds(
+                numeric_bounds(summary_extent.into_iter().flat_map(|(low, high)| [low, high]).chain(
                     data.series
                         .iter()
                         .filter(|(name, _)| {
@@ -2059,7 +2133,7 @@ impl StructureViews {
                                 let placement = self.presentation.placement(name);
                                 bands.iter().flat_map(move |band|
                                     [placement.display(band.min.value), placement.display(band.max.value)])
-                            })),
+                            }))),
                 )
             })
         } else {
@@ -2389,9 +2463,17 @@ impl StructureViews {
                     }
                 }
             });
-        response.response.clone().on_hover_text(
-            "Drag or middle-drag to pan · Shift+wheel to pan horizontally · wheel or pinch to zoom · click a point to link Hex and Inspector"
-        );
+        let summary_hover = response.response.hover_pos().filter(|_| summary_mode).and_then(|pointer|
+            self.plot_summary.hit(pointer, &response.transform, &self.presentation, PICK_RADIUS));
+        response.response.clone().on_hover_text(match summary_hover {
+            Some(hit) => format!("{}\nSamples {}–{}\nMin {} · Max {}", hit.name,
+                crate::format::count(hit.samples.start), crate::format::count(hit.samples.end - 1),
+                hit.range[0], hit.range[1]),
+            None => "Drag or middle-drag to pan · Shift+wheel to pan horizontally · wheel or pinch to zoom · click a point to link Hex and Inspector".to_owned(),
+        });
+        if summary_mode || summary_backdrop {
+            self.plot_summary.paint(ui.painter(), &response.transform, &self.presentation);
+        }
         if gpu_mode { self.plot_gpu.paint(ui.painter(), &response.transform, &self.presentation); }
         log_slow_plot_phase(&mut phase_clock, "draw plot");
         self.plot_axis_width = (plot_outer.width() - response.transform.frame().width()).max(0.);
@@ -2444,7 +2526,14 @@ impl StructureViews {
             let loading = self.plot_reader.is_loading()
                 || self.group_plot_readers.values().any(PlotReader::is_loading)
                 || self.extra_plot_readers.values().any(PlotReader::is_loading);
-            self.overview.update(ui.ctx(), &source, &node, count, fields, group, loading);
+            // With a summary, the strip draws from it instead of scanning the file itself.
+            if let Some((built, channels, columns)) = self.plot_summary.overview() {
+                let scanned = group.as_ref().map_or(&node, |(group_node, _)| group_node);
+                self.overview.update_from_summary(&source, scanned, count, channels, built,
+                    || columns.values.clone());
+            } else {
+                self.overview.update(ui.ctx(), &source, &node, count, fields, group, loading);
+            }
             ui.add_space(crate::theme::DARK.size.overview_gap);
             let issues = overview_issues(&node, count);
             match self.overview.show(ui, frame.x_range(), &node, count, actual.clone(), &issues) {
@@ -2635,14 +2724,22 @@ impl StructureViews {
                                     &PlotPoint::new(point.index as f64, value),
                                 );
                                 let distance = screen.distance_sq(pointer);
-                                (distance < 144.).then_some((distance, name, point))
+                                (distance < PICK_RADIUS * PICK_RADIUS).then_some((distance, name, point))
                             })
                             .min_by(|a, b| a.0.total_cmp(&b.0));
+                    let summary_pick = nearest.is_none().then_some(()).filter(|_| summary_mode)
+                        .and_then(|_| self.plot_summary.hit(pointer, &response.transform, &self.presentation, PICK_RADIUS))
+                        .and_then(|hit| Some((self.plot_summary.pick(&hit, index, coord.y, &self.presentation)?, hit.name)));
                     if let Some((_, name, point)) = nearest {
                         self.plot_axis_series = Some(name.clone());
                         self.plot_axis_group = self.collection_axis(Some(name));
                         self.plot_anchor = Some(point.index);
                         picked = Some((point.bytes.clone(), Some(point.path.to_string())));
+                    } else if let Some(((sample, bytes, path), name)) = summary_pick {
+                        self.plot_axis_group = self.collection_axis(Some(&name));
+                        self.plot_axis_series = Some(name);
+                        self.plot_anchor = Some(sample);
+                        picked = Some((bytes, Some(path)));
                     } else if let Some(bytes) = sample_bytes(&node, index..index + 1) {
                         self.plot_anchor = Some(index);
                         picked = Some((bytes, None));
@@ -2666,9 +2763,9 @@ impl StructureViews {
             }
         });
         // The plot owns its range request. Paging the table never changes this range.
-        if !self.plot_paused && (primary_group.is_some()
+        let width = (response.transform.frame().width() * ui.ctx().pixels_per_point()).ceil() as usize;
+        if !self.plot_paused && !self.plot_summary.active(&actual, width) && (primary_group.is_some()
             || !selected_fields.as_ref().is_some_and(Vec::is_empty)) {
-            let width = (response.transform.frame().width() * ui.ctx().pixels_per_point()).ceil() as usize;
             if let Some((_, (group_node, plan, _))) = primary_group {
                 self.plot_reader.request_group(ui.ctx(), source, group_node.clone(), plan.clone(),
                     actual, width, !self.plot_sampled_preview);
@@ -5245,6 +5342,44 @@ actions:
             }],
             modifiers,
         )
+    }
+
+    #[test]
+    fn zoomed_out_views_draw_from_the_summary_without_reading_samples() {
+        // Four u16 channels; channel d spikes once, mid-file.
+        let count = 512 * 1024;
+        let spike = count / 2 + 3;
+        let bytes: Vec<u8> = (0..count).flat_map(|index| {
+            let ramp = (index / 1024) as u16;
+            [ramp, 1000 + ramp, 7, if index == spike { 60_000 } else { 100 }]
+                .into_iter().flat_map(u16::to_le_bytes)
+        }).collect();
+        let yaml = "structures: [{name: R, fields: [{name: a, type: u16}, {name: b, type: u16}, {name: c, type: u16}, {name: d, type: u16}]}]\n\
+            actions: [{read: {name: records, type: {structure: R}, repeat: until end}}]";
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let output = Program::parse(yaml).unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        views.initialize_target(&output);
+        settle_plot(&ctx, &mut views, &output, &store);
+        views.plot_force_view = Some(0..count);
+        views.plot_fit_all_y = true;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while views.plot_summary.building().is_some() || views.plot_fit_all_y {
+            render_plot(&ctx, &mut views, &output, &store, Vec::new(), Default::default());
+            assert!(std::time::Instant::now() < deadline, "the summary builds and the fit settles");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        render_plot(&ctx, &mut views, &output, &store, Vec::new(), Default::default());
+        assert_eq!(views.plot_view, Some(0..count));
+        assert!(!views.plot_reader.is_loading() && views.plot_reader.data().is_none(),
+            "the reader does not scan a zoomed-out view");
+        let id = egui::Id::new(("decoded_structure_plot", "overlay", output.revision));
+        let bounds = egui_plot::PlotMemory::load(&ctx, id).unwrap().bounds().to_owned();
+        assert!(bounds.min()[1] <= 0. && bounds.max()[1] >= 60_000., "the fit includes the spike: {bounds:?}");
+        // A click on the spike's column links its exact sample.
+        let selected = click_plot(&ctx, &mut views, &output, &store, spike as f64, 59_000., false);
+        assert_eq!(selected, Some(spike * 8 + 6..spike * 8 + 8));
     }
 
     #[test]

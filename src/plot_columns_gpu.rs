@@ -69,10 +69,6 @@ impl GpuColumns {
         self.upload = Some((NEXT_UPLOAD.fetch_add(1, Ordering::Relaxed), Arc::new(upload)));
     }
 
-    pub fn clear(&mut self) {
-        self.upload = None;
-    }
-
     /// `placements` gives each uploaded channel's display scale and offset.
     pub fn paint(&self, painter: &Painter, transform: &PlotTransform, placements: &[[f32; 2]]) {
         let Some((generation, upload)) = &self.upload else { return };
