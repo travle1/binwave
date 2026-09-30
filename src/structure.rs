@@ -733,24 +733,6 @@ pub(crate) struct NumericPlan {
 }
 impl NumericPlan {
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn cache_record_key(&self) -> String {
-        let segment = self.segmented.as_ref().map(|part| [
-            part.outer_start, part.outer_stride, part.inner_offset,
-            part.inner_count, part.inner_stride,
-        ]);
-        serde_json::json!({
-            "version": 2, "start": self.start, "stride": self.stride,
-            "segment": segment,
-        }).to_string()
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn cache_field_keys(&self) -> Vec<String> {
-        self.fields.iter().map(|field| serde_json::json!([
-            field.name, field.suffix, field.offset, field.width, field.span,
-            field.source_path, field.kind, field.endian,
-        ]).to_string()).collect()
-    }
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn cache_layout_key(&self) -> String {
         let segment = self.segmented.as_ref().map(|part| [
             part.outer_start, part.outer_stride, part.inner_offset,

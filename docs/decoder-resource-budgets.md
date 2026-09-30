@@ -61,18 +61,11 @@ the sample index; the full path string is formatted only for selection or
 inspection. This removes per-point path-string allocations from numeric
 query output. Byte ranges and exact sample indices remain attached to points.
 
-For unchanged local files without byte edits, close-range numeric tiles can
-also be stored as versioned decoded chunks under the app cache directory.
-`BINWAVE_PLOT_DISK_CACHE_MB` sets the evictable disk quota in MiB (default
-4096, clamped to 512–65536). The Plot options menu has **Keep decoded data for
-this file**. It protects already stored chunks and persists newly decoded
-selected numeric values as the file is explored. Pending writes and retained
-disk usage are displayed there; a failed write is reported and plot reads
-continue from the source. Ordinary cache clearing preserves kept chunks; the
-same menu provides explicit per-file removal. Compatible field subsets reuse
-stored columns. A request combining retained and new fields currently decodes
-the whole requested group, then merges new columns into the chunk.
-The disk quota and Keep storage do not limit the source file itself.
+Zoomed out, fixed-layout numeric collections are drawn as per-pixel min/max
+columns from a min/max pyramid (one entry per 256 samples, about 1.6% of the
+data, saved under the app cache directory once complete). Decoded plot values are no longer stored
+on disk; the earlier decoded-chunk cache and its **Keep decoded data for this
+file** option were removed, and the app deletes their folder on start.
 
 ## Follow-up work
 

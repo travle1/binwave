@@ -199,7 +199,6 @@ pub struct StructureViews {
     plot_zoom_y: Option<(f64, f64)>,
     plot_follow_selection: bool,
     plot_sampled_preview: bool,
-    plot_cache_error: Option<String>,
     plot_paused: bool,
     plot_anchor: Option<usize>,
     plot_jump: usize,
@@ -1663,39 +1662,6 @@ impl StructureViews {
                 .changed() {
                 self.plot_axis_single_series = !together;
                 self.plot_axis_group = self.plot_axis_series.as_deref().filter(|_| together).map(plot_series_group_key);
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let mut keep = crate::structure_plot::keep_decoded_data(&source);
-                if ui.checkbox(&mut keep, "Keep decoded data for this file")
-                    .on_hover_text("Retain decoded plot values as you explore. Storage grows with covered ranges; this does not decode the whole file.")
-                    .changed() {
-                    match crate::structure_plot::set_keep_decoded_data(&source, keep) {
-                        Ok(()) => {
-                            self.plot_cache_error = None;
-                            if keep {
-                                self.plot_reader.persist_available_tiles();
-                                for reader in self.extra_plot_readers.values() { reader.persist_available_tiles(); }
-                                for reader in self.group_plot_readers.values() { reader.persist_available_tiles(); }
-                            }
-                        }
-                        Err(error) => self.plot_cache_error = Some(format!("{error:#}")),
-                    }
-                }
-                let (bytes, pending, error) = crate::structure_plot::decoded_data_status(&source);
-                ui.weak(format!("Decoded data on disk: {} · {} pending",
-                    crate::format::size(bytes), crate::format::count(pending)))
-                    .on_hover_text(crate::format::exact_bytes(bytes));
-                if let Some(error) = error.or_else(|| self.plot_cache_error.clone()) {
-                    ui.colored_label(egui::Color32::LIGHT_RED, format!("New decoded data was not retained: {error}"));
-                }
-                if ui.button("Remove decoded data for this file").clicked() {
-                    match crate::structure_plot::remove_decoded_data(&source) {
-                        Ok(()) => self.plot_cache_error = None,
-                        Err(error) => self.plot_cache_error = Some(format!("{error:#}")),
-                    }
-                }
-                ui.separator();
             }
             if ui.checkbox(&mut self.plot_sampled_preview, "Fast sampled preview")
                 .on_hover_text("May miss peaks. Off by default; full scans run in the background and can be stopped.")

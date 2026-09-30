@@ -295,6 +295,8 @@ adds a versioned, integrity-checked decoded tile cache for local unedited files,
 with a 4 GiB default evictable disk quota (`BINWAVE_PLOT_DISK_CACHE_MB`), a
 per-file Keep control, pending-write status, and explicit removal. Keep covers
 newly decoded selected numeric fields; it does not initiate a full scan.
+(Later removed: the decoded tile cache and Keep control were superseded by the
+min/max pyramid and direct column reads, and deleted.)
 
 These changes do **not** yet satisfy the full plan. Loaded coverage is not
 independent of viewport resolution. Active readers now divide a shared RAM

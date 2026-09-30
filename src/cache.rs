@@ -242,30 +242,39 @@ pub fn copy_snapshot(source: &mut File, target: &mut File, progress: &LoadProgre
 }
 
 pub fn clear() -> Result<()> {
-    #[cfg(not(target_arch = "wasm32"))]
-    crate::structure_plot::cancel_pending_cache_writes();
     clear_root(&root())
+}
+
+/// Cache folders earlier versions wrote and nothing reads any more.
+const RETIRED: &[&str] = &["decoded-plot-v2"];
+
+/// Delete retired cache folders in the background.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn remove_retired() {
+    let root = root();
+    std::thread::spawn(move || remove_retired_in(&root));
+}
+
+fn remove_retired_in(root: &Path) {
+    for name in RETIRED {
+        let path = root.join(name);
+        if path.is_dir() {
+            if let Err(error) = fs::remove_dir_all(&path) {
+                log::warn!("Could not remove the retired cache {}: {error:#}", path.display());
+            }
+        }
+    }
 }
 
 fn clear_root(root: &Path) -> Result<()> {
     if !root.exists() {
         return Ok(());
     }
-    // Decoded plot chunks explicitly retained by the user survive an ordinary
-    // cache clear. Everything else under this dedicated application root is
-    // disposable; never touch its parent cache directory.
-    for entry in fs::read_dir(&root)? {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_name() == "decoded-plot-v2" && path.is_dir() {
-            for file_dir in fs::read_dir(&path)? {
-                let file_dir = file_dir?;
-                let file_path = file_dir.path();
-                if file_path.is_dir() && file_path.join("keep").exists() { continue; }
-                if file_path.is_dir() { fs::remove_dir_all(file_path)?; }
-                else { fs::remove_file(file_path)?; }
-            }
-        } else if path.is_dir() {
+    // Everything under this dedicated application root is disposable; never
+    // touch its parent cache directory.
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.is_dir() {
             fs::remove_dir_all(path)?;
         } else {
             fs::remove_file(path)?;
@@ -276,23 +285,19 @@ fn clear_root(root: &Path) -> Result<()> {
 
 #[cfg(test)]
 #[test]
-fn ordinary_clear_preserves_only_kept_decoded_chunks() {
+fn clearing_and_retiring_touch_only_the_application_root() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    let decoded = root.join("decoded-plot-v2");
-    let kept = decoded.join("kept");
-    let default = decoded.join("default");
-    fs::create_dir_all(&kept).unwrap();
-    fs::create_dir_all(&default).unwrap();
-    fs::create_dir_all(root.join("ordinary")).unwrap();
-    fs::write(kept.join("keep"), b"file identity").unwrap();
-    fs::write(kept.join("data.chunk"), b"decoded").unwrap();
-    fs::write(default.join("data.chunk"), b"disposable").unwrap();
-    fs::write(root.join("ordinary").join("entry"), b"disposable").unwrap();
-    clear_root(root).unwrap();
-    assert!(kept.join("data.chunk").exists());
-    assert!(!default.exists());
-    assert!(!root.join("ordinary").exists());
+    let root = tmp.path().join("app");
+    fs::create_dir_all(root.join("decoded-plot-v2").join("file")).unwrap();
+    fs::write(root.join("decoded-plot-v2").join("file").join("data.chunk"), b"retired").unwrap();
+    fs::create_dir_all(root.join("pyramid-v1")).unwrap();
+    fs::write(tmp.path().join("neighbour"), b"not ours").unwrap();
+    remove_retired_in(&root);
+    assert!(!root.join("decoded-plot-v2").exists(), "the retired folder goes");
+    assert!(root.join("pyramid-v1").exists(), "current caches stay");
+    clear_root(&root).unwrap();
+    assert!(root.exists() && fs::read_dir(&root).unwrap().next().is_none());
+    assert!(tmp.path().join("neighbour").exists());
 }
 
 /// Bounds generated metadata before a write can exceed the configured budget.

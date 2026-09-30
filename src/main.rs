@@ -110,6 +110,7 @@ fn main() -> eframe::Result<()> {
             std::process::exit(2);
         }
     };
+    cache::remove_retired();
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

@@ -283,13 +283,6 @@ impl ByteView {
             Base::Snapshot(_) => None,
         }
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn plot_source_path(&self) -> Option<PathBuf> {
-        match &self.base {
-            Base::File(source) => source.path.canonicalize().ok(),
-            Base::Snapshot(_) => None,
-        }
-    }
     /// The open file on disk, when there is one to replace.
     pub fn source_path(&self) -> Option<&Path> {
         self.origin.as_ref().map(|origin| origin.path.as_path())
