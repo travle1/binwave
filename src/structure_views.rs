@@ -34,7 +34,9 @@ fn inspector_page_size(array: &LazyArray) -> usize {
 }
 const INITIAL_PLOT_SAMPLES: usize = 1024;
 const MAX_HIGHLIGHTS: usize = 256;
-const DISPLAY_POINT_BUDGET: usize = 1_000_000;
+/// Plotted points shared by all visible series. Hundreds of channels still get
+/// about one min/max bucket per pixel.
+const DISPLAY_POINT_BUDGET: usize = 4_000_000;
 fn plot_query_pixel_width(physical_width: usize, visible_series: usize) -> usize {
     // A min/max bucket can emit up to four points. Display buckets request
     // roughly two per pixel, so divide the shared output budget accordingly.
@@ -3620,7 +3622,8 @@ actions:
         use super::plot_query_pixel_width;
         assert_eq!(plot_query_pixel_width(1920, 1), 1920);
         assert_eq!(plot_query_pixel_width(1920, 36), 1920);
-        assert!(plot_query_pixel_width(1920, 528) < 256);
+        // 528 channels still get about one min/max bucket per two pixels.
+        assert!((900..1920).contains(&plot_query_pixel_width(1920, 528)), "{}", plot_query_pixel_width(1920, 528));
         assert!(plot_query_pixel_width(1920, 528) > 0);
     }
     #[test]

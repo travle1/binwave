@@ -28,7 +28,9 @@ const PREVIEW_LIMIT: Address = 65_536;
 const PREVIEW_WINDOWS: Address = 128;
 const PREVIEW_WINDOW_SIZE: Address = PREVIEW_LIMIT / PREVIEW_WINDOWS;
 const MAX_BUCKETS: Address = 4096;
-const MAX_TOTAL_NUMERIC_POINTS: Address = 100_000;
+/// Buckets shared by every channel of a grouped scan: enough for hundreds of
+/// channels at about one bucket per pixel.
+const MAX_TOTAL_NUMERIC_POINTS: Address = 500_000;
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop only.
 const CACHE_ENTRIES: Address = 3;
 #[cfg(not(target_arch = "wasm32"))]
@@ -520,7 +522,8 @@ impl PlotReader {
                 && key.refine == refine
                 && key.fields.as_ref().is_some_and(|fields| fields.len() == plan.fields.len()
                     && fields.iter().zip(&plan.fields).all(|(name, field)| name == &field.name))
-                && covers_view(key, &range, pixel_width, Some(plan.fields.len()))
+                && covers_view(key, &range, pixel_width, Some(plan.fields.len()),
+                    &fresh_query(&range, count, true, refine))
         })
     }
 
@@ -544,7 +547,8 @@ impl PlotReader {
                 && key.refine == refine
                 && key.fields.is_none()
                 && covers_view(key, &range, pixel_width,
-                    plan.as_ref().map(|plan| plan.fields.len()))
+                    plan.as_ref().map(|plan| plan.fields.len()),
+                    &fresh_query(&range, count, plan.is_some(), refine))
         })
     }
 
@@ -572,7 +576,8 @@ impl PlotReader {
             key.revision == source.revision && key.definition == identity(&node)
                 && key.path == node.path && key.refine == refine
                 && key.fields.as_deref() == fields.as_deref()
-                && covers_view(key, &range, pixel_width, field_count)
+                && covers_view(key, &range, pixel_width, field_count,
+                    &fresh_query(&range, count, numeric_plan.is_some(), refine))
         }) {
             if let Err(error) = source.validate() {
                 self.invalidate();
@@ -580,9 +585,7 @@ impl PlotReader {
             }
             return;
         }
-        let query_range = if numeric_plan.is_some() && refine {
-            numeric_query_coverage(&range, count)
-        } else { range.clone() };
+        let query_range = fresh_query(&range, count, numeric_plan.is_some(), refine);
         let (buckets, exact_limit) = query_resolution(&range, &query_range,
             pixel_width, field_count);
         let key = Key {
@@ -1097,15 +1100,28 @@ fn query_resolution(view: &Range<Address>, query: &Range<Address>,
     (buckets, exact)
 }
 
+/// The range a new request for `view` would scan: numeric refinements add an
+/// aligned margin so short pans reuse the scan.
+#[cfg(not(target_arch = "wasm32"))]
+fn fresh_query(view: &Range<Address>, count: Address, numeric: bool, refine: bool) -> Range<Address> {
+    if numeric && refine { numeric_query_coverage(view, count) } else { view.clone() }
+}
+
+/// Whether a cached scan is as good as a fresh one for `view`: it spans the view
+/// and has at least as many buckets per sample. Comparing density rather than
+/// bucket counts matters once a budget caps buckets: a wide scan zoomed into
+/// must not pass just because a fresh scan hits the same cap over a narrower range.
 #[cfg(not(target_arch = "wasm32"))]
 fn covers_view(key: &Key, view: &Range<Address>, pixel_width: Address,
-    field_count: Option<usize>) -> bool {
+    field_count: Option<usize>, fresh: &Range<Address>) -> bool {
     if key.range.start > view.start || key.range.end < view.end { return false; }
     let (_, wanted_exact) = request_resolution(view, pixel_width, field_count);
     if view.len() <= wanted_exact && key.range.len() > key.exact_limit { return false; }
     if key.range.len() <= key.exact_limit { return true; }
-    let (needed_buckets, _) = query_resolution(view, &key.range, pixel_width, field_count);
-    key.buckets >= needed_buckets
+    let (fresh_buckets, _) = query_resolution(view, fresh, pixel_width, field_count);
+    // Up to a third coarser still counts, so pans (whose margins shift the range
+    // a little) reuse the scan while zooming in twofold or more reads again.
+    3 * key.buckets as u128 * fresh.len().max(1) as u128 >= 2 * fresh_buckets as u128 * key.range.len() as u128
 }
 
 fn reduction_buckets(quality: PlotQuality, requested: Address) -> Address {
@@ -2751,6 +2767,19 @@ actions:
             second.view().plot_cache_key(&second_plan.cache_layout_key()).unwrap());
     }
     #[test]
+    fn zooming_in_reads_again_instead_of_stretching_a_capped_scan() {
+        let (store, node) = fixture(100_000, usize::MAX);
+        let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
+        let ctx = egui::Context::default();
+        let mut reader = PlotReader::default();
+        reader.request_group(&ctx, store.view(), node.clone(), plan.clone(), 0..100_000, 1280, true);
+        settle(&mut reader, &ctx);
+        assert!(!reader.matches_group_request(store.view().revision, &node, &plan, 40_000..50_000, 1280, true),
+            "a tenfold zoom needs finer buckets than the whole-range scan has");
+        assert!(reader.matches_group_request(store.view().revision, &node, &plan, 0..95_000, 1280, true),
+            "a small change still reuses it");
+    }
+    #[test]
     fn grouped_pan_reuses_prefetched_numeric_tiles() {
         let (store, node) = fixture(100_000, usize::MAX);
         let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
@@ -3465,18 +3494,18 @@ actions:
         let first = reader.data.as_ref().unwrap().clone();
         assert!(Arc::ptr_eq(&first, &reader.cache.front().unwrap().data));
         assert_eq!(first.envelopes["value"].len(), MAX_BUCKETS);
+        // Zooming in twofold reads the narrower view at full resolution rather
+        // than stretching the coarser whole-range scan over it.
         reader.request(&ctx, store.view(), node.clone(), 1000..33_768, 2048, false);
         settle(&mut reader, &ctx);
-        assert_eq!(reader.cache.len(), 1);
-        assert!(Arc::ptr_eq(
-            reader.data.as_ref().unwrap(),
-            &reader.cache.front().unwrap().data
-        ));
+        assert_eq!(reader.cache.len(), 2);
+        assert!(!Arc::ptr_eq(reader.data.as_ref().unwrap(), &first));
+        assert_eq!(reader.data().unwrap().envelopes["value"].len(), MAX_BUCKETS);
+        // Returning to the whole range reuses its cached scan.
         reader.request(&ctx, store.view(), node, 0..65_536, 2048, false);
         settle(&mut reader, &ctx);
         assert!(Arc::ptr_eq(reader.data.as_ref().unwrap(), &first));
-        assert!(Arc::ptr_eq(&reader.cache.front().unwrap().data, &first));
-        assert_eq!(reader.cache.len(), 1);
+        assert_eq!(reader.cache.len(), 2);
     }
 
     #[test]
