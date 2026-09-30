@@ -40,6 +40,9 @@ pub struct RecentPair {
     pub decoder: Option<PathBuf>,
     #[serde(default)]
     pub opened_at_unix_secs: u64,
+    /// The collection last plotted in Signal for this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plot_collection: Option<String>,
 }
 
 /// Names for a list of files: each file name, plus as many parent folders as it
@@ -182,10 +185,11 @@ impl FileLocations {
     pub fn remember_pair(&self, data: &Path, decoder: Option<&Path>) {
         let data = data.canonicalize().unwrap_or_else(|_| data.to_path_buf());
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let previous = state.recent_pairs.iter().find(|old| old.data == data).and_then(|old| old.decoder.clone());
+        let previous = state.recent_pairs.iter().find(|old| old.data == data).cloned();
         let pair = RecentPair {
             data,
-            decoder: decoder.map(Path::to_path_buf).or(previous),
+            plot_collection: previous.as_ref().and_then(|old| old.plot_collection.clone()),
+            decoder: decoder.map(Path::to_path_buf).or(previous.and_then(|old| old.decoder)),
             opened_at_unix_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_secs()),
@@ -199,6 +203,21 @@ impl FileLocations {
         state.recent_pairs.insert(0, pair);
         state.recent_pairs.truncate(MAX_RECENT_PAIRS);
     }
+    /// Remember the collection plotted for a recent data file.
+    pub fn remember_plot_collection(&self, data: &Path, collection: &str) {
+        let data = data.canonicalize().unwrap_or_else(|_| data.to_path_buf());
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(pair) = state.recent_pairs.iter_mut().find(|pair| pair.data == data) {
+            pair.plot_collection = Some(collection.to_owned());
+        }
+    }
+
+    pub fn plot_collection(&self, data: &Path) -> Option<String> {
+        let data = data.canonicalize().unwrap_or_else(|_| data.to_path_buf());
+        self.state.lock().unwrap_or_else(|error| error.into_inner()).recent_pairs.iter()
+            .find(|pair| pair.data == data).and_then(|pair| pair.plot_collection.clone())
+    }
+
     /// Drop a data file from the recent list; the file itself is untouched.
     pub fn forget_pair(&self, data: &Path) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -871,5 +890,18 @@ mod tests {
         let pairs = locations.recent_pairs();
         assert_eq!(pairs.len(), 1, "two spellings of one path are one entry");
         assert_eq!(pairs[0].decoder.as_deref(), Some(decoder.as_path()), "reopening without a decoder keeps it");
+    }
+
+    #[test]
+    fn a_files_plotted_collection_survives_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data.bin");
+        std::fs::write(&data, b"x").unwrap();
+        let locations = FileLocations::default();
+        locations.remember_pair(&data, None);
+        locations.remember_plot_collection(&data, "blocks.channels");
+        locations.remember_pair(&data, Some(Path::new("/decoders/other.yaml")));
+        assert_eq!(locations.plot_collection(&data).as_deref(), Some("blocks.channels"));
+        assert_eq!(locations.plot_collection(&dir.path().join("missing.bin")), None);
     }
 }

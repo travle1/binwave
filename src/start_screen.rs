@@ -260,7 +260,7 @@ mod tests {
         let mut recent: Vec<RecentPair> = (0..10).map(|index| {
             let data = dir.path().join(format!("capture{index}.bin"));
             std::fs::write(&data, b"x").unwrap();
-            RecentPair { data, decoder: None, opened_at_unix_secs: 1_792_000_000 - 3 * 3600 }
+            RecentPair { data, decoder: None, opened_at_unix_secs: 1_792_000_000 - 3 * 3600, plot_collection: None }
         }).collect();
         recent[0].decoder = Some(dir.path().join("layout.yaml"));
         recent[1].data = dir.path().join("moved.bin");

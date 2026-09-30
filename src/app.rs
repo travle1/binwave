@@ -201,6 +201,8 @@ pub struct BinwaveApp {
     /// The data file and decoder last written to recent files, so they are
     /// recorded when they change rather than every frame.
     remembered: Option<(PathBuf, Option<PathBuf>)>,
+    /// The plotted collection last written to recent files.
+    remembered_plot: Option<String>,
     show_decoding_guide: bool,
     sidebar_open: bool,
     sidebar_search_open: bool,
@@ -274,6 +276,7 @@ impl Default for BinwaveApp {
             show_empty_workspace: false,
             start_screen: Default::default(),
             remembered: None,
+            remembered_plot: None,
             show_decoding_guide: false,
             sidebar_open: true,
             sidebar_search_open: false,
@@ -1174,6 +1177,12 @@ impl BinwaveApp {
             self.workspace.reveal(Pane::Hex);
             // Each open moves the file to the top of recent files, even a reopen.
             self.remembered = None;
+            self.remembered_plot = None;
+            let preference = match &opened {
+                OpenedFile::Path(path) => self.file_locations.plot_collection(path),
+                OpenedFile::Demo => None,
+            };
+            self.binary.set_plot_preference(preference);
             if let OpenedFile::Path(path) = opened {
                 let recent_decoder = self.pending_recent_decoder.take()
                     .filter(|(data, _)| data == &path)
@@ -1211,6 +1220,11 @@ impl BinwaveApp {
                 self.file_locations.remember_pair(&current.0, current.1.as_deref());
                 self.remembered = Some(current);
             }
+            if let Some(collection) = self.binary.plot_collection()
+                .filter(|collection| self.remembered_plot.as_deref() != Some(*collection)) {
+                self.file_locations.remember_plot_collection(data, collection);
+                self.remembered_plot = Some(collection.to_owned());
+            }
         }
         if self.binary.take_bytes_changed() {
             self.invalidate_csv_after_edit();
@@ -1223,7 +1237,9 @@ impl BinwaveApp {
                     self.file_locations.remember_decoder_run(decoder, data);
                 }
             }
-            if initial_plot_ready {
+            // Open Signal whenever the decode has something to plot; it picks
+            // the collection itself, even when channels are found a moment later.
+            if initial_plot_ready || (!self.binary.showing_byte_preview() && self.binary.has_plot_collections()) {
                 self.workspace.show_initial_plot();
             } else {
                 self.workspace.show_samples();
@@ -4553,17 +4569,22 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(!app.binary.showing_byte_preview());
-        let decoded = labels(workspace_frame(&mut app, &ctx));
-        assert!(decoded.iter().any(|text| text == "amplitude"));
+        // Results with a collection open in Signal, which plots it without asking.
+        let mut decoded = labels(workspace_frame(&mut app, &ctx));
+        for _ in 0..20 {
+            if decoded.iter().any(|text| text.contains("amplitude")) { break; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            decoded = labels(workspace_frame(&mut app, &ctx));
+        }
+        assert!(decoded.iter().any(|text| text.contains("amplitude")), "{decoded:?}");
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_some());
         assert!(
             decoded.iter().any(|text| text.contains("structures:")),
             "running must keep the source visible"
         );
         let (_, editor, _) = app.workspace.dock.find_tab_legacy(&Pane::Layout).unwrap();
-        let (_, samples, _) = app.workspace.dock.find_tab_legacy(&Pane::Table).unwrap();
-        assert_ne!(editor, samples);
-        workspace_click(&mut app, &ctx, "Signal");
-        assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_some());
+        let (_, plot, _) = app.workspace.dock.find_tab_legacy(&Pane::Plot).unwrap();
+        assert_ne!(editor, plot, "results open beside the source, not over it");
         let plotted = labels(workspace_frame(&mut app, &ctx));
         assert!(plotted.iter().any(|text| text.contains("structures:")));
     }
@@ -4609,13 +4630,20 @@ mod tests {
             assert!(Instant::now() < deadline, "{}", app.binary.status().0);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let output = workspace_frame(&mut app, &ctx);
+        let mut output = workspace_frame(&mut app, &ctx);
         assert!(!app.binary.showing_byte_preview());
-        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "amplitude")));
-        assert!(app.workspace.dock.find_tab_legacy(&Pane::Table).is_some());
+        let shows_amplitude = |output: &egui::FullOutput| output.shapes.iter().any(|shape|
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().contains("amplitude")));
+        for _ in 0..20 {
+            if shows_amplitude(&output) { break; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            output = workspace_frame(&mut app, &ctx);
+        }
+        assert!(shows_amplitude(&output));
+        assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_some());
         let (_, editor, _) = app.workspace.dock.find_tab_legacy(&Pane::Layout).unwrap();
-        let (_, table, _) = app.workspace.dock.find_tab_legacy(&Pane::Table).unwrap();
-        assert_ne!(editor, table);
+        let (_, plot, _) = app.workspace.dock.find_tab_legacy(&Pane::Plot).unwrap();
+        assert_ne!(editor, plot, "results open beside the source, not over it");
         workspace_click(&mut app, &ctx, "Signal");
         assert!(app.workspace.dock.find_tab_legacy(&Pane::Plot).is_some());
     }

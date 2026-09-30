@@ -153,6 +153,11 @@ pub struct StructureViews {
     plot_sidebar_series: bool,
     plot_axis_series: Option<String>,
     plot_axis_group: Option<String>,
+    /// Off by default: the Y axis follows the whole collection of the chosen
+    /// series, so a drag moves them together. On: one series at a time.
+    plot_axis_single_series: bool,
+    /// The collection last plotted for this file, preferred when it exists.
+    plot_preference: Option<String>,
     plot_collection_filter: String,
     extra_plot_readers: std::collections::BTreeMap<String, PlotReader>,
     group_plot_readers: BTreeMap<String, PlotReader>,
@@ -1420,13 +1425,41 @@ impl StructureViews {
             self.extra_plot_readers.clear();
             self.group_plot_readers.clear();
             self.group_plan_cache = None;
-            if ui.button("Collections…").clicked() { self.plot_collections_open = !self.plot_collections_open; }
-            ui.label(if self.discovery_rx.is_some() {
-                "Finding collections… Choose one to plot when it appears."
-            } else {
-                "Choose a collection to plot."
-            });
-            return None;
+            // Plot the best collection without asking: the largest channel group
+            // once discovery has run, else the best-ranked one. Collections…
+            // switches to another.
+            // The remembered collection, else the largest channel group, else the
+            // collection the app ranks best.
+            let preferred = self.plot_preference.clone().filter(|path| collection_by_path.contains_key(path.as_str()))
+                .or_else(|| collections.iter().filter(|node| sensor_group_key(node).is_some())
+                    .max_by_key(|node| (collection_count(node), std::cmp::Reverse(sensor_group_key(node).map(|(_, index)| index))))
+                    .map(|node| node.path.clone()))
+                .or_else(|| collections.iter().max_by_key(|node| collection_score(node, output))
+                    .map(|node| node.path.clone()));
+            match preferred.filter(|_| self.discovery_rx.is_none()) {
+                Some(path) => {
+                    // A channel of a group brings in the whole group, as choosing
+                    // the group in Collections does.
+                    let group = collection_by_path.get(path.as_str()).and_then(|node| sensor_group_key(node));
+                    if let Some((key, _)) = group {
+                        self.plot_sources.extend(collections.iter()
+                            .filter(|node| sensor_group_key(node).is_some_and(|(other, _)| other == key))
+                            .map(|node| node.path.clone()));
+                    }
+                    self.plot_sources.insert(path.clone());
+                    self.plot_target = path;
+                    self.plot_sources_initialized = true;
+                    self.plot_fit_all_y = true;
+                    self.plot_axis_series = None;
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Finding collections…");
+                    });
+                    return None;
+                }
+            }
         }
         let primary = if self.plot_sources.contains(&self.plot_target)
             && collection_by_path.contains_key(self.plot_target.as_str()) {
@@ -1550,6 +1583,7 @@ impl StructureViews {
         if self.plot_axis_series.as_ref().is_none_or(|axis|
             !names.contains(axis) || self.plot_hidden.contains(axis)) {
             self.plot_axis_series = names.iter().find(|name| !self.plot_hidden.contains(*name)).cloned();
+            self.plot_axis_group = self.collection_axis(self.plot_axis_series.as_deref());
             self.plot_fit_y = true;
         }
         let series_label = if names.is_empty() {
@@ -1577,6 +1611,13 @@ impl StructureViews {
             }
             ui.menu_button("Plot options", |ui| {
             if self.presentation.menu(ui, &ranges) { self.plot_fit_y = true; }
+            let mut together = !self.plot_axis_single_series;
+            if ui.checkbox(&mut together, "Y axis moves the whole collection")
+                .on_hover_text("Dragging or scaling the Y axis moves every series of the chosen series' collection together. Off: one series at a time.")
+                .changed() {
+                self.plot_axis_single_series = !together;
+                self.plot_axis_group = self.plot_axis_series.as_deref().filter(|_| together).map(plot_series_group_key);
+            }
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let mut keep = crate::structure_plot::keep_decoded_data(&source);
@@ -2599,7 +2640,7 @@ impl StructureViews {
                             .min_by(|a, b| a.0.total_cmp(&b.0));
                     if let Some((_, name, point)) = nearest {
                         self.plot_axis_series = Some(name.clone());
-                        self.plot_axis_group = None;
+                        self.plot_axis_group = self.collection_axis(Some(name));
                         self.plot_anchor = Some(point.index);
                         picked = Some((point.bytes.clone(), Some(point.path.to_string())));
                     } else if let Some(bytes) = sample_bytes(&node, index..index + 1) {
@@ -3170,6 +3211,31 @@ fn plot_series_group_key(name: &str) -> String {
     plot_series_index(path).map_or_else(|| path.to_owned(), |(start, _)| path[..start].to_owned())
 }
 
+impl StructureViews {
+    /// The Y axis group for a chosen series: its whole collection, unless the
+    /// Y axis is set to follow single series.
+    fn collection_axis(&self, series: Option<&str>) -> Option<String> {
+        series.filter(|_| !self.plot_axis_single_series).map(plot_series_group_key)
+    }
+
+    /// Prefer this collection when a decode is plotted without a choice yet.
+    pub fn set_plot_preference(&mut self, collection: Option<String>) {
+        self.plot_preference = collection;
+    }
+
+    /// The collection Signal plots, once one is chosen.
+    pub fn plot_collection(&self) -> Option<&str> {
+        self.plot_sources.contains(&self.plot_target).then_some(self.plot_target.as_str())
+    }
+
+    /// Whether the decode has a collection the Signal panel can plot.
+    pub fn has_plot_collections(&self, output: &ParseOutput) -> bool {
+        let mut collections = Vec::new();
+        collect_collections(&output.nodes, &mut collections);
+        !collections.is_empty() || !self.flattened_collections.is_empty()
+    }
+}
+
 fn plot_axis_target_names(
     names: &[String],
     group: Option<&str>,
@@ -3630,7 +3696,7 @@ actions:
         assert!(plot_query_pixel_width(1920, 528) > 0);
     }
     #[test]
-    fn a_new_decode_waits_for_an_explicit_plot_collection() {
+    fn a_new_decode_plots_its_best_collection_without_asking() {
         let yaml = "actions: [{read: {name: samples, type: u8, repeat: 128}}]";
         let store = ByteStore::from_snapshot(Original::from_bytes(&[7; 128]).unwrap());
         let output = Program::parse(yaml).unwrap()
@@ -3646,8 +3712,16 @@ actions:
                 views.plot(ui, &output, store.view());
             });
         });
-        assert!(views.plot_sources.is_empty());
-        assert!(views.plot_reader.data().is_none());
+        assert_eq!(views.plot_sources.iter().collect::<Vec<_>>(), ["samples"]);
+        assert_eq!(views.plot_target, "samples");
+        assert_eq!(views.plot_collection(), Some("samples"));
+        // A remembered collection that no longer exists is ignored.
+        let mut remembered = StructureViews::default();
+        remembered.set_plot_preference(Some("gone".into()));
+        let _ = ctx.run(egui::RawInput::default(), |_ctx, ui| {
+            egui::CentralPanel::default().show(ui, |ui| { remembered.plot(ui, &output, store.view()); });
+        });
+        assert_eq!(remembered.plot_collection(), Some("samples"));
         let sidebar = egui::containers::panel::PanelState::load(
             &ctx, egui::Id::new("plot_collections_sidebar"),
         ).unwrap();
@@ -3974,6 +4048,72 @@ actions:
         assert!(chips.iter().any(|chip| chip.channels.is_empty() && chip.label.starts_with("Blocks (130")),
             "{:?}", chips.iter().map(|chip| &chip.label).collect::<Vec<_>>());
     }
+    #[test]
+    fn many_channels_zoomed_in_are_read_exactly_and_picked_as_one_group() {
+        let yaml = r#"
+structures:
+  - name: Descriptor
+    fields:
+      - {name: width, type: u8}
+      - {name: groups, type: u16}
+  - name: Metadata
+    fields:
+      - {name: items_per_group, type: u16}
+      - {name: descriptors, type: {structure: Descriptor}, repeat: 1}
+    actions:
+      - define:
+          name: Generated
+          from: descriptors
+          fields:
+            type: {ref: width, cases: {'2': i16}}
+            repeat: {ref: groups}
+            items_per_group: {ref: items_per_group}
+            layout: interleaved
+  - name: Block
+    fields:
+      - {name: header, type: bytes, length: 2}
+      - {name: payload, type: {structure: Generated}}
+actions:
+  - read: {name: metadata, type: {structure: Metadata}}
+  - read: {name: blocks, type: {structure: Block}, repeat: 8}
+"#;
+        // 432 sensors, 256 samples each per block, 8 blocks.
+        let mut bytes = vec![0xB0, 0x01, 2, 0x00, 0x01];
+        for block in 0..8_i32 {
+            bytes.extend([0xAA, 0xBB]);
+            for index in 0..432 * 256 { bytes.extend(((block * 1000 + index / 432) as i16).to_le_bytes()); }
+        }
+        let store = ByteStore::from_snapshot(Original::from_bytes(&bytes).unwrap());
+        let output = Program::parse(yaml).unwrap().run(&store.view(), &AtomicBool::new(false)).unwrap();
+        let ctx = egui::Context::default();
+        let mut views = StructureViews::default();
+        let frame = |views: &mut StructureViews| { let _ = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200., 700.))), ..Default::default() },
+            |_ctx, ui| { egui::CentralPanel::default().show(ui, |ui| { views.plot(ui, &output, store.view()); }); }); };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut settle = |views: &mut StructureViews| loop {
+            frame(views);
+            if !views.plot_sources.is_empty() && views.discovery_rx.is_none() && !views.plot_reader.is_loading() { break; }
+            assert!(std::time::Instant::now() < deadline, "plot timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        settle(&mut views);
+        // Without being asked, Signal plots the whole sensor group with a group Y axis.
+        assert_eq!(views.plot_sources.len(), 432);
+        assert!(views.plot_target.ends_with("[0].values"), "{}", views.plot_target);
+        assert_eq!(views.plot_axis_group.as_deref(), Some("blocks.payload.field_0"));
+        // Zooming in reads exactly once the view fits the per-sensor budget.
+        for view in [500..1500, 600..695] {
+            views.plot_force_view = Some(view.clone());
+            settle(&mut views);
+            frame(&mut views);
+            let data = views.plot_reader.data().unwrap();
+            assert_eq!(data.quality, crate::structure_plot::PlotQuality::Exact, "view {view:?}: {:?}", data.range);
+            let points = data.series.values().next().unwrap().iter().filter(|point| view.contains(&point.index)).count();
+            assert_eq!(points, view.len(), "every sample in view {view:?}");
+        }
+    }
+
     #[test]
     fn overview_strip_scans_grouped_channels_one_series_each() {
         let yaml = r#"
@@ -5450,6 +5590,16 @@ actions: [{read: {name: samples, type: {structure: Sample}, repeat: until end}}]
         let ctx = egui::Context::default();
         let mut views = StructureViews::default();
         settle_plot(&ctx, &mut views, &output, &store);
+        // By default the Y axis spans the whole collection of the chosen series.
+        assert_eq!(views.plot_axis_group.as_deref(), Some("samples"));
+        views.plot_axis_series = Some("samples / ramp".into());
+        views.plot_fit_y = true;
+        settle_plot(&ctx, &mut views, &output, &store);
+        let together = *navigation_memory(&ctx, &views, &output).bounds();
+        assert!(together.min()[1] < -3. && together.max()[1] > 9., "fits every series: {together:?}");
+        // Single-series mode fits the Y axis to the selected series alone.
+        views.plot_axis_single_series = true;
+        views.plot_axis_group = None;
         views.plot_axis_series = Some("samples / sine".into());
         views.plot_fit_y = true;
         settle_plot(&ctx, &mut views, &output, &store);

@@ -192,7 +192,7 @@ mod tests {
         use crate::egui_compat::ContextRun as _;
         let ctx = egui::Context::default();
         crate::theme::install(&ctx);
-        let pair = |path: &str| RecentPair { data: path.into(), decoder: None, opened_at_unix_secs: 0 };
+        let pair = |path: &str| RecentPair { data: path.into(), decoder: None, opened_at_unix_secs: 0, plot_collection: None };
         let recent = [pair("/runs/a/data.bin"), pair("/runs/b/data.bin"), pair("/runs/b/notes.bin")];
         let output = ctx.run(egui::RawInput::default(), |_ctx, ui| {
             egui::CentralPanel::default().show(ui, |ui| { show(ui, &recent, None, false, "Tester"); });

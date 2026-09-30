@@ -1795,6 +1795,16 @@ impl BinaryWorkspace {
                 self.applied_yaml.as_deref() == Some(language.byte_preview())
             })
     }
+    /// The collection Signal should plot first for this file, and the one it plots.
+    pub fn set_plot_preference(&mut self, collection: Option<String>) {
+        self.structure_ui.set_plot_preference(collection);
+    }
+    pub fn plot_collection(&self) -> Option<&str> {
+        self.structure_ui.plot_collection()
+    }
+    pub fn has_plot_collections(&self) -> bool {
+        self.structure_ui.has_plot_collections()
+    }
     pub fn take_initial_plot_ready(&mut self) -> bool {
         std::mem::take(&mut self.initial_plot_ready)
     }

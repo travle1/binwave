@@ -120,6 +120,16 @@ impl StructureWorkspace {
     pub fn has_program(&self) -> bool {
         self.program.is_some() || self.python_source.is_some() || self.pending_source.is_some()
     }
+    pub fn set_plot_preference(&mut self, collection: Option<String>) {
+        self.views.set_plot_preference(collection);
+    }
+    pub fn plot_collection(&self) -> Option<&str> {
+        self.views.plot_collection()
+    }
+    /// Whether the latest decode has something for the Signal panel to plot.
+    pub fn has_plot_collections(&self) -> bool {
+        self.output.as_ref().is_some_and(|output| self.views.has_plot_collections(output))
+    }
     pub fn has_published_program(&self) -> bool {
         self.program.is_some() || self.python_source.is_some()
     }
