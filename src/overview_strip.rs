@@ -14,6 +14,11 @@ use std::ops::Range;
 const BUCKETS: usize = 2000;
 /// Series scanned together in one pass; the picker offers these.
 const MAX_SERIES: usize = 16;
+/// The whole-file scan runs in this many chunks, so a pause for the plot loses
+/// at most the chunk in progress instead of starting over.
+const CHUNKS: usize = 32;
+/// Collections this small are scanned in one go.
+const SINGLE_CHUNK: usize = 65_536;
 
 /// What the strip asks the plot to show.
 #[derive(Debug, PartialEq)]
@@ -61,6 +66,19 @@ impl Envelope {
         Self { total, bands, scanned: data.scanned, complete: data.complete }
     }
 
+    /// Widen each bucket by another scan's bands of the same collection.
+    fn merge(&mut self, other: &Envelope) {
+        let buckets = BUCKETS.min(self.total.max(1));
+        for (name, bands) in &other.bands {
+            let mine = self.bands.entry(name.clone()).or_insert_with(|| vec![None; buckets]);
+            for (slot, band) in mine.iter_mut().zip(bands) {
+                if let Some(band) = band {
+                    *slot = Some(merge(*slot, *band));
+                }
+            }
+        }
+    }
+
     fn range(&self, series: &str) -> Option<[f64; 2]> {
         self.bands.get(series)?.iter().flatten().fold(None, |range, band| Some(merge(range, *band)))
     }
@@ -104,6 +122,9 @@ pub struct OverviewStrip {
     key: Option<Key>,
     envelope: Option<Envelope>,
     generation: u64,
+    /// The next chunk to scan, and the one being read now.
+    chunk: usize,
+    reading: Option<Range<usize>>,
     /// The series chosen per collection path.
     chosen: HashMap<String, String>,
     /// The drag in progress and the view when it started.
@@ -128,19 +149,13 @@ pub fn scanned_fields(catalog: &[String], hidden: impl Fn(&str) -> bool) -> Vec<
 }
 
 impl OverviewStrip {
-    /// Start or reuse the whole-collection scan. It waits while the main plot
-    /// is loading so it never slows the view being looked at.
+    /// Continue the whole-collection scan one chunk at a time. It pauses while the
+    /// plot loads, so it never slows the view being looked at, and resumes where
+    /// it left off. `group` is the plot's grouped scan plan, when it reads the
+    /// collection as a group of channels; the strip then scans them the same way.
     #[allow(clippy::too_many_arguments)]
-    /// `group` is the plot's grouped scan plan, when it reads the collection as
-    /// a group of channels; the strip then scans those channels the same way.
     pub fn update(&mut self, ctx: &egui::Context, source: &ByteView, node: &Node, count: usize,
         fields: Vec<String>, group: Option<(Node, crate::structure::NumericPlan)>, main_loading: bool) {
-        // The strip never competes with the plot: it pauses while the plot loads
-        // and picks up again once the plot is idle.
-        if main_loading && self.reader.is_loading() {
-            self.reader.stop();
-            self.key = None;
-        }
         let scanned = group.as_ref().map(|(group_node, _)| group_node).unwrap_or(node);
         let key = Key {
             revision: source.revision,
@@ -152,40 +167,52 @@ impl OverviewStrip {
             },
         };
         if self.key.as_ref() != Some(&key) {
-            if let Some(cached) = load_cached(source, &key).filter(|cached| cached.total == count) {
-                self.reader.stop();
-                self.envelope = Some(cached);
-                self.key = Some(key);
-            } else if !main_loading {
-                // Keep what was scanned before a pause on screen until it resumes.
-                if self.envelope.as_ref().is_some_and(|envelope| envelope.total != count) {
-                    self.envelope = None;
+            // A different collection, series set or bytes: start over.
+            self.reader.stop();
+            self.reading = None;
+            self.chunk = 0;
+            self.envelope = Some(load_cached(source, &key).filter(|cached| cached.total == count)
+                .unwrap_or_else(|| Envelope { total: count, ..Default::default() }));
+            self.key = Some(key.clone());
+        }
+        let chunks = if count <= SINGLE_CHUNK { 1 } else { CHUNKS };
+        let complete = self.envelope.as_ref().is_some_and(|envelope| envelope.complete);
+        if main_loading && self.reading.is_some() {
+            // Only the chunk in progress is read again later.
+            self.reader.stop();
+            self.reading = None;
+        }
+        if !complete && !main_loading && self.reading.is_none() && self.chunk < chunks && count > 0 {
+            let range = self.chunk * count / chunks..(self.chunk + 1) * count / chunks;
+            let width = (BUCKETS / chunks).max(1);
+            match group {
+                Some((group_node, plan)) => self.reader.request_group(ctx, source.clone(), group_node, plan,
+                    range.clone(), width, true),
+                None => {
+                    let fields = (!key.fields.is_empty()).then(|| key.fields.clone());
+                    self.reader.request_filtered(ctx, source.clone(), node.clone(), range.clone(), width, true, fields);
                 }
-                match group {
-                    Some((group_node, plan)) => self.reader.request_group(ctx, source.clone(), group_node, plan,
-                        0..count, BUCKETS, true),
-                    None => {
-                        let fields = (!key.fields.is_empty()).then(|| key.fields.clone());
-                        self.reader.request_filtered(ctx, source.clone(), node.clone(), 0..count, BUCKETS, true, fields);
-                    }
-                }
-                self.key = Some(key);
             }
+            self.reading = Some(range);
         }
         self.reader.tick(ctx);
         if self.reader.data_generation() != self.generation {
             self.generation = self.reader.data_generation();
-            if let Some(data) = self.reader.data() {
-                let envelope = Envelope::from_data(data, count);
-                if envelope.complete {
-                    if let Some(key) = &self.key {
-                        store_cached(source, key, &envelope);
+            if let (Some(data), Some(reading), Some(envelope)) = (self.reader.data(), self.reading.clone(), &mut self.envelope) {
+                // Min/max only grow, so partial results merge safely.
+                envelope.merge(&Envelope::from_data(data, count));
+                if data.complete && data.range.start <= reading.start && data.range.end >= reading.end {
+                    self.chunk += 1;
+                    self.reading = None;
+                    envelope.scanned = self.chunk * count / chunks;
+                    if self.chunk == chunks {
+                        envelope.complete = true;
+                        store_cached(source, &key, envelope);
                     }
                 }
-                self.envelope = Some(envelope);
             }
         }
-        if self.reader.is_loading() {
+        if self.reading.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -592,15 +619,6 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let envelope = strip.envelope.clone().unwrap();
-        // A plot load pauses a running scan; it starts again once the plot is idle.
-        let mut paused = OverviewStrip::default();
-        let other = crate::byte_store::ByteStore::from_file(std::sync::Arc::new(
-            crate::file_source::FileSource::open(&path).unwrap()));
-        paused.update(&ctx, &other.view(), &node, count, vec!["wave".into()], None, false);
-        if paused.reader.is_loading() {
-            paused.update(&ctx, &other.view(), &node, count, vec!["wave".into()], None, true);
-            assert!(!paused.reader.is_loading() && paused.key.is_none(), "paused while the plot loads");
-        }
         assert_eq!(envelope.range("wave"), Some([-50., 49.]));
         assert!(envelope.flat("zero"));
         assert_eq!(strip.series(&node.path).as_deref(), Some("wave"));
@@ -614,5 +632,46 @@ mod tests {
         reopened.update(&ctx, &source, &node, count, fields.clone(), None, true);
         assert_eq!(reopened.envelope.as_ref(), Some(&envelope), "no rescan, even while the plot loads");
         let _ = std::fs::remove_file(cache_path(&source, &key).unwrap());
+    }
+
+    #[test]
+    fn plot_loads_pause_the_scan_and_it_resumes_where_it_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.bin");
+        let count = 200_000usize;
+        let bytes: Vec<u8> = (0..count).flat_map(|index| ((index / 1000) as i16).to_le_bytes()).collect();
+        std::fs::write(&path, bytes).unwrap();
+        let store = crate::byte_store::ByteStore::from_file(std::sync::Arc::new(
+            crate::file_source::FileSource::open(&path).unwrap()));
+        let source = store.view();
+        let node = crate::structure::Program::parse("actions:\n  - read: {name: level, type: i16, repeat: until end}\n")
+            .unwrap().run(&source, &std::sync::atomic::AtomicBool::new(false)).unwrap().nodes.remove(0);
+        let ctx = egui::Context::default();
+        let mut strip = OverviewStrip::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while strip.chunk < 3 {
+            strip.update(&ctx, &source, &node, count, Vec::new(), None, false);
+            assert!(std::time::Instant::now() < deadline, "the first chunks finish");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let before = (strip.chunk, strip.envelope.clone().unwrap());
+        // The plot starts loading: the scan pauses without losing anything.
+        for _ in 0..5 {
+            strip.update(&ctx, &source, &node, count, Vec::new(), None, true);
+        }
+        assert!(strip.reading.is_none(), "paused while the plot loads");
+        assert_eq!(strip.chunk, before.0, "finished chunks are kept");
+        assert!(before.1.bands.values().next().unwrap().iter().flatten().count() > 0);
+        assert!(strip.envelope.as_ref().unwrap().bands.values().next().unwrap().iter().flatten().count()
+            >= before.1.bands.values().next().unwrap().iter().flatten().count(), "the band never shrinks");
+        while !strip.envelope.as_ref().is_some_and(|envelope| envelope.complete) {
+            strip.update(&ctx, &source, &node, count, Vec::new(), None, false);
+            assert!(std::time::Instant::now() < deadline, "the scan resumes and finishes");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let envelope = strip.envelope.clone().unwrap();
+        assert_eq!(envelope.range(envelope.bands.keys().next().unwrap()), Some([0., 199.]));
+        assert!(envelope.bands.values().next().unwrap().iter().all(Option::is_some), "every bucket filled");
+        let _ = std::fs::remove_file(cache_path(&source, strip.key.as_ref().unwrap()).unwrap());
     }
 }
