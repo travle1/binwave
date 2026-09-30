@@ -4091,7 +4091,7 @@ actions:
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200., 700.))), ..Default::default() },
             |_ctx, ui| { egui::CentralPanel::default().show(ui, |ui| { views.plot(ui, &output, store.view()); }); }); };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let mut settle = |views: &mut StructureViews| loop {
+        let settle = |views: &mut StructureViews| loop {
             frame(views);
             if !views.plot_sources.is_empty() && views.discovery_rx.is_none() && !views.plot_reader.is_loading() { break; }
             assert!(std::time::Instant::now() < deadline, "plot timed out");

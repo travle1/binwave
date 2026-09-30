@@ -830,25 +830,58 @@ pub(crate) struct NumericField {
     pub width: Address,
     pub span: Address,
     pub source_path: Option<String>,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // Desktop cache keys only.
     kind: String,
+    /// `kind`, resolved once: plots decode millions of values per second.
+    primitive: Primitive,
     endian: Endian,
 }
 impl NumericField {
     pub fn decode(&self, record: &[u8]) -> Result<f64> {
-        let bytes = record
-            .get(
-                usize::try_from(self.offset).context("field offset exceeds memory range")?
-                    ..usize::try_from(
-                        self.offset
-                            .checked_add(self.width)
-                            .context("field offset overflow")?,
-                    )
-                    .context("field end exceeds memory range")?,
-            )
-            .context("numeric field exceeds its record")?;
-        decode_primitive(&self.kind, bytes, self.endian)?
-            .numeric()
-            .context("field is not numeric")
+        let start = usize::try_from(self.offset).context("field offset exceeds memory range")?;
+        let end = start.checked_add(usize::try_from(self.width).context("field width exceeds memory range")?)
+            .context("field offset overflow")?;
+        let bytes = record.get(start..end).context("numeric field exceeds its record")?;
+        Ok(self.primitive.decode(bytes, self.endian))
+    }
+}
+
+/// A numeric primitive type, resolved from its name once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Primitive { U8, U16, U32, U64, I8, I16, I32, I64, F32, F64 }
+impl Primitive {
+    fn from_name(kind: &str) -> Option<Self> {
+        Some(match kind {
+            "u8" => Self::U8, "u16" => Self::U16, "u32" => Self::U32, "u64" => Self::U64,
+            "i8" => Self::I8, "i16" => Self::I16, "i32" => Self::I32, "i64" => Self::I64,
+            "f32" => Self::F32, "f64" => Self::F64,
+            _ => return None,
+        })
+    }
+    /// `bytes` holds exactly this type's width.
+    #[inline]
+    fn decode(self, bytes: &[u8], endian: Endian) -> f64 {
+        macro_rules! read {
+            ($ty:ty) => {{
+                let raw = bytes.try_into().expect("numeric field width matches its type");
+                match endian {
+                    Endian::Little => <$ty>::from_le_bytes(raw),
+                    Endian::Big => <$ty>::from_be_bytes(raw),
+                }
+            }};
+        }
+        match self {
+            Self::U8 => bytes[0] as f64,
+            Self::I8 => bytes[0] as i8 as f64,
+            Self::U16 => read!(u16) as f64,
+            Self::U32 => read!(u32) as f64,
+            Self::U64 => read!(u64) as f64,
+            Self::I16 => read!(i16) as f64,
+            Self::I32 => read!(i32) as f64,
+            Self::I64 => read!(i64) as f64,
+            Self::F32 => read!(f32) as f64,
+            Self::F64 => read!(f64),
+        }
     }
 }
 fn constant_size(expr: &Expr) -> Option<Address> {
@@ -924,6 +957,7 @@ fn project_numeric(
                 span: length.unwrap_or(width),
                 source_path: None,
                 kind: kind.clone(),
+                primitive: Primitive::from_name(kind)?,
                 endian: inherited,
             });
         }

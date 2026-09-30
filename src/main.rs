@@ -78,6 +78,9 @@ mod start_screen;
 #[cfg(not(target_arch = "wasm32"))]
 mod overview_strip;
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)] // The plot pipeline adopts it in the next steps.
+mod plot_reduce;
+#[cfg(not(target_arch = "wasm32"))]
 mod window_frame;
 #[cfg(not(target_arch = "wasm32"))]
 mod structure_ui;
