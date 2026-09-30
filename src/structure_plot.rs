@@ -443,6 +443,9 @@ pub struct PlotReader {
     running: Option<Running>,
     data: Option<Arc<PlotData>>,
     data_key: Option<Key>,
+    /// The last complete result for these series, drawn beyond a new read's scan
+    /// front so the plot never blanks while it fills in.
+    backdrop: Option<(Key, Arc<PlotData>)>,
     start_after: Option<Instant>,
     error: Option<String>,
     cache: VecDeque<Cached>,
@@ -614,6 +617,7 @@ impl PlotReader {
         if !compatible {
             self.data = None;
             self.data_key = None;
+            self.backdrop = None;
             self.data_generation = self.data_generation.wrapping_add(1);
         }
         self.start_after = (compatible && self.data.is_some())
@@ -657,13 +661,19 @@ impl PlotReader {
                 {
                     match outcome.result {
                         Ok(data) => {
-                            let data = Arc::new(data);
+                            let data = match &self.backdrop {
+                                Some((key, back)) if !data.complete
+                                    && data.quality != PlotQuality::SampledPreview
+                                    && same_series(key, &outcome.key) => Arc::new(fill_unscanned(data, back)),
+                                _ => Arc::new(data),
+                            };
                             if data.complete {
                                 self.cache.push_front(Cached {
                                     request: self.desired.as_ref().unwrap().clone(),
                                     data: data.clone(),
                                 });
                                 self.cache.truncate(CACHE_ENTRIES);
+                                self.backdrop = Some((outcome.key.clone(), data.clone()));
                             }
                             self.data = Some(data);
                             self.data_key = Some(outcome.key.clone());
@@ -767,6 +777,7 @@ impl PlotReader {
         self.desired = None;
         self.data = None;
         self.data_key = None;
+        self.backdrop = None;
         self.start_after = None;
         self.data_generation = self.data_generation.wrapping_add(1);
         self.error = None;
@@ -795,19 +806,13 @@ impl PlotReader {
         let Some(desired) = self.desired.as_ref().map(|request| &request.key) else {
             return Some(data);
         };
-        if current == desired
-            || (current.revision == desired.revision
-                && current.definition == desired.definition
-                && current.path == desired.path
-                && current.fields == desired.fields
-                && current.range.start <= desired.range.start
-                && current.range.end >= desired.range.end
-                && (data.quality == PlotQuality::Exact
-                    || current.range == desired.range && current.buckets >= desired.buckets)) {
-            Some(data)
-        } else {
-            None
-        }
+        // While a new view loads, keep drawing the last data for the same series
+        // at its own sample positions instead of blanking the plot; the new read
+        // replaces it when it lands.
+        (current.revision == desired.revision
+            && current.definition == desired.definition
+            && current.path == desired.path
+            && current.fields == desired.fields).then_some(data)
     }
     pub fn data_generation(&self) -> u64 {
         self.data_generation
@@ -1133,6 +1138,38 @@ fn fresh_query(view: &Range<Address>, count: Address, numeric: bool, refine: boo
 /// and has at least as many buckets per sample. Comparing density rather than
 /// bucket counts matters once a budget caps buckets: a wide scan zoomed into
 /// must not pass just because a fresh scan hits the same cap over a narrower range.
+/// Two requests for the same series of the same decode, whatever their range.
+#[cfg(not(target_arch = "wasm32"))]
+fn same_series(a: &Key, b: &Key) -> bool {
+    a.revision == b.revision && a.definition == b.definition && a.path == b.path && a.fields == b.fields
+}
+
+/// A partial result with the unscanned rest of its range taken from `back`. The
+/// scan runs forward from the range start, so everything past `start + scanned`
+/// is not read yet; `back` fills it until the scan gets there.
+#[cfg(not(target_arch = "wasm32"))]
+fn fill_unscanned(partial: PlotData, back: &PlotData) -> PlotData {
+    let front = partial.range.start + partial.scanned;
+    let end = partial.range.end;
+    let unscanned = |index: Address| index >= front && index < end;
+    let mut series = partial.series;
+    for (name, points) in &back.series {
+        series.entry(name.clone()).or_default()
+            .extend(points.iter().filter(|point| unscanned(point.index)).cloned());
+    }
+    let mut envelopes = partial.envelopes;
+    for (name, bands) in &back.envelopes {
+        envelopes.entry(name.clone()).or_default()
+            .extend(bands.iter().filter(|band| unscanned(band.range.start)).cloned());
+    }
+    let mut bounds = partial.bounds;
+    for (name, &(low, high)) in &back.bounds {
+        let entry = bounds.entry(name.clone()).or_insert((low, high));
+        *entry = (entry.0.min(low), entry.1.max(high));
+    }
+    PlotData { series, envelopes, bounds, ..partial }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn covers_view(key: &Key, view: &Range<Address>, pixel_width: Address,
     field_count: Option<usize>, fresh: &Range<Address>) -> bool {
@@ -2789,6 +2826,48 @@ actions:
             second.view().plot_cache_key(&second_plan.cache_layout_key()).unwrap());
     }
     #[test]
+    fn a_partial_read_is_filled_past_its_scan_front_with_the_last_complete_data() {
+        let point = |index: Address, value: f64| PlotSample { index, value, bytes: index..index + 1, path: "v".into() };
+        let data = |range: Range<Address>, points: Vec<PlotSample>, scanned: Address, complete: bool| PlotData {
+            range, series: BTreeMap::from([("v".to_owned(), points)]), envelopes: BTreeMap::new(),
+            bounds: BTreeMap::from([("v".to_owned(), (0., 9.))]), quality: PlotQuality::MinMax,
+            scanned, total: 100, complete,
+        };
+        let back = data(0..100, (0..100).step_by(10).map(|i| point(i, 1.)).collect(), 100, true);
+        // The new read covers 20..80 and has scanned 20..50 so far.
+        let partial = data(20..80, (20..50).step_by(5).map(|i| point(i, 2.)).collect(), 30, false);
+        let filled = fill_unscanned(partial, &back);
+        let indices: Vec<_> = filled.series["v"].iter().map(|p| (p.index, p.value)).collect();
+        assert_eq!(indices, [(20, 2.), (25, 2.), (30, 2.), (35, 2.), (40, 2.), (45, 2.), (50, 1.), (60, 1.), (70, 1.)],
+            "new samples up to the scan front, the last complete data after it, nothing outside the view");
+        assert!(!filled.complete);
+        assert_eq!(filled.range, 20..80);
+    }
+
+    #[test]
+    fn zooming_out_keeps_the_plot_filled_while_the_wider_view_loads() {
+        let (store, node) = fixture(400_000, usize::MAX);
+        let ctx = egui::Context::default();
+        let mut reader = PlotReader::default();
+        reader.request(&ctx, store.view(), node.clone(), 100_000..110_000, 800, true);
+        settle(&mut reader, &ctx);
+        reader.request(&ctx, store.view(), node, 0..400_000, 800, true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while reader.is_loading() {
+            reader.tick(&ctx);
+            if let Some(data) = reader.display_data().filter(|data| !data.complete && data.range.start == 0) {
+                let front = data.range.start + data.scanned;
+                if front < 100_000 {
+                    assert!(data.series["value"].iter().any(|point| point.index >= 100_000 && point.index < 110_000),
+                        "the previous view's data stays visible until the scan reaches it");
+                }
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
     fn zooming_in_reads_again_instead_of_stretching_a_capped_scan() {
         let (store, node) = fixture(100_000, usize::MAX);
         let plan = node.lazy.as_ref().unwrap().numeric_plan().unwrap();
@@ -2849,7 +2928,7 @@ actions:
         assert!(reader.data().unwrap().range.end >= 3000);
     }
     #[test]
-    fn zooming_back_in_does_not_display_coarse_overview_as_exact_samples() {
+    fn zooming_back_in_keeps_coarse_data_labelled_reduced_until_exact_samples_load() {
         let (store, node) = fixture(20_000, 5_001);
         let ctx = egui::Context::default();
         let mut reader = PlotReader::default();
@@ -2857,8 +2936,10 @@ actions:
         settle(&mut reader, &ctx);
         assert_eq!(reader.data().unwrap().quality, PlotQuality::MinMax);
         reader.request(&ctx, store.view(), node, 4_900..5_100, 800, true);
-        assert!(reader.display_data().is_none(),
-            "coarse overview should disappear while exact samples load");
+        // The coarse data stays on screen instead of blanking while exact samples
+        // load, and still reports itself as reduced so it isn't taken for samples.
+        assert_eq!(reader.display_data().unwrap().quality, PlotQuality::MinMax,
+            "coarse data stays visible, labelled as reduced, while exact samples load");
         settle(&mut reader, &ctx);
         assert_eq!(reader.display_data().unwrap().quality, PlotQuality::Exact);
         assert!(reader.data().unwrap().series["value"].iter().any(|point|
