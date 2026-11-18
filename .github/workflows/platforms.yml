@@ -58,6 +58,7 @@ jobs:
         with:
           node-version: '22'
       - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: node --test tests/marketing-privacy.mjs
       - run: node tests/browser_python.mjs
       - run: node --test tests/browser_backend.mjs tests/browser_startup.mjs tests/browser_decoder_worker.mjs
       - run: cargo install --locked trunk --version 0.21.14
