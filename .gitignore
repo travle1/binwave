@@ -28,3 +28,7 @@ __pycache__/
 /private/
 /design/
 /docs/design/
+
+# Local Pages/Workers secrets
+.dev.vars
+.dev.vars.*

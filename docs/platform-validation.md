@@ -1,8 +1,7 @@
 # Platform implementation validation
 
-Checked in the isolated `0dea/plottermaxx` worktree on September 13, 2026.
-The main repository was renamed to `/home/developer/projects/rust/binwave` while
-work was in progress; the Git worktree pointer was repaired afterward.
+Checked in an isolated worktree on September 13, 2026. The repository was
+renamed during validation and its Git worktree pointer was repaired afterward.
 
 | Check | Result |
 | --- | --- |
